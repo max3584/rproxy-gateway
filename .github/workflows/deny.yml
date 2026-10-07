@@ -1,0 +1,41 @@
+name: Dependencies (cargo-deny)
+
+# Checks Cargo.lock against the RustSec advisory database (vulnerable,
+# unmaintained, yanked), licenses and sources (deny.toml). Runs on pull requests
+# that change dependencies and every day, since new advisories appear without
+# any change here. Not a required check.
+on:
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - deny.toml
+      - .github/workflows/deny.yml
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deny-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    container: alpine:3.24
+    steps:
+      - name: packages
+        # libgcc: rustc of the rustup toolchain links libgcc_s
+        run: apk add --no-cache bash git curl tar libgcc
+      - uses: actions/checkout@v4
+      # cargo deny reads the dependency graph through cargo metadata
+      - uses: dtolnay/rust-toolchain@stable
+      # the latest release (musl build), not Alpine's package: new advisory formats need a current cargo-deny
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny --locked check

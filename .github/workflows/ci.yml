@@ -1,0 +1,41 @@
+name: CI
+
+# ジョブは Alpine のコンテナ（musl。イメージのバイナリと同じ）で動かす（rproxy-api と同じ方針）。
+# 例外は kind を使う e2e と conformance だけ（e2e.yml）：kind は Docker でノードのコンテナを作るので、
+# Docker のあるランナーの VM で直接動かす。そこでは Rust をビルドせず、Alpine のジョブが作ったバイナリを使う。
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: fmt + clippy + tests
+    runs-on: ubuntu-latest
+    container: alpine:3.24
+    steps:
+      # git: actions/checkout、tar・zstd: actions/cache（busybox の tar では足りない）、gcc・musl-dev: ring
+      - name: packages
+        run: apk add --no-cache bash git tar zstd curl gcc musl-dev
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: tests
+        run: cargo test --locked --all-targets

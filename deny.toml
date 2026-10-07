@@ -1,0 +1,46 @@
+# cargo-deny: checks Cargo.lock (the whole dependency tree) on PRs that change
+# dependencies and every day (.github/workflows/deny.yml).
+# To accept an advisory that cannot be fixed yet, add it to `advisories.ignore`
+# with the reason and the condition for removing it.
+
+[graph]
+# the container images are Linux (musl) only; gnu for local builds
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-unknown-linux-musl",
+]
+
+[advisories]
+# vulnerabilities, unmaintained and unsound crates and yanked versions all fail the check
+unmaintained = "all"
+yanked = "deny"
+ignore = []
+
+[licenses]
+# what the dependency tree uses today (cargo deny list); all permissive
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
