@@ -86,7 +86,8 @@ kubectl -n e2e create secret tls secure-cert --cert="$work/tls2.crt" --key="$wor
 retry 60 sh -c "curl -sf --cacert $work/tls2.crt --resolve secure.example.com:443:$addr https://secure.example.com/rotated > /dev/null"
 
 echo "== rproxy pods cannot read Secrets"
-test "$(kubectl auth can-i get secrets -n $NS --as=system:serviceaccount:$NS:rproxy-gateway-proxy)" = no
+# can-i exits 1 for "no" (and the ERR trap runs in command substitutions)
+test "$(kubectl auth can-i get secrets -n $NS --as=system:serviceaccount:$NS:rproxy-gateway-proxy || true)" = no
 test "$(kubectl -n $NS get pods -l app.kubernetes.io/name=rproxy -o jsonpath='{.items[0].spec.automountServiceAccountToken}')" = false
 
 echo "== RproxyMiddleware (rate_limit)"
