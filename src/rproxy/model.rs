@@ -92,10 +92,19 @@ pub struct Tls {
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct TlsRoute {
 	pub server_names: Vec<String>,
+	/// One destination (`remote_addr` / `remote_port`), or several (`targets`, `features.tls_route_targets`).
+	#[serde(skip_serializing_if = "String::is_empty")]
 	pub remote_addr: String,
+	#[serde(skip_serializing_if = "is_zero")]
 	pub remote_port: u16,
+	#[serde(skip_serializing_if = "Vec::is_empty")]
+	pub targets: Vec<Target>,
 	#[serde(skip_serializing_if = "std::ops::Not::not")]
 	pub passthrough: bool,
+}
+
+fn is_zero(p: &u16) -> bool {
+	*p == 0
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -133,6 +142,9 @@ pub struct HttpRoute {
 	pub service: Option<String>,
 	#[serde(skip_serializing_if = "Vec::is_empty")]
 	pub middlewares: Vec<String>,
+	/// `request` / `backend_request` (`features.http_options` `route_timeouts`).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub timeouts: Option<Value>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -145,6 +157,12 @@ pub struct HttpDefault {
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct Service {
 	pub servers: Vec<Server>,
+	/// `http1`, `h2`, `h2c`, `auto` (`features.services` `protocol`).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub protocol: Option<&'static str>,
+	/// TLS to the `https://` servers (`features.services` `tls`).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub tls: Option<Value>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub pass_host_header: Option<bool>,
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -155,9 +173,17 @@ pub struct Service {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct Server {
+	/// The backend's URL, or (`status`) none: rproxy answers with that status.
+	#[serde(skip_serializing_if = "String::is_empty")]
 	pub url: String,
+	/// A fixed status (`features.http_options` `server_status`): Gateway API's 500 for an invalid backendRef.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub status: Option<u16>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub weight: Option<u32>,
+	/// Middlewares for requests to this server only (`features.http_options` `server_middlewares`).
+	#[serde(skip_serializing_if = "Vec::is_empty")]
+	pub middlewares: Vec<String>,
 }
 
 /// The body of `PUT /rulesets/{name}`.

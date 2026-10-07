@@ -38,12 +38,103 @@ pub struct Options {
 	pub labels: bool,
 	/// Ingress / Traefik resources go into this Gateway's set.
 	pub migration: Option<migrate::Settings>,
+	/// What the Gateway's rproxy pods take.
+	pub features: Features,
 }
 
 impl Default for Options {
 	fn default() -> Self {
-		Options { listen_addrs: vec!["0.0.0.0".into()], cert_dir: "/var/run/rproxy-gateway/certs".into(), labels: true, migration: None }
+		Options {
+			listen_addrs: vec!["0.0.0.0".into()],
+			cert_dir: "/var/run/rproxy-gateway/certs".into(),
+			labels: true,
+			migration: None,
+			features: Features::default(),
+		}
 	}
+}
+
+/// The newer rproxy settings Gateway API needs (rproxy-api docs/API.md, "Gateway
+/// API 向けの L7・TLS"), from `GET /capabilities` `features`. A setting is used
+/// only when every pod of the Gateway takes it; a route that needs a missing one
+/// is not accepted (`UnsupportedValue`, naming what is missing).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Features {
+	pub headers_add: bool,
+	pub redirect_status: bool,
+	pub route_timeouts: bool,
+	pub server_middlewares: bool,
+	pub retry_status: bool,
+	pub server_status: bool,
+	pub cors: bool,
+	pub mirror: bool,
+	pub replace_host: bool,
+	pub service_protocol: bool,
+	pub service_tls: bool,
+	pub tls_route_targets: bool,
+}
+
+impl Default for Features {
+	/// Everything (pods not asked yet; rproxy v0.4.0 has all of them).
+	fn default() -> Self {
+		Features {
+			headers_add: true,
+			redirect_status: true,
+			route_timeouts: true,
+			server_middlewares: true,
+			retry_status: true,
+			server_status: true,
+			cors: true,
+			mirror: true,
+			replace_host: true,
+			service_protocol: true,
+			service_tls: true,
+			tls_route_targets: true,
+		}
+	}
+}
+
+impl Features {
+	pub fn of(c: &rp::Capabilities) -> Features {
+		let opt = |n: &str| c.lists("http_options", n);
+		Features {
+			headers_add: opt("headers_add"),
+			redirect_status: opt("redirect_status"),
+			route_timeouts: opt("route_timeouts"),
+			server_middlewares: opt("server_middlewares"),
+			retry_status: opt("retry_status"),
+			server_status: opt("server_status"),
+			cors: c.lists("middlewares", "cors"),
+			mirror: c.lists("middlewares", "mirror"),
+			replace_host: c.lists("middlewares", "replace_host"),
+			service_protocol: c.lists("services", "protocol"),
+			service_tls: c.lists("services", "tls"),
+			tls_route_targets: c.feature("tls_route_targets"),
+		}
+	}
+
+	/// What both take.
+	pub fn and(&self, o: &Features) -> Features {
+		Features {
+			headers_add: self.headers_add && o.headers_add,
+			redirect_status: self.redirect_status && o.redirect_status,
+			route_timeouts: self.route_timeouts && o.route_timeouts,
+			server_middlewares: self.server_middlewares && o.server_middlewares,
+			retry_status: self.retry_status && o.retry_status,
+			server_status: self.server_status && o.server_status,
+			cors: self.cors && o.cors,
+			mirror: self.mirror && o.mirror,
+			replace_host: self.replace_host && o.replace_host,
+			service_protocol: self.service_protocol && o.service_protocol,
+			service_tls: self.service_tls && o.service_tls,
+			tls_route_targets: self.tls_route_targets && o.tls_route_targets,
+		}
+	}
+}
+
+/// `Err` naming the rproxy feature a setting needs when the pods lack it.
+pub fn needs(have: bool, what: &str, feature: &str) -> Result<(), String> {
+	if have { Ok(()) } else { Err(format!("{what} needs a newer rproxy (GET /capabilities: {feature})")) }
 }
 
 /// The kinds of route.
@@ -600,26 +691,48 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 		let mut tls_routes: Vec<rp::TlsRoute> = vec![];
 		for a in attachments.iter().filter(|a| a.kind == RouteKind::Tls && mine(a)) {
 			let route = l4_route(world, RouteKind::Tls, a.route);
-			let (dest, resolved) = l4::destination(world, route);
+			// every pod of every backend (weights spread over them) where rproxy takes several
+			// destinations per name (`tls_route_targets`); else the Service's ClusterIP
+			let (targets, resolved) = if opts.features.tls_route_targets {
+				let out = l4::targets(world, "TLSRoute", route);
+				(out.targets, out.resolved)
+			} else {
+				let (dest, resolved) = l4::destination(world, route);
+				(dest.map(|d| vec![rp::Target { addr: d.addr, port: d.port, weight: None }]).unwrap_or_default(), resolved)
+			};
 			let entry = results.entry((RouteKind::Tls, a.route)).or_insert((None, None));
 			if entry.0.is_none() {
 				entry.0 = resolved;
 			}
-			// no usable backend: connections for its names are accepted and closed (Gateway API
-			// expects a reset, not a refused connection), through a port nothing listens on
-			let dest = dest.unwrap_or(backends::Endpoint { addr: "127.0.0.1".into(), port: 1 });
 			let names: Vec<String> = a.hosts.clone().unwrap_or_default().iter().map(|h| hostname::to_rproxy(h)).collect();
 			if names.is_empty() {
 				continue;
 			}
 			let passthrough =
 				listeners[a.listener].family == Some(Family::TlsPassthrough) && (has(Family::Https) || has(Family::TlsTerminate));
-			tls_routes.push(rp::TlsRoute { server_names: names, remote_addr: dest.addr.clone(), remote_port: dest.port, passthrough });
+			let mut tr = rp::TlsRoute { server_names: names, passthrough, ..Default::default() };
+			match targets.as_slice() {
+				// no usable backend: connections for its names are accepted and closed (Gateway API
+				// expects a reset, not a refused connection), through a port nothing listens on
+				[] => (tr.remote_addr, tr.remote_port) = ("127.0.0.1".into(), 1),
+				[one] if one.weight.is_none() && !opts.features.tls_route_targets => {
+					(tr.remote_addr, tr.remote_port) = (one.addr.clone(), one.port);
+				}
+				_ => tr.targets = targets,
+			}
+			tls_routes.push(tr);
 			carried.push((RouteKind::Tls, a.route, a.listener));
 		}
 		if has(Family::Http) || has(Family::Https) {
 			let https = has(Family::Https);
-			let ctx = http::Ctx { world, scheme: if https { "https" } else { "http" }, port: *port };
+			let ctx = http::Ctx {
+				world,
+				scheme: if https { "https" } else { "http" },
+				port: *port,
+				features: &opts.features,
+				kind: "HTTPRoute",
+				grpc: false,
+			};
 			let mut entries = vec![];
 			let mut services = BTreeMap::new();
 			let mut middlewares = BTreeMap::new();
@@ -663,7 +776,11 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 				continue;
 			}
 			let first = &tls_routes[0];
-			rule.targets = vec![rp::Target { addr: first.remote_addr.clone(), port: first.remote_port, weight: None }];
+			rule.targets = if first.targets.is_empty() {
+				vec![rp::Target { addr: first.remote_addr.clone(), port: first.remote_port, weight: None }]
+			} else {
+				first.targets.clone()
+			};
 			let terminate = has(Family::TlsTerminate);
 			rule.tls = Some(rp::Tls {
 				mode: if terminate { "terminate" } else { "sni" },
@@ -746,7 +863,10 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 		let (resolved, unsupported) = index.and_then(|i| results.get(&(p.kind, i)).cloned()).unwrap_or_else(|| {
 			// not carried by any rule: still check its references
 			let resolved = index.and_then(|i| match p.kind {
-				RouteKind::Http => http::build(&http::Ctx { world, scheme: "http", port: 80 }, &world.http_routes[i], None, &[]).resolved,
+				RouteKind::Http => {
+					let ctx = http::Ctx { world, scheme: "http", port: 80, features: &opts.features, kind: "HTTPRoute", grpc: false };
+					http::build(&ctx, &world.http_routes[i], None, &[]).resolved
+				}
 				RouteKind::Tls => l4::destination(world, &world.tls_routes[i]).1,
 				k => l4::targets(world, k.kind(), l4_route(world, k, i)).resolved,
 			});

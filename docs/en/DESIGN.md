@@ -88,15 +88,21 @@ rproxy runs with `RPROXY_API_ADDR=0.0.0.0`, `RPROXY_API_PORT=9443`, `RPROXY_TOKE
 | A listener with a more specific host name on the same port | routes of wildcard and host-less listeners get `!Host(...)` so they do not take that host name (listener isolation) |
 | `backendRefs` | the ready pod IPs of the Service's EndpointSlices (not the ClusterIP) as `servers`; `weight` is spread over the pods. ExternalName as the name |
 | No usable backend | `respond` (500) |
-| `RequestHeaderModifier` / `ResponseHeaderModifier` | `headers` (`set`, `remove`; `add` becomes `set`) |
-| `RequestRedirect` | `redirect_regex` (301 / 302; the port follows Gateway API: the scheme's default when the scheme changes, else the listener's port) |
-| `URLRewrite` path | `replace_path` (ReplaceFullPath), `replace_path_regex` (ReplacePrefixMatch) |
+| Some backendRefs invalid | rproxy answers that backendRef's weight share with 500 (`servers[]` with `status: 500`) |
+| `appProtocol: kubernetes.io/h2c` on the backend Service's port | the service's `protocol: h2c` (HTTP/2 with prior knowledge to the backend) |
+| `RequestHeaderModifier` / `ResponseHeaderModifier` | `headers` (`set`, `add`, `remove`; `add` appends to a value already there with `,`) |
+| `RequestRedirect` | `redirect_regex` (`status` 301, 302, 303, 307 or 308; the port follows Gateway API: the scheme's default when the scheme changes, else the listener's port) |
+| `URLRewrite` | hostname: `replace_host`; path: `replace_path` (ReplaceFullPath), `replace_path_regex` (ReplacePrefixMatch) |
+| `CORS` | `cors` (`allow_origins`, `allow_methods`, `allow_headers`, `expose_headers`, `allow_credentials`, `max_age`; `maxAge` defaults to 5) |
+| `RequestMirror` | `mirror` (a service of the mirror backend's pod IPs; `percent` / `fraction`). A mirror backend that does not resolve: `ResolvedRefs: False`, and only the mirror is left out |
+| `filters` of a backendRef | that backend's `servers[].middlewares` (`RequestHeaderModifier`, `ResponseHeaderModifier`, `URLRewrite`; ReplacePrefixMatch only when the rule has one path prefix) |
+| `retry` | `retry` (`attempts` is Gateway API's count + 1, `codes` become `status`, `backoff` `initial_interval`), the last middleware |
 | `ExtensionRef` (`RproxyMiddleware`) | that middleware (`spec` as it is) |
-| `timeouts.backendRequest` (else `request`) | the service's `timeouts.response` |
+| `timeouts.request` / `timeouts.backendRequest` | the route's `timeouts.request` / `timeouts.backend_request` |
 | Listener `TLS` (`tls.mode: Passthrough`) | a tcp rule, `tls.mode: sni`, `unmatched: reject`; `tls.routes` by TLSRoute host name |
 | `HTTPS` and `TLS` (Passthrough) on the same port | `tls.routes` (`passthrough: true`) of the `http` rule: only those names are not decrypted |
 | Listener `TLS` (`tls.mode: Terminate`) | a tcp rule, `tls.mode: terminate`, `tls.routes` by TLSRoute host name (those of Passthrough listeners on the same port with `passthrough: true`) |
-| TLSRoute destination | a `tls.routes` entry has one destination, so the Service's ClusterIP (kube-proxy spreads over the pods; the first pod for a headless Service). With several backendRefs, the one with the largest weight |
+| TLSRoute destination | `tls.routes[].targets`: the pod IPs of all backends (weights spread over the pods) |
 | Listener `TCP` / `UDP` | a tcp / udp rule, `targets` (the pod IPs of all backends of the TCPRoutes / UDPRoutes, weights spread over the pods) |
 | A `TLS` / `TCP` / `UDP` listener nothing attaches to | no rule (the listener is `Programmed: True`; the Service has the port) |
 | A TLSRoute without a usable backend | its names go to `127.0.0.1:1` (accepted, then closed: Gateway API expects a reset, not a refused connection) |
@@ -111,7 +117,15 @@ rproxy runs with `RPROXY_API_ADDR=0.0.0.0`, `RPROXY_API_PORT=9443`, `RPROXY_TOKE
 | `RproxyPolicy` | Adds a rule's `limits`, `bandwidth`, `geoip`, `outlierDetection`, `allowFrom`, `crowdsec` to `spec.targetRefs` (a Gateway in the same namespace, a listener of it with `sectionName`, a Service) (GEP-713). A Service means the L4 rules sending to it (and, for `outlierDetection`, the `http` services). When several policies set the same key, the oldest wins. Status in `status.ancestors[]` (a missing listener: `Accepted: False`, `TargetNotFound`) |
 | `RproxyRule` | `spec.rule` is a rule verbatim (the body of `POST /rules`), added to the rule set of the `spec.parentRef` Gateway. A Gateway in another namespace needs a ReferenceGrant there (from `rproxy.max3584.net/RproxyRule`, to `Gateway`). When a rule with the same key exists: `Accepted: False` (`Conflicted`). Status copies the rproxy rule's `conditions` |
 
-Not supported (the route gets `Accepted: False`, reason `UnsupportedValue`): `URLRewrite` hostname, `RequestMirror`, the `CORS` filter, filters on a backendRef, redirects with 303 / 307 / 308.
+Not supported (the route gets `Accepted: False`, reason `UnsupportedValue`): `RequestMirror`, `CORS` and `RequestRedirect` filters on a backendRef, `ExternalAuth`.
+
+### rproxy features (`features`)
+
+The newer settings above (`add` of `headers`, a redirect's `status`, route `timeouts`, `replace_host`, `servers[].middlewares`, `cors`, `status` of `retry`, `mirror`, a service's `protocol` and `tls`, `tls.routes[].targets`, `servers[].status`) come with rproxy v0.4.0 (rproxy-api docs/en/API.md, "L7 and TLS for Gateway API"). The controller reads `features` of `GET /capabilities` from the Gateway's rproxy pods and uses only what every pod has.
+
+- A route that needs a missing setting gets `Accepted: False` (`UnsupportedValue`, naming the missing `features`). Other routes keep working.
+- What the older shapes can do is done with them: `timeouts.backendRequest` becomes the service's `timeouts.response`, a TLSRoute goes to the Service's ClusterIP (of the backendRef with the largest weight), partly invalid backendRefs use only the valid ones.
+- Pods not asked yet (just created) are rendered for all of v0.4.0 and corrected on the next pass after they are asked.
 
 ## Status
 

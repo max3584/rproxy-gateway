@@ -370,7 +370,7 @@ spec:
 	assert_eq!(rewrite["middlewares"].as_array().unwrap().len(), 2);
 	assert_eq!(
 		http["middlewares"][rewrite["middlewares"][1].as_str().unwrap()],
-		json!({"headers": {"request": {"set": {"X-A": "a", "X-B": "b"}, "remove": ["X-C"]}}})
+		json!({"headers": {"request": {"set": {"X-A": "a"}, "add": {"X-B": "b"}, "remove": ["X-C"]}}})
 	);
 	assert_eq!(
 		http["services"]["default/f/r1"]["servers"],
@@ -397,10 +397,95 @@ spec:
       backendRefs: [{name: web, port: 80}]
 "#
 	);
-	let p = plan(&yaml);
+	// an rproxy without mirrors
+	let w = world(&yaml);
+	let opts = Options { features: Features { mirror: false, ..Default::default() }, ..Default::default() };
+	let p = render_gateway(&w, &w.gateways[0], &opts);
 	let c = cond(&p.parents[0].conds, "Accepted");
 	assert_eq!((c.status, c.reason.as_str()), (false, "UnsupportedValue"));
+	assert!(c.message.contains("middlewares mirror"), "{}", c.message);
 	assert!(p.rules_json()[0]["http"]["routes"].as_array().unwrap().is_empty());
+	// a newer one
+	let p = plan(&yaml);
+	assert!(cond(&p.parents[0].conds, "Accepted").status);
+}
+
+#[test]
+fn newer_rproxy_settings() {
+	let yaml = format!(
+		"{BASE}{}{}",
+		gw("  - {name: http, port: 80, protocol: HTTP}"),
+		r#"
+---
+apiVersion: v1
+kind: Service
+metadata: {name: grpc, namespace: default}
+spec: {ports: [{name: grpc, port: 50051, appProtocol: kubernetes.io/h2c}]}
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata: {name: grpc-1, namespace: default, labels: {kubernetes.io/service-name: grpc}}
+addressType: IPv4
+ports: [{name: grpc, port: 50051}]
+endpoints: [{addresses: [10.0.2.1]}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: nr, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  rules:
+    - matches: [{path: {value: /mirror}}]
+      filters:
+        - {type: RequestMirror, requestMirror: {backendRef: {name: web, port: 80}, percent: 20}}
+        - type: CORS
+          cors: {allowOrigins: ["https://www.foo.com"], allowMethods: [GET], allowCredentials: true, maxAge: 3600}
+        - {type: URLRewrite, urlRewrite: {hostname: one.example.org}}
+      timeouts: {request: 10s, backendRequest: 2s}
+      retry: {codes: [500, 502], attempts: 3, backoff: 100ms}
+      backendRefs:
+        - name: web
+          port: 80
+          weight: 1
+          filters: [{type: RequestHeaderModifier, requestHeaderModifier: {set: [{name: Backend, value: v1}]}}]
+        - {name: nothing, port: 80, weight: 1}
+    - matches: [{path: {value: /grpc}}]
+      backendRefs: [{name: grpc, port: 50051}]
+"#
+	);
+	let p = plan(&yaml);
+	assert!(cond(&p.parents[0].conds, "Accepted").status, "{:?}", p.parents[0].conds);
+	assert_eq!(cond(&p.parents[0].conds, "ResolvedRefs").reason, "BackendNotFound", "the missing Service");
+	let http = &p.rules_json()[0]["http"];
+	let route = http["routes"].as_array().unwrap().iter().find(|r| r["name"] == "default/nr/r0/m0/h0").unwrap().clone();
+	assert_eq!(route["timeouts"], json!({"request": "10000ms", "backend_request": "2000ms"}));
+	let mws: Vec<Value> =
+		route["middlewares"].as_array().unwrap().iter().map(|n| http["middlewares"][n.as_str().unwrap()].clone()).collect();
+	assert_eq!(mws[0], json!({"mirror": {"service": "default/nr/r0/f0/mirror", "percent": 20}}));
+	assert_eq!(mws[1]["cors"]["allow_origins"], json!(["https://www.foo.com"]));
+	assert_eq!(mws[1]["cors"]["allow_credentials"], true);
+	assert_eq!(mws[1]["cors"]["max_age"], 3600);
+	assert_eq!(mws[2], json!({"replace_host": {"host": "one.example.org"}}));
+	assert_eq!(mws[3], json!({"retry": {"attempts": 4, "status": ["500", "502"], "initial_interval": "100ms"}}), "retries last");
+	assert!(http["services"]["default/nr/r0/f0/mirror"]["servers"].as_array().is_some_and(|s| !s.is_empty()));
+	// the web share goes to its pods with the backendRef's middleware, the missing Service's share is answered with 500
+	let servers = http["services"]["default/nr/r0"]["servers"].as_array().unwrap().clone();
+	assert_eq!(servers.len(), 3);
+	assert_eq!(servers[0]["middlewares"], json!(["default/nr/r0/b0/f0.0"]));
+	assert_eq!(http["middlewares"]["default/nr/r0/b0/f0.0"], json!({"headers": {"request": {"set": {"Backend": "v1"}}}}));
+	assert_eq!(servers[2], json!({"status": 500, "weight": 2}));
+	assert_eq!((servers[0]["weight"].clone(), servers[1]["weight"].clone()), (json!(1), json!(1)));
+	assert!(http["services"]["default/nr/r0"].get("timeouts").is_none(), "route timeouts, not the service's");
+	// appProtocol kubernetes.io/h2c: HTTP/2 without TLS to the backend
+	assert_eq!(http["services"]["default/nr/r1"]["protocol"], "h2c");
+
+	// an older rproxy: the backend request timeout as the service's response timeout, no 500 servers
+	let w = world(&yaml);
+	let old = Features { route_timeouts: false, server_status: false, ..Default::default() };
+	let p = render_gateway(&w, &w.gateways[0], &Options { features: old, ..Default::default() });
+	let http = &p.rules_json()[0]["http"];
+	assert_eq!(http["services"]["default/nr/r0"]["timeouts"], json!({"response": "2000ms"}));
+	assert_eq!(http["services"]["default/nr/r0"]["servers"].as_array().unwrap().len(), 2);
 }
 
 #[test]
@@ -491,6 +576,21 @@ spec:
 	assert_eq!(sni["tls"]["unmatched"], "reject");
 	assert_eq!(
 		sni["tls"]["routes"],
+		json!([{"server_names": ["a.example.com", "**.b.example.com"], "targets": [{"addr": "10.0.3.1", "port": 8443}]}]),
+		"the pods (tls_route_targets)"
+	);
+	assert_eq!(sni["targets"], json!([{"addr": "10.0.3.1", "port": 8443}]));
+	// an older rproxy: one destination per name, the Service's ClusterIP
+	let w = world(&yaml);
+	let old = render_gateway(
+		&w,
+		&w.gateways[0],
+		&Options { features: Features { tls_route_targets: false, ..Default::default() }, ..Default::default() },
+	);
+	let old_rules = old.rules_json();
+	let old_sni = old_rules.iter().find(|r| r["protocol"] == "tcp" && r["listen_port"] == 8443).unwrap();
+	assert_eq!(
+		old_sni["tls"]["routes"],
 		json!([{"server_names": ["a.example.com", "**.b.example.com"], "remote_addr": "10.96.0.30", "remote_port": 443}])
 	);
 	let wrong = p.parents.iter().find(|x| x.name == "wrong").unwrap();
@@ -530,7 +630,7 @@ spec:
 	assert_eq!(tls["mode"], "terminate");
 	assert_eq!(
 		tls["routes"],
-		json!([{"server_names": ["registry.example.com"], "remote_addr": "10.96.0.30", "remote_port": 443, "passthrough": true}])
+		json!([{"server_names": ["registry.example.com"], "targets": [{"addr": "10.0.3.1", "port": 8443}], "passthrough": true}])
 	);
 	assert!(rules[0]["http"].is_object());
 	assert!(p.listeners.iter().all(|l| !cond(&l.conds, "Conflicted").status));

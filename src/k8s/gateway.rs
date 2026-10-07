@@ -189,6 +189,18 @@ pub struct HttpRouteRule {
 	pub backend_refs: Vec<HttpBackendRef>,
 	#[serde(default)]
 	pub timeouts: Option<HttpRouteTimeouts>,
+	#[serde(default)]
+	pub retry: Option<HttpRouteRetry>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct HttpRouteRetry {
+	#[serde(default)]
+	pub codes: Vec<i32>,
+	#[serde(default)]
+	pub attempts: Option<i32>,
+	#[serde(default)]
+	pub backoff: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -247,6 +259,44 @@ pub struct HttpRouteFilter {
 	pub url_rewrite: Option<UrlRewrite>,
 	#[serde(default)]
 	pub extension_ref: Option<LocalObjectReference>,
+	#[serde(default)]
+	pub request_mirror: Option<RequestMirror>,
+	#[serde(default)]
+	pub cors: Option<CorsFilter>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct RequestMirror {
+	#[serde(rename = "backendRef")]
+	pub backend_ref: BackendRef,
+	#[serde(default)]
+	pub percent: Option<i32>,
+	#[serde(default)]
+	pub fraction: Option<Fraction>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct Fraction {
+	pub numerator: i32,
+	#[serde(default)]
+	pub denominator: Option<i32>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CorsFilter {
+	#[serde(default)]
+	pub allow_origins: Vec<String>,
+	#[serde(default)]
+	pub allow_credentials: Option<bool>,
+	#[serde(default)]
+	pub allow_methods: Vec<String>,
+	#[serde(default)]
+	pub allow_headers: Vec<String>,
+	#[serde(default)]
+	pub expose_headers: Vec<String>,
+	#[serde(default)]
+	pub max_age: Option<i32>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

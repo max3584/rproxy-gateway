@@ -206,6 +206,26 @@ spec:
       backendRefs: [{{name: missing, port: 80}}]
 ---
 apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {{name: newer, namespace: default}}
+spec:
+  parentRefs: [{{name: gw, sectionName: http}}]
+  hostnames: [newer.example.com]
+  rules:
+    - matches: [{{path: {{type: PathPrefix, value: /add}}}}]
+      filters:
+        - {{type: RequestHeaderModifier, requestHeaderModifier: {{set: [{{name: X-Test, value: one}}]}}}}
+        - {{type: RequestHeaderModifier, requestHeaderModifier: {{add: [{{name: X-Test, value: two}}]}}}}
+      backendRefs: [{{name: echo, port: 80}}]
+    - matches: [{{path: {{type: PathPrefix, value: /see-other}}}}]
+      filters: [{{type: RequestRedirect, requestRedirect: {{path: {{type: ReplaceFullPath, replaceFullPath: /elsewhere}}, statusCode: 303}}}}]
+    - matches: [{{path: {{type: PathPrefix, value: /host}}}}]
+      filters: [{{type: URLRewrite, urlRewrite: {{hostname: rewritten.example.com}}}}]
+      backendRefs: [{{name: echo, port: 80}}]
+    - matches: [{{path: {{type: PathPrefix, value: /partial}}}}]
+      backendRefs: [{{name: echo, port: 80}}, {{name: missing, port: 80}}]
+---
+apiVersion: gateway.networking.k8s.io/v1
 kind: TCPRoute
 metadata: {{name: tcp, namespace: default}}
 spec:
@@ -224,7 +244,19 @@ spec:
 	);
 	let mut world = World::default();
 	world.read_manifests(&yaml).unwrap();
-	let opts = render::Options { listen_addrs: vec!["127.0.0.1".into()], cert_dir: certs.display().to_string(), ..Default::default() };
+	let rp = Rproxy::start(&bin, &dir, api);
+	rp.wait().await;
+	let client = Client::new(None, TOKEN).unwrap();
+	let caps = client.capabilities(SocketAddr::from(([127, 0, 0, 1], api))).await.unwrap();
+	assert!(caps.feature("rulesets"), "this rproxy has no rule sets: {caps:?}");
+	// rendered for what this rproxy takes, as the controller does
+	let features = render::Features::of(&caps);
+	let opts = render::Options {
+		listen_addrs: vec!["127.0.0.1".into()],
+		cert_dir: certs.display().to_string(),
+		features: features.clone(),
+		..Default::default()
+	};
 	let plan = render::render_gateway(&world, &world.gateways[0], &opts);
 	for (name, content) in &plan.files {
 		std::fs::write(certs.join(name), content).unwrap();
@@ -233,12 +265,6 @@ spec:
 	let certsync = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
 	let certsync_port = certsync.local_addr().unwrap().port();
 	tokio::spawn(rproxy_gateway::certsync::serve(certsync, certs.clone()));
-
-	let rp = Rproxy::start(&bin, &dir, api);
-	rp.wait().await;
-	let client = Client::new(None, TOKEN).unwrap();
-	let caps = client.capabilities(SocketAddr::from(([127, 0, 0, 1], api))).await.unwrap();
-	assert!(caps.feature("rulesets"), "this rproxy has no rule sets: {caps:?}");
 	let ep = Endpoint {
 		pod: "rproxy".into(),
 		uid: "1".into(),
@@ -274,6 +300,25 @@ spec:
 	let (_, body) = get(http_port, "web.example.com", "/rewrite").await;
 	assert!(body.contains("/new|"), "{body}");
 	assert_eq!(get(http_port, "web.example.com", "/none").await.0, 500);
+
+	// the newer settings (rproxy-api docs/API.md, "Gateway API 向け"), where this rproxy has them
+	if features.headers_add && features.redirect_status && features.replace_host && features.server_status {
+		let (_, body) = get(http_port, "newer.example.com", "/add").await;
+		assert!(body.ends_with("/add|newer.example.com|one,two"), "{body}");
+		let (s, body) = get(http_port, "newer.example.com", "/see-other").await;
+		assert_eq!(s, 303, "{body}");
+		assert!(body.to_ascii_lowercase().contains(&format!("location: http://newer.example.com:{http_port}/elsewhere")), "{body}");
+		let (_, body) = get(http_port, "newer.example.com", "/host").await;
+		assert!(body.contains("/host|rewritten.example.com|"), "{body}");
+		// half the requests go to the backend, the invalid backendRef's half is answered with 500
+		let mut codes = std::collections::BTreeSet::new();
+		for _ in 0..8 {
+			codes.insert(get(http_port, "newer.example.com", "/partial").await.0);
+		}
+		assert_eq!(codes, [200, 500].into());
+	} else {
+		eprintln!("this rproxy lacks the newer settings ({features:?}); not tested");
+	}
 
 	// HTTPS with SNI
 	{

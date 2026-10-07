@@ -87,6 +87,13 @@ pub fn resolve(world: &World, route_kind: &str, route_ns: &str, b: &BackendRef) 
 	Ok(out)
 }
 
+/// The `appProtocol` of the Service port a backendRef names (`kubernetes.io/h2c`, `kubernetes.io/ws`, ...).
+pub fn app_protocol(world: &World, route_ns: &str, b: &BackendRef) -> Option<String> {
+	let ns = b.namespace.as_deref().unwrap_or(route_ns);
+	let svc = world.services.get(&(ns.to_string(), b.name.clone()))?;
+	svc.spec.as_ref()?.ports.iter().flatten().find(|p| Some(p.port) == b.port)?.app_protocol.clone()
+}
+
 /// One address for a backend that rproxy can only send to as a whole (a
 /// `tls.routes` entry has one destination): the Service's ClusterIP, or the
 /// first ready endpoint of a headless Service.
@@ -110,10 +117,15 @@ pub fn service_address(world: &World, route_kind: &str, route_ns: &str, b: &Back
 /// Weights of each endpoint so that each backend gets its `weight` share
 /// (spread evenly over its endpoints): `None` when all are equal.
 pub fn spread(backends: &[(u32, Vec<Endpoint>)]) -> Vec<(Endpoint, Option<u32>)> {
-	let live: Vec<&(u32, Vec<Endpoint>)> = backends.iter().filter(|(w, e)| *w > 0 && !e.is_empty()).collect();
+	spread_indexed(backends).into_iter().map(|(_, e, w)| (e, w)).collect()
+}
+
+/// `spread`, with the index of the backend each endpoint belongs to.
+pub fn spread_indexed(backends: &[(u32, Vec<Endpoint>)]) -> Vec<(usize, Endpoint, Option<u32>)> {
+	let live: Vec<(usize, &(u32, Vec<Endpoint>))> = backends.iter().enumerate().filter(|(_, (w, e))| *w > 0 && !e.is_empty()).collect();
 	// the least common multiple of the endpoint counts, so each share divides evenly
 	let mut lcm: u64 = 1;
-	for (_, e) in &live {
+	for (_, (_, e)) in &live {
 		let n = e.len() as u64;
 		lcm = lcm / gcd(lcm, n) * n;
 		if lcm > 10_000 {
@@ -122,23 +134,23 @@ pub fn spread(backends: &[(u32, Vec<Endpoint>)]) -> Vec<(Endpoint, Option<u32>)>
 		}
 	}
 	let mut out = vec![];
-	for (w, e) in &live {
+	for (i, (w, e)) in &live {
 		let n = e.len() as u64;
 		let each = if lcm == 0 { (u64::from(*w) * 100).div_ceil(n) } else { u64::from(*w) * lcm / n };
 		for ep in e {
-			out.push((ep.clone(), Some(each.clamp(1, 1_000_000) as u32)));
+			out.push((*i, ep.clone(), Some(each.clamp(1, 1_000_000) as u32)));
 		}
 	}
 	// the smallest weights with the same ratios: rproxy's round robin then spreads in short cycles
-	let g = out.iter().filter_map(|(_, w)| w.map(u64::from)).fold(0, gcd);
+	let g = out.iter().filter_map(|(_, _, w)| w.map(u64::from)).fold(0, gcd);
 	if g > 1 {
-		for (_, w) in &mut out {
+		for (_, _, w) in &mut out {
 			*w = w.map(|w| (u64::from(w) / g) as u32);
 		}
 	}
-	let first = out.first().map(|(_, w)| *w);
-	if out.iter().all(|(_, w)| Some(*w) == first) {
-		for (_, w) in &mut out {
+	let first = out.first().map(|(_, _, w)| *w);
+	if out.iter().all(|(_, _, w)| Some(*w) == first) {
+		for (_, _, w) in &mut out {
 			*w = None;
 		}
 	}

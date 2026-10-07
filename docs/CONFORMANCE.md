@@ -17,16 +17,11 @@ CI の `e2e` ワークフローの `Gateway API conformance` ジョブ（`script
 
 ## 名乗っている機能（`supportedFeatures`）
 
-core（Gateway、HTTPRoute、ReferenceGrant、TLSRoute、TCPRoute、UDPRoute）と、`GatewayPort8080`、`GatewayHTTPListenerIsolation`、`HTTPRouteMethodMatching`、`HTTPRouteQueryParamMatching`、`HTTPRouteResponseHeaderModification`、`HTTPRoutePortRedirect`、`HTTPRouteSchemeRedirect`、`HTTPRoutePathRedirect`、`HTTPRoutePathRewrite`、`HTTPRouteParentRefPort`、`HTTPRouteDestinationPortMatching`、`HTTPRouteNamedRouteRule`、`HTTPRouteBackendProtocolWebSocket`、`HTTPRouteBackendTimeout`、`TLSRouteModeTerminate`、`TLSRouteModeMixed`、`GatewayStaticAddresses`（`--usable-address=192.0.2.10`、`--unusable-address=0.0.0.0`）、`GatewayAddressEmpty`、`GatewayInfrastructure`。GatewayClass の `status.supportedFeatures` と `scripts/conformance.sh` の `FEATURES` は同じ。
+core（Gateway、HTTPRoute、ReferenceGrant、TLSRoute、TCPRoute、UDPRoute）と、`GatewayPort8080`、`GatewayHTTPListenerIsolation`、`HTTPRouteMethodMatching`、`HTTPRouteQueryParamMatching`、`HTTPRouteResponseHeaderModification`、`HTTPRoutePortRedirect`、`HTTPRouteSchemeRedirect`、`HTTPRoutePathRedirect`、`HTTPRoutePathRewrite`、`TLSRouteModeTerminate`、`TLSRouteModeMixed`、`HTTPRouteParentRefPort`、`HTTPRouteDestinationPortMatching`、`HTTPRouteNamedRouteRule`、`HTTPRouteBackendProtocolWebSocket`、`HTTPRouteBackendTimeout`、`GatewayStaticAddresses`、`GatewayAddressEmpty`、`GatewayInfrastructure`、`HTTPRoute303RedirectStatusCode`、`HTTPRoute307RedirectStatusCode`、`HTTPRoute308RedirectStatusCode`、`HTTPRouteRequestTimeout`、`HTTPRouteHostRewrite`、`HTTPRouteBackendRequestHeaderModification`、`HTTPRouteCORS`、`HTTPRouteRetry`、`HTTPRouteRetryBackendTimeout`、`HTTPRouteRetryConnectionError`、`HTTPRouteRequestMirror`、`HTTPRouteRequestMultipleMirrors`、`HTTPRouteRequestPercentageMirror`、`HTTPRouteBackendProtocolH2C`。`GatewayStaticAddresses` は `--usable-address=192.0.2.10`、`--unusable-address=0.0.0.0` で試す。GatewayClass の `status.supportedFeatures` と `scripts/conformance.sh` の `FEATURES` は同じ（単体テストが確かめる）。HTTPRoute の新しい機能は rproxy v0.4.0 の `features` が要る（docs/DESIGN.md の「rproxy の機能」）。
 
 ## 名乗っていないもの
 
 | 機能 | 理由 |
 |---|---|
-| `HTTPRouteHostRewrite` | rproxy は `Host` をクライアントのものか backend の URL のものにする（書き換える口がない） |
-| `HTTPRouteRequestMirror` 系 | rproxy にミラーがない |
-| `HTTPRoute303/307/308RedirectStatusCode` | `redirect_regex` は 301 / 302（GET 以外は 308 / 307） |
-| `HTTPRouteRequestTimeout` | rproxy の `timeouts.response` はヘッダまでで、リクエスト全体の時間ではない |
-| `HTTPRouteBackendRequestHeaderModification` | backendRef ごとのフィルタ（rproxy の servers ごとのミドルウェアがない） |
-| `HTTPRouteCORS`、`HTTPRouteRetry*`、`HTTPRouteBackendProtocolH2C` | 変換がまだ（CORS・retry は rproxy のミドルウェアにある） |
 | `ListenerSet`、`GatewayFrontendClientCertificateValidation`、`BackendTLSPolicy`、`GRPCRoute` | まだ |
+| `HTTPRouteExternalAuth`、`GatewayHTTPSListenerDetectMisdirectedRequests`、Mesh | rproxy に口がない、またはこのコントローラの範囲の外 |

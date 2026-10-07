@@ -57,6 +57,20 @@ pub const SUPPORTED_FEATURES: &[&str] = &[
 	"GatewayStaticAddresses",
 	"GatewayAddressEmpty",
 	"GatewayInfrastructure",
+	"HTTPRoute303RedirectStatusCode",
+	"HTTPRoute307RedirectStatusCode",
+	"HTTPRoute308RedirectStatusCode",
+	"HTTPRouteRequestTimeout",
+	"HTTPRouteHostRewrite",
+	"HTTPRouteBackendRequestHeaderModification",
+	"HTTPRouteCORS",
+	"HTTPRouteRetry",
+	"HTTPRouteRetryBackendTimeout",
+	"HTTPRouteRetryConnectionError",
+	"HTTPRouteRequestMirror",
+	"HTTPRouteRequestMultipleMirrors",
+	"HTTPRouteRequestPercentageMirror",
+	"HTTPRouteBackendProtocolH2C",
 ];
 
 #[derive(Clone, Debug)]
@@ -261,13 +275,23 @@ async fn reconcile_all(
 		cert_dir: provision::CERT_DIR.into(),
 		labels: true,
 		migration: cfg.migration.clone(),
+		features: render::Features::default(),
 	};
-	let rendered: Vec<(&crate::k8s::gateway::Gateway, GatewayPlan)> = world
-		.gateways
-		.iter()
-		.filter(|g| classes.contains(&g.spec.gateway_class_name))
-		.map(|gw| (gw, render::render_gateway(&world, gw, &opts)))
-		.collect();
+	let mut rendered: Vec<(&crate::k8s::gateway::Gateway, GatewayPlan)> = vec![];
+	for gw in world.gateways.iter().filter(|g| classes.contains(&g.spec.gateway_class_name)) {
+		// what the Gateway's rproxy pods take (all of rproxy v0.4.0 before they are asked)
+		let (ns, name) = (gw.metadata.namespace.clone().unwrap_or_default(), gw.metadata.name.clone().unwrap_or_default());
+		let eps = match &cfg.mode {
+			Mode::Managed(_) => {
+				let id = provision::gateway_id(&ns, &name);
+				provision::pods(&pods_now, &ns, &[(provision::LABEL_GATEWAY.to_string(), id)].into())
+			}
+			Mode::Fleet(f) => provision::pods(&pods_now, &cfg.namespace, &provision::parse_selector(&f.selector)),
+		};
+		let features = pod_features(rp, &eps, &mut state.caps).await;
+		let opts = render::Options { features, ..opts.clone() };
+		rendered.push((gw, render::render_gateway(&world, gw, &opts)));
+	}
 	// fleet: one certificate Secret with every Gateway's files, mounted into every pod
 	let fleet_pods = match &cfg.mode {
 		Mode::Fleet(f) => {
@@ -659,6 +683,27 @@ pub async fn sync_pod(
 		Ok(None) => (PodSync::Pending(format!("pod {}: the rule set disappeared", ep.pod)), true),
 		Err(e) => (PodSync::NotReady(format!("pod {}: {e:#}", ep.pod)), true),
 	}
+}
+
+/// The rproxy settings every pod in `eps` takes (asks the pods not asked yet).
+async fn pod_features(rp: &Client, eps: &[Endpoint], caps: &mut HashMap<String, Capabilities>) -> render::Features {
+	let mut out = render::Features::default();
+	for ep in eps {
+		if !caps.contains_key(&ep.uid) {
+			let Ok(addr) = api_addr(ep) else { continue };
+			match rp.scoped(ep.target.as_deref()).capabilities(addr).await {
+				Ok(c) => {
+					caps.insert(ep.uid.clone(), c);
+				}
+				Err(e) => {
+					debug!(pod = ep.pod, error = format!("{e:#}"), "capabilities not known yet");
+					continue;
+				}
+			}
+		}
+		out = out.and(&render::Features::of(&caps[&ep.uid]));
+	}
+	out
 }
 
 /// The index in `rules[3]: ...` (rproxy's errors for one rule of a set).

@@ -27,6 +27,12 @@ pub struct Ctx<'a> {
 	/// `http` or `https`.
 	pub scheme: &'static str,
 	pub port: u16,
+	/// What the rproxy pods take.
+	pub features: &'a crate::render::Features,
+	/// `HTTPRoute` or `GRPCRoute` (ReferenceGrants name the route's kind).
+	pub kind: &'static str,
+	/// A GRPCRoute: backends speak HTTP/2 (h2c).
+	pub grpc: bool,
 }
 
 /// One rproxy route before priorities are given.
@@ -76,7 +82,7 @@ pub struct Output {
 	pub entries: Vec<Entry>,
 	pub services: BTreeMap<String, rp::Service>,
 	pub middlewares: BTreeMap<String, Value>,
-	/// `ResolvedRefs` of the route.
+	/// `ResolvedRefs` of the route (the first problem).
 	pub resolved: Option<Cond>,
 	/// Why the route cannot be accepted (an unsupported filter or value).
 	pub unsupported: Option<String>,
@@ -190,20 +196,23 @@ fn sort_key(route: &HttpRoute, m: &HttpRouteMatch, host: Option<&str>, rule: usi
 	}
 }
 
-fn header_ops(m: &HeaderModifier) -> Value {
-	let mut set = serde_json::Map::new();
-	// rproxy's headers middleware has set and remove; add is applied as set
-	for h in m.set.iter().chain(&m.add) {
-		set.insert(h.name.clone(), Value::String(h.value.clone()));
-	}
+fn header_ops(ctx: &Ctx, m: &HeaderModifier) -> Result<Value, String> {
+	let map = |hs: &[crate::k8s::gateway::HttpHeader]| -> serde_json::Map<String, Value> {
+		hs.iter().map(|h| (h.name.clone(), Value::String(h.value.clone()))).collect()
+	};
 	let mut out = serde_json::Map::new();
-	if !set.is_empty() {
-		out.insert("set".into(), Value::Object(set));
+	if !m.set.is_empty() {
+		out.insert("set".into(), Value::Object(map(&m.set)));
+	}
+	if !m.add.is_empty() {
+		// rproxy's `add` appends to a header already there (`a` → `a,v`)
+		crate::render::needs(ctx.features.headers_add, "HeaderModifier add", "http_options headers_add")?;
+		out.insert("add".into(), Value::Object(map(&m.add)));
 	}
 	if !m.remove.is_empty() {
 		out.insert("remove".into(), json!(m.remove));
 	}
-	Value::Object(out)
+	Ok(Value::Object(out))
 }
 
 /// The path prefix a `ReplacePrefixMatch` replaces: the match's prefix without a trailing slash.
@@ -217,10 +226,17 @@ const URL_HEAD: &str = "^[a-z]+://([^/?]*?)(?::[0-9]+)?";
 fn redirect(ctx: &Ctx, r: &RequestRedirect, m: &HttpRouteMatch) -> Result<Vec<Value>, String> {
 	let status = r.status_code.unwrap_or(302);
 	let permanent = match status {
-		301 => true,
-		302 => false,
-		other => return Err(format!("RequestRedirect statusCode {other} is not supported (301 and 302)")),
+		301 | 308 => true,
+		302 | 303 | 307 => false,
+		other => return Err(format!("RequestRedirect statusCode {other} is not supported")),
 	};
+	if !matches!(status, 301 | 302) {
+		crate::render::needs(
+			ctx.features.redirect_status,
+			&format!("RequestRedirect statusCode {status}"),
+			"http_options redirect_status",
+		)?;
+	}
 	let scheme = r.scheme.clone().unwrap_or_else(|| ctx.scheme.to_string()).to_ascii_lowercase();
 	let default_port = |s: &str| if s == "https" { 443 } else { 80 };
 	let port = match r.port {
@@ -235,7 +251,15 @@ fn redirect(ctx: &Ctx, r: &RequestRedirect, m: &HttpRouteMatch) -> Result<Vec<Va
 		None => "${1}".into(),
 	};
 	let head = format!("{}://{host}{port}", replacement_literal(&scheme));
-	let mw = |regex: String, replacement: String| json!({"redirect_regex": {"regex": regex, "replacement": replacement, "permanent": permanent}});
+	let with_status = ctx.features.redirect_status;
+	let mw = |regex: String, replacement: String| {
+		let mut v = json!({"regex": regex, "replacement": replacement, "permanent": permanent});
+		if with_status {
+			// the exact code (otherwise rproxy picks 307 / 308 for methods other than GET and HEAD)
+			v["status"] = json!(status);
+		}
+		json!({ "redirect_regex": v })
+	};
 	match &r.path {
 		None => Ok(vec![mw(format!("{URL_HEAD}(/[^?]*)?(\\?.*)?$"), format!("{head}${{2}}${{3}}"))]),
 		Some(PathModifier { kind, replace_full_path: Some(p), .. }) if kind == "ReplaceFullPath" => {
@@ -257,47 +281,103 @@ fn redirect(ctx: &Ctx, r: &RequestRedirect, m: &HttpRouteMatch) -> Result<Vec<Va
 	}
 }
 
-fn rewrite(f: &crate::k8s::gateway::UrlRewrite, m: &HttpRouteMatch) -> Result<Vec<Value>, String> {
-	if f.hostname.is_some() {
-		return Err("URLRewrite hostname is not supported (rproxy sets Host from the client or the backend URL)".into());
+fn rewrite(ctx: &Ctx, f: &crate::k8s::gateway::UrlRewrite, m: &HttpRouteMatch) -> Result<Vec<Value>, String> {
+	let mut out = vec![];
+	if let Some(h) = &f.hostname {
+		crate::render::needs(ctx.features.replace_host, "URLRewrite hostname", "middlewares replace_host")?;
+		out.push(json!({"replace_host": {"host": h}}));
 	}
 	match &f.path {
-		None => Ok(vec![]),
+		None => {}
 		Some(PathModifier { kind, replace_full_path: Some(p), .. }) if kind == "ReplaceFullPath" => {
-			Ok(vec![json!({"replace_path": {"path": p}})])
+			out.push(json!({"replace_path": {"path": p}}));
 		}
 		Some(PathModifier { kind, replace_prefix_match: Some(np), .. }) if kind == "ReplacePrefixMatch" => {
 			let prefix = regex_escape(&matched_prefix(m));
 			let np = np.trim_end_matches('/');
 			if np.is_empty() {
-				Ok(vec![
-					json!({"replace_path_regex": {"regex": format!("^{prefix}(/.*)$"), "replacement": "${1}"}}),
-					json!({"replace_path_regex": {"regex": format!("^{prefix}$"), "replacement": "/"}}),
-				])
+				out.push(json!({"replace_path_regex": {"regex": format!("^{prefix}(/.*)$"), "replacement": "${1}"}}));
+				out.push(json!({"replace_path_regex": {"regex": format!("^{prefix}$"), "replacement": "/"}}));
 			} else {
-				Ok(vec![
+				out.push(
 					json!({"replace_path_regex": {"regex": format!("^{prefix}(/.*)?$"), "replacement": format!("{}${{1}}", replacement_literal(np))}}),
-				])
+				);
 			}
 		}
-		Some(p) => Err(format!("URLRewrite path type {} is not supported", p.kind)),
+		Some(p) => return Err(format!("URLRewrite path type {} is not supported", p.kind)),
 	}
+	Ok(out)
 }
 
-/// The middlewares of one filter (several for prefix replacements), or why it cannot be used.
-/// `Ok(None)`: an ExtensionRef that does not resolve (the rule answers 500).
-fn filter(ctx: &Ctx, ns: &str, f: &HttpRouteFilter, m: &HttpRouteMatch) -> Result<Option<Vec<Value>>, String> {
-	Ok(Some(match f.kind.as_str() {
+fn cors(ctx: &Ctx, c: &crate::k8s::gateway::CorsFilter) -> Result<Value, String> {
+	crate::render::needs(ctx.features.cors, "the CORS filter", "middlewares cors")?;
+	let mut v = json!({
+		"allow_origins": c.allow_origins,
+		"allow_methods": c.allow_methods,
+		"allow_headers": c.allow_headers,
+		"expose_headers": c.expose_headers,
+	});
+	if c.allow_credentials == Some(true) {
+		v["allow_credentials"] = json!(true);
+	}
+	// Gateway API's default is 5 seconds
+	v["max_age"] = json!(c.max_age.unwrap_or(5));
+	Ok(json!({ "cors": v }))
+}
+
+/// What a filter gives.
+enum Filtered {
+	/// Middlewares (several for prefix replacements).
+	Middlewares(Vec<Value>),
+	/// An ExtensionRef that does not resolve (the rule answers 500).
+	Missing,
+}
+
+/// The middlewares of one filter, or why it cannot be used. `base`: names for
+/// what the filter adds (a mirror's service).
+fn filter(ctx: &Ctx, ns: &str, f: &HttpRouteFilter, m: &HttpRouteMatch, base: &str, out: &mut Output) -> Result<Filtered, String> {
+	Ok(Filtered::Middlewares(match f.kind.as_str() {
 		"RequestHeaderModifier" => {
-			vec![json!({"headers": {"request": header_ops(f.request_header_modifier.as_ref().ok_or("requestHeaderModifier is missing")?)}})]
+			vec![
+				json!({"headers": {"request": header_ops(ctx, f.request_header_modifier.as_ref().ok_or("requestHeaderModifier is missing")?)?}}),
+			]
 		}
 		"ResponseHeaderModifier" => {
 			vec![
-				json!({"headers": {"response": header_ops(f.response_header_modifier.as_ref().ok_or("responseHeaderModifier is missing")?)}}),
+				json!({"headers": {"response": header_ops(ctx, f.response_header_modifier.as_ref().ok_or("responseHeaderModifier is missing")?)?}}),
 			]
 		}
 		"RequestRedirect" => redirect(ctx, f.request_redirect.as_ref().ok_or("requestRedirect is missing")?, m)?,
-		"URLRewrite" => rewrite(f.url_rewrite.as_ref().ok_or("urlRewrite is missing")?, m)?,
+		"URLRewrite" => rewrite(ctx, f.url_rewrite.as_ref().ok_or("urlRewrite is missing")?, m)?,
+		"CORS" => vec![cors(ctx, f.cors.as_ref().ok_or("cors is missing")?)?],
+		"RequestMirror" => {
+			crate::render::needs(ctx.features.mirror, "the RequestMirror filter", "middlewares mirror")?;
+			let mirror = f.request_mirror.as_ref().ok_or("requestMirror is missing")?;
+			let eps = match backends::resolve(ctx.world, ctx.kind, ns, &mirror.backend_ref) {
+				Ok(eps) => eps,
+				Err(e) => {
+					out.resolved.get_or_insert(e);
+					return Ok(Filtered::Middlewares(vec![]));
+				}
+			};
+			if eps.is_empty() {
+				// nothing to mirror to (no ready pod): requests go on unmirrored
+				return Ok(Filtered::Middlewares(vec![]));
+			}
+			let name = format!("{base}/mirror");
+			let servers = backends::spread(&[(1, eps)])
+				.into_iter()
+				.map(|(ep, weight)| rp::Server { url: format!("http://{}", ep.authority()), weight, ..Default::default() })
+				.collect();
+			out.services.insert(name.clone(), rp::Service { servers, ..Default::default() });
+			let mut v = json!({ "service": name });
+			if let Some(fr) = &mirror.fraction {
+				v["fraction"] = json!({"numerator": fr.numerator, "denominator": fr.denominator.unwrap_or(100)});
+			} else if let Some(p) = mirror.percent {
+				v["percent"] = json!(p);
+			}
+			vec![json!({ "mirror": v })]
+		}
 		"ExtensionRef" => {
 			let r = f.extension_ref.as_ref().ok_or("extensionRef is missing")?;
 			if r.group != RPROXY_GROUP || r.kind != "RproxyMiddleware" {
@@ -305,11 +385,88 @@ fn filter(ctx: &Ctx, ns: &str, f: &HttpRouteFilter, m: &HttpRouteMatch) -> Resul
 			}
 			match ctx.world.middlewares.get(&(ns.to_string(), r.name.clone())) {
 				Some(mw) => vec![Value::Object(mw.spec.0.0.clone())],
-				None => return Ok(None),
+				None => return Ok(Filtered::Missing),
 			}
 		}
 		other => return Err(format!("filter {other} is not supported")),
 	}))
+}
+
+/// The middlewares of a backendRef's filters (rproxy's per-server middlewares:
+/// header changes, the host and the full path).
+fn backend_filter(ctx: &Ctx, f: &HttpRouteFilter, matches: &[HttpRouteMatch]) -> Result<Vec<Value>, String> {
+	crate::render::needs(ctx.features.server_middlewares, "filters on backendRefs", "http_options server_middlewares")?;
+	match f.kind.as_str() {
+		"RequestHeaderModifier" | "ResponseHeaderModifier" => {
+			let mut dummy = Output::default();
+			match filter(ctx, "", f, &HttpRouteMatch::default(), "", &mut dummy)? {
+				Filtered::Middlewares(m) => Ok(m),
+				Filtered::Missing => Err("unreachable".into()),
+			}
+		}
+		"URLRewrite" => {
+			let r = f.url_rewrite.as_ref().ok_or("urlRewrite is missing")?;
+			let prefix = r.path.as_ref().is_some_and(|p| p.kind == "ReplacePrefixMatch");
+			// a prefix replacement depends on the match; a server serves all of the rule's matches
+			let distinct: std::collections::BTreeSet<String> = matches.iter().map(matched_prefix).collect();
+			if prefix && distinct.len() > 1 {
+				return Err("URLRewrite ReplacePrefixMatch on a backendRef of a rule with several path prefixes is not supported".into());
+			}
+			rewrite(ctx, r, matches.first().unwrap_or(&HttpRouteMatch::default()))
+		}
+		other => Err(format!("filter {other} on a backendRef is not supported")),
+	}
+}
+
+/// rproxy's `retry` middleware for a rule's `retry`.
+fn retry(ctx: &Ctx, r: &crate::k8s::gateway::HttpRouteRetry) -> Result<Option<Value>, String> {
+	// Gateway API counts the retries, rproxy the attempts (the first included)
+	let retries = r.attempts.unwrap_or(1);
+	if retries <= 0 {
+		return Ok(None);
+	}
+	let mut v = json!({ "attempts": retries + 1 });
+	if !r.codes.is_empty() {
+		crate::render::needs(ctx.features.retry_status, "retry codes", "http_options retry_status")?;
+		v["status"] = json!(r.codes.iter().map(|c| c.to_string()).collect::<Vec<_>>());
+	}
+	if let Some(b) = &r.backoff {
+		if crate::render::duration_ms(b).is_none() {
+			return Err(format!("retry backoff {b:?} is not a duration"));
+		}
+		v["initial_interval"] = json!(b);
+	}
+	Ok(Some(json!({ "retry": v })))
+}
+
+/// The route timeouts of a rule (`Ok(None)`: none), or where the rproxy lacks
+/// them the backend request timeout as the service's response timeout.
+fn timeouts(ctx: &Ctx, t: &crate::k8s::gateway::HttpRouteTimeouts) -> Result<(Option<Value>, Option<Value>), String> {
+	let parse = |d: &Option<String>| -> Result<Option<u64>, String> {
+		match d.as_deref() {
+			None => Ok(None),
+			Some(d) => match crate::render::duration_ms(d) {
+				Some(0) => Ok(None),
+				Some(ms) => Ok(Some(ms)),
+				None => Err(format!("timeout {d:?} is not a duration")),
+			},
+		}
+	};
+	let (request, backend) = (parse(&t.request)?, parse(&t.backend_request)?);
+	if ctx.features.route_timeouts {
+		let mut v = serde_json::Map::new();
+		if let Some(ms) = request {
+			v.insert("request".into(), json!(format!("{ms}ms")));
+		}
+		if let Some(ms) = backend {
+			v.insert("backend_request".into(), json!(format!("{ms}ms")));
+		}
+		return Ok(((!v.is_empty()).then_some(Value::Object(v)), None));
+	}
+	if request.is_some() && backend.is_none() {
+		return Err("timeouts.request needs a newer rproxy (GET /capabilities: http_options route_timeouts)".into());
+	}
+	Ok((None, backend.map(|ms| json!({"response": format!("{ms}ms")}))))
 }
 
 /// Builds the routes of `route` served on a listener: `hosts` are the route's
@@ -323,57 +480,119 @@ pub fn build(ctx: &Ctx, route: &HttpRoute, hosts: Option<&[String]>, exclusions:
 		Some(h) => h.iter().map(|s| Some(s.as_str())).collect(),
 		None => vec![None],
 	};
-	let mut resolved: Option<Cond> = None;
 	for (i, rule) in route.spec.rules.iter().enumerate() {
 		let base = format!("{ns}/{name}/r{i}");
-		// backends
+		let default_match = [HttpRouteMatch::default()];
+		let matches: &[HttpRouteMatch] = if rule.matches.is_empty() { &default_match } else { &rule.matches };
+		// backends: (weight, endpoints, the backendRef's middlewares); an invalid backendRef
+		// gets its share answered with 500 where rproxy can (`servers[].status`)
 		let mut weighted: Vec<(u32, Vec<Endpoint>)> = vec![];
-		for b in &rule.backend_refs {
-			if !b.filters.is_empty() {
-				out.unsupported.get_or_insert_with(|| "filters on backendRefs are not supported".into());
-			}
-			match backends::resolve(ctx.world, "HTTPRoute", &ns, &b.backend) {
+		let mut server_mws: Vec<Vec<String>> = vec![];
+		let mut fixed_500: Vec<bool> = vec![];
+		let mut protocols: Vec<Option<String>> = vec![];
+		let mut any_valid = false;
+		for (bi, b) in rule.backend_refs.iter().enumerate() {
+			let weight = b.backend.weight.unwrap_or(1).max(0) as u32;
+			match backends::resolve(ctx.world, ctx.kind, &ns, &b.backend) {
 				Ok(eps) => {
 					let svc = (b.backend.namespace.clone().unwrap_or_else(|| ns.clone()), b.backend.name.clone());
 					out.backends.entry(base.clone()).or_default().push(svc);
-					weighted.push((b.backend.weight.unwrap_or(1).max(0) as u32, eps));
+					let mut names = vec![];
+					for (k, f) in b.filters.iter().enumerate() {
+						match backend_filter(ctx, f, matches) {
+							Ok(mws) => {
+								for (x, mw) in mws.into_iter().enumerate() {
+									let n = format!("{base}/b{bi}/f{k}.{x}");
+									out.middlewares.insert(n.clone(), mw);
+									names.push(n);
+								}
+							}
+							Err(e) => {
+								out.unsupported.get_or_insert(format!("rule {i}: {e}"));
+							}
+						}
+					}
+					protocols.push(backends::app_protocol(ctx.world, &ns, &b.backend));
+					any_valid = true;
+					weighted.push((weight, eps));
+					server_mws.push(names);
+					fixed_500.push(false);
 				}
 				Err(e) => {
-					resolved.get_or_insert(e);
+					out.resolved.get_or_insert(e);
+					if ctx.features.server_status && weight > 0 {
+						weighted.push((weight, vec![Endpoint { addr: String::new(), port: 0 }]));
+						server_mws.push(vec![]);
+						fixed_500.push(true);
+					}
 				}
 			}
 		}
-		let servers: Vec<rp::Server> = backends::spread(&weighted)
+		let servers: Vec<rp::Server> = backends::spread_indexed(&weighted)
 			.into_iter()
-			.map(|(ep, weight)| rp::Server { url: format!("http://{}", ep.authority()), weight })
+			.map(|(g, ep, weight)| {
+				if fixed_500[g] {
+					rp::Server { status: Some(500), weight, ..Default::default() }
+				} else {
+					rp::Server {
+						url: format!("http://{}", ep.authority()),
+						weight,
+						middlewares: server_mws[g].clone(),
+						..Default::default()
+					}
+				}
+			})
 			.collect();
-		let service = if servers.is_empty() {
+		let mut route_timeouts = None;
+		let service = if servers.is_empty() || !any_valid {
 			None
 		} else {
 			let mut svc = rp::Service { servers, ..Default::default() };
 			if let Some(t) = &rule.timeouts {
-				if let Some(d) = t.backend_request.as_deref().or(t.request.as_deref()) {
-					match crate::render::duration_ms(d) {
-						Some(0) => {}
-						Some(ms) => svc.timeouts = Some(json!({"response": format!("{ms}ms")})),
-						None => {
-							out.unsupported.get_or_insert_with(|| format!("timeout {d:?} is not a duration"));
-						}
+				match timeouts(ctx, t) {
+					Ok((on_route, on_service)) => {
+						route_timeouts = on_route;
+						svc.timeouts = on_service;
+					}
+					Err(e) => {
+						out.unsupported.get_or_insert(format!("rule {i}: {e}"));
+					}
+				}
+			}
+			// the backends' protocol: gRPC is HTTP/2 without TLS; an HTTPRoute's backends say so with appProtocol
+			let h2c = |p: &Option<String>| p.as_deref() == Some("kubernetes.io/h2c");
+			let wanted =
+				if ctx.grpc && protocols.iter().all(|p| p.is_none() || h2c(p)) || !protocols.is_empty() && protocols.iter().all(h2c) {
+					Some("h2c")
+				} else {
+					None
+				};
+			if let Some(p) = wanted {
+				match crate::render::needs(ctx.features.service_protocol, "HTTP/2 to backends (h2c)", "services protocol") {
+					Ok(()) => svc.protocol = Some(p),
+					Err(e) => {
+						out.unsupported.get_or_insert(format!("rule {i}: {e}"));
 					}
 				}
 			}
 			out.services.insert(base.clone(), svc);
 			Some(base.clone())
 		};
-		let default_match = [HttpRouteMatch::default()];
-		let matches: &[HttpRouteMatch] = if rule.matches.is_empty() { &default_match } else { &rule.matches };
+		let retry_mw = match rule.retry.as_ref().map(|r| retry(ctx, r)) {
+			Some(Ok(mw)) => mw,
+			Some(Err(e)) => {
+				out.unsupported.get_or_insert(format!("rule {i}: {e}"));
+				None
+			}
+			None => None,
+		};
 		for (j, m) in matches.iter().enumerate() {
 			let mut chain = vec![];
 			let mut answers = false;
 			let mut broken = false;
 			for (k, f) in rule.filters.iter().enumerate() {
-				match filter(ctx, &ns, f, m) {
-					Ok(Some(mws)) => {
+				match filter(ctx, &ns, f, m, &format!("{base}/f{k}"), &mut out) {
+					Ok(Filtered::Middlewares(mws)) => {
 						for (x, mw) in mws.into_iter().enumerate() {
 							answers |= mw.get("redirect_regex").is_some() || mw.get("respond").is_some();
 							let n = format!("{base}/m{j}/f{k}.{x}");
@@ -381,9 +600,9 @@ pub fn build(ctx: &Ctx, route: &HttpRoute, hosts: Option<&[String]>, exclusions:
 							chain.push(n);
 						}
 					}
-					Ok(None) => {
+					Ok(Filtered::Missing) => {
 						broken = true;
-						resolved.get_or_insert(Cond::new(
+						out.resolved.get_or_insert(Cond::new(
 							"ResolvedRefs",
 							false,
 							"BackendNotFound",
@@ -396,6 +615,13 @@ pub fn build(ctx: &Ctx, route: &HttpRoute, hosts: Option<&[String]>, exclusions:
 				}
 			}
 			let service = if broken { None } else { service.clone() };
+			if service.is_some() && !answers {
+				if let Some(mw) = &retry_mw {
+					let n = format!("{base}/retry");
+					out.middlewares.insert(n.clone(), mw.clone());
+					chain.push(n);
+				}
+			}
 			if service.is_none() && !answers {
 				out.middlewares.insert(RESPOND_500.into(), json!({"respond": {"status": 500, "body": "500 Internal Server Error\n"}}));
 				chain.push(RESPOND_500.into());
@@ -410,6 +636,7 @@ pub fn build(ctx: &Ctx, route: &HttpRoute, hosts: Option<&[String]>, exclusions:
 							priority: None,
 							service: service.clone(),
 							middlewares: chain.clone(),
+							timeouts: if service.is_some() { route_timeouts.clone() } else { None },
 						},
 					}),
 					Err(e) => {
@@ -419,7 +646,6 @@ pub fn build(ctx: &Ctx, route: &HttpRoute, hosts: Option<&[String]>, exclusions:
 			}
 		}
 	}
-	out.resolved = resolved;
 	out
 }
 
@@ -463,7 +689,8 @@ mod tests {
 	#[test]
 	fn redirects() {
 		let world = World::default();
-		let ctx = Ctx { world: &world, scheme: "http", port: 80 };
+		let features = crate::render::Features::default();
+		let ctx = Ctx { world: &world, scheme: "http", port: 80, features: &features, kind: "HTTPRoute", grpc: false };
 		let r = RequestRedirect { scheme: Some("https".into()), status_code: Some(301), ..Default::default() };
 		let v = redirect(&ctx, &r, &m(None)).unwrap();
 		assert_eq!(v[0]["redirect_regex"]["replacement"], "https://${1}${2}${3}");
@@ -473,13 +700,22 @@ mod tests {
 			path: Some(PathModifier { kind: "ReplacePrefixMatch".into(), replace_prefix_match: Some("/".into()), replace_full_path: None }),
 			..Default::default()
 		};
-		let ctx8080 = Ctx { world: &world, scheme: "http", port: 8080 };
+		let ctx8080 = Ctx { world: &world, scheme: "http", port: 8080, features: &features, kind: "HTTPRoute", grpc: false };
 		let v = redirect(&ctx8080, &r, &m(Some(("PathPrefix", "/old/")))).unwrap();
 		assert_eq!(v.len(), 2);
 		assert_eq!(v[0]["redirect_regex"]["regex"], "^[a-z]+://([^/?]*?)(?::[0-9]+)?/old(/[^?]*)(\\?.*)?$");
 		assert_eq!(v[0]["redirect_regex"]["replacement"], "http://example.org:8080${2}${3}");
 		assert_eq!(v[1]["redirect_regex"]["replacement"], "http://example.org:8080/${2}");
-		assert!(redirect(&ctx, &RequestRedirect { status_code: Some(307), ..Default::default() }, &m(None)).is_err());
+		let v = redirect(&ctx, &RequestRedirect { status_code: Some(307), ..Default::default() }, &m(None)).unwrap();
+		assert_eq!(v[0]["redirect_regex"]["status"], 307);
+		assert_eq!(v[0]["redirect_regex"]["permanent"], false);
+		// an older rproxy: 301 and 302 only
+		let old = crate::render::Features { redirect_status: false, ..Default::default() };
+		let ctx_old = Ctx { world: &world, scheme: "http", port: 80, features: &old, kind: "HTTPRoute", grpc: false };
+		let e = redirect(&ctx_old, &RequestRedirect { status_code: Some(303), ..Default::default() }, &m(None)).unwrap_err();
+		assert!(e.contains("redirect_status"), "{e}");
+		let v = redirect(&ctx_old, &RequestRedirect { status_code: Some(301), ..Default::default() }, &m(None)).unwrap();
+		assert!(v[0]["redirect_regex"].get("status").is_none());
 	}
 
 	#[test]
@@ -492,8 +728,16 @@ mod tests {
 				replace_full_path: None,
 			}),
 		};
-		let v = rewrite(&f, &m(Some(("PathPrefix", "/old")))).unwrap();
+		let world = World::default();
+		let features = crate::render::Features::default();
+		let ctx = Ctx { world: &world, scheme: "http", port: 80, features: &features, kind: "HTTPRoute", grpc: false };
+		let v = rewrite(&ctx, &f, &m(Some(("PathPrefix", "/old")))).unwrap();
 		assert_eq!(v, vec![json!({"replace_path_regex": {"regex": "^/old(/.*)?$", "replacement": "/new${1}"}})]);
+		let host = crate::k8s::gateway::UrlRewrite { hostname: Some("one.example.org".into()), path: None };
+		assert_eq!(rewrite(&ctx, &host, &m(None)).unwrap(), vec![json!({"replace_host": {"host": "one.example.org"}})]);
+		let old = crate::render::Features { replace_host: false, ..Default::default() };
+		let ctx_old = Ctx { world: &world, scheme: "http", port: 80, features: &old, kind: "HTTPRoute", grpc: false };
+		assert!(rewrite(&ctx_old, &host, &m(None)).is_err());
 		assert_eq!(regex_escape("/a.b$"), "/a\\.b\\$");
 	}
 }
