@@ -1,0 +1,9 @@
+target
+.env
+__pycache__/
+# conformance / e2e の出力
+/conformance-report*.yaml
+/e2e-logs/
+
+# Claude Code の作業用（エージェントの worktree）
+/.claude/worktrees/

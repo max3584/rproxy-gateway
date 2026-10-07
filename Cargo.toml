@@ -1,0 +1,15 @@
+[package]
+name = "rproxy-gateway"
+version = "0.4.0"
+edition = "2024"
+rust-version = "1.89"
+authors = ["touka shiro / max3584 <max3584.work@gmail.com>"]
+description = "Kubernetes Gateway API controller for rproxy (drives rproxy-api through its control API)"
+homepage = "https://github.com/max3584/rproxy-gateway"
+repository = "https://github.com/max3584/rproxy-gateway"
+readme = "README.md"
+license = "MIT"
+publish = false
+
+[dependencies]
+clap = { version = "4.5", features = ["derive", "env"] }
