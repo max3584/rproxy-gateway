@@ -1140,6 +1140,7 @@ spec:
     - {{name: main, port: 80, protocol: HTTP, hostname: one.example.com}}
     - {{name: clash, port: 80, protocol: HTTP, hostname: gw.example.com}}
     - {{name: tcp, port: 80, protocol: TCP}}
+    - {{name: after-tcp, port: 80, protocol: HTTP, hostname: two.example.com}}
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: ListenerSet
@@ -1183,6 +1184,7 @@ spec:
 	assert_eq!(cond(&l("ls1", "clash").conds, "Conflicted").reason, "HostnameConflict", "the Gateway's listener wins");
 	assert_eq!(cond(&l("ls1", "tcp").conds, "Conflicted").reason, "ProtocolConflict");
 	assert!(cond(&l("ls1", "main").conds, "Accepted").status);
+	assert!(cond(&l("ls1", "after-tcp").conds, "Accepted").status, "a listener that lost a conflict takes nothing");
 	assert_eq!(cond(&l("ls2", "only").conds, "Conflicted").reason, "HostnameConflict", "the older ListenerSet wins");
 	assert_eq!((set("ls2").accepted.status, set("ls2").accepted.reason.as_str()), (false, "ListenersNotValid"));
 	// routes: through the ListenerSet to its listener only; through the Gateway to the Gateway's
