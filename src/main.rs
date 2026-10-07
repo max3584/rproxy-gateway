@@ -57,6 +57,9 @@ struct ControllerArgs {
 	/// managed: the type of each Gateway's Service.
 	#[arg(long, env = "RPROXY_GATEWAY_SERVICE_TYPE", default_value = "LoadBalancer")]
 	service_type: String,
+	/// managed: make a NetworkPolicy per Gateway so only the controller reaches rproxy's control API and certsync.
+	#[arg(long, env = "RPROXY_GATEWAY_NETWORK_POLICY", default_value_t = true, action = clap::ArgAction::Set)]
+	network_policy: bool,
 	/// managed: imagePullPolicy of rproxy pods.
 	#[arg(long, env = "RPROXY_GATEWAY_IMAGE_PULL_POLICY", default_value = "IfNotPresent")]
 	image_pull_policy: String,
@@ -221,6 +224,7 @@ fn main() -> anyhow::Result<()> {
 					replicas: a.replicas,
 					service_type: a.service_type,
 					pull_policy: a.image_pull_policy,
+					network_policy: a.network_policy.then(|| a.namespace.clone()),
 				}),
 			};
 			let cfg = controller::Config {

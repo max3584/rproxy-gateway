@@ -50,6 +50,8 @@ pub const ANNOTATION_GATEWAY: &str = "rproxy.max3584.net/gateway";
 pub const ANNOTATION_CERTS: &str = "rproxy.max3584.net/certs";
 /// On a control API Secret: the name its certificate was issued for.
 pub const ANNOTATION_SERVER_NAME: &str = "rproxy.max3584.net/server-name";
+/// On rproxy pod templates: the hash of the control API Secret (rproxy reads its certificate at start).
+pub const ANNOTATION_API: &str = "rproxy.max3584.net/api";
 /// The certificate Secret of fleet pods (every Gateway's files).
 pub const FLEET_CERTS_SECRET: &str = "rproxy-fleet-certs";
 /// The control API port of rproxy pods.
@@ -73,6 +75,9 @@ pub struct Managed {
 	pub replicas: i32,
 	pub service_type: String,
 	pub pull_policy: String,
+	/// A NetworkPolicy per Gateway letting only the controller (in this namespace) reach
+	/// rproxy's control API and certsync (`None`: none made).
+	pub network_policy: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -269,8 +274,10 @@ pub fn api_secret(t: &Target, current: Option<&Secret>, boot: &bootstrap::Bootst
 	let name = server_name_for(&t.id);
 	let have = data_of(current);
 	let issued_for = current.and_then(|s| s.metadata.annotations.as_ref()).and_then(|a| a.get(ANNOTATION_SERVER_NAME));
+	let ends = current.and_then(|s| s.metadata.annotations.as_ref()).and_then(|a| a.get(bootstrap::ANNOTATION_NOT_AFTER));
 	let keep = have.get("ca.crt") == Some(&boot.ca_pem)
 		&& issued_for == Some(&name)
+		&& !bootstrap::renew(ends.map(String::as_str))
 		&& have.contains_key("tls.crt")
 		&& have.contains_key("tls.key");
 	let (crt, key) = if keep {
@@ -290,6 +297,8 @@ pub fn api_secret(t: &Target, current: Option<&Secret>, boot: &bootstrap::Bootst
 	let mut meta = t.meta(&api_secret_name(&t.id), t.secret_labels());
 	meta.labels.get_or_insert_default().remove(LABEL_CERTS_FOR);
 	meta.annotations.get_or_insert_default().insert(ANNOTATION_SERVER_NAME.into(), name);
+	let ends = if keep { ends.cloned().unwrap_or_default() } else { bootstrap::not_after(bootstrap::LEAF_DAYS).to_string() };
+	meta.annotations.get_or_insert_default().insert(bootstrap::ANNOTATION_NOT_AFTER.into(), ends);
 	Ok(secret(meta, &data))
 }
 
@@ -326,7 +335,8 @@ pub fn service_account(t: &Target) -> ServiceAccount {
 }
 
 /// A Gateway's rproxy Deployment: rproxy and certsync.
-pub fn deployment(t: &Target, m: &Managed) -> Deployment {
+/// `api_hash`: the control API Secret's content hash, on the pod template: a new certificate or token rolls the pods.
+pub fn deployment(t: &Target, m: &Managed, api_hash: &str) -> Deployment {
 	let name = object_name(&t.id);
 	let restricted = SecurityContext {
 		allow_privilege_escalation: Some(false),
@@ -368,12 +378,25 @@ pub fn deployment(t: &Target, m: &Managed) -> Deployment {
 		image_pull_policy: Some(m.pull_policy.clone()),
 		args: Some(vec!["certsync".into(), "--dir".into(), CERT_DIR.into(), "--listen".into(), format!("0.0.0.0:{CERTSYNC_PORT}")]),
 		ports: Some(vec![ContainerPort { name: Some("certsync".into()), container_port: CERTSYNC_PORT.into(), ..Default::default() }]),
+		// listen on the pod's IP only
+		env: Some(vec![EnvVar {
+			name: "POD_IP".into(),
+			value_from: Some(k8s_openapi::api::core::v1::EnvVarSource {
+				field_ref: Some(k8s_openapi::api::core::v1::ObjectFieldSelector {
+					field_path: "status.podIP".into(),
+					..Default::default()
+				}),
+				..Default::default()
+			}),
+			..Default::default()
+		}]),
 		volume_mounts: Some(vec![mount("certs", CERT_DIR)]),
 		security_context: Some(restricted),
 		..Default::default()
 	};
 	let item = |k: &str| KeyToPath { key: k.into(), path: k.into(), ..Default::default() };
-	let pod_meta = t.meta(&name, labels(&t.id));
+	let mut pod_meta = t.meta(&name, labels(&t.id));
+	pod_meta.annotations.get_or_insert_default().insert(ANNOTATION_API.into(), api_hash.into());
 	Deployment {
 		metadata: t.meta(&name, labels(&t.id)),
 		spec: Some(DeploymentSpec {
@@ -443,6 +466,47 @@ pub fn service(t: &Target, m: &Managed) -> Service {
 			..Default::default()
 		}),
 		..Default::default()
+	}
+}
+
+/// Who may reach a Gateway's rproxy pods: anyone on the listener ports; on the control
+/// API and certsync ports only the controller's pods (`controller_ns`, `app.kubernetes.io/name: rproxy-gateway`).
+pub fn network_policy(t: &Target, controller_ns: &str) -> k8s_openapi::api::networking::v1::NetworkPolicy {
+	use k8s_openapi::api::networking::v1::{
+		NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort, NetworkPolicySpec,
+	};
+	let port = |p: u16, proto: &str| NetworkPolicyPort {
+		port: Some(IntOrString::Int(p.into())),
+		protocol: Some(proto.into()),
+		..Default::default()
+	};
+	let controller = NetworkPolicyPeer {
+		namespace_selector: Some(LabelSelector {
+			match_labels: Some([("kubernetes.io/metadata.name".to_string(), controller_ns.to_string())].into()),
+			..Default::default()
+		}),
+		pod_selector: Some(LabelSelector {
+			match_labels: Some([("app.kubernetes.io/name".to_string(), "rproxy-gateway".to_string())].into()),
+			..Default::default()
+		}),
+		..Default::default()
+	};
+	let mut rules = vec![NetworkPolicyIngressRule {
+		from: Some(vec![controller]),
+		ports: Some(vec![port(API_PORT, "TCP"), port(CERTSYNC_PORT, "TCP")]),
+	}];
+	let listeners: Vec<NetworkPolicyPort> = t.plan.ports().into_iter().map(|(proto, p)| port(p, proto.k8s())).collect();
+	if !listeners.is_empty() {
+		rules.push(NetworkPolicyIngressRule { from: None, ports: Some(listeners) });
+	}
+	NetworkPolicy {
+		metadata: t.meta(&object_name(&t.id), labels(&t.id)),
+		spec: Some(NetworkPolicySpec {
+			pod_selector: Some(LabelSelector { match_labels: Some(labels(&t.id)), ..Default::default() }),
+			policy_types: Some(vec!["Ingress".into()]),
+			ingress: Some(rules),
+			..Default::default()
+		}),
 	}
 }
 
@@ -521,8 +585,15 @@ pub async fn apply_managed(
 		Api::<Secret>::namespaced(client.clone(), ns).patch(&api_secret_name(&t.id), &pp(), &Patch::Apply(&api)).await?;
 	}
 	let name = object_name(&t.id);
+	if let Some(cns) = &m.network_policy {
+		let np = network_policy(t, cns);
+		Api::<k8s_openapi::api::networking::v1::NetworkPolicy>::namespaced(client.clone(), ns)
+			.patch(&name, &pp(), &Patch::Apply(&np))
+			.await?;
+	}
 	Api::<ServiceAccount>::namespaced(client.clone(), ns).patch(&name, &pp(), &Patch::Apply(&service_account(t))).await?;
-	Api::<Deployment>::namespaced(client.clone(), ns).patch(&name, &pp(), &Patch::Apply(&deployment(t, m))).await?;
+	let api_hash = content_hash(&data_of(Some(&api)));
+	Api::<Deployment>::namespaced(client.clone(), ns).patch(&name, &pp(), &Patch::Apply(&deployment(t, m, &api_hash))).await?;
 	let svc_api = Api::<Service>::namespaced(client.clone(), ns);
 	if t.plan.ports().is_empty() {
 		// a Service needs a port; none until a listener is valid
@@ -552,6 +623,14 @@ pub async fn collect_garbage(client: &kube::Client, keep: &[String]) -> anyhow::
 		if gone(&s.metadata) {
 			let (ns, name) = ns_name(&s.metadata);
 			Api::<Service>::namespaced(client.clone(), &ns).delete(&name, &dp).await?;
+		}
+	}
+	if let Ok(list) = Api::<k8s_openapi::api::networking::v1::NetworkPolicy>::all(client.clone()).list(&lp).await {
+		for np in list {
+			if gone(&np.metadata) {
+				let (ns, name) = ns_name(&np.metadata);
+				Api::<k8s_openapi::api::networking::v1::NetworkPolicy>::namespaced(client.clone(), &ns).delete(&name, &dp).await?;
+			}
 		}
 	}
 	for s in Api::<ServiceAccount>::all(client.clone()).list(&lp).await? {
@@ -625,6 +704,21 @@ pub fn pods(store: &[std::sync::Arc<Pod>], ns: &str, selector: &BTreeMap<String,
 			}
 			let labels = p.metadata.labels.clone().unwrap_or_default();
 			let managed = labels.get("app.kubernetes.io/managed-by").map(String::as_str) == Some(MANAGER);
+			// a managed pod belongs to its Gateway's Deployment (a ReplicaSet `rproxy-<id>-...`):
+			// a pod someone else made with the same labels is not talked to
+			if managed {
+				let id = labels.get(LABEL_GATEWAY)?;
+				let prefix = format!("{}-", object_name(id));
+				let owned = p
+					.metadata
+					.owner_references
+					.iter()
+					.flatten()
+					.any(|o| o.kind == "ReplicaSet" && o.controller == Some(true) && o.name.starts_with(&prefix));
+				if !owned {
+					return None;
+				}
+			}
 			Some(Endpoint {
 				namespace: ns.to_string(),
 				pod: p.metadata.name.clone().unwrap_or_default(),
@@ -685,7 +779,12 @@ mod tests {
 			replicas: 2,
 			service_type: "LoadBalancer".into(),
 			pull_policy: "IfNotPresent".into(),
+			network_policy: Some("rproxy-gateway-system".into()),
 		};
+		let np = network_policy(&Target::new(&plan()), "rproxy-gateway-system");
+		let rules = np.spec.unwrap().ingress.unwrap();
+		assert_eq!(rules[0].ports.as_ref().unwrap().len(), 2, "the control API and certsync: the controller only");
+		assert!(rules[1].from.is_none(), "the listeners: anyone");
 		let p = plan();
 		let mut t = Target::new(&p);
 		t.labels = [("team".to_string(), "a".to_string()), ("app.kubernetes.io/name".to_string(), "mine".to_string())].into();
@@ -693,7 +792,7 @@ mod tests {
 		t.owner = Some(owner("gateway.networking.k8s.io/v1", "web", "uid-1"));
 		t.addresses = vec!["192.0.2.10".into()];
 		let id = t.id.clone();
-		let d = deployment(&t, &m);
+		let d = deployment(&t, &m, "h");
 		assert_eq!(d.metadata.namespace.as_deref(), Some("default"), "next to the Gateway");
 		assert_eq!(d.metadata.owner_references.as_ref().unwrap()[0].uid, "uid-1");
 		let spec = d.spec.unwrap();
@@ -751,6 +850,11 @@ mod tests {
 		crate::pem::check_pair(&d["tls.crt"], &d["tls.key"]).unwrap();
 		let again = api_secret(&t, Some(&first), &b).unwrap();
 		assert_eq!(data_of(Some(&again)), d, "the certificate is kept");
+		// near its end: issued again
+		let mut old = first.clone();
+		old.metadata.annotations.as_mut().unwrap().insert(bootstrap::ANNOTATION_NOT_AFTER.into(), "2001-01-01T00:00:00Z".into());
+		assert_ne!(data_of(Some(&api_secret(&t, Some(&old), &b).unwrap()))["tls.crt"], d["tls.crt"]);
+		assert!(!bootstrap::renew(Some(&bootstrap::not_after(bootstrap::LEAF_DAYS).to_string())));
 		// another CA: issued again
 		let other = boot();
 		let renewed = api_secret(&t, Some(&first), &other).unwrap();

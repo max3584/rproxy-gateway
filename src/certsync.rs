@@ -6,9 +6,11 @@
 //! `rproxy-fleet-certs`), which the controller writes and the kubelet mounts as
 //! a volume into the pod: neither rproxy nor certsync use the Kubernetes API
 //! (the pod has no ServiceAccount token), so they cannot read other Secrets.
-//! certsync answers `GET /files` with the names in that directory, which the
-//! controller checks before it PUTs rules that name them (the kubelet updates
-//! a mounted Secret a little after it changes).
+//! certsync answers `POST /files` (a JSON list of names) with those of them that
+//! are in that directory, which the controller checks before it PUTs rules that
+//! name them (the kubelet updates a mounted Secret a little after it changes).
+//! It never lists the directory: file names are hashes of their content, so
+//! knowing whether a file is there needs its name, which only the controller has.
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
@@ -31,9 +33,12 @@ pub struct Args {
 	/// The directory of the certificate files (the mounted Secret).
 	#[arg(long, default_value = crate::controller::provision::CERT_DIR)]
 	pub dir: PathBuf,
-	/// Where `GET /files` and `GET /healthz` are answered.
+	/// Where `POST /files` and `GET /healthz` are answered.
 	#[arg(long, default_value = "0.0.0.0:9444")]
 	pub listen: SocketAddr,
+	/// The pod's IP (`POD_IP`): listen there only, with the port of `--listen`.
+	#[arg(long, env = "POD_IP")]
+	pub pod_ip: Option<std::net::IpAddr>,
 }
 
 /// The file names in `dir`: plain names only (a mounted Secret also holds
@@ -56,13 +61,20 @@ pub fn list(dir: &Path) -> std::io::Result<BTreeSet<String>> {
 }
 
 pub async fn run(args: Args) -> anyhow::Result<()> {
-	let listener = tokio::net::TcpListener::bind(args.listen).await.with_context(|| format!("listen on {}", args.listen))?;
-	info!(dir = %args.dir.display(), listen = %args.listen, "certsync started");
+	let listen = match args.pod_ip {
+		Some(ip) => SocketAddr::new(ip, args.listen.port()),
+		None => args.listen,
+	};
+	let listener = tokio::net::TcpListener::bind(listen).await.with_context(|| format!("listen on {listen}"))?;
+	info!(dir = %args.dir.display(), %listen, "certsync started");
 	serve(listener, args.dir).await;
 	Ok(())
 }
 
-/// Answers `GET /files` (the names in `dir`) and `GET /healthz`.
+/// The most a request or answer body may hold.
+pub const BODY_LIMIT: usize = 1 << 20;
+
+/// Answers `POST /files` (which of the names asked for are in `dir`) and `GET /healthz`.
 pub async fn serve(listener: tokio::net::TcpListener, dir: PathBuf) {
 	loop {
 		let Ok((tcp, _)) = listener.accept().await else { continue };
@@ -71,12 +83,21 @@ pub async fn serve(listener: tokio::net::TcpListener, dir: PathBuf) {
 			let svc = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
 				let dir = dir.clone();
 				async move {
-					let (status, body) = match req.uri().path() {
-						"/files" => match list(&dir) {
-							Ok(n) => (200, serde_json::to_vec(&n).unwrap_or_default()),
-							Err(e) => (503, format!("{}: {e}", dir.display()).into_bytes()),
-						},
-						"/healthz" => (200, b"ok".to_vec()),
+					let (status, body) = match (req.method().as_str(), req.uri().path()) {
+						("POST", "/files") => {
+							let body = http_body_util::BodyExt::collect(http_body_util::Limited::new(req.into_body(), BODY_LIMIT)).await;
+							match body.ok().and_then(|b| serde_json::from_slice::<Vec<String>>(&b.to_bytes()).ok()) {
+								Some(asked) => match list(&dir) {
+									Ok(present) => {
+										let found: BTreeSet<&String> = asked.iter().filter(|n| present.contains(*n)).collect();
+										(200, serde_json::to_vec(&found).unwrap_or_default())
+									}
+									Err(e) => (503, format!("{}: {e}", dir.display()).into_bytes()),
+								},
+								None => (400, b"a JSON list of file names".to_vec()),
+							}
+						}
+						("GET", "/healthz") => (200, b"ok".to_vec()),
 						_ => (404, b"not found".to_vec()),
 					};
 					Ok::<_, std::convert::Infallible>(
@@ -93,17 +114,23 @@ pub async fn serve(listener: tokio::net::TcpListener, dir: PathBuf) {
 	}
 }
 
-/// The files certsync on `ip` has written (the controller's side of `GET /files`).
-pub async fn files(ip: &str, port: u16) -> anyhow::Result<BTreeSet<String>> {
+/// Which of `names` certsync on `ip` has (the controller's side of `POST /files`).
+pub async fn present(ip: &str, port: u16, names: &[&String]) -> anyhow::Result<BTreeSet<String>> {
 	let addr: SocketAddr = format!("{}:{port}", if ip.contains(':') { format!("[{ip}]") } else { ip.to_string() }).parse()?;
 	let fut = async {
 		let tcp = tokio::net::TcpStream::connect(addr).await?;
 		let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp)).await?;
 		tokio::spawn(conn);
-		let req = Request::get("/files").header("host", "certsync").body(Full::new(Bytes::new()))?;
+		let req = Request::post("/files")
+			.header("host", "certsync")
+			.header("content-type", "application/json")
+			.body(Full::new(Bytes::from(serde_json::to_vec(names)?)))?;
 		let resp = sender.send_request(req).await?;
 		let status = resp.status();
-		let body = http_body_util::BodyExt::collect(resp.into_body()).await?.to_bytes();
+		let body = http_body_util::BodyExt::collect(http_body_util::Limited::new(resp.into_body(), BODY_LIMIT))
+			.await
+			.map_err(|e| anyhow::anyhow!("certsync {addr}: {e}"))?
+			.to_bytes();
 		anyhow::ensure!(status.is_success(), "certsync {addr}: {status}");
 		Ok(serde_json::from_slice(&body)?)
 	};
@@ -129,6 +156,28 @@ mod tests {
 			assert_eq!(list(&dir).unwrap(), ["a.crt".to_string()].into());
 			assert_eq!(std::fs::read(dir.join("a.crt")).unwrap(), b"A");
 		}
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	#[tokio::test]
+	async fn answers_only_for_names_asked() {
+		let dir = std::env::temp_dir().join(format!("certsync-serve-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+		std::fs::write(dir.join("abc.key"), b"k").unwrap();
+		std::fs::write(dir.join("other.key"), b"k").unwrap();
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let port = listener.local_addr().unwrap().port();
+		tokio::spawn(serve(listener, dir.clone()));
+		let (a, b) = ("abc.key".to_string(), "missing.key".to_string());
+		let got = present("127.0.0.1", port, &[&a, &b]).await.unwrap();
+		assert_eq!(got, [a.clone()].into(), "other.key is never told");
+		// no listing
+		let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+		let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp)).await.unwrap();
+		tokio::spawn(conn);
+		let resp = sender.send_request(Request::get("/files").header("host", "x").body(Full::new(Bytes::new())).unwrap()).await.unwrap();
+		assert_eq!(resp.status(), 404);
 		std::fs::remove_dir_all(&dir).unwrap();
 	}
 }

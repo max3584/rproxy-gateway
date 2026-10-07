@@ -768,7 +768,8 @@ pub async fn sync_pod(
 		Err(e) => return (PodSync::NotReady(format!("pod {}: {e:#}", ep.pod)), true),
 	}
 	if !plan.files.is_empty() {
-		match crate::certsync::files(&ep.ip, ep.certsync_port).await {
+		let names: Vec<&String> = plan.files.keys().collect();
+		match crate::certsync::present(&ep.ip, ep.certsync_port, &names).await {
 			Ok(present) => {
 				let missing: Vec<&String> = plan.files.keys().filter(|f| !present.contains(*f)).collect();
 				if !missing.is_empty() {

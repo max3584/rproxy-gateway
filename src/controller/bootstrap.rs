@@ -56,15 +56,50 @@ fn field(s: &Secret, key: &str) -> Option<Vec<u8>> {
 /// A new CA: (certificate PEM, key PEM).
 pub fn new_ca() -> anyhow::Result<(String, String)> {
 	let key = rcgen::KeyPair::generate()?;
-	let cert = ca_params()?.self_signed(&key)?;
+	let mut params = ca_params()?;
+	set_validity(&mut params, CA_DAYS)?;
+	let cert = params.self_signed(&key)?;
 	Ok((cert.pem(), key.serialize_pem()))
+}
+
+/// How long the CA is valid (it is replaced by deleting its Secret: docs/SECURITY.md).
+pub const CA_DAYS: i64 = 3650;
+/// How long a control API certificate is valid; it is issued again `RENEW_DAYS` before it ends.
+pub const LEAF_DAYS: i64 = 365;
+pub const RENEW_DAYS: i64 = 30;
+/// On a control API Secret: when its certificate ends (RFC 3339).
+pub const ANNOTATION_NOT_AFTER: &str = "rproxy.max3584.net/not-after";
+
+/// Valid from yesterday for `days` days.
+fn set_validity(params: &mut rcgen::CertificateParams, days: i64) -> anyhow::Result<()> {
+	let ymd = |d: jiff::civil::Date| rcgen::date_time_ymd(i32::from(d.year()), d.month() as u8, d.day() as u8);
+	let today = jiff::Timestamp::now().to_zoned(jiff::tz::TimeZone::UTC).date();
+	params.not_before = ymd(today.yesterday()?);
+	params.not_after = ymd(today.checked_add(jiff::Span::new().days(days))?);
+	Ok(())
+}
+
+/// When a certificate issued now for `days` days ends.
+pub fn not_after(days: i64) -> jiff::Timestamp {
+	jiff::Timestamp::now().checked_add(jiff::SignedDuration::from_hours(24 * days)).unwrap_or(jiff::Timestamp::MAX)
+}
+
+/// Whether a certificate ending at `not_after` (RFC 3339) is to be issued again.
+pub fn renew(not_after: Option<&str>) -> bool {
+	let Some(t) = not_after.and_then(|t| t.parse::<jiff::Timestamp>().ok()) else { return true };
+	t.duration_since(jiff::Timestamp::now()) < jiff::SignedDuration::from_hours(24 * RENEW_DAYS)
 }
 
 /// The CA's parameters: the same each time, so the issuer of a certificate can be
 /// built again from the stored key (its subject is what certificates name as issuer).
 fn ca_params() -> anyhow::Result<rcgen::CertificateParams> {
 	let mut params = rcgen::CertificateParams::new(Vec::<String>::new())?;
-	params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+	// it issues control API certificates only: no intermediate CAs, names under rproxy-gateway.internal
+	params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+	params.name_constraints = Some(rcgen::NameConstraints {
+		permitted_subtrees: vec![rcgen::GeneralSubtree::DnsName("rproxy-gateway.internal".into())],
+		excluded_subtrees: vec![],
+	});
 	params.distinguished_name = rcgen::DistinguishedName::new();
 	params.distinguished_name.push(rcgen::DnType::CommonName, "rproxy-gateway CA");
 	params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign, rcgen::KeyUsagePurpose::CrlSign];
@@ -79,6 +114,7 @@ pub fn issue_api_cert(ca_key_pem: &str, name: &str) -> anyhow::Result<(String, S
 	let mut params = rcgen::CertificateParams::new(vec![name.to_string()])?;
 	params.distinguished_name.push(rcgen::DnType::CommonName, name);
 	params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+	set_validity(&mut params, LEAF_DAYS)?;
 	let cert = params.signed_by(&key, &issuer)?;
 	Ok((cert.pem(), key.serialize_pem()))
 }
@@ -121,9 +157,11 @@ pub async fn ensure(client: &kube::Client, ns: &str) -> anyhow::Result<Bootstrap
 	let ca_pem = field(&ca, "tls.crt").context("the CA Secret has no tls.crt")?;
 	let ca_key = field(&ca, "tls.key").context("the CA Secret has no tls.key")?;
 	let current = api.get_opt(API_TLS_SECRET).await?;
-	if current.as_ref().and_then(|s| field(s, "ca.crt")).as_deref() != Some(ca_pem.as_slice()) {
+	let ends = current.as_ref().and_then(|s| s.metadata.annotations.as_ref()).and_then(|a| a.get(ANNOTATION_NOT_AFTER)).cloned();
+	if current.as_ref().and_then(|s| field(s, "ca.crt")).as_deref() != Some(ca_pem.as_slice()) || renew(ends.as_deref()) {
 		let (crt, key) = issue_api_cert(std::str::from_utf8(&ca_key)?, API_SERVER_NAME)?;
-		let s = secret(API_TLS_SECRET, ns, &[("tls.crt", crt.into_bytes()), ("tls.key", key.into_bytes()), ("ca.crt", ca_pem.clone())]);
+		let mut s = secret(API_TLS_SECRET, ns, &[("tls.crt", crt.into_bytes()), ("tls.key", key.into_bytes()), ("ca.crt", ca_pem.clone())]);
+		s.metadata.annotations = Some([(ANNOTATION_NOT_AFTER.to_string(), not_after(LEAF_DAYS).to_string())].into());
 		info!(secret = API_TLS_SECRET, "issuing rproxy's control API certificate");
 		match current {
 			Some(_) => {
@@ -175,6 +213,21 @@ mod tests {
 		let leaf = rustls_pki_types::CertificateDer::from_pem_slice(crt.as_bytes()).unwrap();
 		let name = rustls_pki_types::ServerName::try_from(API_SERVER_NAME).unwrap();
 		verifier.verify_server_cert(&leaf, &[], &name, &[], rustls_pki_types::UnixTime::now()).unwrap();
+	}
+
+	#[test]
+	fn the_ca_only_issues_names_under_its_domain() {
+		use rustls::client::danger::ServerCertVerifier;
+		use rustls_pki_types::pem::PemObject;
+		let (ca, ca_key) = new_ca().unwrap();
+		let mut roots = rustls::RootCertStore::empty();
+		roots.add(rustls_pki_types::CertificateDer::from_pem_slice(ca.as_bytes()).unwrap()).unwrap();
+		let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+		let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(std::sync::Arc::new(roots), provider).build().unwrap();
+		let (crt, _) = issue_api_cert(&ca_key, "example.com").unwrap();
+		let leaf = rustls_pki_types::CertificateDer::from_pem_slice(crt.as_bytes()).unwrap();
+		let name = rustls_pki_types::ServerName::try_from("example.com").unwrap();
+		assert!(verifier.verify_server_cert(&leaf, &[], &name, &[], rustls_pki_types::UnixTime::now()).is_err(), "name constraints");
 	}
 
 	#[test]
