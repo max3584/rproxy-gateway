@@ -8,12 +8,16 @@ The `Gateway API conformance` job of the CI `e2e` workflow (`scripts/conformance
 
 | Profile | core | extended |
 |---|---|---|
-| GATEWAY-HTTP | 35 / 36 (failing: `HTTPRouteRequestHeaderModifier`) | 14 / 16 (`HTTPRouteResponseHeaderModifier`, `HTTPRouteRewritePath`) |
-| GATEWAY-TLS | 19 / 19 | 4 / 4 (`TLSRouteModeTerminate`, `TLSRouteModeMixed` and others) |
-| GATEWAY-TCP | 18 / 18 | |
-| GATEWAY-UDP | 19 / 19 | |
+| GATEWAY-HTTP | 36 / 36 | 54 / 56 (`HTTPRouteCORS`, `HTTPRouteRetry`) |
+| GATEWAY-GRPC | 14 / 14 | 11 / 11 |
+| GATEWAY-TLS | 19 / 19 | 16 / 16 |
+| GATEWAY-TCP | 18 / 18 | 11 / 11 |
+| GATEWAY-UDP | 19 / 19 | 11 / 11 |
 
-All three failures are the `add` of HeaderModifier (append after an existing value). rproxy's `headers` middleware has only `set` and `remove`, and `add` is applied as `set` for now (max3584/rproxy-api#224). Once rproxy has `add`, the controller follows and core passes completely.
+Core passes completely, and the CI conformance job fails when any core test fails (extended failures are reported only). The two extended failures are on rproxy's side (max3584/rproxy-api#238):
+
+- `HTTPRouteCORS`: rproxy forwards a preflight from an origin that is not allowed to the backend (the test expects rproxy to answer without CORS headers)
+- `HTTPRouteRetry`: with a single backend, retrying on a status code does not go to the same backend again
 
 ## Claimed features (`supportedFeatures`)
 

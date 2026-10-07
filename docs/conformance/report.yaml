@@ -1,5 +1,5 @@
 apiVersion: gateway.networking.k8s.io/v1
-date: "2026-10-07T05:08:41Z"
+date: "2026-10-07T08:11:36Z"
 gatewayAPIChannel: standard
 gatewayAPIVersion: v1.6.3
 implementation:
@@ -13,28 +13,40 @@ kind: ConformanceReport
 mode: default
 profiles:
 - core:
-    failedTests:
-    - HTTPRouteRequestHeaderModifier
-    result: failure
+    result: success
     statistics:
-      Failed: 1
-      Passed: 35
+      Failed: 0
+      Passed: 36
       Skipped: 0
   extended:
     failedTests:
-    - HTTPRouteResponseHeaderModifier
-    - HTTPRouteRewritePath
+    - HTTPRouteCORS
+    - HTTPRouteRetry
     result: failure
     statistics:
       Failed: 2
-      Passed: 14
+      Passed: 54
       Skipped: 0
     supportedFeatures:
+    - BackendTLSPolicy
+    - BackendTLSPolicySANValidation
+    - GatewayAddressEmpty
+    - GatewayBackendClientCertificate
+    - GatewayFrontendClientCertificateValidation
     - GatewayHTTPListenerIsolation
+    - GatewayInfrastructure
     - GatewayPort8080
+    - GatewayStaticAddresses
+    - HTTPRoute303RedirectStatusCode
+    - HTTPRoute307RedirectStatusCode
+    - HTTPRoute308RedirectStatusCode
+    - HTTPRouteBackendProtocolH2C
     - HTTPRouteBackendProtocolWebSocket
+    - HTTPRouteBackendRequestHeaderModification
     - HTTPRouteBackendTimeout
+    - HTTPRouteCORS
     - HTTPRouteDestinationPortMatching
+    - HTTPRouteHostRewrite
     - HTTPRouteMethodMatching
     - HTTPRouteNamedRouteRule
     - HTTPRouteParentRefPort
@@ -42,44 +54,74 @@ profiles:
     - HTTPRoutePathRewrite
     - HTTPRoutePortRedirect
     - HTTPRouteQueryParamMatching
-    - HTTPRouteResponseHeaderModification
-    - HTTPRouteSchemeRedirect
-    unsupportedFeatures:
-    - BackendTLSPolicy
-    - BackendTLSPolicySANValidation
-    - GatewayAddressEmpty
-    - GatewayBackendClientCertificate
-    - GatewayFrontendClientCertificateValidation
-    - GatewayFrontendClientCertificateValidationInsecureFallback
-    - GatewayHTTPSListenerDetectMisdirectedRequests
-    - GatewayInfrastructure
-    - GatewayStaticAddresses
-    - HTTPRoute303RedirectStatusCode
-    - HTTPRoute307RedirectStatusCode
-    - HTTPRoute308RedirectStatusCode
-    - HTTPRouteBackendProtocolH2C
-    - HTTPRouteBackendRequestHeaderModification
-    - HTTPRouteCORS
-    - HTTPRouteHostRewrite
     - HTTPRouteRequestMirror
     - HTTPRouteRequestMultipleMirrors
     - HTTPRouteRequestPercentageMirror
     - HTTPRouteRequestTimeout
+    - HTTPRouteResponseHeaderModification
     - HTTPRouteRetry
     - HTTPRouteRetryBackendTimeout
     - HTTPRouteRetryConnectionError
+    - HTTPRouteSchemeRedirect
     - ListenerSet
+    unsupportedFeatures:
+    - GatewayFrontendClientCertificateValidationInsecureFallback
+    - GatewayHTTPSListenerDetectMisdirectedRequests
   name: GATEWAY-HTTP
-  summary: Core tests failed with 1 test failures. Extended tests failed with 2 test
-    failures.
+  summary: Core tests succeeded. Extended tests failed with 2 test failures.
+- core:
+    result: success
+    statistics:
+      Failed: 0
+      Passed: 14
+      Skipped: 0
+  extended:
+    result: success
+    statistics:
+      Failed: 0
+      Passed: 11
+      Skipped: 0
+    supportedFeatures:
+    - GatewayAddressEmpty
+    - GatewayBackendClientCertificate
+    - GatewayFrontendClientCertificateValidation
+    - GatewayHTTPListenerIsolation
+    - GatewayInfrastructure
+    - GatewayPort8080
+    - GatewayStaticAddresses
+    - ListenerSet
+    unsupportedFeatures:
+    - GatewayFrontendClientCertificateValidationInsecureFallback
+    - GatewayHTTPSListenerDetectMisdirectedRequests
+  name: GATEWAY-GRPC
+  summary: Core tests succeeded. Extended tests succeeded.
 - core:
     result: success
     statistics:
       Failed: 0
       Passed: 18
       Skipped: 0
+  extended:
+    result: success
+    statistics:
+      Failed: 0
+      Passed: 11
+      Skipped: 0
+    supportedFeatures:
+    - GatewayAddressEmpty
+    - GatewayBackendClientCertificate
+    - GatewayFrontendClientCertificateValidation
+    - GatewayHTTPListenerIsolation
+    - GatewayInfrastructure
+    - GatewayPort8080
+    - GatewayStaticAddresses
+    - ListenerSet
+    - TCPRoute
+    unsupportedFeatures:
+    - GatewayFrontendClientCertificateValidationInsecureFallback
+    - GatewayHTTPSListenerDetectMisdirectedRequests
   name: GATEWAY-TCP
-  summary: Core tests succeeded.
+  summary: Core tests succeeded. Extended tests succeeded.
 - core:
     result: success
     statistics:
@@ -90,22 +132,22 @@ profiles:
     result: success
     statistics:
       Failed: 0
-      Passed: 4
+      Passed: 16
       Skipped: 0
     supportedFeatures:
-    - GatewayHTTPListenerIsolation
-    - GatewayPort8080
-    - TLSRouteModeMixed
-    - TLSRouteModeTerminate
-    unsupportedFeatures:
     - GatewayAddressEmpty
     - GatewayBackendClientCertificate
     - GatewayFrontendClientCertificateValidation
-    - GatewayFrontendClientCertificateValidationInsecureFallback
-    - GatewayHTTPSListenerDetectMisdirectedRequests
+    - GatewayHTTPListenerIsolation
     - GatewayInfrastructure
+    - GatewayPort8080
     - GatewayStaticAddresses
     - ListenerSet
+    - TLSRouteModeMixed
+    - TLSRouteModeTerminate
+    unsupportedFeatures:
+    - GatewayFrontendClientCertificateValidationInsecureFallback
+    - GatewayHTTPSListenerDetectMisdirectedRequests
   name: GATEWAY-TLS
   summary: Core tests succeeded. Extended tests succeeded.
 - core:
@@ -114,5 +156,24 @@ profiles:
       Failed: 0
       Passed: 19
       Skipped: 0
+  extended:
+    result: success
+    statistics:
+      Failed: 0
+      Passed: 11
+      Skipped: 0
+    supportedFeatures:
+    - GatewayAddressEmpty
+    - GatewayBackendClientCertificate
+    - GatewayFrontendClientCertificateValidation
+    - GatewayHTTPListenerIsolation
+    - GatewayInfrastructure
+    - GatewayPort8080
+    - GatewayStaticAddresses
+    - ListenerSet
+    - UDPRoute
+    unsupportedFeatures:
+    - GatewayFrontendClientCertificateValidationInsecureFallback
+    - GatewayHTTPSListenerDetectMisdirectedRequests
   name: GATEWAY-UDP
-  summary: Core tests succeeded.
+  summary: Core tests succeeded. Extended tests succeeded.

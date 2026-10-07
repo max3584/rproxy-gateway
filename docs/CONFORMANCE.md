@@ -8,12 +8,16 @@ CI の `e2e` ワークフローの `Gateway API conformance` ジョブ（`script
 
 | プロファイル | core | extended |
 |---|---|---|
-| GATEWAY-HTTP | 35 / 36（落ちるのは `HTTPRouteRequestHeaderModifier`） | 14 / 16（`HTTPRouteResponseHeaderModifier`、`HTTPRouteRewritePath`） |
-| GATEWAY-TLS | 19 / 19 | 4 / 4（`TLSRouteModeTerminate`、`TLSRouteModeMixed` ほか） |
-| GATEWAY-TCP | 18 / 18 | |
-| GATEWAY-UDP | 19 / 19 | |
+| GATEWAY-HTTP | 36 / 36 | 54 / 56（`HTTPRouteCORS`、`HTTPRouteRetry`） |
+| GATEWAY-GRPC | 14 / 14 | 11 / 11 |
+| GATEWAY-TLS | 19 / 19 | 16 / 16 |
+| GATEWAY-TCP | 18 / 18 | 11 / 11 |
+| GATEWAY-UDP | 19 / 19 | 11 / 11 |
 
-落ちる 3 つはどれも HeaderModifier の `add`（既にある値の後ろに足す）。rproxy の `headers` ミドルウェアには `set` と `remove` しかなく、いまは `add` を `set` にしている（max3584/rproxy-api#224）。rproxy に `add` が入れば、コントローラをそれに合わせて core がそろう。
+core はすべて通り、CI の conformance のジョブは core が 1 つでも落ちると失敗する（extended は知らせるだけ）。落ちる extended の 2 つは rproxy 側（max3584/rproxy-api#238）：
+
+- `HTTPRouteCORS`：許さないオリジンのプリフライトを rproxy が転送先へ送る（試験は rproxy が CORS のヘッダなしで答えることを求める）
+- `HTTPRouteRetry`：転送先が 1 つのとき、状態コードでの送り直しが同じ転送先へ行かない
 
 ## 名乗っている機能（`supportedFeatures`）
 
