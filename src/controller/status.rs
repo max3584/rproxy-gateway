@@ -102,6 +102,8 @@ pub fn gateway_status(plan: &GatewayPlan, addresses: &[(String, String)], pods: 
 		Cond::new("Programmed", false, "Invalid", "the Gateway is not accepted")
 	} else if let Some(e) = &plan.address_error {
 		Cond::new("Programmed", false, "AddressNotUsable", e.clone())
+	} else if let Some(m) = plan.serving_pending.as_ref().filter(|_| synced(pods) > 0) {
+		Cond::new("Programmed", false, "Pending", m.clone())
 	} else if addresses.is_empty() {
 		Cond::new("Programmed", false, "AddressNotAssigned", "waiting for an address (the rproxy Service)")
 	} else if synced(pods) == 0 {

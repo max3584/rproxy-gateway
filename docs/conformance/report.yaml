@@ -1,6 +1,6 @@
 apiVersion: gateway.networking.k8s.io/v1
-date: "2026-10-07T08:11:36Z"
-gatewayAPIChannel: standard
+date: "2026-10-07T09:27:38Z"
+gatewayAPIChannel: experimental
 gatewayAPIVersion: v1.6.3
 implementation:
   contact:
@@ -19,13 +19,10 @@ profiles:
       Passed: 36
       Skipped: 0
   extended:
-    failedTests:
-    - HTTPRouteCORS
-    - HTTPRouteRetry
-    result: failure
+    result: success
     statistics:
-      Failed: 2
-      Passed: 54
+      Failed: 0
+      Passed: 57
       Skipped: 0
     supportedFeatures:
     - BackendTLSPolicy
@@ -33,6 +30,7 @@ profiles:
     - GatewayAddressEmpty
     - GatewayBackendClientCertificate
     - GatewayFrontendClientCertificateValidation
+    - GatewayFrontendClientCertificateValidationInsecureFallback
     - GatewayHTTPListenerIsolation
     - GatewayInfrastructure
     - GatewayPort8080
@@ -65,10 +63,9 @@ profiles:
     - HTTPRouteSchemeRedirect
     - ListenerSet
     unsupportedFeatures:
-    - GatewayFrontendClientCertificateValidationInsecureFallback
     - GatewayHTTPSListenerDetectMisdirectedRequests
   name: GATEWAY-HTTP
-  summary: Core tests succeeded. Extended tests failed with 2 test failures.
+  summary: Core tests succeeded. Extended tests succeeded.
 - core:
     result: success
     statistics:
@@ -85,13 +82,13 @@ profiles:
     - GatewayAddressEmpty
     - GatewayBackendClientCertificate
     - GatewayFrontendClientCertificateValidation
+    - GatewayFrontendClientCertificateValidationInsecureFallback
     - GatewayHTTPListenerIsolation
     - GatewayInfrastructure
     - GatewayPort8080
     - GatewayStaticAddresses
     - ListenerSet
     unsupportedFeatures:
-    - GatewayFrontendClientCertificateValidationInsecureFallback
     - GatewayHTTPSListenerDetectMisdirectedRequests
   name: GATEWAY-GRPC
   summary: Core tests succeeded. Extended tests succeeded.
@@ -111,6 +108,7 @@ profiles:
     - GatewayAddressEmpty
     - GatewayBackendClientCertificate
     - GatewayFrontendClientCertificateValidation
+    - GatewayFrontendClientCertificateValidationInsecureFallback
     - GatewayHTTPListenerIsolation
     - GatewayInfrastructure
     - GatewayPort8080
@@ -118,7 +116,6 @@ profiles:
     - ListenerSet
     - TCPRoute
     unsupportedFeatures:
-    - GatewayFrontendClientCertificateValidationInsecureFallback
     - GatewayHTTPSListenerDetectMisdirectedRequests
   name: GATEWAY-TCP
   summary: Core tests succeeded. Extended tests succeeded.
@@ -138,6 +135,7 @@ profiles:
     - GatewayAddressEmpty
     - GatewayBackendClientCertificate
     - GatewayFrontendClientCertificateValidation
+    - GatewayFrontendClientCertificateValidationInsecureFallback
     - GatewayHTTPListenerIsolation
     - GatewayInfrastructure
     - GatewayPort8080
@@ -146,7 +144,6 @@ profiles:
     - TLSRouteModeMixed
     - TLSRouteModeTerminate
     unsupportedFeatures:
-    - GatewayFrontendClientCertificateValidationInsecureFallback
     - GatewayHTTPSListenerDetectMisdirectedRequests
   name: GATEWAY-TLS
   summary: Core tests succeeded. Extended tests succeeded.
@@ -166,6 +163,7 @@ profiles:
     - GatewayAddressEmpty
     - GatewayBackendClientCertificate
     - GatewayFrontendClientCertificateValidation
+    - GatewayFrontendClientCertificateValidationInsecureFallback
     - GatewayHTTPListenerIsolation
     - GatewayInfrastructure
     - GatewayPort8080
@@ -173,7 +171,6 @@ profiles:
     - ListenerSet
     - UDPRoute
     unsupportedFeatures:
-    - GatewayFrontendClientCertificateValidationInsecureFallback
     - GatewayHTTPSListenerDetectMisdirectedRequests
   name: GATEWAY-UDP
   summary: Core tests succeeded. Extended tests succeeded.

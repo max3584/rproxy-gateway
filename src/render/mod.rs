@@ -73,6 +73,8 @@ pub struct Features {
 	pub service_protocol: bool,
 	pub service_tls: bool,
 	pub tls_route_targets: bool,
+	/// `tls.client_auth` mode `optional_no_verify` (`features.client_auth_modes`).
+	pub client_auth_no_verify: bool,
 }
 
 impl Default for Features {
@@ -91,6 +93,7 @@ impl Default for Features {
 			service_protocol: true,
 			service_tls: true,
 			tls_route_targets: true,
+			client_auth_no_verify: true,
 		}
 	}
 }
@@ -111,6 +114,7 @@ impl Features {
 			service_protocol: c.lists("services", "protocol"),
 			service_tls: c.lists("services", "tls"),
 			tls_route_targets: c.feature("tls_route_targets"),
+			client_auth_no_verify: c.lists("client_auth_modes", "optional_no_verify"),
 		}
 	}
 
@@ -129,6 +133,7 @@ impl Features {
 			service_protocol: self.service_protocol && o.service_protocol,
 			service_tls: self.service_tls && o.service_tls,
 			tls_route_targets: self.tls_route_targets && o.tls_route_targets,
+			client_auth_no_verify: self.client_auth_no_verify && o.client_auth_no_verify,
 		}
 	}
 }
@@ -230,6 +235,8 @@ pub struct GatewayPlan {
 	pub address_error: Option<String>,
 	/// The ListenerSets naming this Gateway (attached or not).
 	pub listener_sets: Vec<ListenerSetPlan>,
+	/// Why traffic does not reach rproxy yet though it is applied (`Programmed: False`, `Pending`).
+	pub serving_pending: Option<String>,
 	/// `status.attachedListenerSets`.
 	pub attached_listener_sets: i32,
 	/// BackendTLSPolicy status for this Gateway (the policies of the backends its routes send to).
@@ -398,7 +405,8 @@ struct ListenerState<'a> {
 	/// Certificate files (cert, key) for HTTPS and terminating TLS listeners.
 	certs: Vec<(String, String)>,
 	/// The CA file client certificates are validated against (frontend validation).
-	client_ca: Option<String>,
+	/// rproxy's `tls.client_auth` for the listener's port (frontend validation).
+	client_auth: Option<Value>,
 	accepted: bool,
 	/// Accepted but with nothing to serve with (no usable certificate): routes
 	/// attach, but no rule is made.
@@ -529,7 +537,7 @@ fn validate_listener<'a>(
 		conds: vec![],
 		supported_kinds: vec![],
 		certs: vec![],
-		client_ca: None,
+		client_auth: None,
 		accepted: true,
 		unservable: false,
 		attached: 0,
@@ -604,10 +612,15 @@ fn validate_listener<'a>(
 		}
 		// client certificates (spec.tls.frontend: the port's configuration, else the default)
 		if let Some(v) = frontend_validation(gw, st.port) {
-			if v.mode.as_deref() != Some("AllowInsecureFallback") {
+			// AllowInsecureFallback: certificates are asked for and checked, the result goes to the
+			// backend, and connections are accepted either way (rproxy's `optional_no_verify`);
+			// an rproxy without that mode does not ask for certificates at all
+			let insecure = v.mode.as_deref() == Some("AllowInsecureFallback");
+			if !insecure || opts.features.client_auth_no_verify {
+				let mode = if insecure { "optional_no_verify" } else { "required" };
 				match client_ca(world, gw_ns, v, files, opts) {
 					(Some(ca), problem) => {
-						st.client_ca = Some(ca);
+						st.client_auth = Some(serde_json::json!({"mode": mode, "ca_file": ca}));
 						if let Some(p) = problem {
 							if resolved.status {
 								resolved = p;
@@ -929,8 +942,7 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 			}
 		}
 		// client certificates: the port's CA (validation is per port)
-		let client_auth =
-			members.iter().find_map(|i| listeners[*i].client_ca.clone()).map(|ca| serde_json::json!({"mode": "required", "ca_file": ca}));
+		let client_auth = members.iter().find_map(|i| listeners[*i].client_auth.clone());
 		// TLS routes by server name (passthrough, or terminated on a TLS listener)
 		let mut tls_routes: Vec<rp::TlsRoute> = vec![];
 		for a in attachments.iter().filter(|a| a.kind == RouteKind::Tls && mine(a)) {
@@ -1246,7 +1258,7 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 			"InsecureFrontendValidationMode",
 			true,
 			"ConfigurationChanged",
-			"AllowInsecureFallback: connections without a valid client certificate are accepted",
+			"AllowInsecureFallback: connections without a valid client certificate are accepted (the result is passed to the backend in X-Client-Verify)",
 		));
 	}
 	if opts.labels {

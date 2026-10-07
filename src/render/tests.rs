@@ -1110,9 +1110,21 @@ spec:
 		assert_eq!((a.status, a.reason.as_str()), (false, "NoValidCACertificate"), "{n}");
 	}
 	assert!(rule(8443).is_none() && rule(9443).is_none() && rule(10443).is_none());
-	// insecure fallback: no client certificate asked for, a condition on the Gateway
-	assert!(rule(11443).unwrap()["tls"].get("client_auth").is_none());
+	// insecure fallback: asked for and checked, accepted either way (optional_no_verify), a condition on the Gateway
+	assert_eq!(rule(11443).unwrap()["tls"]["client_auth"]["mode"], "optional_no_verify");
+	assert!(rule(11443).unwrap()["tls"]["client_auth"]["ca_file"].is_string());
 	assert!(cond(&p.conds, "InsecureFrontendValidationMode").status);
+	// an rproxy without that mode: no client certificate asked for
+	let w = world(&yaml);
+	let old = render_gateway(
+		&w,
+		&w.gateways[0],
+		&Options { features: Features { client_auth_no_verify: false, ..Default::default() }, ..Default::default() },
+	);
+	let old_rules = old.rules_json();
+	let old_rule = old_rules.iter().find(|r| r["listen_port"] == 11443).unwrap();
+	assert!(old_rule["tls"].get("client_auth").is_none());
+	assert_eq!(rule(443).unwrap()["tls"]["client_auth"]["mode"], "required");
 	assert!(cond(&l("f").conds, "Accepted").status, "HTTP listeners are not affected");
 	assert!(cond(&l("a").conds, "ResolvedRefs").status);
 }
