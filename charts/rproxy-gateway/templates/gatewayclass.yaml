@@ -1,0 +1,20 @@
+{{- if .Values.gatewayClass.create }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: {{ .Values.gatewayClass.name }}
+  labels: {{- include "rproxy-gateway.labels" . | nindent 4 }}
+spec:
+  controllerName: {{ .Values.controller.controllerName }}
+  description: rproxy (rproxy-gateway)
+{{- end }}
+{{- if and .Values.migration.migrateTo .Values.migration.createIngressClass }}
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: {{ .Values.migration.ingressClass }}
+  labels: {{- include "rproxy-gateway.labels" . | nindent 4 }}
+spec:
+  controller: {{ .Values.controller.controllerName }}
+{{- end }}

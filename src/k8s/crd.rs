@@ -135,3 +135,12 @@ pub fn crds_yaml() -> String {
 	}
 	out
 }
+
+#[cfg(test)]
+mod tests {
+	#[test]
+	fn the_chart_has_the_current_crds() {
+		let chart = include_str!("../../charts/rproxy-gateway/crds/rproxy.max3584.net.yaml");
+		assert!(chart == super::crds_yaml(), "run: cargo run -- crds > charts/rproxy-gateway/crds/rproxy.max3584.net.yaml");
+	}
+}

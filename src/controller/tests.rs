@@ -211,6 +211,7 @@ async fn waits_for_certificate_files_and_reports_failures() {
 				attached: 0,
 				conds: vec![crate::render::status::Cond::ok("Accepted", "Accepted")],
 				rule_key: Some("tcp/0.0.0.0:443".into()),
+				servable: true,
 			}],
 			..p.clone()
 		},

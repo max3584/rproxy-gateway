@@ -1,0 +1,9 @@
+# The rproxy image the controller deploys (managed mode, the chart's fleet
+# DaemonSet): rproxy-api's static musl binary, built from rproxy-api (a release
+# tarball, or a checkout in CI) into dist/<TARGETARCH>/rproxy-api.
+FROM alpine:3.24
+ARG TARGETARCH
+RUN apk add --no-cache ca-certificates
+COPY dist/${TARGETARCH}/rproxy-api /usr/local/bin/rproxy-api
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/rproxy-api"]

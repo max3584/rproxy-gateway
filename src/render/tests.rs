@@ -298,6 +298,9 @@ stringData: {{tls.crt: nope, tls.key: nope}}
 	assert_eq!(p.files[name], crt.as_bytes());
 	let l = |n: &str| p.listeners.iter().find(|x| x.name == n).unwrap();
 	assert_eq!(cond(&l("c").conds, "ResolvedRefs").reason, "InvalidCertificateRef");
+	assert!(cond(&l("c").conds, "Accepted").status && !l("c").servable, "routes attach, nothing is served");
+	let gc = cond(&p.conds, "Accepted");
+	assert_eq!((gc.status, gc.reason.as_str()), (true, "ListenersNotValid"));
 	assert_eq!(cond(&l("d").conds, "ResolvedRefs").reason, "RefNotPermitted");
 	assert_eq!(cond(&l("e").conds, "ResolvedRefs").reason, "InvalidRouteKinds");
 	assert!(l("e").supported_kinds.is_empty());
@@ -498,7 +501,7 @@ spec:
 	assert!(!cond(&l("dnstcp").conds, "Conflicted").status, "TCP and UDP share a port");
 	assert_eq!(l("empty").rule_key, None);
 	assert_eq!(l("sni").supported_kinds[0].kind, "TLSRoute");
-	assert_eq!(p.ports().len(), 3);
+	assert_eq!(p.ports().len(), 5, "listeners without a rule still get a Service port");
 }
 
 #[test]
@@ -846,4 +849,47 @@ fn traefik_rules() {
 		migrate::Settings::parse_entry_points(&["web=8080".into(), "dns=53/udp".into()]).unwrap(),
 		[("dns".to_string(), (rp::Protocol::Udp, 53)), ("web".to_string(), (rp::Protocol::Tcp, 8080))].into()
 	);
+}
+
+#[test]
+fn a_route_on_two_listeners_of_one_port_and_the_oldest_tcp_route() {
+	let yaml = format!(
+		"{BASE}{L4_BASE}{}{}",
+		gw(r#"  - {name: a, port: 80, protocol: HTTP, hostname: a.example.com}
+  - {name: b, port: 80, protocol: HTTP, hostname: b.example.com}
+  - {name: pg, port: 5432, protocol: TCP}"#),
+		r#"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: both, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  rules: [{backendRefs: [{name: web, port: 80}]}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata: {name: newer, namespace: default, creationTimestamp: "2026-02-01T00:00:00Z"}
+spec:
+  parentRefs: [{name: gw, sectionName: pg}]
+  rules: [{backendRefs: [{name: tls, port: 443}]}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata: {name: older, namespace: default, creationTimestamp: "2026-01-01T00:00:00Z"}
+spec:
+  parentRefs: [{name: gw, sectionName: pg}]
+  rules: [{backendRefs: [{name: db, port: 5432}]}]
+"#
+	);
+	let p = plan(&yaml);
+	let rules = p.rules_json();
+	let web = rules.iter().find(|r| r["listen_port"] == 80).unwrap();
+	let names: Vec<&str> = web["http"]["routes"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect();
+	assert_eq!(names.len(), 2);
+	assert_ne!(names[0], names[1]);
+	let pg = rules.iter().find(|r| r["listen_port"] == 5432).unwrap();
+	assert_eq!(pg["targets"][0]["addr"], "10.0.2.1", "the oldest route");
+	assert!(p.parents.iter().all(|x| cond(&x.conds, "Accepted").status));
+	assert_eq!(p.listeners.iter().find(|l| l.name == "pg").unwrap().attached, 2);
 }

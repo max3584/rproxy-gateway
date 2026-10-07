@@ -75,7 +75,10 @@ rproxy は `RPROXY_API_ADDR=0.0.0.0`、`RPROXY_API_PORT=9443`、`RPROXY_TOKEN_FI
 | リスナー `TLS`（`tls.mode: Terminate`） | tcp のルール、`tls.mode: terminate`、TLSRoute のホスト名ごとに `tls.routes`（同じポートの Passthrough のリスナーの分は `passthrough: true`） |
 | TLSRoute の宛先 | `tls.routes` の 1 つの項目は宛先が 1 つなので、Service の ClusterIP（kube-proxy が Pod に配る。headless なら最初の Pod）。backendRefs が複数なら weight の最も大きいもの |
 | リスナー `TCP` / `UDP` | tcp / udp のルール、`targets`（TCPRoute / UDPRoute のすべての backend の Pod の IP、weight を Pod の数で配る） |
-| 何もつながっていない `TLS` / `TCP` / `UDP` のリスナー | ルールを作らない（ポートは閉じたまま。リスナーは `Programmed: True`） |
+| 何もつながっていない `TLS` / `TCP` / `UDP` のリスナー | ルールを作らない（リスナーは `Programmed: True`。Service のポートはある） |
+| 使える backend のない TLSRoute | その名前は `127.0.0.1:1` へ（つないでから閉じる。Gateway API は接続の拒否ではなくリセットを求める） |
+| 1 つの TCP / UDP のリスナーに複数のルート | どれも `Accepted` だが、通信は最も古いルートへ |
+| 証明書の使えない `HTTPS` のリスナー | ルートはつながる（`attachedRoutes` に数える）が、ルールは作らない（`ResolvedRefs: False`、`Programmed: False`） |
 
 ### rproxy の CRD（`rproxy.max3584.net/v1alpha1`）
 

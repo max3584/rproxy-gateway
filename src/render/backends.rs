@@ -129,6 +129,13 @@ pub fn spread(backends: &[(u32, Vec<Endpoint>)]) -> Vec<(Endpoint, Option<u32>)>
 			out.push((ep.clone(), Some(each.clamp(1, 1_000_000) as u32)));
 		}
 	}
+	// the smallest weights with the same ratios: rproxy's round robin then spreads in short cycles
+	let g = out.iter().filter_map(|(_, w)| w.map(u64::from)).fold(0, gcd);
+	if g > 1 {
+		for (_, w) in &mut out {
+			*w = w.map(|w| (u64::from(w) / g) as u32);
+		}
+	}
 	let first = out.first().map(|(_, w)| *w);
 	if out.iter().all(|(_, w)| Some(*w) == first) {
 		for (_, w) in &mut out {
@@ -156,7 +163,7 @@ mod tests {
 		let w: Vec<u32> = out.iter().map(|(_, w)| w.unwrap()).collect();
 		assert_eq!(w, vec![3, 3, 2, 2, 2]);
 		let out = spread(&[(70, eps(1, "a")), (30, eps(1, "b")), (0, eps(1, "c"))]);
-		assert_eq!(out.iter().map(|(_, w)| w.unwrap()).collect::<Vec<_>>(), vec![70, 30]);
+		assert_eq!(out.iter().map(|(_, w)| w.unwrap()).collect::<Vec<_>>(), vec![7, 3]);
 		let out = spread(&[(1, eps(2, "a"))]);
 		assert!(out.iter().all(|(_, w)| w.is_none()));
 		assert!(spread(&[(1, vec![])]).is_empty());

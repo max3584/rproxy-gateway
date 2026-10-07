@@ -1,0 +1,89 @@
+{{- if .Values.fleet.enabled }}
+# fleet mode: rproxy on every node (hostNetwork), serving every Gateway. The controller
+# PUTs each Gateway's rule set to every pod. The control API is TLS + token (Secrets the
+# controller creates on its first start: install the chart, then the DaemonSet's pods start).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: rproxy
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rproxy-gateway.labels" . | nindent 4 }}
+    app.kubernetes.io/name: rproxy
+    app.kubernetes.io/component: fleet
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rproxy
+      app.kubernetes.io/component: fleet
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rproxy
+        app.kubernetes.io/component: fleet
+    spec:
+      serviceAccountName: rproxy-gateway-proxy
+      hostNetwork: {{ .Values.fleet.hostNetwork }}
+      dnsPolicy: {{ if .Values.fleet.hostNetwork }}ClusterFirstWithHostNet{{ else }}ClusterFirst{{ end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: rproxy
+          image: {{ include "rproxy-gateway.rproxyImage" . }}
+          imagePullPolicy: {{ .Values.rproxy.image.pullPolicy }}
+          env:
+            - {name: RPROXY_API_ADDR, value: "0.0.0.0"}
+            - {name: RPROXY_API_PORT, value: "9443"}
+            - {name: RPROXY_TOKEN_FILE, value: /etc/rproxy-gateway/token/tokens.yaml}
+            - {name: RPROXY_TLS_CERT, value: /etc/rproxy-gateway/api-tls/tls.crt}
+            - {name: RPROXY_TLS_KEY, value: /etc/rproxy-gateway/api-tls/tls.key}
+          ports:
+            - {name: api, containerPort: 9443}
+          livenessProbe:
+            httpGet: {path: /healthz, port: 9443, scheme: HTTPS}
+          # root with only NET_BIND_SERVICE: listens on the node's low ports
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL], add: [NET_BIND_SERVICE]}
+          {{- with .Values.fleet.resources }}
+          resources: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - {name: token, mountPath: /etc/rproxy-gateway/token, readOnly: true}
+            - {name: api-tls, mountPath: /etc/rproxy-gateway/api-tls, readOnly: true}
+            - {name: certs, mountPath: /var/run/rproxy-gateway/certs, readOnly: true}
+        - name: certsync
+          image: {{ include "rproxy-gateway.controllerImage" . }}
+          imagePullPolicy: {{ .Values.controller.image.pullPolicy }}
+          args: [certsync, --selector=rproxy.max3584.net/certs-for=fleet, --dir=/var/run/rproxy-gateway/certs, --listen=0.0.0.0:9444]
+          env:
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+          ports:
+            - {name: certsync, containerPort: 9444}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: certs, mountPath: /var/run/rproxy-gateway/certs}
+      volumes:
+        - name: token
+          secret:
+            secretName: rproxy-gateway-token
+            items: [{key: tokens.yaml, path: tokens.yaml}]
+        - name: api-tls
+          secret: {secretName: rproxy-gateway-api-tls}
+        - name: certs
+          emptyDir: {medium: Memory}
+      {{- with .Values.fleet.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.fleet.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

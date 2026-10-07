@@ -1,0 +1,154 @@
+name: e2e
+
+# rproxy-gateway against a real rproxy (rproxy-api built from RPROXY_REF):
+# - "real rproxy (rule sets)": tests/rproxy.rs in an Alpine container (no Kubernetes)
+# - "e2e (kind)" and "Gateway API conformance": on the runner VM, since kind runs the
+#   cluster's nodes as Docker containers (the Alpine job container has no Docker
+#   daemon; docker-in-docker would need a privileged nested daemon). There, nothing is
+#   built from Rust: the binaries come from the Alpine jobs.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      rproxy_ref:
+        description: "rproxy-api ref to build rproxy from"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # rproxy-api master has the rule sets (#28); another ref (a release tag, a branch) by hand
+  RPROXY_REF: ${{ inputs.rproxy_ref || 'master' }}
+
+jobs:
+  build:
+    name: build (musl)
+    runs-on: ubuntu-latest
+    container: alpine:3.24
+    steps:
+      - name: packages
+        run: apk add --no-cache bash git tar zstd curl gcc musl-dev
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --release
+      - run: mkdir -p dist/amd64 && cp target/release/rproxy-gateway dist/amd64/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rproxy-gateway
+          path: dist/amd64/rproxy-gateway
+
+  rproxy:
+    name: rproxy (rproxy-api)
+    runs-on: ubuntu-latest
+    container: alpine:3.24
+    steps:
+      - name: packages
+        run: apk add --no-cache bash git tar zstd curl gcc musl-dev
+      - uses: actions/checkout@v4
+      - name: rproxy-api commit
+        id: ref
+        shell: bash
+        run: |
+          sha=$(git ls-remote https://github.com/max3584/rproxy-api.git "$RPROXY_REF" | head -1 | cut -f1)
+          [ -n "$sha" ] || sha=$(git ls-remote https://github.com/max3584/rproxy-api.git master | cut -f1)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        id: cache
+        with:
+          path: dist/amd64/rproxy-api
+          key: rproxy-api-musl-${{ steps.ref.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.cache.outputs.cache-hit != 'true'
+      - name: build
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: scripts/build-rproxy.sh "${{ steps.ref.outputs.sha }}" dist/amd64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rproxy-api
+          path: dist/amd64/rproxy-api
+
+  real:
+    name: real rproxy (rule sets)
+    needs: rproxy
+    runs-on: ubuntu-latest
+    container: alpine:3.24
+    steps:
+      - name: packages
+        run: apk add --no-cache bash git tar zstd curl gcc musl-dev
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          name: rproxy-api
+          path: dist/amd64
+      - name: tests/rproxy.rs
+        env:
+          RPROXY_TEST_REQUIRE: "1"
+        run: |
+          chmod +x dist/amd64/rproxy-api
+          RPROXY_BIN=$PWD/dist/amd64/rproxy-api cargo test --locked --test rproxy -- --nocapture
+
+  kind:
+    name: e2e (kind)
+    needs: [build, rproxy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/amd64
+          merge-multiple: true
+      - name: kind
+        run: |
+          curl -sLo "$RUNNER_TEMP/kind" https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+          sudo install -m 755 "$RUNNER_TEMP/kind" /usr/local/bin/kind
+      - name: scripts/e2e.sh
+        env:
+          MIGRATE: e2e/e2e
+        run: scripts/e2e.sh
+
+  conformance:
+    name: Gateway API conformance
+    needs: [build, rproxy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/amd64
+          merge-multiple: true
+      - name: kind
+        run: |
+          curl -sLo "$RUNNER_TEMP/kind" https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+          sudo install -m 755 "$RUNNER_TEMP/kind" /usr/local/bin/kind
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - name: scripts/conformance.sh
+        run: scripts/conformance.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: conformance-report
+          path: |
+            conformance-report.yaml
+            ${{ runner.temp }}/rproxy-gateway-conformance/conformance.log
+      # the report is the deliverable (docs/CONFORMANCE.md lists the known failures, e.g. the
+      # `add` of header modifiers that rproxy's headers middleware lacks): shown, not blocking
+      - name: result
+        continue-on-error: true
+        run: exit "$(cat "$RUNNER_TEMP/rproxy-gateway-conformance/status")"
