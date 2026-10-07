@@ -14,11 +14,6 @@ on:
         description: "rproxy replicas per Gateway (managed.replicas)"
         required: false
         default: "2"
-  # TEMPORARY (iteration on the PR): removed before merging
-  pull_request:
-    paths:
-      - .github/workflows/acceptance.yml
-      - scripts/acceptance.sh
 
 permissions:
   contents: read

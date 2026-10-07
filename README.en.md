@@ -84,6 +84,7 @@ cargo fmt --check
 ```
 
 - e2e (`scripts/e2e.sh`) and conformance (`scripts/conformance.sh`) run on kind (Docker needed; the CI `e2e` workflow). rproxy is built from rproxy-api master (another ref when run by hand).
+- Acceptance test (`scripts/acceptance.sh`, the manual `acceptance` workflow): installs the published chart and images on a 4-node kind cluster with MetalLB and cert-manager and measures failover, certificate renewal and state recovery under continuous traffic.
 
 ## License
 
