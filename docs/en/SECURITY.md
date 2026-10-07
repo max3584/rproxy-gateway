@@ -55,6 +55,10 @@ When `certificateRefs` (or `spec.tls.backend.clientCertificateRef`) names a Secr
   - CA: `kubectl -n rproxy-gateway-system delete secret rproxy-gateway-ca rproxy-gateway-api-tls`, then restart the controller: every control API certificate is issued again by the new CA and the rproxy pods roll
   - master token: `kubectl -n rproxy-gateway-system delete secret rproxy-gateway-token`, then restart the controller: the per-Gateway tokens change and the rproxy pods roll (restart the DaemonSet in fleet mode)
 
+## Owners of rproxy's rule sets
+
+rproxy makes a rule set belong to the name of the token that created it (other non-admin tokens cannot change it). The controller's token is always named `rproxy-gateway` whatever its value, so after a token rotation (and after re-PUTs once rproxy restarts) the owner stays the same. The tokens' `allow_rulesets` are `k8s/` for the fleet's and, for each managed Gateway's, only that Gateway's rule set (`k8s/<namespace>/<name>`).
+
 ## Images
 
 `controller.image.digest` and `rproxy.image.digest` (`sha256:...`) pin the images (over the tags).

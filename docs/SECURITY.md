@@ -55,6 +55,10 @@ English: [en/SECURITY.md](en/SECURITY.md)
   - CA：`kubectl -n rproxy-gateway-system delete secret rproxy-gateway-ca rproxy-gateway-api-tls` → コントローラを再起動。新しい CA で制御 API の証明書がすべて出し直され、rproxy の Pod が入れ替わる
   - マスタートークン：`kubectl -n rproxy-gateway-system delete secret rproxy-gateway-token` → コントローラを再起動。Gateway ごとのトークンも変わり、rproxy の Pod が入れ替わる（fleet は DaemonSet を再起動）
 
+## rproxy のルールセットの持ち主
+
+rproxy はルールセットを、作ったトークンの名前のものにする（ほかの admin でないトークンは変えられない）。コントローラのトークンは値が変わっても名前はいつも `rproxy-gateway` なので、トークンを入れ替えても（rproxy の再起動のあとの PUT し直しも）同じ持ち主のまま。トークンの `allow_rulesets` は、fleet のものが `k8s/`、managed の Gateway ごとのものがその Gateway のルールセット（`k8s/<namespace>/<name>`）だけ。
+
 ## イメージ
 
 `controller.image.digest`・`rproxy.image.digest`（`sha256:...`）でダイジェストに固定できる（タグより優先）。

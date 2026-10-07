@@ -45,7 +45,11 @@ struct Rproxy {
 impl Rproxy {
 	fn start(bin: &Path, dir: &Path, api: u16) -> Rproxy {
 		let tokens = dir.join("tokens.yaml");
-		std::fs::write(&tokens, rproxy_gateway::controller::bootstrap::token_file(TOKEN)).unwrap();
+		std::fs::write(
+			&tokens,
+			rproxy_gateway::controller::bootstrap::token_file(TOKEN, rproxy_gateway::controller::bootstrap::FLEET_RULESETS),
+		)
+		.unwrap();
 		let log = std::fs::File::create(dir.join(format!("rproxy-{api}.log"))).unwrap();
 		let child = Command::new(bin)
 			.env("RPROXY_API_ADDR", "127.0.0.1")

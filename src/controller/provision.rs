@@ -291,7 +291,7 @@ pub fn api_secret(t: &Target, current: Option<&Secret>, boot: &bootstrap::Bootst
 		("tls.crt".to_string(), crt),
 		("tls.key".to_string(), key),
 		("ca.crt".to_string(), boot.ca_pem.clone()),
-		("tokens.yaml".to_string(), bootstrap::token_file(&token).into_bytes()),
+		("tokens.yaml".to_string(), bootstrap::token_file(&token, &t.plan.ruleset).into_bytes()),
 	]
 	.into();
 	let mut meta = t.meta(&api_secret_name(&t.id), t.secret_labels());
@@ -771,6 +771,7 @@ mod tests {
 		GatewayPlan {
 			namespace: "default".into(),
 			name: "web".into(),
+			ruleset: "k8s/default/web".into(),
 			rules: vec![crate::rproxy::model::Rule { protocol: Protocol::Tcp, listen_port: 443, ..Default::default() }],
 			files: [("abc.crt".to_string(), b"x".to_vec())].into(),
 			..Default::default()
@@ -868,6 +869,7 @@ mod tests {
 		let token = bootstrap::derive_token("master", &t.id);
 		assert!(String::from_utf8_lossy(&d["tokens.yaml"]).contains(&crate::pem::sha256_hex(token.as_bytes())));
 		assert!(!String::from_utf8_lossy(&d["tokens.yaml"]).contains(&crate::pem::sha256_hex(b"master")), "not the master token");
+		assert!(String::from_utf8_lossy(&d["tokens.yaml"]).contains("allow_rulesets: [\"k8s/default/web\"]"), "its own rule set only");
 		crate::pem::check_pair(&d["tls.crt"], &d["tls.key"]).unwrap();
 		let again = api_secret(&t, Some(&first), &b).unwrap();
 		assert_eq!(data_of(Some(&again)), d, "the certificate is kept");
