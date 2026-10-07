@@ -363,6 +363,8 @@ struct ListenerState<'a> {
 	supported_kinds: Vec<RouteGroupKind>,
 	/// Certificate files (cert, key) for HTTPS and terminating TLS listeners.
 	certs: Vec<(String, String)>,
+	/// The CA file client certificates are validated against (frontend validation).
+	client_ca: Option<String>,
 	accepted: bool,
 	/// Accepted but with nothing to serve with (no usable certificate): routes
 	/// attach, but no rule is made.
@@ -437,6 +439,7 @@ fn validate_listener<'a>(
 		conds: vec![],
 		supported_kinds: vec![],
 		certs: vec![],
+		client_ca: None,
 		accepted: true,
 		unservable: false,
 		attached: 0,
@@ -509,12 +512,99 @@ fn validate_listener<'a>(
 			// nothing to serve with: routes still attach, the listener is not programmed
 			st.unservable = true;
 		}
+		// client certificates (spec.tls.frontend: the port's configuration, else the default)
+		if let Some(v) = frontend_validation(gw, st.port) {
+			if v.mode.as_deref() != Some("AllowInsecureFallback") {
+				match client_ca(world, gw_ns, v, files, opts) {
+					(Some(ca), problem) => {
+						st.client_ca = Some(ca);
+						if let Some(p) = problem {
+							if resolved.status {
+								resolved = p;
+							}
+						}
+					}
+					(None, problem) => {
+						let p = problem.unwrap_or_else(|| Cond::new("ResolvedRefs", false, "InvalidCACertificateRef", "no CA certificate"));
+						st.accepted = false;
+						st.conds.push(Cond::new(
+							"Accepted",
+							false,
+							"NoValidCACertificate",
+							format!("no usable CA certificate: {}", p.message),
+						));
+						if resolved.status {
+							resolved = p;
+						}
+					}
+				}
+			}
+		}
 	}
 	if st.conds.iter().all(|c| c.kind != "Accepted") {
 		st.conds.push(Cond::ok("Accepted", "Accepted"));
 	}
 	st.conds.push(resolved);
 	st
+}
+
+/// The frontend validation of a port: `spec.tls.frontend.perPort`, else its `default`.
+fn frontend_validation(gw: &Gateway, port: u16) -> Option<&crate::k8s::gateway::FrontendTlsValidation> {
+	let f = gw.spec.tls.as_ref()?.frontend.as_ref()?;
+	match f.per_port.iter().find(|p| p.port == i32::from(port)) {
+		Some(p) => p.tls.validation.as_ref(),
+		None => f.default.validation.as_ref(),
+	}
+}
+
+/// The CA bundle of `caCertificateRefs` as a file (the usable ones), and the
+/// first reference that is not usable (`ResolvedRefs: False`).
+fn client_ca(
+	world: &World,
+	gw_ns: &str,
+	v: &crate::k8s::gateway::FrontendTlsValidation,
+	files: &mut BTreeMap<String, Vec<u8>>,
+	opts: &Options,
+) -> (Option<String>, Option<Cond>) {
+	let mut bundle: Vec<u8> = vec![];
+	let mut problem: Option<Cond> = None;
+	let bad = |reason: &str, message: String| Cond::new("ResolvedRefs", false, reason, message);
+	for r in &v.ca_certificate_refs {
+		let group = r.group.as_deref().unwrap_or("");
+		let kind = r.kind.as_deref().unwrap_or("ConfigMap");
+		let ns = r.namespace.as_deref().unwrap_or(gw_ns);
+		let p = if !group.is_empty() || kind != "ConfigMap" {
+			Some(bad("InvalidCACertificateKind", format!("caCertificateRef {group}/{kind} {}: only ConfigMaps are supported", r.name)))
+		} else if !world.granted((GROUP, "Gateway", gw_ns), ("", "ConfigMap", ns, &r.name)) {
+			Some(bad("RefNotPermitted", format!("ConfigMap {ns}/{}: no ReferenceGrant allows the reference", r.name)))
+		} else {
+			match world.config_maps.get(&(ns.to_string(), r.name.clone())).and_then(|c| c.data.as_ref()).and_then(|d| d.get("ca.crt")) {
+				None => Some(bad("InvalidCACertificateRef", format!("ConfigMap {ns}/{} not found or without ca.crt", r.name))),
+				Some(pem) => match crate::pem::check_certs(pem.as_bytes()) {
+					Ok(_) => {
+						bundle.extend_from_slice(pem.trim_end().as_bytes());
+						bundle.push(b'\n');
+						None
+					}
+					Err(e) => Some(bad("InvalidCACertificateRef", format!("ConfigMap {ns}/{} ca.crt: {e}", r.name))),
+				},
+			}
+		};
+		if problem.is_none() {
+			problem = p;
+		}
+	}
+	if bundle.is_empty() {
+		return (None, problem);
+	}
+	(Some(ca_file(&bundle, files, opts)), problem)
+}
+
+/// Adds a CA bundle to `files` (named by its hash); returns its path.
+pub fn ca_file(pem: &[u8], files: &mut BTreeMap<String, Vec<u8>>, opts: &Options) -> String {
+	let name = format!("{}.ca.crt", crate::pem::short_hash(pem));
+	files.insert(name.clone(), pem.to_vec());
+	format!("{}/{name}", opts.cert_dir)
 }
 
 /// Marks conflicting listeners (same port, protocols that cannot share it, or the same host name).
@@ -687,6 +777,9 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 				}
 			}
 		}
+		// client certificates: the port's CA (validation is per port)
+		let client_auth =
+			members.iter().find_map(|i| listeners[*i].client_ca.clone()).map(|ca| serde_json::json!({"mode": "required", "ca_file": ca}));
 		// TLS routes by server name (passthrough, or terminated on a TLS listener)
 		let mut tls_routes: Vec<rp::TlsRoute> = vec![];
 		for a in attachments.iter().filter(|a| a.kind == RouteKind::Tls && mine(a)) {
@@ -768,7 +861,7 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 			rule.http = Some(rp::Http { routes, default: None, services, middlewares });
 			if https {
 				let passthrough: Vec<rp::TlsRoute> = tls_routes.into_iter().filter(|r| r.passthrough).collect();
-				rule.tls = Some(rp::Tls { mode: "terminate", certificates, routes: passthrough, ..Default::default() });
+				rule.tls = Some(rp::Tls { mode: "terminate", certificates, routes: passthrough, client_auth, ..Default::default() });
 			}
 		} else if has(Family::TlsPassthrough) || has(Family::TlsTerminate) {
 			if tls_routes.is_empty() {
@@ -786,6 +879,7 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 				mode: if terminate { "terminate" } else { "sni" },
 				routes: tls_routes,
 				certificates: if terminate { certificates } else { vec![] },
+				client_auth: if terminate { client_auth } else { None },
 				unmatched: Some("reject"),
 				..Default::default()
 			});
@@ -943,6 +1037,23 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 	if let Ok((ips, unusable)) = addresses {
 		plan.addresses = ips;
 		plan.address_error = unusable;
+	}
+	// client certificates not enforced somewhere (rproxy does not ask for them then)
+	let frontend = gw.spec.tls.as_ref().and_then(|t| t.frontend.as_ref());
+	let insecure = frontend.is_some_and(|f| {
+		f.default
+			.validation
+			.iter()
+			.chain(f.per_port.iter().filter_map(|p| p.tls.validation.as_ref()))
+			.any(|v| v.mode.as_deref() == Some("AllowInsecureFallback"))
+	});
+	if insecure {
+		plan.conds.push(Cond::new(
+			"InsecureFrontendValidationMode",
+			true,
+			"ConfigurationChanged",
+			"AllowInsecureFallback: connections without a valid client certificate are accepted",
+		));
 	}
 	if opts.labels {
 		let labels: BTreeMap<String, String> = [

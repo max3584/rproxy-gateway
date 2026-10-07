@@ -57,6 +57,56 @@ pub struct GatewaySpec {
 	pub addresses: Vec<GatewayAddress>,
 	#[serde(default)]
 	pub infrastructure: Option<GatewayInfrastructure>,
+	#[serde(default)]
+	pub tls: Option<GatewayTlsConfig>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayTlsConfig {
+	#[serde(default)]
+	pub backend: Option<GatewayBackendTls>,
+	#[serde(default)]
+	pub frontend: Option<FrontendTlsConfig>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayBackendTls {
+	#[serde(default)]
+	pub client_certificate_ref: Option<SecretObjectReference>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrontendTlsConfig {
+	#[serde(default)]
+	pub default: TlsConfig,
+	#[serde(default)]
+	pub per_port: Vec<TlsPortConfig>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct TlsPortConfig {
+	pub port: i32,
+	#[serde(default)]
+	pub tls: TlsConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct TlsConfig {
+	#[serde(default)]
+	pub validation: Option<FrontendTlsValidation>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrontendTlsValidation {
+	#[serde(default)]
+	pub ca_certificate_refs: Vec<SecretObjectReference>,
+	/// `AllowValidOnly` (the default) or `AllowInsecureFallback`.
+	#[serde(default)]
+	pub mode: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

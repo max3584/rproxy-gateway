@@ -45,6 +45,10 @@ impl World {
 				let s: k8s_openapi::api::core::v1::Secret = serde_json::from_value(obj).map_err(err)?;
 				self.secrets.insert(crate::render::world::key(&s.metadata), s);
 			}
+			("", "ConfigMap") => {
+				let c: k8s_openapi::api::core::v1::ConfigMap = serde_json::from_value(obj).map_err(err)?;
+				self.config_maps.insert(crate::render::world::key(&c.metadata), c);
+			}
 			("", "Namespace") => {
 				let n: k8s_openapi::api::core::v1::Namespace = serde_json::from_value(obj).map_err(err)?;
 				self.namespaces.insert(n.metadata.name.clone().unwrap_or_default(), n.metadata.labels.unwrap_or_default());

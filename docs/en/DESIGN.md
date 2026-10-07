@@ -107,6 +107,7 @@ rproxy runs with `RPROXY_API_ADDR=0.0.0.0`, `RPROXY_API_PORT=9443`, `RPROXY_TOKE
 | A `TLS` / `TCP` / `UDP` listener nothing attaches to | no rule (the listener is `Programmed: True`; the Service has the port) |
 | A TLSRoute without a usable backend | its names go to `127.0.0.1:1` (accepted, then closed: Gateway API expects a reset, not a refused connection) |
 | Several routes on one TCP / UDP listener | all `Accepted`, the traffic goes to the oldest |
+| The Gateway's `spec.tls.frontend` (client certificate validation) | `tls.client_auth` of the port's rule (`mode: required`, `ca_file` a file of the `ca.crt` of the `caCertificateRefs` ConfigMaps). `perPort` for the port, else `default`. Kinds other than ConfigMap: `InvalidCACertificateKind`; missing or without `ca.crt`: `InvalidCACertificateRef`; another namespace needs a ReferenceGrant (to `ConfigMap`, else `RefNotPermitted`). With no usable one the listener is `Accepted: False` (`NoValidCACertificate`). `AllowInsecureFallback` does not ask for client certificates (rproxy has no way to validate and pass the result on to the backend), and the Gateway gets `InsecureFrontendValidationMode: True` |
 | An `HTTPS` listener without a usable certificate | routes attach (counted in `attachedRoutes`), no rule is made (`ResolvedRefs: False`, `Programmed: False`) |
 
 ### rproxy's CRDs (`rproxy.max3584.net/v1alpha1`)

@@ -71,6 +71,7 @@ pub const SUPPORTED_FEATURES: &[&str] = &[
 	"HTTPRouteRequestMultipleMirrors",
 	"HTTPRouteRequestPercentageMirror",
 	"HTTPRouteBackendProtocolH2C",
+	"GatewayFrontendClientCertificateValidation",
 ];
 
 #[derive(Clone, Debug)]

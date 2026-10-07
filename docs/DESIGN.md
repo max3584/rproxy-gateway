@@ -107,6 +107,7 @@ rproxy は `RPROXY_API_ADDR=0.0.0.0`、`RPROXY_API_PORT=9443`、`RPROXY_TOKEN_FI
 | 何もつながっていない `TLS` / `TCP` / `UDP` のリスナー | ルールを作らない（リスナーは `Programmed: True`。Service のポートはある） |
 | 使える backend のない TLSRoute | その名前は `127.0.0.1:1` へ（つないでから閉じる。Gateway API は接続の拒否ではなくリセットを求める） |
 | 1 つの TCP / UDP のリスナーに複数のルート | どれも `Accepted` だが、通信は最も古いルートへ |
+| Gateway の `spec.tls.frontend`（クライアント証明書の検証） | そのポートのルールの `tls.client_auth`（`mode: required`、`ca_file` は `caCertificateRefs` の ConfigMap の `ca.crt` をまとめたファイル）。`perPort` があればそのポート、なければ `default`。ConfigMap 以外は `InvalidCACertificateKind`、見つからない・`ca.crt` のないものは `InvalidCACertificateRef`、ほかの namespace は ReferenceGrant（to `ConfigMap`）が要る（`RefNotPermitted`）。使えるものが 1 つもなければリスナーは `Accepted: False`（`NoValidCACertificate`）。`AllowInsecureFallback` はクライアント証明書を求めない（rproxy に「検証して結果を backend に渡す」口がない）で、Gateway に `InsecureFrontendValidationMode: True` |
 | 証明書の使えない `HTTPS` のリスナー | ルートはつながる（`attachedRoutes` に数える）が、ルールは作らない（`ResolvedRefs: False`、`Programmed: False`） |
 
 ### rproxy の CRD（`rproxy.max3584.net/v1alpha1`）

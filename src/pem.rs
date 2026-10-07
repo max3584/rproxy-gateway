@@ -13,6 +13,15 @@ pub fn check_pair(crt: &[u8], key: &[u8]) -> Result<(), String> {
 	Ok(())
 }
 
+/// Whether `pem` holds at least one certificate (a CA bundle).
+pub fn check_certs(pem: &[u8]) -> Result<usize, String> {
+	let certs: Vec<_> = CertificateDer::pem_slice_iter(pem).collect::<Result<_, _>>().map_err(|e| e.to_string())?;
+	if certs.is_empty() {
+		return Err("no PEM certificate".into());
+	}
+	Ok(certs.len())
+}
+
 /// The first 16 hex digits of the SHA-256 of `data`.
 pub fn short_hash(data: &[u8]) -> String {
 	hex(&ring::digest::digest(&ring::digest::SHA256, data).as_ref()[..8])
