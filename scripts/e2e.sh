@@ -79,6 +79,17 @@ echo "== HTTPS"
 retry 60 sh -c "curl -sf --cacert $work/tls.crt --resolve secure.example.com:443:$addr https://secure.example.com/s > $work/https.json"
 jq -e '.path == "/s"' "$work/https.json" > /dev/null
 
+echo "== certificate rotation: the new certificate is served soon (mounted Secret, pod annotation)"
+openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=secure.example.com -addext subjectAltName=DNS:secure.example.com \
+  -keyout "$work/tls2.key" -out "$work/tls2.crt" 2> /dev/null
+kubectl -n e2e create secret tls secure-cert --cert="$work/tls2.crt" --key="$work/tls2.key" --dry-run=client -o yaml | kubectl apply -f - > /dev/null
+retry 60 sh -c "curl -sf --cacert $work/tls2.crt --resolve secure.example.com:443:$addr https://secure.example.com/rotated > /dev/null"
+
+echo "== rproxy pods cannot read Secrets"
+# can-i exits 1 for "no" (and the ERR trap runs in command substitutions)
+test "$(kubectl auth can-i get secrets -n $NS --as=system:serviceaccount:$NS:rproxy-gateway-proxy || true)" = no
+test "$(kubectl -n $NS get pods -l app.kubernetes.io/name=rproxy -o jsonpath='{.items[0].spec.automountServiceAccountToken}')" = false
+
 echo "== RproxyMiddleware (rate_limit)"
 curl -s -o /dev/null -H 'Host: e2e.example.com' "http://$addr/limited/1"
 test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: e2e.example.com' "http://$addr/limited/2")" = 429

@@ -5,11 +5,11 @@
 //! Skipped without `RPROXY_BIN` (fails instead with `RPROXY_TEST_REQUIRE=1`, as
 //! in CI).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rproxy_gateway::controller::provision::Endpoint;
@@ -229,18 +229,25 @@ spec:
 	for (name, content) in &plan.files {
 		std::fs::write(certs.join(name), content).unwrap();
 	}
-	// certsync's GET /files
-	let present: Arc<Mutex<Option<BTreeSet<String>>>> = Arc::new(Mutex::new(Some(plan.files.keys().cloned().collect())));
+	// certsync's GET /files (the directory the kubelet mounts the Secret into)
 	let certsync = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
 	let certsync_port = certsync.local_addr().unwrap().port();
-	tokio::spawn(rproxy_gateway::certsync::serve(certsync, present));
+	tokio::spawn(rproxy_gateway::certsync::serve(certsync, certs.clone()));
 
 	let rp = Rproxy::start(&bin, &dir, api);
 	rp.wait().await;
 	let client = Client::new(None, TOKEN).unwrap();
 	let caps = client.capabilities(SocketAddr::from(([127, 0, 0, 1], api))).await.unwrap();
 	assert!(caps.feature("rulesets"), "this rproxy has no rule sets: {caps:?}");
-	let ep = Endpoint { pod: "rproxy".into(), uid: "1".into(), ip: "127.0.0.1".into(), host_ip: None, api_port: api, certsync_port };
+	let ep = Endpoint {
+		pod: "rproxy".into(),
+		uid: "1".into(),
+		ip: "127.0.0.1".into(),
+		host_ip: None,
+		api_port: api,
+		certsync_port,
+		certs: None,
+	};
 	let mut applied = Applied::new();
 	let mut caps_cache = HashMap::new();
 	let (r, _) = sync_pod(&client, &ep, &plan, &mut applied, &mut caps_cache).await;

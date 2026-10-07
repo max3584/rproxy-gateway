@@ -23,7 +23,7 @@ English: [en/MIGRATION.md](en/MIGRATION.md)
 |---|---|
 | IngressRoute の `match` | そのまま（rproxy の `match` は Traefik v3 の書き方）。v2 の `Headers`・`HeadersRegexp`・`HostHeader`・`Query(a=b)` は書き直す。v2 のプレースホルダ（`{name:regex}`）とほかの matcher は外す |
 | IngressRoute の `services`（Service、port は番号か名前） | EndpointSlice の Pod の IP の `servers`。`scheme`（なければポート 443・名前が https で始まるものは https）、`weight`、`passHostHeader: false`。`TraefikService` は外す |
-| IngressRoute の `tls.secretName` | 証明書のファイル（certsync） |
+| IngressRoute の `tls.secretName` | 証明書のファイル（Secret のボリューム） |
 | `tls.certResolver` | `{acme: <resolver>, domains: [...]}`（`domains`、なければ `Host()` の名前）。rproxy の設定ファイルの `global.acme` にそのリゾルバが要る |
 | `tls.options`（TLSOption） | `tls.options`（`minVersion`・`cipherSuites`）、`client_auth`（`clientAuth.secretNames` の Secret の `tls.ca` / `ca.crt` をファイルに）、`alpn`。`maxVersion`・`curvePreferences`・`sniStrict` は外す |
 | Middleware | rproxy のミドルウェア（`redirectScheme`、`redirectRegex`、`stripPrefix`、`addPrefix`、`replacePath(Regex)`、`headers`、`rateLimit`、`inFlightReq`、`ipAllowList`、`basicAuth`（Secret の `users` を htpasswd のファイルに）、`forwardAuth`、`compress`、`retry`、`circuitBreaker`、`errors`、`buffering`、CrowdSec のプラグイン、`chain` は展開） |

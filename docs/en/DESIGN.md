@@ -9,7 +9,7 @@ The implementation of rproxy-api docs/en/DESIGN-v0.4.md 3. (#28). This page reco
 ```
 Gateway API / CRDs ──watch──▶ rproxy-gateway ──PUT /rulesets/k8s/<ns>/<name>──▶ rproxy (control API, HTTPS + token)
                                     │                                             ▲
-                                    └──certificate Secret (<id>-certs)──▶ certsync ──files──┘ (emptyDir in the same pod)
+                                    └──certificate Secret (<id>-certs)──mounted by the kubelet──┘ (rproxy pods do not use the API)
 ```
 
 - The controller talks to rproxy only through the control API (`GET /capabilities`, `GET /readyz`, `GET` / `PUT` / `DELETE /rulesets/{name}`). rproxy knows nothing of the Kubernetes API.
@@ -41,18 +41,29 @@ On its first start the controller creates these Secrets in its namespace (readin
 
 | Secret | Contents | Read by |
 |---|---|---|
-| `rproxy-gateway-ca` | A CA certificate and key | the controller |
-| `rproxy-gateway-api-tls` | rproxy's control API certificate (issued by the CA for `rproxy-api.rproxy-gateway.internal`; pods are reached by IP, so the name is fixed) | rproxy |
-| `rproxy-gateway-token` | The controller's token (`token`) and the token file rproxy reads (`tokens.yaml`, only the SHA-256; scopes `rules:read`, `rules:write`, `acme:write`) | `token`: the controller; `tokens.yaml`: rproxy |
+| `rproxy-gateway-ca` | A CA certificate and key | the controller (rproxy pods cannot read it) |
+| `rproxy-gateway-api-tls` | rproxy's control API certificate (issued by the CA for `rproxy-api.rproxy-gateway.internal`; pods are reached by IP, so the name is fixed) | rproxy (a volume) |
+| `rproxy-gateway-token` | The controller's token (`token`) and the token file rproxy reads (`tokens.yaml`, only the SHA-256; scopes `rules:read`, `rules:write`, `acme:write`) | `token`: the controller; `tokens.yaml`: rproxy (a volume with only that key) |
 
 rproxy runs with `RPROXY_API_ADDR=0.0.0.0`, `RPROXY_API_PORT=9443`, `RPROXY_TOKEN_FILE` and `RPROXY_TLS_CERT` / `RPROXY_TLS_KEY` (the three rproxy requires for a control API on a non-loopback address).
 
-## Certificates (certsync)
+## Certificates (a mounted Secret, certsync)
 
 - `certificateRefs` Secrets become files on the rproxy host, referenced with `cert_file` / `key_file` (key material never goes over the control API; rproxy-api design 3.3).
 - Files are named by their content's hash (`<first 16 hex digits of sha256>.crt` / `.key`). New content is a new path, which reaches rproxy as a rule change.
-- The controller puts each Gateway's certificates into one Secret (`rproxy-<id>-certs`, label `rproxy.max3584.net/certs-for`). `certsync` in the rproxy pod (`rproxy-gateway certsync` of this image) watches it and writes the files into an `emptyDir` shared with rproxy (`/var/run/rproxy-gateway/certs`).
-- Before a PUT the controller checks with certsync's `GET /files` that the files are there (until then `Programmed: False`, reason `Pending`). Files no Secret holds any more stay 5 minutes before they are removed (so old rules reading them again do not break).
+- The controller puts each Gateway's certificates into one Secret (`rproxy-<id>-certs`), which the kubelet mounts into the rproxy pod as a Secret volume (`/var/run/rproxy-gateway/certs`, read-only, mode 0440). In fleet mode every Gateway's certificates go into one Secret (`rproxy-fleet-certs`) mounted into the DaemonSet's pods (a Secret holds up to 1 MiB).
+- rproxy pods do not use the Kubernetes API: no ServiceAccount token is mounted (`automountServiceAccountToken: false`) and they have no RBAC. Only the referenced certificates reach the pod, through the Secret the controller writes; other Secrets of the namespace (the CA key, the controller's token, other Gateways' certificates) cannot be read.
+- When it changes the Secret, the controller sets an annotation on the pods (`rproxy.max3584.net/certs`, the content's hash). The kubelet handles the pod update by refreshing the volume at once (without the annotation, its periodic sync, about a minute, refreshes it).
+- `certsync` in the same pod (`rproxy-gateway certsync` of this image) only answers `GET /files` with the file names in that directory (it does not use the API). Before a PUT the controller checks that the files are there (until then `Programmed: False`, reason `Pending`).
+- Files no rule uses any more stay in the Secret for 5 minutes before they are dropped (so old rules reading them again do not break).
+
+### Designs not chosen
+
+| Design | Why not |
+|---|---|
+| certsync watching Secrets (the previous design) | The rproxy pod needs to read every Secret of the namespace; `resourceNames` cannot narrow watch and list by name |
+| A namespace per Gateway | Each Gateway would need its own namespace, RBAC and token Secret; it does not work for fleet mode |
+| Sending keys over the control API | Against rproxy-api design 3.3 (key material never crosses the network) |
 
 ## Applying (rule sets)
 
@@ -60,7 +71,7 @@ rproxy runs with `RPROXY_API_ADDR=0.0.0.0`, `RPROXY_API_PORT=9443`, `RPROXY_TOKE
 2. Wait until `GET /readyz` is ready (not for an rproxy without `features.readyz`).
 3. `GET /rulesets/{name}`. When the content and the etag are what was last PUT, nothing happens. Otherwise (the content changed, rproxy restarted and lost the set, someone else changed it) `PUT /rulesets/{name}`: `generation` is the Gateway's `metadata.generation` (or rproxy's, if larger, so a Gateway created again does not get `stale_generation`), `If-Match` is the current etag.
 4. When rproxy refuses one rule (`400`, `rules[i]: ...`), that rule is left out and the rest is PUT again (one mistake in an RproxyRule or a migrated route does not stop the whole set). The refused rule is reported as `Accepted: False` (`Invalid`).
-5. Status is written from the `conditions` of the rules in `GET /rulesets/{name}` after the PUT. When a rule is `failed`, the set is PUT again a little later (e.g. a file certsync has just written).
+5. Status is written from the `conditions` of the rules in `GET /rulesets/{name}` after the PUT. When a rule is `failed`, the set is PUT again a little later (e.g. a file the kubelet has just written).
 
 ## Mapping (Gateway API → rproxy)
 
