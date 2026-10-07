@@ -8,6 +8,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 
 use crate::k8s::crd::{RproxyMiddleware, RproxyPolicy, RproxyRule};
 use crate::k8s::gateway::{Gateway, GatewayClass, HttpRoute, L4Route, ReferenceGrant};
+use crate::render::migrate::MigrationInput;
 
 /// (namespace, name)
 pub type Key = (String, String);
@@ -34,6 +35,8 @@ pub struct World {
 	pub middlewares: BTreeMap<Key, RproxyMiddleware>,
 	pub policies: Vec<RproxyPolicy>,
 	pub raw_rules: Vec<RproxyRule>,
+	/// Ingress and Traefik resources (only when migration is on).
+	pub migration: MigrationInput,
 }
 
 impl World {

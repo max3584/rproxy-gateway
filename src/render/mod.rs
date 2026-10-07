@@ -12,8 +12,10 @@ pub mod backends;
 pub mod hostname;
 pub mod http;
 pub mod l4;
+pub mod migrate;
 pub mod policy;
 pub mod status;
+pub mod traefik_mw;
 pub mod world;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -34,11 +36,13 @@ pub struct Options {
 	pub cert_dir: String,
 	/// Whether rproxy takes `labels` (`features.labels`).
 	pub labels: bool,
+	/// Ingress / Traefik resources go into this Gateway's set.
+	pub migration: Option<migrate::Settings>,
 }
 
 impl Default for Options {
 	fn default() -> Self {
-		Options { listen_addrs: vec!["0.0.0.0".into()], cert_dir: "/var/run/rproxy-gateway/certs".into(), labels: true }
+		Options { listen_addrs: vec!["0.0.0.0".into()], cert_dir: "/var/run/rproxy-gateway/certs".into(), labels: true, migration: None }
 	}
 }
 
@@ -107,6 +111,8 @@ pub struct GatewayPlan {
 	pub raw_status: Vec<policy::RawStatus>,
 	/// RproxyPolicy status for this Gateway.
 	pub policies: Vec<policy::PolicyStatus>,
+	/// What migration could not convert.
+	pub notes: Vec<String>,
 }
 
 impl GatewayPlan {
@@ -677,6 +683,22 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 			}
 		}
 		p.conds.push(resolved.unwrap_or_else(|| Cond::ok("ResolvedRefs", "ResolvedRefs")));
+	}
+
+	// Ingress and Traefik resources
+	if let Some(m) = opts.migration.as_ref().filter(|m| m.gateway == (gw_ns.clone(), gw_name.clone())) {
+		let out = migrate::render(world, m, opts);
+		for (key, add) in out.ports {
+			let rkey = rp::rule_key(key.0, &opts.listen_addrs[0], key.1);
+			let existing = plan.rules.iter_mut().find(|r| r.key() == rkey);
+			let (rule, notes) = migrate::apply_port(key, add, existing, new_rule(key.0, key.1, opts));
+			plan.notes.extend(notes);
+			if let Some(r) = rule {
+				plan.rules.push(r);
+			}
+		}
+		files.extend(out.files);
+		plan.notes.extend(out.notes);
 	}
 
 	// rproxy's own resources

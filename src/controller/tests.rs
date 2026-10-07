@@ -73,6 +73,9 @@ async fn handle(fake: Arc<Mutex<Fake>>, req: Request<hyper::body::Incoming>) -> 
 			let generation = req["generation"].as_i64().unwrap();
 			let rules = req["rules"].as_array().unwrap().clone();
 			f.puts.push((name.clone(), if_match.clone(), generation));
+			if let Some(i) = rules.iter().position(|r| r["remote_addr"] == "bad name") {
+				return reply(400, json!({"error": format!("rules[{i}]: remote_addr: not a host name"), "code": "invalid"}));
+			}
 			if let Some((g, e, _)) = f.sets.get(&name) {
 				if let Some(m) = &if_match {
 					if m != e {
@@ -233,4 +236,28 @@ async fn a_wrong_token_is_reported() {
 		Endpoint { pod: "rproxy-0".into(), uid: "u1".into(), ip: "127.0.0.1".into(), host_ip: None, api_port: port, certsync_port: port };
 	let (r, _) = sync_pod(&rp, &ep, &plan(80, &[]), &mut Applied::new(), &mut HashMap::new()).await;
 	assert!(matches!(&r, PodSync::NotReady(m) if m.contains("401")), "{r:?}");
+}
+
+#[tokio::test]
+async fn a_refused_rule_does_not_stop_the_others() {
+	let fake = Arc::new(Mutex::new(Fake::default()));
+	let port = start(fake.clone()).await;
+	let rp = Client::new(None, "secret").unwrap();
+	let ep =
+		Endpoint { pod: "rproxy-0".into(), uid: "u1".into(), ip: "127.0.0.1".into(), host_ip: None, api_port: port, certsync_port: port };
+	let mut p = plan(80, &[]);
+	p.raw = vec![json!({"protocol": "tcp", "listen_addr": "0.0.0.0", "listen_port": 25, "remote_addr": "bad name", "remote_port": 25})];
+	let mut applied = Applied::new();
+	let mut caps = HashMap::new();
+	let (r, _) = sync_pod(&rp, &ep, &p, &mut applied, &mut caps).await;
+	let PodSync::Synced(views) = r else { panic!("{r:?}") };
+	assert_eq!(views.len(), 2);
+	let bad = views.iter().find(|v| v.listen_port == 25).unwrap();
+	assert_eq!(bad.condition("Accepted").reason, "Invalid");
+	assert!(bad.condition("Programmed").message.contains("not a host name"));
+	assert_eq!(fake.lock().unwrap().sets["k8s/default/gw"].2.len(), 1, "the good rule is applied");
+	// the next pass: nothing to PUT, the refusal is still reported
+	let (r, _) = sync_pod(&rp, &ep, &p, &mut applied, &mut caps).await;
+	assert!(matches!(&r, PodSync::Synced(v) if v.len() == 2), "{r:?}");
+	assert_eq!(fake.lock().unwrap().puts.len(), 2);
 }

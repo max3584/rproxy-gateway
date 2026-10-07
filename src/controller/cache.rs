@@ -10,6 +10,7 @@ use std::sync::Arc;
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::{Namespace, Pod, Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
+use k8s_openapi::api::networking::v1::Ingress;
 use kube::api::{Api, DynamicObject};
 use kube::discovery::ApiResource;
 use kube::runtime::reflector::{self, Store};
@@ -33,10 +34,14 @@ pub struct Cache {
 	secrets: Store<Secret>,
 	namespaces: Store<Namespace>,
 	pub pods: Store<Pod>,
+	ingresses: Option<Store<Ingress>>,
 	dynamic: Vec<DynKind>,
 	/// Resources found by discovery, by kind (for status patches).
 	pub resources: Vec<(&'static str, ApiResource)>,
 }
+
+/// Traefik's CRDs read for migration.
+pub const TRAEFIK_KINDS: &[&str] = &["IngressRoute", "IngressRouteTCP", "IngressRouteUDP", "Middleware", "TLSOption"];
 
 /// The kinds watched dynamically: (group, kind).
 pub const DYNAMIC_KINDS: &[(&str, &str)] = &[
@@ -91,18 +96,31 @@ fn spawn_dyn_watch(client: &kube::Client, ar: &ApiResource, changed: Arc<Notify>
 
 impl Cache {
 	/// Starts the watches; `own_ns` is where the controller's rproxy pods run.
-	pub async fn start(client: &kube::Client, own_ns: &str, extra_kinds: &[(&'static str, &'static str)]) -> anyhow::Result<Cache> {
+	/// `migration`: also watch Ingress and Traefik's CRDs.
+	pub async fn start(client: &kube::Client, own_ns: &str, migration: bool) -> anyhow::Result<Cache> {
 		let changed = Arc::new(Notify::new());
 		let mut dynamic = vec![];
 		let mut resources = vec![];
 		let groups = discover(client).await?;
-		for (group, kind) in DYNAMIC_KINDS.iter().chain(extra_kinds) {
+		let mut kinds: Vec<(&'static str, &'static str)> = DYNAMIC_KINDS.to_vec();
+		if migration {
+			for kind in TRAEFIK_KINDS {
+				// traefik.io, else the older traefik.containo.us
+				let group = crate::k8s::traefik::GROUPS
+					.iter()
+					.find(|g| groups.iter().any(|(gg, k, _)| gg == *g && k == kind))
+					.copied()
+					.unwrap_or("traefik.io");
+				kinds.push((group, kind));
+			}
+		}
+		for &(group, kind) in &kinds {
 			match groups.iter().find(|(g, k, _)| g == group && k == kind) {
 				Some((_, _, ar)) => {
 					info!(kind, version = %ar.version, "watching");
 					let store = spawn_dyn_watch(client, ar, changed.clone());
 					dynamic.push(DynKind { kind, store });
-					resources.push((*kind, ar.clone()));
+					resources.push((kind, ar.clone()));
 				}
 				None => warn!(group, kind, "not served by the API server (CRD not installed); not watched"),
 			}
@@ -113,6 +131,7 @@ impl Cache {
 			secrets: spawn_watch(Api::all(client.clone()), changed.clone(), "Secret"),
 			namespaces: spawn_watch(Api::all(client.clone()), changed.clone(), "Namespace"),
 			pods: spawn_pod_watch(client, own_ns, changed.clone()),
+			ingresses: migration.then(|| spawn_watch(Api::all(client.clone()), changed.clone(), "Ingress")),
 			dynamic,
 			resources,
 			changed,
@@ -127,6 +146,9 @@ impl Cache {
 		let _ = self.secrets.wait_until_ready().await;
 		let _ = self.namespaces.wait_until_ready().await;
 		let _ = self.pods.wait_until_ready().await;
+		if let Some(i) = &self.ingresses {
+			let _ = i.wait_until_ready().await;
+		}
 		for d in &self.dynamic {
 			let _ = d.store.wait_until_ready().await;
 		}
@@ -147,9 +169,12 @@ impl Cache {
 		}
 		for s in self.secrets.state() {
 			// only Secrets that can be certificates, to keep the snapshot small
-			if s.data.as_ref().is_some_and(|d| d.contains_key("tls.crt") || d.contains_key("ca.crt")) {
+			if s.data.as_ref().is_some_and(|d| ["tls.crt", "ca.crt", "tls.ca", "users"].iter().any(|k| d.contains_key(*k))) {
 				w.secrets.insert(crate::render::world::key(&s.metadata), (*s).clone());
 			}
+		}
+		for i in self.ingresses.iter().flat_map(|s| s.state()) {
+			w.migration.ingresses.push((*i).clone());
 		}
 		for n in self.namespaces.state() {
 			w.namespaces.insert(n.metadata.name.clone().unwrap_or_default(), n.metadata.labels.clone().unwrap_or_default());

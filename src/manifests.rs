@@ -55,6 +55,24 @@ impl World {
 			}
 			(crate::k8s::crd::GROUP, "RproxyPolicy") => self.policies.push(serde_json::from_value(obj).map_err(err)?),
 			(crate::k8s::crd::GROUP, "RproxyRule") => self.raw_rules.push(serde_json::from_value(obj).map_err(err)?),
+			("networking.k8s.io", "Ingress") => self.migration.ingresses.push(serde_json::from_value(obj).map_err(err)?),
+			(g, "IngressRoute") if crate::k8s::traefik::GROUPS.contains(&g) => {
+				self.migration.ingress_routes.push(serde_json::from_value(obj).map_err(err)?)
+			}
+			(g, "IngressRouteTCP") if crate::k8s::traefik::GROUPS.contains(&g) => {
+				self.migration.ingress_routes_tcp.push(serde_json::from_value(obj).map_err(err)?)
+			}
+			(g, "IngressRouteUDP") if crate::k8s::traefik::GROUPS.contains(&g) => {
+				self.migration.ingress_routes_udp.push(serde_json::from_value(obj).map_err(err)?)
+			}
+			(g, "Middleware") if crate::k8s::traefik::GROUPS.contains(&g) => {
+				let m: crate::k8s::traefik::Middleware = serde_json::from_value(obj).map_err(err)?;
+				self.migration.middlewares.insert(crate::render::world::key(&m.metadata), m);
+			}
+			(g, "TLSOption") if crate::k8s::traefik::GROUPS.contains(&g) => {
+				let m: crate::k8s::traefik::TlsOption = serde_json::from_value(obj).map_err(err)?;
+				self.migration.tls_options.insert(crate::render::world::key(&m.metadata), m);
+			}
 			_ => {}
 		}
 		Ok(())
