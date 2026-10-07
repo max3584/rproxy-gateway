@@ -4,20 +4,17 @@ English: [en/CONFORMANCE.md](en/CONFORMANCE.md)
 
 CI の `e2e` ワークフローの `Gateway API conformance` ジョブ（`scripts/conformance.sh`）が、kind の上で Gateway API v1.6.3 の conformance テストを動かす（rproxy は rproxy-api の master からビルド）。Gateway API の CRD は experimental channel（`experimental-install.yaml`）：名乗る機能の一部（`HTTPRouteRetry*` の `HTTPRouteRule.retry`）は experimental の欄で、standard の CRD では API サーバが捨てる。レポートはジョブの成果物（`conformance-report`）とジョブのまとめに出る。最後のレポートは [conformance/report.yaml](conformance/report.yaml)。
 
-## 結果（2026-10-07、rproxy-gateway v0.4.0-dev、rproxy-api master）
+## 結果（2026-10-07、rproxy-gateway v0.4.0-dev、Gateway API の experimental channel）
 
 | プロファイル | core | extended |
 |---|---|---|
-| GATEWAY-HTTP | 36 / 36 | 54 / 56（`HTTPRouteCORS`、`HTTPRouteRetry`） |
+| GATEWAY-HTTP | 36 / 36 | 57 / 57 |
 | GATEWAY-GRPC | 14 / 14 | 11 / 11 |
 | GATEWAY-TLS | 19 / 19 | 16 / 16 |
 | GATEWAY-TCP | 18 / 18 | 11 / 11 |
 | GATEWAY-UDP | 19 / 19 | 11 / 11 |
 
-core はすべて通り、CI の conformance のジョブは core が 1 つでも落ちると失敗する（extended は知らせるだけ）。落ちる extended の 2 つは rproxy 側（max3584/rproxy-api#238）：
-
-- `HTTPRouteCORS`：許さないオリジンのプリフライトを rproxy が転送先へ送る（試験は rproxy が CORS のヘッダなしで答えることを求める）
-- `HTTPRouteRetry`：転送先が 1 つのとき、状態コードでの送り直しが同じ転送先へ行かない
+名乗る機能の試験はすべて通る（同じコミットで 4 回続けて同じ結果）。CI の conformance のジョブは core が 1 つでも落ちると失敗する（extended は知らせるだけ）。
 
 ## 名乗っている機能（`supportedFeatures`）
 
