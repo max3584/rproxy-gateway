@@ -407,7 +407,29 @@ settle() {
   local t
   t=$(now_ms)
   wait_for "$RECOVERY_TIMEOUT" probes_ok_since "$t" || return 1
+  # pods being deleted are gone (the next scenario starts from a clean placement)
+  wait_for 120 none_terminating || true
   sleep 5
+}
+none_terminating() {
+  [ -z "$(kubectl get pods -A -l 'app.kubernetes.io/name in (rproxy, rproxy-gateway)' -o json | jq -r '.items[] | select(.metadata.deletionTimestamp != null) | .metadata.name')" ]
+}
+pod_gone() { ! kubectl -n "$APP" get pod "$1" > /dev/null 2>&1; }
+# the node MetalLB announces the Gateway address from (ServiceL2Status; the last event otherwise)
+announcer() {
+  local n
+  n=$(kubectl get servicel2statuses.metallb.io -A -o json 2> /dev/null |
+    jq -r --arg s "$DEPLOY" --arg ns "$APP" '.items[] | select(.status.serviceName == $s and .status.serviceNamespace == $ns) | .status.node' | head -1)
+  if [ -z "$n" ]; then
+    n=$(kubectl -n "$APP" get events --field-selector "involvedObject.name=$DEPLOY,reason=nodeAssigned" --sort-by=.lastTimestamp -o jsonpath='{.items[-1:].message}' 2> /dev/null |
+      sed -n 's/.*node "\([^"]*\)".*/\1/p')
+  fi
+  echo "${n:-unknown}"
+}
+# live rproxy pods with their nodes: name node
+rproxy_nodes() {
+  kubectl -n "$APP" get pods -l app.kubernetes.io/name=rproxy -o json |
+    jq -r '.items[] | select(.metadata.deletionTimestamp == null) | "\(.metadata.name) \(.spec.nodeName)"'
 }
 placement() {
   kubectl get pods -A -l 'app.kubernetes.io/name in (rproxy, rproxy-gateway)' -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName --no-headers | tr '\n' ' '
@@ -436,43 +458,66 @@ scenario_a() {
 }
 
 # ---------------------------------------------------------------- b. one rproxy pod deleted
+# b1: a pod on another node than the one MetalLB announces from; b2: the pod on that node
 scenario_b() {
-  local t0 old victim ok=PASS
+  local which=$1 t0 old victim ok=PASS ann t_gone label
   old=$(rproxy_pods | awk '{print $1}' | tr '\n' ' ')
-  victim=${old%% *}
-  log "== b. delete rproxy pod $victim"
+  ann=$(announcer)
+  if [ "$which" = other ]; then
+    victim=$(rproxy_nodes | awk -v n="$ann" '$2 != n {print $1}' | head -1)
+    label="b1. rproxy pod deleted (not on the announcing node)"
+  else
+    victim=$(rproxy_nodes | awk -v n="$ann" '$2 == n {print $1}' | head -1)
+    label="b2. rproxy pod deleted (on the announcing node)"
+  fi
+  if [ -z "$victim" ]; then
+    printf '%s\t–\t–\t–\tSKIP\tno rproxy pod %s the announcing node %s (placement: %s)\n' "$label" "$([ "$which" = other ] && echo off || echo on)" "$ann" "$(rproxy_nodes | tr '\n' ' ')" >> "$results"
+    return 0
+  fi
+  log "== $label: $victim; MetalLB announces from $ann; placement: $(rproxy_nodes | tr '\n' ' ')"
   t0=$(now_ms)
   kubectl -n "$APP" delete pod "$victim" --wait=false > /dev/null
   new_pods_serve "$old" "$RECOVERY_TIMEOUT" || ok=FAIL
   local served=$SERVED_AT
   [ "$served" -gt 0 ] || served=$(now_ms)
+  wait_for 120 pod_gone "$victim" || true
+  t_gone=$(now_ms)
   settle || ok=FAIL
-  record "b. rproxy pod deleted" "$t0" "$(now_ms)" "$(secs $((served - t0)))s" "$ok" "replacement serving its rule set after $(secs $((served - t0)))s; ${NEW_GAPS}"
+  record "$label" "$t0" "$(now_ms)" "$(secs $((served - t0)))s" "$ok" \
+    "replacement serving after $(secs $((served - t0)))s; deleted pod gone after $(secs $((t_gone - t0)))s; announcing node $ann → $(announcer); ${NEW_GAPS}"
 }
+scenario_b1() { scenario_b other; }
+scenario_b2() { scenario_b announcing; }
 
 # ---------------------------------------------------------------- c. node drained
 scenario_c() {
-  local t0 old node ld ok=PASS notes
+  local t0 old node ld ok=PASS notes ann
   old=$(rproxy_pods | awk '{print $1}' | tr '\n' ' ')
   ld=$(leader)
+  ann=$(announcer)
   local ld_node rp_nodes
   ld_node=$(kubectl -n "$NS" get pod "$ld" -o jsonpath='{.spec.nodeName}' 2> /dev/null || true)
-  rp_nodes=$(kubectl -n "$APP" get pods -l app.kubernetes.io/name=rproxy -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}')
-  # the node with the most rproxy pods, the leader's node if it has one
+  rp_nodes=$(rproxy_nodes | awk '{print $2}')
+  # the node MetalLB announces from (it has an rproxy pod: externalTrafficPolicy Local), else the
+  # node with the most rproxy pods
   node=$(echo "$rp_nodes" | sort | uniq -c | sort -rn | awk '{print $2}' | head -1)
-  if echo "$rp_nodes" | grep -qx "$ld_node"; then node=$ld_node; fi
+  if echo "$rp_nodes" | grep -qx "$ann"; then node=$ann; fi
   local on_node also=""
   on_node=$(echo "$rp_nodes" | grep -cx "$node" || true)
-  if [ "$node" = "$ld_node" ]; then also=", and the controller leader"; fi
+  if [ "$node" = "$ld_node" ]; then also=" and the controller leader"; fi
+  if [ "$node" = "$ann" ]; then also+=", the announcing node"; fi
   notes="drained $node ($on_node of $MANAGED_REPLICAS rproxy pods$also)"
   log "== c. drain $node; placement: $(placement)"
   t0=$(now_ms)
   kubectl drain "$node" --ignore-daemonsets --delete-emptydir-data --timeout=300s > "$work/drain.log" 2>&1 || { ok=FAIL; notes+="; drain failed"; }
+  local t_drained
+  t_drained=$(now_ms)
   new_pods_serve "$old" "$RECOVERY_TIMEOUT" || ok=FAIL
   local served=$SERVED_AT
   [ "$served" -gt 0 ] || served=$(now_ms)
   settle || ok=FAIL
-  record "c. node drained" "$t0" "$(now_ms)" "$(secs $((served - t0)))s" "$ok" "$notes; ${NEW_GAPS}"
+  record "c. node drained" "$t0" "$(now_ms)" "$(secs $((served - t0)))s" "$ok" \
+    "$notes; kubectl drain took $(secs $((t_drained - t0)))s; announcing node → $(announcer); ${NEW_GAPS}"
   kubectl uncordon "$node" > /dev/null
 }
 
@@ -545,7 +590,7 @@ scenario_f() {
     "rule sets back on every pod after $(secs $((t_routes - t0)))s; HTTPRoute created meanwhile served after $(secs $((t_new - t0)))s; statuses Programmed/Accepted after $(secs $((t_status - t0)))s; leader $(leader); ${NEW_GAPS}"
 }
 
-for s in a b c d e f; do
+for s in a b1 b2 c d e f; do
   if ! "scenario_$s"; then
     echo "scenario $s aborted" >&2
     printf '%s\t–\t–\t–\tFAIL\taborted\n' "$s" >> "$results"
@@ -569,7 +614,7 @@ stop_probes
   echo "|---|---|---|---|---|---|"
   awk -F'\t' '{ printf "| %s | %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5, $6 }' "$results"
   echo
-  echo "PASS (outage): requests failed but everything recovered (recorded, not a failure). FAIL: routes never recovered, the certificate never rotated or the state was not restored (timeouts: recovery ${RECOVERY_TIMEOUT}s, leader ${LEADER_TIMEOUT}s, route change ${APPLY_TIMEOUT}s, rotation ${ROTATE_TIMEOUT}s)."
+  echo "PASS (outage): requests failed but everything recovered (recorded, not a failure). SKIP: the placement did not allow the scenario. FAIL: routes never recovered, the certificate never rotated or the state was not restored (timeouts: recovery ${RECOVERY_TIMEOUT}s, leader ${LEADER_TIMEOUT}s, route change ${APPLY_TIMEOUT}s, rotation ${ROTATE_TIMEOUT}s)."
 } > "$work/summary.md"
 cat "$work/summary.md"
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then cat "$work/summary.md" >> "$GITHUB_STEP_SUMMARY"; fi
