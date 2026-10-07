@@ -54,6 +54,9 @@ pub const SUPPORTED_FEATURES: &[&str] = &[
 	"HTTPRouteNamedRouteRule",
 	"HTTPRouteBackendProtocolWebSocket",
 	"HTTPRouteBackendTimeout",
+	"GatewayStaticAddresses",
+	"GatewayAddressEmpty",
+	"GatewayInfrastructure",
 ];
 
 #[derive(Clone, Debug)]
@@ -94,7 +97,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
 	let client = kube::Client::try_default().await.context("connecting to Kubernetes")?;
 	let boot = bootstrap::ensure(&client, &cfg.namespace).await.context("the controller's Secrets")?;
 	let rp = Client::new(Some(&boot.ca_pem), &boot.token)?;
-	let cache = std::sync::Arc::new(cache::Cache::start(&client, &cfg.namespace, cfg.migration.is_some()).await?);
+	let cache = std::sync::Arc::new(cache::Cache::start(&client, cfg.migration.is_some()).await?);
 	tokio::spawn(health(cfg.health));
 	{
 		// CRDs installed later (Traefik, Gateway API kinds) are watched without a restart
@@ -130,7 +133,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
 		}
 		// a pass stops as soon as leadership is lost (another replica may be leading already)
 		let pass = tokio::select! {
-			r = reconcile_all(&client, &cache, &rp, &cfg, &mut state) => Some(r),
+			r = reconcile_all(&client, &cache, &rp, &cfg, &boot, &mut state) => Some(r),
 			_ = lost(&mut leading) => None,
 			_ = &mut shutdown => {
 				if let Some(s) = &cfg.leader { leader::release(&lease_api, s).await; }
@@ -220,7 +223,14 @@ async fn patch_status(api: &Api<DynamicObject>, name: &str, status: Value) -> an
 }
 
 /// One pass over everything; `Ok(true)` asks for another pass soon.
-async fn reconcile_all(client: &kube::Client, cache: &cache::Cache, rp: &Client, cfg: &Config, state: &mut State) -> anyhow::Result<bool> {
+async fn reconcile_all(
+	client: &kube::Client,
+	cache: &cache::Cache,
+	rp: &Client,
+	cfg: &Config,
+	boot: &bootstrap::Bootstrap,
+	state: &mut State,
+) -> anyhow::Result<bool> {
 	let world = cache.snapshot();
 	let now = render::status::now();
 	let mut soon = false;
@@ -261,14 +271,19 @@ async fn reconcile_all(client: &kube::Client, cache: &cache::Cache, rp: &Client,
 	// fleet: one certificate Secret with every Gateway's files, mounted into every pod
 	let fleet_pods = match &cfg.mode {
 		Mode::Fleet(f) => {
-			let eps = provision::pods(&pods_now, &provision::parse_selector(&f.selector));
+			let eps = provision::pods(&pods_now, &cfg.namespace, &provision::parse_selector(&f.selector));
 			let mut files = BTreeMap::new();
-			for (_, plan) in &rendered {
+			for (_, plan) in rendered.iter().filter(|(_, p)| p.accepted()) {
 				files.extend(plan.files.iter().map(|(k, v)| (k.clone(), v.clone())));
 			}
 			let absent = state.absent.entry(provision::FLEET_CERTS_SECRET.into()).or_default();
-			match provision::apply_certs(client, &cfg.namespace, provision::FLEET_CERTS_SECRET, "fleet", None, &files, absent).await {
-				Ok(hash) => provision::touch_pods(client, &cfg.namespace, &eps, &hash).await,
+			let ns = cfg.namespace.clone();
+			match provision::apply_certs(client, &cfg.namespace, provision::FLEET_CERTS_SECRET, &files, absent, |d| {
+				provision::fleet_certs_secret(&ns, d)
+			})
+			.await
+			{
+				Ok(hash) => provision::touch_pods(client, &eps, &hash).await,
 				Err(e) => {
 					warn!(error = format!("{e:#}"), "cannot write the fleet's certificate Secret");
 					soon = true;
@@ -278,28 +293,55 @@ async fn reconcile_all(client: &kube::Client, cache: &cache::Cache, rp: &Client,
 		}
 		Mode::Managed(_) => vec![],
 	};
-	for (gw, plan) in rendered {
+	let gateway_api_version = cache.resource("Gateway").map(|ar| ar.api_version);
+	for (gw, mut plan) in rendered {
 		let id = provision::gateway_id(&plan.namespace, &plan.name);
-		keep_ids.push(id.clone());
 		let infra = gw.spec.infrastructure.clone().unwrap_or_default();
 		let (addresses, endpoints) = match &cfg.mode {
+			// not accepted (an unsupported address type, parametersRef): nothing is deployed
+			_ if !plan.accepted() => (vec![], vec![]),
 			Mode::Managed(m) => {
-				let absent = state.absent.entry(provision::certs_secret_name(&id)).or_default();
+				keep_ids.push(id.clone());
+				let absent = state.absent.entry(format!("{}/{}", plan.namespace, provision::certs_secret_name(&id))).or_default();
 				let selector: BTreeMap<String, String> = [(provision::LABEL_GATEWAY.to_string(), id.clone())].into();
-				let eps = provision::pods(&pods_now, &selector);
-				let svc =
-					match provision::apply_managed(client, &cfg.namespace, &plan, m, (&infra.labels, &infra.annotations), absent).await {
-						Ok((s, hash)) => {
-							provision::touch_pods(client, &cfg.namespace, &eps, &hash).await;
-							s
-						}
-						Err(e) => {
+				let eps = provision::pods(&pods_now, &plan.namespace, &selector);
+				let mut t = provision::Target::new(&plan);
+				t.labels = infra.labels.clone();
+				t.annotations = infra.annotations.clone();
+				t.owner = match (&gateway_api_version, &gw.metadata.uid) {
+					(Some(v), Some(uid)) => Some(provision::owner(v, &plan.name, uid)),
+					_ => None,
+				};
+				if plan.address_error.is_none() {
+					t.addresses = plan.addresses.clone();
+				}
+				let current_api = world.secrets.get(&(plan.namespace.clone(), provision::api_secret_name(&id)));
+				let applied = provision::apply_managed(client, &t, m, boot, current_api, absent).await;
+				let svc = match applied {
+					Ok(a) => {
+						provision::touch_pods(client, &eps, &a.certs).await;
+						a.service
+					}
+					Err(e) => {
+						if plan.address_error.is_none() && !plan.addresses.is_empty() && format!("{e:#}").contains("externalIPs") {
+							// the cluster refuses the address (validation, an admission policy)
+							plan.address_error = Some(format!("the Service cannot take the address: {e:#}"));
+						} else {
 							warn!(gateway = %plan.ruleset, error = format!("{e:#}"), "cannot deploy rproxy");
-							soon = true;
-							None
 						}
-					};
-				(svc.as_ref().map(provision::service_addresses).unwrap_or_default(), eps)
+						soon = true;
+						None
+					}
+				};
+				let addresses = match svc.as_ref() {
+					// the addresses asked for, once the Service has them
+					Some(_) if !plan.addresses.is_empty() && plan.address_error.is_none() => {
+						plan.addresses.iter().map(|a| ("IPAddress".to_string(), a.clone())).collect()
+					}
+					Some(s) => provision::service_addresses(s),
+					None => vec![],
+				};
+				(addresses, eps)
 			}
 			Mode::Fleet(f) => {
 				let eps = fleet_pods.clone();
@@ -311,6 +353,15 @@ async fn reconcile_all(client: &kube::Client, cache: &cache::Cache, rp: &Client,
 				} else {
 					f.addresses.clone()
 				};
+				let addrs = if plan.addresses.is_empty() {
+					addrs
+				} else {
+					// the fleet's addresses are fixed: an address asked for must be one of them
+					if let Some(a) = plan.addresses.iter().find(|a| !addrs.contains(a)) {
+						plan.address_error.get_or_insert(format!("{a} is not an address of the rproxy fleet ({})", addrs.join(", ")));
+					}
+					plan.addresses.clone()
+				};
 				(
 					addrs
 						.into_iter()
@@ -320,6 +371,7 @@ async fn reconcile_all(client: &kube::Client, cache: &cache::Cache, rp: &Client,
 				)
 			}
 		};
+		let addresses = if plan.address_error.is_some() { vec![] } else { addresses };
 		if !plan.notes.is_empty() {
 			let digest = crate::pem::short_hash(plan.notes.join("\n").as_bytes());
 			if notes_seen.insert(digest) {
@@ -354,12 +406,12 @@ async fn reconcile_all(client: &kube::Client, cache: &cache::Cache, rp: &Client,
 	state
 		.absent
 		.retain(|name, _| name == provision::FLEET_CERTS_SECRET || keep_ids.iter().any(|id| provision::certs_secret_name(id) == *name));
-	if let Err(e) = provision::collect_garbage(client, &cfg.namespace, &keep_ids).await {
+	if let Err(e) = provision::collect_garbage(client, &keep_ids).await {
 		warn!(error = %e, "cannot remove rproxy of deleted Gateways");
 	}
 	if let Mode::Fleet(f) = &cfg.mode {
 		let keep: BTreeSet<&str> = plans.iter().map(|(p, _)| p.ruleset.as_str()).collect();
-		for ep in provision::pods(&pods_now, &provision::parse_selector(&f.selector)) {
+		for ep in provision::pods(&pods_now, &cfg.namespace, &provision::parse_selector(&f.selector)) {
 			let Ok(addr) = api_addr(&ep) else { continue };
 			if let Ok(sets) = rp.list_rulesets(addr).await {
 				for s in sets.iter().filter(|s| s.name.starts_with("k8s/") && !keep.contains(s.name.as_str())) {
@@ -487,6 +539,8 @@ pub async fn sync_pod(
 	applied: &mut Applied,
 	caps: &mut HashMap<String, Capabilities>,
 ) -> (PodSync, bool) {
+	// a managed Gateway's rproxy has its own token and certificate name
+	let rp = &rp.scoped(ep.target.as_deref());
 	let addr = match api_addr(ep) {
 		Ok(a) => a,
 		Err(e) => return (PodSync::NotReady(format!("pod {}: {e}", ep.pod)), true),

@@ -66,12 +66,16 @@ pub struct GatewayInfrastructure {
 	pub labels: BTreeMap<String, String>,
 	#[serde(default)]
 	pub annotations: BTreeMap<String, String>,
+	#[serde(default)]
+	pub parameters_ref: Option<LocalObjectReference>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct GatewayAddress {
 	#[serde(default, rename = "type")]
 	pub kind: Option<String>,
+	/// Empty: any address of the type (GatewayAddressEmpty).
+	#[serde(default)]
 	pub value: String,
 }
 

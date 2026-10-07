@@ -57,7 +57,7 @@ spec:
     - backendRefs: [{name: app, port: 8080}]
 ```
 
-- 既定（managed）では、Gateway ごとに rproxy の Deployment と `LoadBalancer` の Service をコントローラの namespace に作る（`managed.serviceType`、`managed.replicas`）。
+- 既定（managed）では、Gateway ごとに rproxy の Deployment と `LoadBalancer` の Service を Gateway の namespace に作る（`managed.serviceType`、`managed.replicas`）。Gateway の `spec.infrastructure` のラベル・注釈と `spec.addresses`（Service の `externalIPs`）を使う。
 - コントローラは既定で 2 レプリカ。Lease でリーダーを選び、1 つだけが反映する（docs/DESIGN.md の「冗長化」）。
 - `fleet.enabled=true` では、chart の DaemonSet（`hostNetwork: true`）の rproxy がすべての Gateway を受け持つ。
 - chart の値は [charts/rproxy-gateway/values.yaml](charts/rproxy-gateway/values.yaml)。

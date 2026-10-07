@@ -28,22 +28,26 @@ Gateway API / CRDs ──watch──▶ rproxy-gateway ──PUT /rulesets/k8s/<
 
 | mode | rproxy | Address (Gateway `status.addresses`) |
 |---|---|---|
-| `managed` (default) | The controller creates, in its own namespace, one Deployment and Service per Gateway (`rproxy-<id>`, type `--service-type`, `LoadBalancer` by default), and deletes them when the Gateway goes | The Service's load balancer address (the ClusterIP for type `ClusterIP`) |
+| `managed` (default) | The controller creates, in the Gateway's namespace, one Deployment, Service and ServiceAccount per Gateway (`rproxy-<id>`, Service type `--service-type`, `LoadBalancer` by default) and Secrets (certificates `rproxy-<id>-certs`, control API `rproxy-<id>-api`). The Gateway owns them all (`ownerReferences`), so they go when it goes | `spec.addresses` when given, else the Service's load balancer address (the ClusterIP for type `ClusterIP`) |
 | `fleet` | rproxy pods deployed beforehand (e.g. the chart's DaemonSet with `hostNetwork: true`, `--fleet-selector`) serve every Gateway. The controller PUTs the same set to every pod | `--fleet-address`, else the pods' node IPs |
 
 - `<id>` is `<namespace>-<name>` (up to 40 characters) and a 6-digit hash.
+- What managed mode creates carries the Gateway's `spec.infrastructure` `labels` and `annotations` (pods too) and the label `gateway.networking.k8s.io/gateway-name` (the controller's own labels win: they select the pods). No `spec.infrastructure.parametersRef` kind is supported, so a Gateway with one is `Accepted: False` (`InvalidParameters`).
+- `spec.addresses`: `IPAddress` only (other types: `Accepted: False`, `UnsupportedAddress`). In managed mode they become the Service's `externalIPs` (kube-proxy sends traffic for those IPs to rproxy). An entry without a value keeps the Service's address. Unspecified, loopback, link-local or multicast IPs, and IPs the cluster does not let the Service take, make `Programmed: False` (`AddressNotUsable`). In fleet mode an address must be one of the fleet's (`--fleet-address`, or the nodes' IPs), else `AddressNotUsable`.
 - Managed pods run as non-root (65532) and take ports below 1024 through `net.ipv4.ip_unprivileged_port_start=0` (a namespaced, safe sysctl).
 - In fleet mode, when two Gateways use the same port, rproxy refuses the later one's rule with `409 already_exists` and that listener's `Programmed` is `False`.
 
 ## Control API connection
 
-On its first start the controller creates these Secrets in its namespace (reading them when they exist).
+On its first start the controller creates these Secrets in its namespace (reading them when they exist). The fleet's rproxy uses them.
 
 | Secret | Contents | Read by |
 |---|---|---|
 | `rproxy-gateway-ca` | A CA certificate and key | the controller (rproxy pods cannot read it) |
 | `rproxy-gateway-api-tls` | rproxy's control API certificate (issued by the CA for `rproxy-api.rproxy-gateway.internal`; pods are reached by IP, so the name is fixed) | rproxy (a volume) |
 | `rproxy-gateway-token` | The controller's token (`token`) and the token file rproxy reads (`tokens.yaml`, only the SHA-256; scopes `rules:read`, `rules:write`, `acme:write`) | `token`: the controller; `tokens.yaml`: rproxy (a volume with only that key) |
+
+Each managed rproxy uses `rproxy-<id>-api` in its Gateway's namespace: a control API certificate the CA issued for `<id>.rproxy-api.rproxy-gateway.internal`, and the token file (`tokens.yaml`, only the SHA-256) of a token derived from the master token (HMAC-SHA256 keyed with the master token over the Gateway's id). The controller connects to each pod with that name and token. Reading the Secrets of one Gateway's namespace gives no way into other Gateways' rproxy or into the controller (the master token and the CA key stay in the controller's namespace).
 
 rproxy runs with `RPROXY_API_ADDR=0.0.0.0`, `RPROXY_API_PORT=9443`, `RPROXY_TOKEN_FILE` and `RPROXY_TLS_CERT` / `RPROXY_TLS_KEY` (the three rproxy requires for a control API on a non-loopback address).
 
@@ -62,7 +66,7 @@ rproxy runs with `RPROXY_API_ADDR=0.0.0.0`, `RPROXY_API_PORT=9443`, `RPROXY_TOKE
 | Design | Why not |
 |---|---|
 | certsync watching Secrets (the previous design) | The rproxy pod needs to read every Secret of the namespace; `resourceNames` cannot narrow watch and list by name |
-| A namespace per Gateway | Each Gateway would need its own namespace, RBAC and token Secret; it does not work for fleet mode |
+| Every Gateway's rproxy in one namespace (the previous design) | The CA key and the master token sit next to the rproxy pods, and every Gateway's control API opens with the same certificate and token. It does not fit Gateway API's `infrastructure` either (objects made in the Gateway's namespace) |
 | Sending keys over the control API | Against rproxy-api design 3.3 (key material never crosses the network) |
 
 ## Applying (rule sets)

@@ -16,8 +16,13 @@ use serde_json::Value;
 
 use super::model::{Capabilities, Ruleset, RulesetApplied, RulesetRequest, RulesetSummary};
 
-/// The name in rproxy's control API certificate (`tls::issue_api_cert`).
+/// The name in the fleet's control API certificate (`bootstrap::issue_api_cert`).
 pub const API_SERVER_NAME: &str = "rproxy-api.rproxy-gateway.internal";
+
+/// The name in a managed Gateway's control API certificate.
+pub fn server_name_for(target: &str) -> String {
+	format!("{target}.{API_SERVER_NAME}")
+}
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -25,7 +30,11 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Clone)]
 pub struct Client {
 	tls: Option<tokio_rustls::TlsConnector>,
+	/// The master token.
+	master: Arc<str>,
+	/// The token and server name used (the master's, or a Gateway's: `scoped`).
 	token: Arc<str>,
+	server_name: Arc<str>,
 }
 
 /// An answer that is not a success.
@@ -64,7 +73,24 @@ impl Client {
 				Some(tokio_rustls::TlsConnector::from(Arc::new(config)))
 			}
 		};
-		Ok(Client { tls, token: token.into() })
+		Ok(Client { tls, master: token.into(), token: token.into(), server_name: API_SERVER_NAME.into() })
+	}
+
+	/// The client for one managed Gateway's rproxy (`target`: its id): its own
+	/// token and certificate name. `None`: the fleet's (the master token).
+	pub fn scoped(&self, target: Option<&str>) -> Client {
+		let mut c = self.clone();
+		match target {
+			Some(t) => {
+				c.token = crate::controller::bootstrap::derive_token(&self.master, t).into();
+				c.server_name = server_name_for(t).into();
+			}
+			None => {
+				c.token = self.master.clone();
+				c.server_name = API_SERVER_NAME.into();
+			}
+		}
+		c
 	}
 
 	async fn send(
@@ -81,7 +107,7 @@ impl Client {
 			let mut req = Request::builder()
 				.method(method)
 				.uri(path)
-				.header("host", API_SERVER_NAME)
+				.header("host", &*self.server_name)
 				.header("authorization", format!("Bearer {}", self.token))
 				.header("user-agent", concat!("rproxy-gateway/", env!("CARGO_PKG_VERSION")));
 			for (k, v) in headers {
@@ -93,8 +119,10 @@ impl Client {
 			let req = req.body(Full::new(Bytes::from(body.unwrap_or_default())))?;
 			let resp = match &self.tls {
 				Some(tls) => {
-					let stream =
-						tls.connect(ServerName::try_from(API_SERVER_NAME)?, tcp).await.with_context(|| format!("TLS to {addr}"))?;
+					let stream = tls
+						.connect(ServerName::try_from(self.server_name.to_string())?, tcp)
+						.await
+						.with_context(|| format!("TLS to {addr}"))?;
 					let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
 					tokio::spawn(conn);
 					sender.send_request(req).await?

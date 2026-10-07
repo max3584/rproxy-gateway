@@ -35,7 +35,7 @@ rproxy:
   # addresses rules listen on (the first is listen_addr, the rest extra_listen_addrs); add "::" for IPv6
   listenAddresses: ["0.0.0.0"]
 
-# managed mode (default): one rproxy Deployment and Service per Gateway, in this namespace
+# managed mode (default): one rproxy Deployment, Service and ServiceAccount per Gateway, in the Gateway's namespace
 managed:
   replicas: 1
   # type of each Gateway's Service: LoadBalancer, NodePort or ClusterIP

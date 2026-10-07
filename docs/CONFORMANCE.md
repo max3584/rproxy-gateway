@@ -17,7 +17,7 @@ CI の `e2e` ワークフローの `Gateway API conformance` ジョブ（`script
 
 ## 名乗っている機能（`supportedFeatures`）
 
-core（Gateway、HTTPRoute、ReferenceGrant、TLSRoute、TCPRoute、UDPRoute）と、`GatewayPort8080`、`GatewayHTTPListenerIsolation`、`HTTPRouteMethodMatching`、`HTTPRouteQueryParamMatching`、`HTTPRouteResponseHeaderModification`、`HTTPRoutePortRedirect`、`HTTPRouteSchemeRedirect`、`HTTPRoutePathRedirect`、`HTTPRoutePathRewrite`、`HTTPRouteParentRefPort`、`HTTPRouteDestinationPortMatching`、`HTTPRouteNamedRouteRule`、`HTTPRouteBackendProtocolWebSocket`、`HTTPRouteBackendTimeout`、`TLSRouteModeTerminate`、`TLSRouteModeMixed`。GatewayClass の `status.supportedFeatures` と `scripts/conformance.sh` の `FEATURES` は同じ。
+core（Gateway、HTTPRoute、ReferenceGrant、TLSRoute、TCPRoute、UDPRoute）と、`GatewayPort8080`、`GatewayHTTPListenerIsolation`、`HTTPRouteMethodMatching`、`HTTPRouteQueryParamMatching`、`HTTPRouteResponseHeaderModification`、`HTTPRoutePortRedirect`、`HTTPRouteSchemeRedirect`、`HTTPRoutePathRedirect`、`HTTPRoutePathRewrite`、`HTTPRouteParentRefPort`、`HTTPRouteDestinationPortMatching`、`HTTPRouteNamedRouteRule`、`HTTPRouteBackendProtocolWebSocket`、`HTTPRouteBackendTimeout`、`TLSRouteModeTerminate`、`TLSRouteModeMixed`、`GatewayStaticAddresses`（`--usable-address=192.0.2.10`、`--unusable-address=0.0.0.0`）、`GatewayAddressEmpty`、`GatewayInfrastructure`。GatewayClass の `status.supportedFeatures` と `scripts/conformance.sh` の `FEATURES` は同じ。
 
 ## 名乗っていないもの
 
@@ -29,5 +29,4 @@ core（Gateway、HTTPRoute、ReferenceGrant、TLSRoute、TCPRoute、UDPRoute）�
 | `HTTPRouteRequestTimeout` | rproxy の `timeouts.response` はヘッダまでで、リクエスト全体の時間ではない |
 | `HTTPRouteBackendRequestHeaderModification` | backendRef ごとのフィルタ（rproxy の servers ごとのミドルウェアがない） |
 | `HTTPRouteCORS`、`HTTPRouteRetry*`、`HTTPRouteBackendProtocolH2C` | 変換がまだ（CORS・retry は rproxy のミドルウェアにある） |
-| `GatewayStaticAddresses`、`GatewayInfrastructure`、`GatewayAddressEmpty` | Gateway の `addresses`・`infrastructure` の扱いがまだ |
 | `ListenerSet`、`GatewayFrontendClientCertificateValidation`、`BackendTLSPolicy`、`GRPCRoute` | まだ |
