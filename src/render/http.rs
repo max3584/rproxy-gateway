@@ -80,6 +80,8 @@ pub struct Output {
 	pub resolved: Option<Cond>,
 	/// Why the route cannot be accepted (an unsupported filter or value).
 	pub unsupported: Option<String>,
+	/// rproxy service name → the Services it sends to (for RproxyPolicy).
+	pub backends: BTreeMap<String, Vec<crate::render::world::Key>>,
 }
 
 /// Quotes an argument of a `match` expression (backticks, or double quotes for a value with a backtick).
@@ -326,15 +328,17 @@ pub fn build(ctx: &Ctx, route: &HttpRoute, hosts: Option<&[String]>, exclusions:
 		let base = format!("{ns}/{name}/r{i}");
 		// backends
 		let mut weighted: Vec<(u32, Vec<Endpoint>)> = vec![];
-		let mut any_invalid = false;
 		for b in &rule.backend_refs {
 			if !b.filters.is_empty() {
 				out.unsupported.get_or_insert_with(|| "filters on backendRefs are not supported".into());
 			}
 			match backends::resolve(ctx.world, "HTTPRoute", &ns, &b.backend) {
-				Ok(eps) => weighted.push((b.backend.weight.unwrap_or(1).max(0) as u32, eps)),
+				Ok(eps) => {
+					let svc = (b.backend.namespace.clone().unwrap_or_else(|| ns.clone()), b.backend.name.clone());
+					out.backends.entry(base.clone()).or_default().push(svc);
+					weighted.push((b.backend.weight.unwrap_or(1).max(0) as u32, eps));
+				}
 				Err(e) => {
-					any_invalid = true;
 					resolved.get_or_insert(e);
 				}
 			}
@@ -361,7 +365,6 @@ pub fn build(ctx: &Ctx, route: &HttpRoute, hosts: Option<&[String]>, exclusions:
 			out.services.insert(base.clone(), svc);
 			Some(base.clone())
 		};
-		let _ = any_invalid;
 		let default_match = [HttpRouteMatch::default()];
 		let matches: &[HttpRouteMatch] = if rule.matches.is_empty() { &default_match } else { &rule.matches };
 		for (j, m) in matches.iter().enumerate() {

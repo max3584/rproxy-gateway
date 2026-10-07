@@ -43,6 +43,9 @@ pub const SUPPORTED_FEATURES: &[&str] = &[
 	"HTTPRoutePathRedirect",
 	"HTTPRoutePathRewrite",
 	"GatewayHTTPListenerIsolation",
+	"TLSRoute",
+	"TCPRoute",
+	"UDPRoute",
 ];
 
 #[derive(Clone, Debug)]
@@ -227,7 +230,78 @@ async fn reconcile_all(
 	}
 
 	write_route_status(client, cache, &world, &plans, cfg, &now).await;
+	write_crd_status(client, cache, &world, &plans, cfg, &now).await;
 	Ok(soon)
+}
+
+/// RproxyPolicy `status.ancestors` and RproxyRule `status`.
+async fn write_crd_status(
+	client: &kube::Client,
+	cache: &cache::Cache,
+	world: &render::world::World,
+	plans: &[(GatewayPlan, Vec<PodSync>)],
+	cfg: &Config,
+	now: &str,
+) {
+	let mut ancestors: BTreeMap<(String, String), Vec<Value>> = BTreeMap::new();
+	for p in &world.policies {
+		let key = (p.metadata.namespace.clone().unwrap_or_default(), p.metadata.name.clone().unwrap_or_default());
+		let prev = p.status.as_ref().and_then(|s| serde_json::to_value(s).ok());
+		for (plan, _) in plans {
+			for ps in plan.policies.iter().filter(|ps| ps.namespace == key.0 && ps.name == key.1) {
+				ancestors.entry(key.clone()).or_default().push(status::policy_entry(ps, &cfg.controller_name, prev.as_ref(), now));
+			}
+		}
+		let mine = ancestors.remove(&key).unwrap_or_default();
+		let had = prev
+			.as_ref()
+			.and_then(|s| s["ancestors"].as_array())
+			.is_some_and(|a| a.iter().any(|e| e["controllerName"] == cfg.controller_name.as_str()));
+		if mine.is_empty() && !had {
+			continue;
+		}
+		let new = json!({ "ancestors": status::policy_ancestors(prev.as_ref(), mine, &cfg.controller_name) });
+		if prev.as_ref().map(|p| &p["ancestors"]) == Some(&new["ancestors"]) {
+			continue;
+		}
+		if let Some(api) = dyn_api(client, cache, "RproxyPolicy", Some(&key.0)) {
+			if let Err(e) = patch_status(&api, &key.1, new).await {
+				warn!(policy = format!("{}/{}", key.0, key.1), error = %e, "cannot write RproxyPolicy status");
+			}
+		}
+	}
+	for r in &world.raw_rules {
+		let (ns, name) = (r.metadata.namespace.clone().unwrap_or_default(), r.metadata.name.clone().unwrap_or_default());
+		let prev = r.status.as_ref().and_then(|s| serde_json::to_value(s).ok());
+		let found =
+			plans.iter().find_map(|(plan, pods)| plan.raw_status.iter().find(|s| s.namespace == ns && s.name == name).map(|s| (s, pods)));
+		let new = match found {
+			Some((st, pods)) => status::raw_status(st, pods, prev.as_ref(), now),
+			None => {
+				let st = render::policy::RawStatus {
+					namespace: ns.clone(),
+					name: name.clone(),
+					generation: r.metadata.generation.unwrap_or(0),
+					rule_key: None,
+					conds: vec![render::status::Cond::new(
+						"Accepted",
+						false,
+						"NoMatchingParent",
+						"the Gateway does not exist or is not handled by this controller",
+					)],
+				};
+				status::raw_status(&st, &[], prev.as_ref(), now)
+			}
+		};
+		if prev.as_ref() == Some(&new) {
+			continue;
+		}
+		if let Some(api) = dyn_api(client, cache, "RproxyRule", Some(&ns)) {
+			if let Err(e) = patch_status(&api, &name, new).await {
+				warn!(rule = format!("{ns}/{name}"), error = %e, "cannot write RproxyRule status");
+			}
+		}
+	}
 }
 
 fn api_addr(ep: &Endpoint) -> anyhow::Result<SocketAddr> {

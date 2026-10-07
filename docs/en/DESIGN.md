@@ -69,6 +69,20 @@ rproxy runs with `RPROXY_API_ADDR=0.0.0.0`, `RPROXY_API_PORT=9443`, `RPROXY_TOKE
 | `URLRewrite` path | `replace_path` (ReplaceFullPath), `replace_path_regex` (ReplacePrefixMatch) |
 | `ExtensionRef` (`RproxyMiddleware`) | that middleware (`spec` as it is) |
 | `timeouts.backendRequest` (else `request`) | the service's `timeouts.response` |
+| Listener `TLS` (`tls.mode: Passthrough`) | a tcp rule, `tls.mode: sni`, `unmatched: reject`; `tls.routes` by TLSRoute host name |
+| `HTTPS` and `TLS` (Passthrough) on the same port | `tls.routes` (`passthrough: true`) of the `http` rule: only those names are not decrypted |
+| Listener `TLS` (`tls.mode: Terminate`) | a tcp rule, `tls.mode: terminate`, `tls.routes` by TLSRoute host name (those of Passthrough listeners on the same port with `passthrough: true`) |
+| TLSRoute destination | a `tls.routes` entry has one destination, so the Service's ClusterIP (kube-proxy spreads over the pods; the first pod for a headless Service). With several backendRefs, the one with the largest weight |
+| Listener `TCP` / `UDP` | a tcp / udp rule, `targets` (the pod IPs of all backends of the TCPRoutes / UDPRoutes, weights spread over the pods) |
+| A `TLS` / `TCP` / `UDP` listener nothing attaches to | no rule (the port stays closed; the listener is `Programmed: True`) |
+
+### rproxy's CRDs (`rproxy.max3584.net/v1alpha1`)
+
+| CRD | Use |
+|---|---|
+| `RproxyMiddleware` | `spec` has the shape of rproxy's `http.middlewares.<name>` (e.g. `{rate_limit: {average: 10}}`). Used through an HTTPRoute `ExtensionRef` filter. When it is missing, that rule answers 500 and `ResolvedRefs: False` |
+| `RproxyPolicy` | Adds a rule's `limits`, `bandwidth`, `geoip`, `outlierDetection`, `allowFrom`, `crowdsec` to `spec.targetRefs` (a Gateway in the same namespace, a listener of it with `sectionName`, a Service) (GEP-713). A Service means the L4 rules sending to it (and, for `outlierDetection`, the `http` services). When several policies set the same key, the oldest wins. Status in `status.ancestors[]` (a missing listener: `Accepted: False`, `TargetNotFound`) |
+| `RproxyRule` | `spec.rule` is a rule verbatim (the body of `POST /rules`), added to the rule set of the `spec.parentRef` Gateway. A Gateway in another namespace needs a ReferenceGrant there (from `rproxy.max3584.net/RproxyRule`, to `Gateway`). When a rule with the same key exists: `Accepted: False` (`Conflicted`). Status copies the rproxy rule's `conditions` |
 
 Not supported (the route gets `Accepted: False`, reason `UnsupportedValue`): `URLRewrite` hostname, `RequestMirror`, the `CORS` filter, filters on a backendRef, redirects with 303 / 307 / 308.
 
