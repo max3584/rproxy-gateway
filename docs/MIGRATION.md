@@ -16,6 +16,7 @@ English: [en/MIGRATION.md](en/MIGRATION.md)
 |---|---|---|
 | `--migrate-to` | なし（読まない） | 移行先の Gateway（`namespace/name`） |
 | `--ingress-class` | `rproxy` | 読む Ingress のクラス（`spec.ingressClassName`、なければ注釈 `kubernetes.io/ingress.class`） |
+| `--migration-allow-cross-namespace` | off | ほかの namespace の Service・Middleware・TLSOption への参照を ReferenceGrant なしに許す（Traefik の `allowCrossNamespace`）。既定では、参照先の namespace に ReferenceGrant（from `traefik.io` の `IngressRoute`・`IngressRouteTCP`・`IngressRouteUDP`・`Middleware`）が要る。Ingress の `defaultBackend` は移行先の Gateway の namespace のものだけ |
 | `--traefik-entrypoint` | `web=80,websecure=443` | Traefik のエントリーポイント（`名前=ポート[/udp]`）。`entryPoints` を書かないルートは、そのプロトコルのすべてのエントリーポイント |
 
 ## 変換

@@ -1533,3 +1533,20 @@ spec:
 	assert!(p3.raw.is_empty());
 	assert!(p3.raw_status.iter().all(|s| cond(&s.conds, "Accepted").reason == "NotAllowed"));
 }
+
+#[test]
+fn cross_namespace_secrets_can_be_turned_off() {
+	let (crt, key) = crate::pem::tests::pair("example.com");
+	let yaml = format!(
+		"{BASE}\n---\napiVersion: v1\nkind: Secret\nmetadata: {{name: cert, namespace: other}}\nstringData:\n  tls.crt: |\n{}\n  tls.key: |\n{}\n---\napiVersion: gateway.networking.k8s.io/v1beta1\nkind: ReferenceGrant\nmetadata: {{name: g, namespace: other}}\nspec:\n  from: [{{group: gateway.networking.k8s.io, kind: Gateway, namespace: default}}]\n  to: [{{group: \"\", kind: Secret}}]\n{}",
+		indent(&crt),
+		indent(&key),
+		gw("  - {name: https, port: 443, protocol: HTTPS, tls: {certificateRefs: [{name: cert, namespace: other}]}}")
+	);
+	let w = world(&yaml);
+	let on = render_gateway(&w, &w.gateways[0], &Options::default());
+	assert!(cond(&on.listeners[0].conds, "ResolvedRefs").status);
+	let off = render_gateway(&w, &w.gateways[0], &Options { cross_namespace_secrets: false, ..Default::default() });
+	assert_eq!(cond(&off.listeners[0].conds, "ResolvedRefs").reason, "RefNotPermitted");
+	assert!(off.files.is_empty(), "no key copied");
+}

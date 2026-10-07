@@ -29,11 +29,11 @@ Gateway API / CRDs ──watch──▶ rproxy-gateway ──PUT /rulesets/k8s/<
 | mode | rproxy | Address (Gateway `status.addresses`) |
 |---|---|---|
 | `managed` (default) | The controller creates, in the Gateway's namespace, one Deployment, Service and ServiceAccount per Gateway (`rproxy-<id>`, Service type `--service-type`, `LoadBalancer` by default) and Secrets (certificates `rproxy-<id>-certs`, control API `rproxy-<id>-api`). The Gateway owns them all (`ownerReferences`), so they go when it goes | `spec.addresses` when given, else the Service's load balancer address (the ClusterIP for type `ClusterIP`) |
-| `fleet` | rproxy pods deployed beforehand (e.g. the chart's DaemonSet with `hostNetwork: true`, `--fleet-selector`) serve every Gateway. The controller PUTs the same set to every pod | `--fleet-address`, else the pods' node IPs |
+| `fleet` (for one trust domain: [SECURITY.md](SECURITY.md)) | rproxy pods deployed beforehand (e.g. the chart's DaemonSet with `hostNetwork: true`, `--fleet-selector`) serve every Gateway. The controller PUTs the same set to every pod | `--fleet-address`, else the pods' node IPs |
 
 - `<id>` is `<namespace>-<name>` (up to 40 characters) and a 6-digit hash.
 - What managed mode creates carries the Gateway's `spec.infrastructure` `labels` and `annotations` (pods too) and the label `gateway.networking.k8s.io/gateway-name` (the controller's own labels win: they select the pods). No `spec.infrastructure.parametersRef` kind is supported, so a Gateway with one is `Accepted: False` (`InvalidParameters`).
-- `spec.addresses`: `IPAddress` only (other types: `Accepted: False`, `UnsupportedAddress`). In managed mode they become the Service's `externalIPs` (kube-proxy sends traffic for those IPs to rproxy). An entry without a value keeps the Service's address. Unspecified, loopback, link-local or multicast IPs, and IPs the cluster does not let the Service take, make `Programmed: False` (`AddressNotUsable`). In fleet mode an address must be one of the fleet's (`--fleet-address`, or the nodes' IPs), else `AddressNotUsable`.
+- `spec.addresses`: `IPAddress` only (other types: `Accepted: False`, `UnsupportedAddress`). In managed mode they become the Service's `externalIPs` (off by default: only within `--address-cidr`, never another Service's IP; [SECURITY.md](SECURITY.md)) (kube-proxy sends traffic for those IPs to rproxy). An entry without a value keeps the Service's address. Unspecified, loopback, link-local or multicast IPs, and IPs the cluster does not let the Service take, make `Programmed: False` (`AddressNotUsable`). In fleet mode an address must be one of the fleet's (`--fleet-address`, or the nodes' IPs), else `AddressNotUsable`.
 - Managed pods run as non-root (65532) and take ports below 1024 through `net.ipv4.ip_unprivileged_port_start=0` (a namespaced, safe sysctl).
 - In fleet mode, when two Gateways use the same port, rproxy refuses the later one's rule with `409 already_exists` and that listener's `Programmed` is `False`.
 
@@ -58,7 +58,7 @@ rproxy runs with `RPROXY_API_ADDR=0.0.0.0`, `RPROXY_API_PORT=9443`, `RPROXY_TOKE
 - The controller puts each Gateway's certificates into one Secret (`rproxy-<id>-certs`), which the kubelet mounts into the rproxy pod as a Secret volume (`/var/run/rproxy-gateway/certs`, read-only, mode 0440). In fleet mode every Gateway's certificates go into one Secret (`rproxy-fleet-certs`) mounted into the DaemonSet's pods (a Secret holds up to 1 MiB).
 - rproxy pods do not use the Kubernetes API: no ServiceAccount token is mounted (`automountServiceAccountToken: false`) and they have no RBAC. Only the referenced certificates reach the pod, through the Secret the controller writes; other Secrets of the namespace (the CA key, the controller's token, other Gateways' certificates) cannot be read.
 - When it changes the Secret, the controller sets an annotation on the pods (`rproxy.max3584.net/certs`, the content's hash). The kubelet handles the pod update by refreshing the volume at once (without the annotation, its periodic sync, about a minute, refreshes it).
-- `certsync` in the same pod (`rproxy-gateway certsync` of this image) only answers `GET /files` with the file names in that directory (it does not use the API). Before a PUT the controller checks that the files are there (until then `Programmed: False`, reason `Pending`).
+- `certsync` in the same pod (`rproxy-gateway certsync` of this image) only answers `POST /files` with which of the names the controller sends (content hashes) are in that directory (it never lists them, does not use the API, and listens on the pod's IP). Before a PUT the controller checks that the files are there (until then `Programmed: False`, reason `Pending`).
 - Files no rule uses any more stay in the Secret for 5 minutes before they are dropped (so old rules reading them again do not break).
 
 ### Designs not chosen
@@ -86,7 +86,7 @@ rproxy runs with `RPROXY_API_ADDR=0.0.0.0`, `RPROXY_API_PORT=9443`, `RPROXY_TOKE
 | HTTPRoute `matches` | the `match` expression: `Host` (`*.example.com` as `**.example.com`), `Path` (Exact), `Path(p) \|\| PathPrefix(p/)` (PathPrefix, matched at `/` boundaries), `PathRegexp(^(?:re)$)`, `Method`, `Header` / `HeaderRegexp`, `Query` / `QueryRegexp` |
 | Rule precedence | Gateway API's order (host name specificity → Exact → longest PathPrefix → method → number of header matches → number of query matches → oldest route → namespace/name → order written) as `priority` |
 | A listener with a more specific host name on the same port | routes of wildcard and host-less listeners get `!Host(...)` so they do not take that host name (listener isolation) |
-| `backendRefs` | the ready pod IPs of the Service's EndpointSlices (not the ClusterIP) as `servers`; `weight` is spread over the pods. ExternalName as the name |
+| `backendRefs` | the ready pod IPs of the Service's EndpointSlices (not the ClusterIP) as `servers`; `weight` is spread over the pods. ExternalName as the name (off by default: `--allow-external-name-services`) |
 | No usable backend | `respond` (500) |
 | Some backendRefs invalid | rproxy answers that backendRef's weight share with 500 (`servers[]` with `status: 500`) |
 | `appProtocol: kubernetes.io/h2c` on the backend Service's port | the service's `protocol: h2c` (HTTP/2 with prior knowledge to the backend) |

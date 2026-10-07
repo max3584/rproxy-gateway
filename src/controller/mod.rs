@@ -100,10 +100,28 @@ pub struct Config {
 	/// Annotation prefixes of `spec.infrastructure` allowed onto the Service besides the
 	/// ones that are not address or load balancer settings.
 	pub service_annotations: Vec<String>,
+	/// certificateRefs may name Secrets of other namespaces (with a ReferenceGrant).
+	pub cross_namespace_secrets: bool,
 	/// Fleet mode: RproxyRules are read (off by default: fleet pods are shared by every Gateway).
 	pub fleet_rproxy_rules: bool,
+	/// The namespaces watched besides the controller's own (empty: all; then the controller needs a ClusterRole).
+	pub watch_namespaces: Vec<String>,
 	/// Leader election (`None`: this replica always leads, for a single replica).
 	pub leader: Option<leader::Settings>,
+}
+
+impl Config {
+	/// The namespaces watched: `None` for all, else `watch_namespaces` and the controller's own.
+	pub fn scope(&self) -> cache::Scope {
+		if self.watch_namespaces.is_empty() {
+			return None;
+		}
+		let mut nss = self.watch_namespaces.clone();
+		nss.push(self.namespace.clone());
+		nss.sort();
+		nss.dedup();
+		Some(nss)
+	}
 }
 
 /// How often the API server is asked again for kinds that were not served.
@@ -134,7 +152,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
 	let client = kube::Client::try_default().await.context("connecting to Kubernetes")?;
 	let boot = bootstrap::ensure(&client, &cfg.namespace).await.context("the controller's Secrets")?;
 	let rp = Client::new(Some(&boot.ca_pem), &boot.token)?;
-	let cache = std::sync::Arc::new(cache::Cache::start(&client, cfg.migration.is_some()).await?);
+	let cache = std::sync::Arc::new(cache::Cache::start(&client, cfg.migration.is_some(), cfg.scope()).await?);
 	tokio::spawn(health(cfg.health));
 	{
 		// CRDs installed later (Traefik, Gateway API kinds) are watched without a restart
@@ -303,6 +321,7 @@ async fn reconcile_all(
 		features: render::Features::default(),
 		address_cidrs: cfg.address_cidrs.clone(),
 		raw_rules: !matches!(cfg.mode, Mode::Fleet(_)) || cfg.fleet_rproxy_rules,
+		cross_namespace_secrets: cfg.cross_namespace_secrets,
 	};
 	let mut rendered: Vec<(&crate::k8s::gateway::Gateway, GatewayPlan)> = vec![];
 	for gw in world.gateways.iter().filter(|g| classes.contains(&g.spec.gateway_class_name)) {
@@ -404,7 +423,7 @@ async fn reconcile_all(
 	state.absent.retain(|name, _| {
 		name == provision::FLEET_CERTS_SECRET || keep_ids.iter().any(|id| name.ends_with(&format!("/{}", provision::certs_secret_name(id))))
 	});
-	if let Err(e) = provision::collect_garbage(client, &keep_ids).await {
+	if let Err(e) = provision::collect_garbage(client, &keep_ids, &cfg.scope()).await {
 		warn!(error = %e, "cannot remove rproxy of deleted Gateways");
 	}
 	if let Mode::Fleet(f) = &cfg.mode {

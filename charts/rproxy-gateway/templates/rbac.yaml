@@ -1,53 +1,98 @@
+{{- /* namespaced rules: in a ClusterRole (all namespaces), or a Role per watched namespace */ -}}
+{{- define "rproxy-gateway.namespacedRules" -}}
+- apiGroups: [gateway.networking.k8s.io]
+  resources: [gateways, httproutes, grpcroutes, tlsroutes, tcproutes, udproutes, referencegrants, listenersets, backendtlspolicies]
+  verbs: [get, list, watch]
+- apiGroups: [gateway.networking.k8s.io]
+  resources: [gateways/status, httproutes/status, grpcroutes/status, tlsroutes/status, tcproutes/status, udproutes/status, listenersets/status, backendtlspolicies/status]
+  verbs: [get, update, patch]
+- apiGroups: [rproxy.max3584.net]
+  resources: [rproxymiddlewares, rproxypolicies, rproxyrules]
+  verbs: [get, list, watch]
+- apiGroups: [rproxy.max3584.net]
+  resources: [rproxypolicies/status, rproxyrules/status]
+  verbs: [get, update, patch]
+# CA certificates (ConfigMaps with ca.crt: frontend client certificate validation, BackendTLSPolicy)
+- apiGroups: [""]
+  resources: [configmaps]
+  verbs: [get, list, watch]
+# backends (EndpointSlices); certificates (Secrets); managed mode: each Gateway's rproxy (Deployment,
+# Service, ServiceAccount, NetworkPolicy, its certificate and control API Secrets) in the Gateway's namespace
+- apiGroups: [""]
+  resources: [services, secrets, serviceaccounts]
+  verbs: [get, list, watch, create, update, patch, delete]
+- apiGroups: [apps]
+  resources: [deployments]
+  verbs: [get, list, watch, create, update, patch, delete]
+- apiGroups: [networking.k8s.io]
+  resources: [networkpolicies]
+  verbs: [get, list, watch, create, update, patch, delete]
+# rproxy pods: the certificate Secret's hash as an annotation, so the kubelet updates the mounted files at once
+- apiGroups: [""]
+  resources: [pods]
+  verbs: [get, list, watch, patch]
+- apiGroups: [discovery.k8s.io]
+  resources: [endpointslices]
+  verbs: [get, list, watch]
+{{- if .Values.migration.migrateTo }}
+- apiGroups: [networking.k8s.io]
+  resources: [ingresses]
+  verbs: [get, list, watch]
+# the Gateway's addresses in status.loadBalancer
+- apiGroups: [networking.k8s.io]
+  resources: [ingresses/status]
+  verbs: [get, update, patch]
+- apiGroups: [traefik.io, traefik.containo.us]
+  resources: [ingressroutes, ingressroutetcps, ingressrouteudps, middlewares, tlsoptions]
+  verbs: [get, list, watch]
+{{- end }}
+{{- end }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: rproxy-gateway
   labels: {{- include "rproxy-gateway.labels" . | nindent 4 }}
 rules:
+  # cluster-scoped: GatewayClasses, namespaces (allowedRoutes selectors)
   - apiGroups: [gateway.networking.k8s.io]
-    resources: [gatewayclasses, gateways, httproutes, grpcroutes, tlsroutes, tcproutes, udproutes, referencegrants, listenersets, backendtlspolicies]
+    resources: [gatewayclasses]
     verbs: [get, list, watch]
   - apiGroups: [gateway.networking.k8s.io]
-    resources: [gatewayclasses/status, gateways/status, httproutes/status, grpcroutes/status, tlsroutes/status, tcproutes/status, udproutes/status, listenersets/status, backendtlspolicies/status]
+    resources: [gatewayclasses/status]
     verbs: [get, update, patch]
-  - apiGroups: [rproxy.max3584.net]
-    resources: [rproxymiddlewares, rproxypolicies, rproxyrules]
-    verbs: [get, list, watch]
-  - apiGroups: [rproxy.max3584.net]
-    resources: [rproxypolicies/status, rproxyrules/status]
-    verbs: [get, update, patch]
-  # backends (EndpointSlices), certificates (Secrets), namespace selectors
-  # CA certificates (ConfigMaps with ca.crt: frontend client certificate validation, BackendTLSPolicy)
   - apiGroups: [""]
-    resources: [namespaces, configmaps]
+    resources: [namespaces]
     verbs: [get, list, watch]
-  # managed mode: each Gateway's rproxy (Deployment, Service, ServiceAccount, its certificate and
-  # control API Secrets) next to the Gateway, in the Gateway's namespace
-  - apiGroups: [""]
-    resources: [services, secrets, serviceaccounts]
-    verbs: [get, list, watch, create, update, patch, delete]
-  - apiGroups: [apps]
-    resources: [deployments]
-    verbs: [get, list, watch, create, update, patch, delete]
-  # rproxy pods: the certificate Secret's hash as an annotation, so the kubelet updates the mounted files at once
-  - apiGroups: [""]
-    resources: [pods]
-    verbs: [get, list, watch, patch]
-  - apiGroups: [discovery.k8s.io]
-    resources: [endpointslices]
-    verbs: [get, list, watch]
-  {{- if .Values.migration.migrateTo }}
-  - apiGroups: [networking.k8s.io]
-    resources: [ingresses]
-    verbs: [get, list, watch]
-  # the Gateway's addresses in status.loadBalancer
-  - apiGroups: [networking.k8s.io]
-    resources: [ingresses/status]
-    verbs: [get, update, patch]
-  - apiGroups: [traefik.io, traefik.containo.us]
-    resources: [ingressroutes, ingressroutetcps, ingressrouteudps, middlewares, tlsoptions]
-    verbs: [get, list, watch]
+  {{- if not .Values.controller.watchNamespaces }}
+  # every namespace (controller.watchNamespaces narrows this to Roles in the listed namespaces)
+  {{- include "rproxy-gateway.namespacedRules" . | nindent 2 }}
   {{- end }}
+{{- range $ns := (.Values.controller.watchNamespaces | default list) }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rproxy-gateway-watch
+  namespace: {{ $ns }}
+  labels: {{- include "rproxy-gateway.labels" $ | nindent 4 }}
+rules:
+  {{- include "rproxy-gateway.namespacedRules" $ | nindent 2 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rproxy-gateway-watch
+  namespace: {{ $ns }}
+  labels: {{- include "rproxy-gateway.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: rproxy-gateway-watch
+subjects:
+  - kind: ServiceAccount
+    name: rproxy-gateway
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -74,6 +119,9 @@ rules:
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
     verbs: [get, create, update]
+  {{- if .Values.controller.watchNamespaces }}
+  {{- include "rproxy-gateway.namespacedRules" . | nindent 2 }}
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

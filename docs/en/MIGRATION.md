@@ -16,6 +16,7 @@ With `--migrate-to <namespace>/<name>`, the controller reads Ingress and Traefik
 |---|---|---|
 | `--migrate-to` | none (nothing read) | The target Gateway (`namespace/name`) |
 | `--ingress-class` | `rproxy` | The Ingress class read (`spec.ingressClassName`, else the annotation `kubernetes.io/ingress.class`) |
+| `--migration-allow-cross-namespace` | off | allow references to Services, Middlewares and TLSOptions of other namespaces without a ReferenceGrant (Traefik's `allowCrossNamespace`). By default a ReferenceGrant in the target namespace is needed (from `traefik.io` `IngressRoute`, `IngressRouteTCP`, `IngressRouteUDP`, `Middleware`). An Ingress `defaultBackend` counts only from the target Gateway's namespace |
 | `--traefik-entrypoint` | `web=80,websecure=443` | Traefik entry points (`name=port[/udp]`). Routes without `entryPoints` go to every entry point of their protocol |
 
 ## Mapping

@@ -607,25 +607,29 @@ pub async fn apply_managed(
 /// Deletes managed objects of Gateways that are gone or no longer ours (`keep`:
 /// ids still in use), in every namespace. (Deleting a Gateway deletes them as
 /// well: the Gateway owns them.)
-pub async fn collect_garbage(client: &kube::Client, keep: &[String]) -> anyhow::Result<()> {
+pub async fn collect_garbage(client: &kube::Client, keep: &[String], scope: &crate::controller::cache::Scope) -> anyhow::Result<()> {
+	let nss: Vec<Option<String>> = match scope {
+		None => vec![None],
+		Some(n) => n.iter().cloned().map(Some).collect(),
+	};
 	let lp = ListParams::default().labels(&format!("app.kubernetes.io/managed-by={MANAGER},{LABEL_GATEWAY}"));
 	let gone = |m: &ObjectMeta| m.labels.as_ref().and_then(|l| l.get(LABEL_GATEWAY)).is_some_and(|id| !keep.contains(id));
 	let dp = DeleteParams::default();
 	let ns_name = |m: &ObjectMeta| (m.namespace.clone().unwrap_or_default(), m.name.clone().unwrap_or_default());
-	for d in Api::<Deployment>::all(client.clone()).list(&lp).await? {
+	for d in list_in::<Deployment>(client, &nss, &lp).await? {
 		if gone(&d.metadata) {
 			let (ns, name) = ns_name(&d.metadata);
 			info!(deployment = format!("{ns}/{name}"), "deleting rproxy of a Gateway that is gone");
 			Api::<Deployment>::namespaced(client.clone(), &ns).delete(&name, &dp).await?;
 		}
 	}
-	for s in Api::<Service>::all(client.clone()).list(&lp).await? {
+	for s in list_in::<Service>(client, &nss, &lp).await? {
 		if gone(&s.metadata) {
 			let (ns, name) = ns_name(&s.metadata);
 			Api::<Service>::namespaced(client.clone(), &ns).delete(&name, &dp).await?;
 		}
 	}
-	if let Ok(list) = Api::<k8s_openapi::api::networking::v1::NetworkPolicy>::all(client.clone()).list(&lp).await {
+	if let Ok(list) = list_in::<k8s_openapi::api::networking::v1::NetworkPolicy>(client, &nss, &lp).await {
 		for np in list {
 			if gone(&np.metadata) {
 				let (ns, name) = ns_name(&np.metadata);
@@ -633,19 +637,36 @@ pub async fn collect_garbage(client: &kube::Client, keep: &[String]) -> anyhow::
 			}
 		}
 	}
-	for s in Api::<ServiceAccount>::all(client.clone()).list(&lp).await? {
+	for s in list_in::<ServiceAccount>(client, &nss, &lp).await? {
 		if gone(&s.metadata) {
 			let (ns, name) = ns_name(&s.metadata);
 			Api::<ServiceAccount>::namespaced(client.clone(), &ns).delete(&name, &dp).await?;
 		}
 	}
-	for s in Api::<Secret>::all(client.clone()).list(&lp).await? {
+	for s in list_in::<Secret>(client, &nss, &lp).await? {
 		if gone(&s.metadata) {
 			let (ns, name) = ns_name(&s.metadata);
 			Api::<Secret>::namespaced(client.clone(), &ns).delete(&name, &dp).await?;
 		}
 	}
 	Ok(())
+}
+
+/// Lists `K` in each namespace (`None`: all namespaces).
+async fn list_in<K>(client: &kube::Client, nss: &[Option<String>], lp: &ListParams) -> anyhow::Result<Vec<K>>
+where
+	K: kube::Resource<Scope = k8s_openapi::NamespaceResourceScope> + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
+	K::DynamicType: Default,
+{
+	let mut out = vec![];
+	for ns in nss {
+		let api: Api<K> = match ns {
+			Some(ns) => Api::namespaced(client.clone(), ns),
+			None => Api::all(client.clone()),
+		};
+		out.extend(api.list(lp).await?.items);
+	}
+	Ok(out)
 }
 
 /// Gateway status addresses from the Service: load balancer addresses, else the ClusterIP.

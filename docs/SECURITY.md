@@ -1,0 +1,60 @@
+English: [en/SECURITY.md](en/SECURITY.md)
+
+# rproxy-gateway のセキュリティ
+
+コントローラが何を信頼し、テナント（Gateway やルートを書ける人）に何をさせないかをまとめる。設計の全体は [DESIGN.md](DESIGN.md)。
+
+## 信頼の境界
+
+| 誰 | できること | できないこと |
+|---|---|---|
+| クラスタの管理者 | chart の値・コントローラのフラグを決める | — |
+| Gateway の持ち主（namespace の編集者） | 自分の namespace に Gateway・ルート・RproxyRule・RproxyMiddleware を書く | ほかの namespace の Service・Secret を、そちらの ReferenceGrant なしに使う。クラスタの IP を自分のものにする。ほかの Gateway の鍵や rproxy を使う |
+| managed の rproxy の Pod | 自分の Gateway の証明書（マウントした Secret）を読む | Kubernetes の API を使う（トークンなし・RBAC なし）。ほかの Gateway の資格を使う |
+
+## managed と fleet
+
+- **managed（既定）**：Gateway ごとに、Gateway の namespace に rproxy を置く。制御 API の証明書とトークンは Gateway ごと（CA が `<id>.rproxy-api.rproxy-gateway.internal` に出したもの、マスタートークンから HMAC で導いたもの）。テナントを分けるのはこちら。
+- **fleet**：すべての Gateway が同じ rproxy の Pod（hostNetwork の DaemonSet）を使う。**1 つの信頼の範囲（1 人の管理者）のためのもの**で、テナントを分けない。すべての Gateway の証明書を 1 つの Secret（`rproxy-fleet-certs`）にまとめて全 Pod に渡し、ノードのポートは先に取った Gateway のもの（後から来たものは `Programmed: False`）。fleet では RproxyRule を既定で読まない（`fleet.rproxyRules` / `--fleet-rproxy-rules`）。
+
+## テナントの入力への制限
+
+| 項目 | 既定 | 変え方 |
+|---|---|---|
+| `spec.addresses`（managed では Service の `externalIPs`） | **使えない**（`Programmed: False`、`AddressNotUsable`）。許した範囲でも、ほかの Service の ClusterIP・externalIPs・LB の IP は取れない（CVE-2020-8554 の形を防ぐ） | `managed.addressCIDRs` / `--address-cidr`。Service や Pod の範囲を入れない |
+| `spec.infrastructure.annotations` の Service への伝わり方 | アドレス・LB を決める注釈（`metallb.universe.tf/`、`lbipam.cilium.io/`、`service.beta.kubernetes.io/` など）は Service に付けない（Pod・ServiceAccount には付ける） | `managed.serviceAnnotationPrefixes` / `--service-annotation-prefix` |
+| ExternalName の Service を backend に | **使えない**（`ResolvedRefs: False`）。API サーバ・ほかの namespace・メタデータの口など、何でも名指しできるため | `controller.allowExternalNameServices` / `--allow-external-name-services` |
+| RproxyRule・RproxyMiddleware が名前を書くファイル（`*_file`・`file`・`*_path`） | その Gateway の証明書のファイル（証明書ディレクトリの中の、その Gateway の分）だけ。ほかは `Accepted: False` / `UnsupportedValue` | — |
+| 移行（Ingress・Traefik）のほかの namespace への参照（Service・Middleware・TLSOption・errors の service） | 参照先の namespace の ReferenceGrant（from `traefik.io` の `IngressRoute*`・`Middleware`）がなければ変換しない（Traefik の `allowCrossNamespace=false` と同じ） | `migration.allowCrossNamespace` / `--migration-allow-cross-namespace` |
+| Ingress の path | バッククォート・引用符・制御文字・`/` で始まらないものは変換しない（`match` の式に埋め込むため） | — |
+| Ingress の `defaultBackend` | 移行先の Gateway の namespace のものだけ | — |
+
+## ほかの namespace の秘密鍵（M7）
+
+`certificateRefs`（と `spec.tls.backend.clientCertificateRef`）がほかの namespace の Secret を ReferenceGrant 付きで指すと、managed ではその鍵を Gateway の namespace の Secret（`rproxy-<id>-certs`）に写す（rproxy の Pod がマウントできるのは同じ namespace の Secret だけ）。そのため **Gateway の namespace で Secret を読める人は、その鍵を読める**。ReferenceGrant は「参照の許可」だが、ここでは結果として「読む許可」にもなる。共有のワイルドカード証明書などで困るなら：
+
+- `controller.crossNamespaceSecrets: false`（`--cross-namespace-secrets=false`）でほかの namespace の鍵を使わない（`ResolvedRefs: False`、`RefNotPermitted`）。Gateway API の conformance のうちほかの namespace の証明書の試験は通らなくなる
+- または鍵を Gateway の namespace に置く
+
+## コントローラの権限（M10）
+
+- 既定ではすべての namespace の Gateway API の型・Secret・Service・Deployment・ServiceAccount・NetworkPolicy・Pod（patch）を扱う ClusterRole を持つ（Gateway の namespace に rproxy を置き、どこの証明書でも参照できるため）。コントローラが乗っ取られると、クラスタ全体の Secret が読める。
+- `controller.watchNamespaces`（`--watch-namespaces`）を決めると、そこ（とコントローラの namespace）だけを watch し、chart はその namespace ごとの Role を作る。ClusterRole に残るのは GatewayClass と namespace（allowedRoutes の selector）だけ。
+
+## ネットワーク
+
+- managed：Gateway ごとに NetworkPolicy を作る（`managed.networkPolicy`、既定 true）。rproxy の制御 API（9443）と certsync（9444）はコントローラの Pod からだけ、リスナーのポートは誰からでも。CNI が NetworkPolicy を扱わなければ効かない。
+- certsync はファイルの一覧を返さない：コントローラが名前（中身のハッシュ）を送り、あるかどうかだけを返す。Pod の IP で待ち受ける。
+- fleet（hostNetwork）では NetworkPolicy が効かない。制御 API と certsync は Pod の IP（＝ノードの IP）で待ち受けるので、ノードへの外からの通信はファイアウォールで絞る。
+
+## 制御 API の資格と入れ替え
+
+- CA（`rproxy-gateway-ca`）は pathLen 0、名前の制約 `rproxy-gateway.internal`、10 年。制御 API の証明書は 1 年で、終わる 30 日前に出し直し、rproxy の Pod を入れ替える（Pod のテンプレートの注釈）。
+- コントローラは rproxy の答えの本文を 8 MiB、certsync の答えを 1 MiB までしか読まない。managed の Pod は、その Gateway の Deployment の ReplicaSet（`rproxy-<id>-...`）のものだけを相手にする。
+- 入れ替え：
+  - CA：`kubectl -n rproxy-gateway-system delete secret rproxy-gateway-ca rproxy-gateway-api-tls` → コントローラを再起動。新しい CA で制御 API の証明書がすべて出し直され、rproxy の Pod が入れ替わる
+  - マスタートークン：`kubectl -n rproxy-gateway-system delete secret rproxy-gateway-token` → コントローラを再起動。Gateway ごとのトークンも変わり、rproxy の Pod が入れ替わる（fleet は DaemonSet を再起動）
+
+## イメージ
+
+`controller.image.digest`・`rproxy.image.digest`（`sha256:...`）でダイジェストに固定できる（タグより優先）。

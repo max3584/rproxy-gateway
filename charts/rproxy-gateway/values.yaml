@@ -7,6 +7,8 @@ controller:
     repository: ghcr.io/max3584/rproxy-gateway
     # defaults to the chart's appVersion
     tag: ""
+    # sha256:...: pins the image (used instead of the tag)
+    digest: ""
     pullPolicy: IfNotPresent
   # replicas elect a leader with a Lease (rproxy-gateway in the release namespace); one acts at a time
   replicas: 2
@@ -25,12 +27,21 @@ controller:
   podAnnotations: {}
   # extra arguments of `rproxy-gateway controller`
   extraArgs: []
+  # watch only these namespaces (and the release namespace): the controller then gets Roles there
+  # instead of a ClusterRole for namespaced objects. Empty: every namespace (docs/SECURITY.md)
+  watchNamespaces: []
+  # certificateRefs may name Secrets of other namespaces (with a ReferenceGrant); managed mode copies
+  # those keys into the Gateway's namespace (docs/SECURITY.md)
+  crossNamespaceSecrets: true
+  # ExternalName Services as backends (they can name anything: the API server, other namespaces)
+  allowExternalNameServices: false
 
 # rproxy itself (the data plane)
 rproxy:
   image:
     repository: ghcr.io/max3584/rproxy-gateway/rproxy
     tag: "0.4.0"
+    digest: ""
     pullPolicy: IfNotPresent
   # addresses rules listen on (the first is listen_addr, the rest extra_listen_addrs); add "::" for IPv6
   listenAddresses: ["0.0.0.0"]
@@ -40,6 +51,14 @@ managed:
   replicas: 1
   # type of each Gateway's Service: LoadBalancer, NodePort or ClusterIP
   serviceType: LoadBalancer
+  # IP ranges Gateways' spec.addresses may take (the Service's externalIPs). Empty: static addresses
+  # are off. Never include the Service or pod ranges (a Gateway could capture another Service's traffic)
+  addressCIDRs: []
+  # spec.infrastructure annotation prefixes let onto the Service though they ask load balancers for
+  # addresses (metallb.universe.tf/, service.beta.kubernetes.io/, ...; off by default)
+  serviceAnnotationPrefixes: []
+  # a NetworkPolicy per Gateway: only the controller reaches rproxy's control API and certsync
+  networkPolicy: true
 
 # fleet mode: rproxy pods deployed by this chart serve every Gateway (rproxy-api docs/DESIGN-v0.4.md 3.3)
 fleet:
@@ -51,6 +70,8 @@ fleet:
   nodeSelector: {}
   tolerations: []
   resources: {}
+  # RproxyRules (off: the fleet's pods are shared by every Gateway; fleet is for one trust domain)
+  rproxyRules: false
 
 # a GatewayClass for this controller
 gatewayClass:
@@ -66,5 +87,7 @@ migration:
   traefikEntryPoints: ["web=80", "websecure=443"]
   # also create an IngressClass for ingressClass
   createIngressClass: false
+  # references to other namespaces without a ReferenceGrant (Traefik's allowCrossNamespace)
+  allowCrossNamespace: false
 
 imagePullSecrets: []

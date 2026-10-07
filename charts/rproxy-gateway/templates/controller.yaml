@@ -43,9 +43,19 @@ spec:
             - --resync-secs={{ .Values.controller.resyncSeconds }}
             - --listen-addr={{ join "," .Values.rproxy.listenAddresses }}
             - --leader-elect={{ .Values.controller.leaderElection }}
+            - --cross-namespace-secrets={{ .Values.controller.crossNamespaceSecrets }}
+            {{- if .Values.controller.allowExternalNameServices }}
+            - --allow-external-name-services
+            {{- end }}
+            {{- with .Values.controller.watchNamespaces }}
+            - --watch-namespaces={{ join "," . }}
+            {{- end }}
             {{- if .Values.fleet.enabled }}
             - --mode=fleet
             - --fleet-selector=app.kubernetes.io/name=rproxy,app.kubernetes.io/component=fleet
+            {{- if .Values.fleet.rproxyRules }}
+            - --fleet-rproxy-rules
+            {{- end }}
             {{- with .Values.fleet.addresses }}
             - --fleet-address={{ join "," . }}
             {{- end }}
@@ -56,11 +66,21 @@ spec:
             - --image-pull-policy={{ .Values.rproxy.image.pullPolicy }}
             - --replicas={{ .Values.managed.replicas }}
             - --service-type={{ .Values.managed.serviceType }}
+            - --network-policy={{ .Values.managed.networkPolicy }}
+            {{- with .Values.managed.addressCIDRs }}
+            - --address-cidr={{ join "," . }}
+            {{- end }}
+            {{- with .Values.managed.serviceAnnotationPrefixes }}
+            - --service-annotation-prefix={{ join "," . }}
+            {{- end }}
             {{- end }}
             {{- if .Values.migration.migrateTo }}
             - --migrate-to={{ .Values.migration.migrateTo }}
             - --ingress-class={{ .Values.migration.ingressClass }}
             - --traefik-entrypoint={{ join "," .Values.migration.traefikEntryPoints }}
+            {{- if .Values.migration.allowCrossNamespace }}
+            - --migration-allow-cross-namespace
+            {{- end }}
             {{- end }}
             {{- range .Values.controller.extraArgs }}
             {{- if . }}

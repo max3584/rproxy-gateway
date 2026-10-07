@@ -46,6 +46,9 @@ pub struct Options {
 	pub address_cidrs: Vec<Cidr>,
 	/// Whether RproxyRules are read (fleet mode: off unless the controller is told so).
 	pub raw_rules: bool,
+	/// Whether certificateRefs may name Secrets of other namespaces (with a ReferenceGrant).
+	/// In managed mode their keys are copied into the Gateway's namespace.
+	pub cross_namespace_secrets: bool,
 }
 
 /// An IP range (`10.0.0.0/24`).
@@ -95,6 +98,7 @@ impl Default for Options {
 			features: Features::default(),
 			address_cidrs: vec![],
 			raw_rules: true,
+			cross_namespace_secrets: true,
 		}
 	}
 }
@@ -583,6 +587,13 @@ fn certificate(
 	let ns = r.namespace.as_deref().unwrap_or(from_ns);
 	if !world.granted((GROUP, from_kind, from_ns), ("", "Secret", ns, &r.name)) {
 		return Err(bad("RefNotPermitted", format!("Secret {ns}/{}: no ReferenceGrant allows the reference", r.name)));
+	}
+	// managed mode copies the key into the Gateway's namespace: an operator may forbid that
+	if ns != from_ns && !opts.cross_namespace_secrets {
+		return Err(bad(
+			"RefNotPermitted",
+			format!("Secret {ns}/{}: keys from other namespaces are off (the controller's --cross-namespace-secrets)", r.name),
+		));
 	}
 	let Some(secret) = world.secrets.get(&(ns.to_string(), r.name.clone())) else {
 		return Err(bad("InvalidCertificateRef", format!("Secret {ns}/{} not found", r.name)));

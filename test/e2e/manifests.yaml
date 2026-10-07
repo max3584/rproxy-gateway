@@ -111,3 +111,14 @@ spec:
     - match: Host(`traefik.example.com`) && PathPrefix(`/traefik`)
       middlewares: [{name: strip}]
       services: [{name: echo, port: 8080}]
+---
+# a reference to another namespace without a ReferenceGrant: not converted (scripts/e2e.sh, H2)
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata: {name: cross, namespace: e2e}
+spec:
+  entryPoints: [web]
+  routes:
+    - match: Host(`cross.example.com`)
+      kind: Rule
+      services: [{name: kubernetes, namespace: default, port: 443}]

@@ -89,6 +89,14 @@ struct ControllerArgs {
 	/// they steer addresses or load balancers (`metallb.universe.tf/`, `service.beta.kubernetes.io/`, ...).
 	#[arg(long, env = "RPROXY_GATEWAY_SERVICE_ANNOTATION_PREFIX", value_delimiter = ',')]
 	service_annotation_prefix: Vec<String>,
+	/// Watch only these namespaces (and the controller's own); empty: all. With a list, the chart
+	/// gives the controller Roles in those namespaces instead of a ClusterRole for namespaced objects.
+	#[arg(long, env = "RPROXY_GATEWAY_WATCH_NAMESPACES", value_delimiter = ',')]
+	watch_namespaces: Vec<String>,
+	/// Let certificateRefs (and the backend client certificate) name Secrets of other namespaces when
+	/// a ReferenceGrant allows it. Managed mode copies those keys into the Gateway's namespace.
+	#[arg(long, env = "RPROXY_GATEWAY_CROSS_NAMESPACE_SECRETS", default_value_t = true, action = clap::ArgAction::Set)]
+	cross_namespace_secrets: bool,
 	/// fleet: read RproxyRules (off by default: fleet pods are shared by every Gateway).
 	#[arg(long, env = "RPROXY_GATEWAY_FLEET_RPROXY_RULES")]
 	fleet_rproxy_rules: bool,
@@ -239,6 +247,8 @@ fn main() -> anyhow::Result<()> {
 				allow_external_name: a.allow_external_name_services,
 				service_annotations: a.service_annotation_prefix.clone(),
 				fleet_rproxy_rules: a.fleet_rproxy_rules,
+				cross_namespace_secrets: a.cross_namespace_secrets,
+				watch_namespaces: a.watch_namespaces.clone(),
 				leader: a.leader_elect.then(|| {
 					let identity = a
 						.leader_identity
