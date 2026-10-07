@@ -4,7 +4,8 @@ English: [en/MIGRATION.md](en/MIGRATION.md)
 
 `--migrate-to <namespace>/<name>` を付けると、コントローラは Ingress と Traefik の CRD を読んで、その Gateway のルールセットに足す（rproxy-api の docs/DESIGN-v0.4.md 3.3。既定では読まない）。Gateway API に移るまでの間、同じ rproxy で動かすためのもの。
 
-- 読むだけで、Ingress・Traefik のリソースには何も書かない（状態も書かない）。
+- Ingress・Traefik のリソースの中身には何も書かない。状態は、Ingress の `status.loadBalancer.ingress` に移行先の Gateway のアドレス（`status.addresses`）を書く（`kubectl get ingress` の ADDRESS、external-dns などが読む）。Traefik の CRD には状態の欄がないので書かない。
+- Traefik の CRD は、コントローラが動き出したあとに入れてもよい（30 秒ごとに API サーバに聞き直し、出てきた種類の watch を始める。再起動は要らない）。Gateway API の CRD も同じ。
 - 変換は rproxy-api の `contrib/traefik2rproxy.py`（docs/MIGRATING-FROM-TRAEFIK.md）と同じ。変換できないものは外して、コントローラのログ（`migration: not converted`、内容が変わったときに 1 回）と `rproxy-gateway render` の `notes` に出す。
 - 移行先の Gateway に同じポートのリスナーがあれば、そのルールに足す（`http` どうし・TLS の有無が同じとき）。合わなければ移行するほうを外す。
 - 移行したルートは Traefik と同じ優先（`priority`、なければ `match` の長さ）。Gateway API のルートの `priority` は 1 からの番号なので、同じポートでは移行したルートが先に試されることが多い。

@@ -71,6 +71,9 @@ pub struct Config {
 	pub leader: Option<leader::Settings>,
 }
 
+/// How often the API server is asked again for kinds that were not served.
+const REDISCOVER: Duration = Duration::from_secs(30);
+
 /// Migration notes already logged (by digest), so each set is logged once.
 static NOTES_SEEN: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
 
@@ -91,8 +94,20 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
 	let client = kube::Client::try_default().await.context("connecting to Kubernetes")?;
 	let boot = bootstrap::ensure(&client, &cfg.namespace).await.context("the controller's Secrets")?;
 	let rp = Client::new(Some(&boot.ca_pem), &boot.token)?;
-	let cache = cache::Cache::start(&client, &cfg.namespace, cfg.migration.is_some()).await?;
+	let cache = std::sync::Arc::new(cache::Cache::start(&client, &cfg.namespace, cfg.migration.is_some()).await?);
 	tokio::spawn(health(cfg.health));
+	{
+		// CRDs installed later (Traefik, Gateway API kinds) are watched without a restart
+		let (cache, client) = (cache.clone(), client.clone());
+		tokio::spawn(async move {
+			loop {
+				tokio::time::sleep(REDISCOVER).await;
+				if let Err(e) = cache.rediscover(&client, false).await {
+					debug!(error = %e, "discovery failed");
+				}
+			}
+		});
+	}
 	let (leading_tx, mut leading) = tokio::sync::watch::channel(cfg.leader.is_none());
 	let lease_api: Api<k8s_openapi::api::coordination::v1::Lease> = Api::namespaced(client.clone(), &cfg.namespace);
 	if let Some(s) = cfg.leader.clone() {
@@ -194,8 +209,8 @@ async fn health(addr: SocketAddr) {
 fn dyn_api(client: &kube::Client, cache: &cache::Cache, kind: &str, ns: Option<&str>) -> Option<Api<DynamicObject>> {
 	let ar = cache.resource(kind)?;
 	Some(match ns {
-		Some(ns) => Api::namespaced_with(client.clone(), ns, ar),
-		None => Api::all_with(client.clone(), ar),
+		Some(ns) => Api::namespaced_with(client.clone(), ns, &ar),
+		None => Api::all_with(client.clone(), &ar),
 	})
 }
 
@@ -227,6 +242,7 @@ async fn reconcile_all(client: &kube::Client, cache: &cache::Cache, rp: &Client,
 	}
 
 	let pods_now = cache.pods.state();
+	let mut migration_addresses: Option<Vec<(String, String)>> = None;
 	let mut notes_seen = NOTES_SEEN.lock().unwrap().clone();
 	let mut plans: Vec<(GatewayPlan, Vec<PodSync>)> = vec![];
 	let mut keep_ids = vec![];
@@ -319,6 +335,9 @@ async fn reconcile_all(client: &kube::Client, cache: &cache::Cache, rp: &Client,
 			results.push(r);
 		}
 		if let Some(api) = dyn_api(client, cache, "Gateway", Some(&plan.namespace)) {
+			if cfg.migration.as_ref().is_some_and(|m| m.gateway == (plan.namespace.clone(), plan.name.clone())) {
+				migration_addresses = Some(addresses.clone());
+			}
 			let st = status::gateway_status(&plan, &addresses, &results, gw.status.as_ref(), &now);
 			if gw.status.as_ref() != Some(&st) {
 				if let Err(e) = patch_status(&api, &plan.name, st).await {
@@ -353,9 +372,35 @@ async fn reconcile_all(client: &kube::Client, cache: &cache::Cache, rp: &Client,
 		}
 	}
 
+	if let (Some(m), Some(addresses)) = (&cfg.migration, &migration_addresses) {
+		write_ingress_status(client, &world, m, addresses).await;
+	}
 	write_route_status(client, cache, &world, &plans, cfg, &now).await;
 	write_crd_status(client, cache, &world, &plans, cfg, &now).await;
 	Ok(soon)
+}
+
+/// `status.loadBalancer` of the Ingresses read into the migration Gateway's set: its addresses.
+async fn write_ingress_status(
+	client: &kube::Client,
+	world: &render::world::World,
+	m: &render::migrate::Settings,
+	addresses: &[(String, String)],
+) {
+	let want = render::migrate::ingress_status(addresses);
+	for i in render::migrate::handled_ingresses(world, m) {
+		let have = i.status.as_ref().and_then(|s| serde_json::to_value(s).ok()).unwrap_or(Value::Null);
+		let have_lb = have.get("loadBalancer").and_then(|l| l.get("ingress")).cloned().unwrap_or(json!([]));
+		if have_lb == want["loadBalancer"]["ingress"] {
+			continue;
+		}
+		let (ns, name) = (i.metadata.namespace.clone().unwrap_or_default(), i.metadata.name.clone().unwrap_or_default());
+		let api: Api<k8s_openapi::api::networking::v1::Ingress> = Api::namespaced(client.clone(), &ns);
+		// a merge patch replaces the list as a whole
+		if let Err(e) = api.patch_status(&name, &PatchParams::default(), &Patch::Merge(json!({ "status": want }))).await {
+			warn!(ingress = format!("{ns}/{name}"), error = %e, "cannot write Ingress status");
+		}
+	}
 }
 
 /// RproxyPolicy `status.ancestors` and RproxyRule `status`.
