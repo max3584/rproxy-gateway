@@ -27,6 +27,10 @@ rules:
   - apiGroups: [networking.k8s.io]
     resources: [ingresses]
     verbs: [get, list, watch]
+  # the Gateway's addresses in status.loadBalancer
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses/status]
+    verbs: [get, update, patch]
   - apiGroups: [traefik.io, traefik.containo.us]
     resources: [ingressroutes, ingressroutetcps, ingressrouteudps, middlewares, tlsoptions]
     verbs: [get, list, watch]

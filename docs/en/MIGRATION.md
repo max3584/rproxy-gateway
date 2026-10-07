@@ -4,7 +4,8 @@
 
 With `--migrate-to <namespace>/<name>`, the controller reads Ingress and Traefik's CRDs and adds them to that Gateway's rule set (rproxy-api docs/en/DESIGN-v0.4.md 3.3; off by default). It is for running them on the same rproxy until they move to Gateway API.
 
-- Read only: nothing is written to Ingress or Traefik resources (no status either).
+- Nothing is written to the spec of Ingress or Traefik resources. As status, an Ingress gets the target Gateway's addresses (`status.addresses`) in `status.loadBalancer.ingress` (the ADDRESS of `kubectl get ingress`, read by external-dns and the like). Traefik's CRDs have no status, so nothing is written there.
+- Traefik's CRDs may be installed after the controller started: it asks the API server again every 30 seconds and starts watching kinds that appeared (no restart needed). The same goes for Gateway API's CRDs.
 - The mapping is the one of rproxy-api's `contrib/traefik2rproxy.py` (docs/en/MIGRATING-FROM-TRAEFIK.md). What cannot be converted is left out and reported in the controller's log (`migration: not converted`, once each time the notes change) and in the `notes` of `rproxy-gateway render`.
 - When the target Gateway has a listener on the same port, the migrated routes are added to its rule (both `http`, with or without TLS alike). Otherwise the migrated part is left out.
 - Migrated routes keep Traefik's precedence (`priority`, else the length of `match`). Gateway API routes are numbered from 1, so on a shared port the migrated routes are often tried first.

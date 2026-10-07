@@ -42,7 +42,6 @@ echo "== cluster"
 kind get clusters | grep -qx "$CLUSTER" || kind create cluster --name "$CLUSTER" --wait 180s
 kind load docker-image --name "$CLUSTER" rproxy-gateway:e2e rproxy:e2e
 kubectl apply --server-side -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/$GATEWAY_API_VERSION/standard-install.yaml" > /dev/null
-kubectl apply --server-side -f "$TRAEFIK_CRDS" > /dev/null
 # the runner reaches ClusterIPs (Gateway addresses) through the kind node (kube-proxy there)
 node_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CLUSTER-control-plane")
 svc_cidr=$(kubectl get svc kubernetes -o jsonpath='{.spec.clusterIP}' | awk -F. '{print $1"."$2".0.0/16"}')
@@ -56,6 +55,9 @@ helm upgrade --install rproxy-gateway charts/rproxy-gateway -n $NS --create-name
   ${MIGRATE:+--set migration.migrateTo=$MIGRATE} \
   ${CONTROLLER_ARGS:+--set "controller.extraArgs={$CONTROLLER_ARGS}"}
 kubectl wait --for=condition=Accepted gatewayclass/rproxy --timeout=120s
+# installed after the controller: it finds them without a restart (discovery every 30 s)
+kubectl apply --server-side -f "$TRAEFIK_CRDS" > /dev/null
+kubectl wait --for=condition=Established crd/ingressroutes.traefik.io crd/middlewares.traefik.io --timeout=60s > /dev/null
 
 if [ -n "${SETUP_ONLY:-}" ]; then exit 0; fi
 
@@ -108,7 +110,9 @@ test "$(kubectl -n e2e get gateway e2e -o jsonpath='{.status.listeners[?(@.name=
 if [ -n "${MIGRATE:-}" ]; then
   echo "== migration (Ingress, IngressRoute)"
   retry 60 sh -c "curl -sf -H 'Host: ingress.example.com' http://$addr/i | jq -e '.path == \"/i\"' > /dev/null"
-  retry 60 sh -c "curl -sf -H 'Host: traefik.example.com' http://$addr/traefik/t | jq -e '.path == \"/t\"' > /dev/null"
+  retry 90 sh -c "curl -sf -H 'Host: traefik.example.com' http://$addr/traefik/t | jq -e '.path == \"/t\"' > /dev/null"
+  echo "== migration: Ingress status"
+  retry 60 sh -c "test \"\$(kubectl -n e2e get ingress -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}')\" = $addr"
 fi
 
 echo "== rproxy restart: the controller applies the rule set again"

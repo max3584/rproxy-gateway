@@ -1,11 +1,11 @@
 //! Watches (reflectors) of everything rendering reads, and snapshots of them.
 //!
 //! Third-party kinds (Gateway API, rproxy's CRDs, Traefik) are watched as dynamic
-//! objects at the version the API server serves (found by discovery); kinds
-//! whose CRDs are not installed are skipped (restart the controller after
-//! installing them).
+//! objects at the version the API server serves (found by discovery). Kinds
+//! whose CRDs are not installed are skipped and looked for again now and then
+//! (`rediscover`): a CRD installed later is watched without a restart.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::{Namespace, Pod, Secret, Service};
@@ -35,9 +35,10 @@ pub struct Cache {
 	namespaces: Store<Namespace>,
 	pub pods: Store<Pod>,
 	ingresses: Option<Store<Ingress>>,
-	dynamic: Vec<DynKind>,
-	/// Resources found by discovery, by kind (for status patches).
-	pub resources: Vec<(&'static str, ApiResource)>,
+	/// The watched dynamic kinds and their resources (found by discovery; for status patches).
+	dynamic: RwLock<Vec<(DynKind, ApiResource)>>,
+	/// Whether Traefik's kinds are wanted (migration).
+	migration: bool,
 }
 
 /// Traefik's CRDs read for migration.
@@ -99,11 +100,25 @@ impl Cache {
 	/// `migration`: also watch Ingress and Traefik's CRDs.
 	pub async fn start(client: &kube::Client, own_ns: &str, migration: bool) -> anyhow::Result<Cache> {
 		let changed = Arc::new(Notify::new());
-		let mut dynamic = vec![];
-		let mut resources = vec![];
-		let groups = discover(client).await?;
+		let cache = Cache {
+			services: spawn_watch(Api::all(client.clone()), changed.clone(), "Service"),
+			slices: spawn_watch(Api::all(client.clone()), changed.clone(), "EndpointSlice"),
+			secrets: spawn_watch(Api::all(client.clone()), changed.clone(), "Secret"),
+			namespaces: spawn_watch(Api::all(client.clone()), changed.clone(), "Namespace"),
+			pods: spawn_pod_watch(client, own_ns, changed.clone()),
+			ingresses: migration.then(|| spawn_watch(Api::all(client.clone()), changed.clone(), "Ingress")),
+			dynamic: RwLock::new(vec![]),
+			migration,
+			changed,
+		};
+		cache.rediscover(client, true).await?;
+		Ok(cache)
+	}
+
+	/// The (group, kind) pairs to watch, given what the API server serves.
+	fn wanted(&self, groups: &[(String, String, ApiResource)]) -> Vec<(&'static str, &'static str)> {
 		let mut kinds: Vec<(&'static str, &'static str)> = DYNAMIC_KINDS.to_vec();
-		if migration {
+		if self.migration {
 			for kind in TRAEFIK_KINDS {
 				// traefik.io, else the older traefik.containo.us
 				let group = crate::k8s::traefik::GROUPS
@@ -114,29 +129,38 @@ impl Cache {
 				kinds.push((group, kind));
 			}
 		}
-		for &(group, kind) in &kinds {
+		kinds
+	}
+
+	/// Starts watching the wanted kinds the API server serves now and that are not
+	/// watched yet (CRDs installed after the controller started). `first`: log
+	/// the kinds that are missing.
+	pub async fn rediscover(&self, client: &kube::Client, first: bool) -> anyhow::Result<()> {
+		let groups = discover(client).await?;
+		let mut added = false;
+		for (group, kind) in self.wanted(&groups) {
+			if self.dynamic.read().unwrap().iter().any(|(d, _)| d.kind == kind) {
+				continue;
+			}
 			match groups.iter().find(|(g, k, _)| g == group && k == kind) {
 				Some((_, _, ar)) => {
 					info!(kind, version = %ar.version, "watching");
-					let store = spawn_dyn_watch(client, ar, changed.clone());
-					dynamic.push(DynKind { kind, store });
-					resources.push((kind, ar.clone()));
+					let store = spawn_dyn_watch(client, ar, self.changed.clone());
+					if !first {
+						// a new kind: render once it has listed
+						let _ = store.wait_until_ready().await;
+					}
+					self.dynamic.write().unwrap().push((DynKind { kind, store }, ar.clone()));
+					added = true;
 				}
-				None => warn!(group, kind, "not served by the API server (CRD not installed); not watched"),
+				None if first => warn!(group, kind, "not served by the API server (CRD not installed); looked for again later"),
+				None => {}
 			}
 		}
-		let cache = Cache {
-			services: spawn_watch(Api::all(client.clone()), changed.clone(), "Service"),
-			slices: spawn_watch(Api::all(client.clone()), changed.clone(), "EndpointSlice"),
-			secrets: spawn_watch(Api::all(client.clone()), changed.clone(), "Secret"),
-			namespaces: spawn_watch(Api::all(client.clone()), changed.clone(), "Namespace"),
-			pods: spawn_pod_watch(client, own_ns, changed.clone()),
-			ingresses: migration.then(|| spawn_watch(Api::all(client.clone()), changed.clone(), "Ingress")),
-			dynamic,
-			resources,
-			changed,
-		};
-		Ok(cache)
+		if added && !first {
+			self.changed.notify_one();
+		}
+		Ok(())
 	}
 
 	/// Waits until every watch has listed once.
@@ -149,13 +173,14 @@ impl Cache {
 		if let Some(i) = &self.ingresses {
 			let _ = i.wait_until_ready().await;
 		}
-		for d in &self.dynamic {
-			let _ = d.store.wait_until_ready().await;
+		let stores: Vec<Store<DynamicObject>> = self.dynamic.read().unwrap().iter().map(|(d, _)| d.store.clone()).collect();
+		for s in stores {
+			let _ = s.wait_until_ready().await;
 		}
 	}
 
-	pub fn resource(&self, kind: &str) -> Option<&ApiResource> {
-		self.resources.iter().find(|(k, _)| *k == kind).map(|(_, ar)| ar)
+	pub fn resource(&self, kind: &str) -> Option<ApiResource> {
+		self.dynamic.read().unwrap().iter().find(|(d, _)| d.kind == kind).map(|(_, ar)| ar.clone())
 	}
 
 	/// Everything as it is now.
@@ -179,14 +204,13 @@ impl Cache {
 		for n in self.namespaces.state() {
 			w.namespaces.insert(n.metadata.name.clone().unwrap_or_default(), n.metadata.labels.clone().unwrap_or_default());
 		}
-		for d in &self.dynamic {
+		for (d, ar) in self.dynamic.read().unwrap().iter() {
 			for o in d.store.state() {
 				let mut v = match serde_json::to_value(&*o) {
 					Ok(v) => v,
 					Err(_) => continue,
 				};
 				// the dynamic object's type information comes from the store
-				let ar = self.resource(d.kind).expect("watched kinds have a resource");
 				v["apiVersion"] = ar.api_version.clone().into();
 				v["kind"] = ar.kind.clone().into();
 				if let Err(e) = w.insert(v) {

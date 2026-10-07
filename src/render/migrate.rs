@@ -804,6 +804,18 @@ fn port_value(p: &k8s_openapi::api::networking::v1::ServiceBackendPort) -> Optio
 	p.number.map(|n| json!(n)).or_else(|| p.name.clone().map(Value::String))
 }
 
+/// The Ingresses read into the rule set (those of `settings.ingress_class`).
+pub fn handled_ingresses<'a>(world: &'a World, settings: &Settings) -> Vec<&'a Ingress> {
+	world.migration.ingresses.iter().filter(|i| ingress_class(i).as_deref() == Some(settings.ingress_class.as_str())).collect()
+}
+
+/// An Ingress's `status.loadBalancer.ingress` for the Gateway's addresses ((type, value)).
+pub fn ingress_status(addresses: &[(String, String)]) -> Value {
+	let entries: Vec<Value> =
+		addresses.iter().map(|(kind, value)| if kind == "Hostname" { json!({"hostname": value}) } else { json!({"ip": value}) }).collect();
+	json!({"loadBalancer": {"ingress": entries}})
+}
+
 fn ingress_class(i: &Ingress) -> Option<String> {
 	i.spec
 		.as_ref()

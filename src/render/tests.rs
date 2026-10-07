@@ -893,3 +893,25 @@ spec:
 	assert!(p.parents.iter().all(|x| cond(&x.conds, "Accepted").status));
 	assert_eq!(p.listeners.iter().find(|l| l.name == "pg").unwrap().attached, 2);
 }
+
+#[test]
+fn ingress_status_and_handled_ingresses() {
+	let w = world(
+		r#"
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: {name: mine, namespace: default}
+spec: {ingressClassName: rproxy}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: {name: theirs, namespace: default}
+spec: {ingressClassName: nginx}
+"#,
+	);
+	let m = migrate_opts().migration.unwrap();
+	let names: Vec<_> = migrate::handled_ingresses(&w, &m).iter().map(|i| i.metadata.name.clone().unwrap()).collect();
+	assert_eq!(names, ["mine"]);
+	let v = migrate::ingress_status(&[("IPAddress".into(), "10.0.0.1".into()), ("Hostname".into(), "lb.example.com".into())]);
+	assert_eq!(v, json!({"loadBalancer": {"ingress": [{"ip": "10.0.0.1"}, {"hostname": "lb.example.com"}]}}));
+}
