@@ -184,6 +184,17 @@ pub struct ListenerPlan {
 	pub servable: bool,
 }
 
+/// A ListenerSet's status (for the Gateway it names).
+#[derive(Clone, Debug)]
+pub struct ListenerSetPlan {
+	pub namespace: String,
+	pub name: String,
+	pub generation: i64,
+	/// `Accepted` (`Programmed` comes from rproxy's answer).
+	pub accepted: Cond,
+	pub listeners: Vec<ListenerPlan>,
+}
+
 /// Everything about one Gateway.
 #[derive(Clone, Debug, Default)]
 pub struct GatewayPlan {
@@ -212,6 +223,10 @@ pub struct GatewayPlan {
 	pub addresses: Vec<String>,
 	/// Why an address of `spec.addresses` cannot be used (`Programmed: False`, `AddressNotUsable`).
 	pub address_error: Option<String>,
+	/// The ListenerSets naming this Gateway (attached or not).
+	pub listener_sets: Vec<ListenerSetPlan>,
+	/// `status.attachedListenerSets`.
+	pub attached_listener_sets: i32,
 }
 
 impl GatewayPlan {
@@ -355,8 +370,20 @@ impl Family {
 	}
 }
 
+/// Whose listener: the Gateway's own, or a ListenerSet's (index into the Gateway's attached sets).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Owner {
+	Gateway,
+	Set(usize),
+}
+
 struct ListenerState<'a> {
 	l: &'a Listener,
+	owner: Owner,
+	/// The owner's namespace (references and `allowedRoutes` `Same` are relative to it).
+	ns: String,
+	/// A name unique across the Gateway and its ListenerSets (rproxy route names).
+	label: String,
 	port: u16,
 	family: Option<Family>,
 	conds: Vec<Cond>,
@@ -385,10 +412,51 @@ pub fn refers_to(parent: &ParentReference, route_ns: &str, gw_ns: &str, gw_name:
 		&& parent.name == gw_name
 }
 
+/// Whether a ListenerSet names the Gateway `gw_ns/gw_name` as its parent.
+fn set_refers_to(ls: &crate::k8s::gateway::ListenerSet, gw_ns: &str, gw_name: &str) -> bool {
+	let p = &ls.spec.parent_ref;
+	let ls_ns = ls.metadata.namespace.as_deref().unwrap_or_default();
+	p.group.as_deref().unwrap_or(GROUP) == GROUP
+		&& p.kind.as_deref().unwrap_or("Gateway") == "Gateway"
+		&& p.namespace.as_deref().unwrap_or(ls_ns) == gw_ns
+		&& p.name == gw_name
+}
+
+/// Whether the Gateway's `allowedListeners` lets a ListenerSet in `ns` attach (none by default).
+fn set_allowed(world: &World, gw: &Gateway, ns: &str) -> bool {
+	let n = gw.spec.allowed_listeners.as_ref().and_then(|a| a.namespaces.as_ref());
+	match n.and_then(|n| n.from.as_deref()).unwrap_or("None") {
+		"All" => true,
+		"Same" => gw.metadata.namespace.as_deref() == Some(ns),
+		"Selector" => n.and_then(|n| n.selector.as_ref()).is_some_and(|s| world.namespace_matches(ns, s)),
+		_ => false,
+	}
+}
+
+/// What a route's parent reference names: the Gateway, one of its attached ListenerSets, or neither.
+fn parent_owner(
+	p: &ParentReference,
+	route_ns: &str,
+	gw_ns: &str,
+	gw_name: &str,
+	sets: &[&crate::k8s::gateway::ListenerSet],
+) -> Option<Owner> {
+	if refers_to(p, route_ns, gw_ns, gw_name) {
+		return Some(Owner::Gateway);
+	}
+	if p.group.as_deref().unwrap_or(GROUP) != GROUP || p.kind.as_deref() != Some("ListenerSet") {
+		return None;
+	}
+	let ns = p.namespace.as_deref().unwrap_or(route_ns);
+	sets.iter()
+		.position(|ls| ls.metadata.namespace.as_deref() == Some(ns) && ls.metadata.name.as_deref() == Some(p.name.as_str()))
+		.map(Owner::Set)
+}
+
 /// A certificate Secret → files, or why not.
 fn certificate(
 	world: &World,
-	gw_ns: &str,
+	from: (&str, &str),
 	r: &crate::k8s::gateway::SecretObjectReference,
 	files: &mut BTreeMap<String, Vec<u8>>,
 	opts: &Options,
@@ -399,8 +467,9 @@ fn certificate(
 	if !group.is_empty() || kind != "Secret" {
 		return Err(bad("InvalidCertificateRef", format!("certificateRef {group}/{kind} {}: only Secrets are supported", r.name)));
 	}
-	let ns = r.namespace.as_deref().unwrap_or(gw_ns);
-	if !world.granted((GROUP, "Gateway", gw_ns), ("", "Secret", ns, &r.name)) {
+	let (from_kind, from_ns) = from;
+	let ns = r.namespace.as_deref().unwrap_or(from_ns);
+	if !world.granted((GROUP, from_kind, from_ns), ("", "Secret", ns, &r.name)) {
 		return Err(bad("RefNotPermitted", format!("Secret {ns}/{}: no ReferenceGrant allows the reference", r.name)));
 	}
 	let Some(secret) = world.secrets.get(&(ns.to_string(), r.name.clone())) else {
@@ -424,16 +493,30 @@ pub fn cert_files(crt: &[u8], key: &[u8], files: &mut BTreeMap<String, Vec<u8>>,
 	(format!("{}/{id}.crt", opts.cert_dir), format!("{}/{id}.key", opts.cert_dir))
 }
 
+/// Where a listener comes from: its owner, the owner's kind and namespace (for
+/// ReferenceGrants), and its unique label.
+struct Origin {
+	owner: Owner,
+	kind: &'static str,
+	ns: String,
+	label: String,
+}
+
 fn validate_listener<'a>(
 	world: &World,
 	gw: &Gateway,
 	l: &'a Listener,
+	origin: Origin,
 	files: &mut BTreeMap<String, Vec<u8>>,
 	opts: &Options,
 ) -> ListenerState<'a> {
 	let gw_ns = gw.metadata.namespace.as_deref().unwrap_or_default();
+	let from = (origin.kind, origin.ns.clone());
 	let mut st = ListenerState {
 		l,
+		owner: origin.owner,
+		ns: origin.ns,
+		label: origin.label,
 		port: u16::try_from(l.port).unwrap_or(0),
 		family: None,
 		conds: vec![],
@@ -492,7 +575,7 @@ fn validate_listener<'a>(
 	if matches!(family, Family::Https | Family::TlsTerminate) {
 		let tls = l.tls.clone().unwrap_or_default();
 		for r in &tls.certificate_refs {
-			match certificate(world, gw_ns, r, files, opts) {
+			match certificate(world, (from.0, &from.1), r, files, opts) {
 				Ok(pair) => {
 					if !st.certs.contains(&pair) {
 						st.certs.push(pair);
@@ -640,7 +723,7 @@ fn conflicts(listeners: &mut [ListenerState]) {
 }
 
 /// Whether a route of `kind` in `route_ns` may attach to `st`: `Err(reason)` if not.
-fn allowed(world: &World, gw_ns: &str, st: &ListenerState, kind: RouteKind, route_ns: &str) -> Result<(), &'static str> {
+fn allowed(world: &World, st: &ListenerState, kind: RouteKind, route_ns: &str) -> Result<(), &'static str> {
 	if !st.supported_kinds.iter().any(|k| k.kind == kind.kind()) {
 		return Err("NotAllowedByListeners");
 	}
@@ -648,7 +731,7 @@ fn allowed(world: &World, gw_ns: &str, st: &ListenerState, kind: RouteKind, rout
 	let ok = match ns.and_then(|n| n.from.as_deref()).unwrap_or("Same") {
 		"All" => true,
 		"Selector" => ns.and_then(|n| n.selector.as_ref()).is_some_and(|s| world.namespace_matches(route_ns, s)),
-		_ => route_ns == gw_ns,
+		_ => route_ns == st.ns,
 	};
 	if ok { Ok(()) } else { Err("NotAllowedByListeners") }
 }
@@ -724,17 +807,55 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 		..Default::default()
 	};
 	let mut files = BTreeMap::new();
-	let mut listeners: Vec<ListenerState> = gw.spec.listeners.iter().map(|l| validate_listener(world, gw, l, &mut files, opts)).collect();
+	// ListenerSets naming this Gateway, in precedence order (oldest, then namespace/name)
+	let mut named: Vec<&crate::k8s::gateway::ListenerSet> =
+		world.listener_sets.iter().filter(|ls| set_refers_to(ls, &gw_ns, &gw_name)).collect();
+	named.sort_by_key(|ls| {
+		(ls.metadata.creation_timestamp.as_ref().map(|t| t.0.to_string()), ls.metadata.namespace.clone(), ls.metadata.name.clone())
+	});
+	let (sets, refused): (Vec<_>, Vec<_>) =
+		named.into_iter().partition(|ls| set_allowed(world, gw, ls.metadata.namespace.as_deref().unwrap_or_default()));
+	for ls in refused {
+		plan.listener_sets.push(ListenerSetPlan {
+			namespace: ls.metadata.namespace.clone().unwrap_or_default(),
+			name: ls.metadata.name.clone().unwrap_or_default(),
+			generation: ls.metadata.generation.unwrap_or(0),
+			accepted: Cond::new("Accepted", false, "NotAllowed", "the Gateway's allowedListeners does not allow this ListenerSet"),
+			listeners: vec![],
+		});
+	}
+	// the Gateway's listeners first, then the ListenerSets' (earlier ones win conflicts)
+	let mut listeners: Vec<ListenerState> = gw
+		.spec
+		.listeners
+		.iter()
+		.map(|l| {
+			let origin = Origin { owner: Owner::Gateway, kind: "Gateway", ns: gw_ns.clone(), label: l.name.clone() };
+			validate_listener(world, gw, l, origin, &mut files, opts)
+		})
+		.collect();
+	for (si, ls) in sets.iter().enumerate() {
+		let ls_ns = ls.metadata.namespace.clone().unwrap_or_default();
+		let ls_name = ls.metadata.name.clone().unwrap_or_default();
+		for l in &ls.spec.listeners {
+			let origin = Origin { owner: Owner::Set(si), kind: "ListenerSet", ns: ls_ns.clone(), label: format!("{ls_name}/{}", l.name) };
+			listeners.push(validate_listener(world, gw, l, origin, &mut files, opts));
+		}
+	}
 	conflicts(&mut listeners);
 
 	// attach routes
 	let mut attachments: Vec<Attachment> = vec![];
+	// the owner each entry of plan.parents names
+	let mut owners: Vec<Owner> = vec![];
 	for r in routes(world) {
 		let rns = r.meta.namespace.clone().unwrap_or_default();
-		for p in r.parent_refs.iter().filter(|p| refers_to(p, &rns, &gw_ns, &gw_name)) {
-			let accepted = attach(world, &gw_ns, &mut listeners, p, r.kind, &rns, r.hostnames, |li, hosts| {
+		for p in r.parent_refs {
+			let Some(owner) = parent_owner(p, &rns, &gw_ns, &gw_name, &sets) else { continue };
+			let accepted = attach(world, &mut listeners, owner, p, r.kind, &rns, r.hostnames, |li, hosts| {
 				attachments.push(Attachment { kind: r.kind, route: r.index, listener: li, hosts })
 			});
+			owners.push(owner);
 			plan.parents.push(ParentStatus {
 				kind: r.kind,
 				namespace: rns.clone(),
@@ -836,7 +957,7 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 				if several {
 					// one rproxy route per listener: names stay unique
 					for e in &mut out.entries {
-						e.route.name = format!("{}@{}", e.route.name, listeners[a.listener].l.name);
+						e.route.name = format!("{}@{}", e.route.name, listeners[a.listener].label);
 					}
 				}
 				let entry = results.entry((RouteKind::Http, a.route)).or_insert((None, None));
@@ -923,10 +1044,10 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 				RouteKind::Http => &world.http_routes[ri].metadata,
 				k => &l4_route(world, k, ri).metadata,
 			};
-			for p in plan.parents.iter_mut().filter(|p| {
+			for (p, owner) in plan.parents.iter_mut().zip(&owners).filter(|(p, _)| {
 				p.kind == kind && Some(&p.namespace) == route_meta.namespace.as_ref() && Some(&p.name) == route_meta.name.as_ref()
 			}) {
-				if listeners_for(&listeners, &p.parent_ref).contains(&li) {
+				if listeners_for(&listeners, *owner, &p.parent_ref).contains(&li) {
 					p.rule_keys.insert(key.clone());
 				}
 			}
@@ -991,7 +1112,11 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 	}
 
 	// rproxy's own resources
-	let by_name: BTreeMap<String, String> = listener_keys.iter().map(|(i, k)| (listeners[*i].l.name.clone(), k.clone())).collect();
+	let by_name: BTreeMap<String, String> = listener_keys
+		.iter()
+		.filter(|(i, _)| listeners[**i].owner == Owner::Gateway)
+		.map(|(i, k)| (listeners[*i].l.name.clone(), k.clone()))
+		.collect();
 	plan.policies = policy::apply(
 		world,
 		gw,
@@ -1003,23 +1128,38 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 	plan.raw = raw;
 	plan.raw_status = raw_status;
 
-	plan.listeners = listeners
-		.iter()
-		.enumerate()
-		.map(|(i, st)| ListenerPlan {
-			name: st.l.name.clone(),
-			supported_kinds: st.supported_kinds.clone(),
-			attached: st.attached,
-			conds: st.conds.clone(),
-			rule_key: listener_keys.get(&i).cloned(),
-			servable: st.accepted && !st.unservable,
-		})
-		.collect();
+	let listener_plan = |(i, st): (usize, &ListenerState)| ListenerPlan {
+		name: st.l.name.clone(),
+		supported_kinds: st.supported_kinds.clone(),
+		attached: st.attached,
+		conds: st.conds.clone(),
+		rule_key: listener_keys.get(&i).cloned(),
+		servable: st.accepted && !st.unservable,
+	};
+	plan.listeners = listeners.iter().enumerate().filter(|(_, st)| st.owner == Owner::Gateway).map(listener_plan).collect();
+	for (si, ls) in sets.iter().enumerate() {
+		let mine: Vec<ListenerPlan> =
+			listeners.iter().enumerate().filter(|(_, st)| st.owner == Owner::Set(si)).map(listener_plan).collect();
+		// accepted with at least one valid listener
+		let accepted = if mine.iter().any(|l| status::get(&l.conds, "Accepted").is_some_and(|c| c.status)) {
+			Cond::ok("Accepted", "Accepted")
+		} else {
+			Cond::new("Accepted", false, "ListenersNotValid", "no listener of the ListenerSet is valid")
+		};
+		plan.listener_sets.push(ListenerSetPlan {
+			namespace: ls.metadata.namespace.clone().unwrap_or_default(),
+			name: ls.metadata.name.clone().unwrap_or_default(),
+			generation: ls.metadata.generation.unwrap_or(0),
+			accepted,
+			listeners: mine,
+		});
+	}
 	// Service ports: every listener that can be served, with or without a rule yet
 	plan.listener_ports =
 		listeners.iter().filter(|l| l.accepted && !l.unservable).filter_map(|l| l.family.map(|f| (f.protocol(), l.port))).collect();
-	let any = listeners.iter().any(|l| l.accepted);
-	let all = listeners.iter().all(|l| l.accepted);
+	let own: Vec<&ListenerState> = listeners.iter().filter(|l| l.owner == Owner::Gateway).collect();
+	let any = own.iter().any(|l| l.accepted);
+	let all = own.iter().all(|l| l.accepted);
 	let addresses = gateway_addresses(gw);
 	let params = gw.spec.infrastructure.as_ref().and_then(|i| i.parameters_ref.as_ref());
 	plan.conds.push(if let Some(p) = params {
@@ -1027,7 +1167,7 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 		Cond::new("Accepted", false, "InvalidParameters", format!("parametersRef {}/{} {}: not supported", p.group, p.kind, p.name))
 	} else if let Err(e) = &addresses {
 		Cond::new("Accepted", false, "UnsupportedAddress", e.clone())
-	} else if listeners.is_empty() || all {
+	} else if own.is_empty() || all {
 		Cond::ok("Accepted", "Accepted")
 	} else if any {
 		Cond::new("Accepted", true, "ListenersNotValid", "some listeners are not valid")
@@ -1038,6 +1178,12 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 		plan.addresses = ips;
 		plan.address_error = unusable;
 	}
+	if !plan.accepted() {
+		for ls in plan.listener_sets.iter_mut().filter(|ls| ls.accepted.status) {
+			ls.accepted = Cond::new("Accepted", false, "ParentNotAccepted", "the Gateway is not accepted");
+		}
+	}
+	plan.attached_listener_sets = plan.listener_sets.iter().filter(|ls| ls.accepted.status).count() as i32;
 	// client certificates not enforced somewhere (rproxy does not ask for them then)
 	let frontend = gw.spec.tls.as_ref().and_then(|t| t.frontend.as_ref());
 	let insecure = frontend.is_some_and(|f| {
@@ -1091,10 +1237,11 @@ fn new_rule(protocol: rp::Protocol, port: u16, opts: &Options) -> rp::Rule {
 }
 
 /// The listeners a parent reference names (by section name and port).
-fn listeners_for(listeners: &[ListenerState], p: &ParentReference) -> Vec<usize> {
+fn listeners_for(listeners: &[ListenerState], owner: Owner, p: &ParentReference) -> Vec<usize> {
 	listeners
 		.iter()
 		.enumerate()
+		.filter(|(_, st)| st.owner == owner)
 		.filter(|(_, st)| p.section_name.as_deref().is_none_or(|s| s == st.l.name) && p.port.is_none_or(|port| i32::from(st.port) == port))
 		.map(|(i, _)| i)
 		.collect()
@@ -1104,15 +1251,15 @@ fn listeners_for(listeners: &[ListenerState], p: &ParentReference) -> Vec<usize>
 #[allow(clippy::too_many_arguments)]
 fn attach(
 	world: &World,
-	gw_ns: &str,
 	listeners: &mut [ListenerState],
+	owner: Owner,
 	p: &ParentReference,
 	kind: RouteKind,
 	route_ns: &str,
 	hostnames: &[String],
 	mut add: impl FnMut(usize, Option<Vec<String>>),
 ) -> Cond {
-	let candidates = listeners_for(listeners, p);
+	let candidates = listeners_for(listeners, owner, p);
 	if candidates.is_empty() {
 		return Cond::new("Accepted", false, "NoMatchingParent", "no listener matches the parentRef's sectionName and port");
 	}
@@ -1123,7 +1270,7 @@ fn attach(
 		if !st.accepted {
 			continue;
 		}
-		if let Err(r) = allowed(world, gw_ns, st, kind, route_ns) {
+		if let Err(r) = allowed(world, st, kind, route_ns) {
 			reason = r;
 			continue;
 		}

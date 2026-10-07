@@ -1116,3 +1116,84 @@ spec:
 	assert!(cond(&l("f").conds, "Accepted").status, "HTTP listeners are not affected");
 	assert!(cond(&l("a").conds, "ResolvedRefs").status);
 }
+
+#[test]
+fn listener_sets() {
+	let yaml = format!(
+		r#"{BASE}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {{name: gw, namespace: default}}
+spec:
+  gatewayClassName: rproxy
+  allowedListeners: {{namespaces: {{from: Same}}}}
+  listeners:
+    - {{name: main, port: 80, protocol: HTTP, hostname: gw.example.com}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ListenerSet
+metadata: {{name: ls1, namespace: default, creationTimestamp: "2026-01-01T00:00:00Z"}}
+spec:
+  parentRef: {{name: gw}}
+  listeners:
+    - {{name: main, port: 80, protocol: HTTP, hostname: one.example.com}}
+    - {{name: clash, port: 80, protocol: HTTP, hostname: gw.example.com}}
+    - {{name: tcp, port: 80, protocol: TCP}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ListenerSet
+metadata: {{name: ls2, namespace: default, creationTimestamp: "2026-01-02T00:00:00Z"}}
+spec:
+  parentRef: {{name: gw}}
+  listeners:
+    - {{name: only, port: 80, protocol: HTTP, hostname: one.example.com}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ListenerSet
+metadata: {{name: far, namespace: other}}
+spec:
+  parentRef: {{name: gw, namespace: default}}
+  listeners: [{{name: x, port: 8080, protocol: HTTP}}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {{name: to-set, namespace: default}}
+spec:
+  parentRefs:
+    - {{kind: ListenerSet, group: gateway.networking.k8s.io, name: ls1, sectionName: main}}
+    - {{kind: ListenerSet, group: gateway.networking.k8s.io, name: ls1, sectionName: missing}}
+  rules: [{{backendRefs: [{{name: web, port: 80}}]}}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {{name: to-gateway, namespace: default}}
+spec:
+  parentRefs: [{{name: gw}}]
+  rules: [{{backendRefs: [{{name: web, port: 80}}]}}]
+"#
+	);
+	let p = plan(&yaml);
+	assert_eq!(p.listeners.len(), 1, "the Gateway's status has its own listeners only");
+	assert_eq!(p.attached_listener_sets, 1, "ls1 (ls2 has no valid listener, far is not allowed)");
+	let set = |n: &str| p.listener_sets.iter().find(|s| s.name == n).unwrap();
+	assert_eq!(set("far").accepted.reason, "NotAllowed");
+	assert!(set("ls1").accepted.status);
+	let l = |s: &str, n: &str| set(s).listeners.iter().find(|x| x.name == n).unwrap().clone();
+	assert_eq!(cond(&l("ls1", "clash").conds, "Conflicted").reason, "HostnameConflict", "the Gateway's listener wins");
+	assert_eq!(cond(&l("ls1", "tcp").conds, "Conflicted").reason, "ProtocolConflict");
+	assert!(cond(&l("ls1", "main").conds, "Accepted").status);
+	assert_eq!(cond(&l("ls2", "only").conds, "Conflicted").reason, "HostnameConflict", "the older ListenerSet wins");
+	assert_eq!((set("ls2").accepted.status, set("ls2").accepted.reason.as_str()), (false, "ListenersNotValid"));
+	// routes: through the ListenerSet to its listener only; through the Gateway to the Gateway's
+	assert_eq!(l("ls1", "main").attached, 1);
+	assert_eq!(p.listeners[0].attached, 1);
+	let parents: Vec<_> = p.parents.iter().filter(|x| x.name == "to-set").collect();
+	assert_eq!(parents.len(), 2);
+	assert!(cond(&parents[0].conds, "Accepted").status);
+	assert_eq!(cond(&parents[1].conds, "Accepted").reason, "NoMatchingParent");
+	let http = &p.rules_json()[0]["http"];
+	let rules: Vec<String> = http["routes"].as_array().unwrap().iter().map(|r| r["match"].as_str().unwrap().to_string()).collect();
+	assert!(rules.iter().any(|r| r.contains("Host(`one.example.com`)")), "{rules:?}");
+	assert!(rules.iter().any(|r| r.contains("Host(`gw.example.com`)")), "{rules:?}");
+}

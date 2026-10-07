@@ -7,7 +7,7 @@ use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 
 use crate::k8s::crd::{RproxyMiddleware, RproxyPolicy, RproxyRule};
-use crate::k8s::gateway::{Gateway, GatewayClass, HttpRoute, L4Route, ReferenceGrant};
+use crate::k8s::gateway::{Gateway, GatewayClass, HttpRoute, L4Route, ListenerSet, ReferenceGrant};
 use crate::render::migrate::MigrationInput;
 
 /// (namespace, name)
@@ -21,6 +21,7 @@ pub fn key(meta: &ObjectMeta) -> Key {
 pub struct World {
 	pub classes: Vec<GatewayClass>,
 	pub gateways: Vec<Gateway>,
+	pub listener_sets: Vec<ListenerSet>,
 	pub http_routes: Vec<HttpRoute>,
 	pub tls_routes: Vec<L4Route>,
 	pub tcp_routes: Vec<L4Route>,

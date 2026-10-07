@@ -19,6 +19,7 @@ impl World {
 		match (group, kind.as_str()) {
 			(crate::k8s::gateway::GROUP, "GatewayClass") => self.classes.push(serde_json::from_value(obj).map_err(err)?),
 			(crate::k8s::gateway::GROUP, "Gateway") => self.gateways.push(serde_json::from_value(obj).map_err(err)?),
+			(crate::k8s::gateway::GROUP, "ListenerSet") => self.listener_sets.push(serde_json::from_value(obj).map_err(err)?),
 			(crate::k8s::gateway::GROUP, "HTTPRoute") => self.http_routes.push(serde_json::from_value(obj).map_err(err)?),
 			(crate::k8s::gateway::GROUP, "TLSRoute") => self.tls_routes.push(serde_json::from_value(obj).map_err(err)?),
 			(crate::k8s::gateway::GROUP, "TCPRoute") => self.tcp_routes.push(serde_json::from_value(obj).map_err(err)?),
