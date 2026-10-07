@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use k8s_openapi::api::core::v1::{Secret, Service};
+use k8s_openapi::api::core::v1::{ConfigMap, Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 
@@ -30,6 +30,8 @@ pub struct World {
 	/// Keyed by (namespace, Service name).
 	pub slices: BTreeMap<Key, Vec<EndpointSlice>>,
 	pub secrets: BTreeMap<Key, Secret>,
+	/// ConfigMaps with a `ca.crt` (CA certificates).
+	pub config_maps: BTreeMap<Key, ConfigMap>,
 	/// Namespace labels.
 	pub namespaces: BTreeMap<String, BTreeMap<String, String>>,
 	pub middlewares: BTreeMap<Key, RproxyMiddleware>,

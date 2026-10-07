@@ -1038,3 +1038,81 @@ fn gateway_addresses_and_parameters() {
 	let p = with("  infrastructure: {labels: {a: b}, annotations: {c: d}}\n");
 	assert!(p.accepted());
 }
+
+#[test]
+fn frontend_client_certificate_validation() {
+	let (crt, key) = crate::pem::tests::pair("example.com");
+	let (ca, _) = crate::pem::tests::pair("clients");
+	let yaml = format!(
+		r#"{BASE}
+---
+apiVersion: v1
+kind: Secret
+metadata: {{name: cert, namespace: default}}
+stringData:
+  tls.crt: |
+{}
+  tls.key: |
+{}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {{name: ca, namespace: default}}
+data:
+  ca.crt: |
+{}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {{name: ca, namespace: other}}
+data:
+  ca.crt: |
+{}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {{name: gw, namespace: default}}
+spec:
+  gatewayClassName: rproxy
+  tls:
+    frontend:
+      default:
+        validation: {{caCertificateRefs: [{{kind: ConfigMap, group: "", name: ca}}]}}
+      perPort:
+        - {{port: 8443, tls: {{validation: {{caCertificateRefs: [{{kind: ConfigMap, name: missing}}]}}}}}}
+        - {{port: 9443, tls: {{validation: {{caCertificateRefs: [{{kind: Service, group: "", name: web}}]}}}}}}
+        - {{port: 10443, tls: {{validation: {{caCertificateRefs: [{{kind: ConfigMap, name: ca, namespace: other}}]}}}}}}
+        - {{port: 11443, tls: {{validation: {{caCertificateRefs: [{{kind: ConfigMap, name: ca}}], mode: AllowInsecureFallback}}}}}}
+  listeners:
+    - {{name: a, port: 443, protocol: HTTPS, tls: {{certificateRefs: [{{name: cert}}]}}}}
+    - {{name: b, port: 8443, protocol: HTTPS, tls: {{certificateRefs: [{{name: cert}}]}}}}
+    - {{name: c, port: 9443, protocol: HTTPS, tls: {{certificateRefs: [{{name: cert}}]}}}}
+    - {{name: d, port: 10443, protocol: HTTPS, tls: {{certificateRefs: [{{name: cert}}]}}}}
+    - {{name: e, port: 11443, protocol: HTTPS, tls: {{certificateRefs: [{{name: cert}}]}}}}
+    - {{name: f, port: 80, protocol: HTTP}}
+"#,
+		indent(&crt),
+		indent(&key),
+		indent(&ca),
+		indent(&ca)
+	);
+	let p = plan(&yaml);
+	let l = |n: &str| p.listeners.iter().find(|x| x.name == n).unwrap();
+	let rules = p.rules_json();
+	let rule = |port: u16| rules.iter().find(|r| r["listen_port"] == port);
+	let auth = &rule(443).unwrap()["tls"]["client_auth"];
+	assert_eq!(auth["mode"], "required");
+	let file = auth["ca_file"].as_str().unwrap().rsplit('/').next().unwrap();
+	assert_eq!(String::from_utf8_lossy(&p.files[file]).trim(), ca.trim());
+	for (n, reason) in [("b", "InvalidCACertificateRef"), ("c", "InvalidCACertificateKind"), ("d", "RefNotPermitted")] {
+		assert_eq!(cond(&l(n).conds, "ResolvedRefs").reason, reason, "{n}");
+		let a = cond(&l(n).conds, "Accepted");
+		assert_eq!((a.status, a.reason.as_str()), (false, "NoValidCACertificate"), "{n}");
+	}
+	assert!(rule(8443).is_none() && rule(9443).is_none() && rule(10443).is_none());
+	// insecure fallback: no client certificate asked for, a condition on the Gateway
+	assert!(rule(11443).unwrap()["tls"].get("client_auth").is_none());
+	assert!(cond(&p.conds, "InsecureFrontendValidationMode").status);
+	assert!(cond(&l("f").conds, "Accepted").status, "HTTP listeners are not affected");
+	assert!(cond(&l("a").conds, "ResolvedRefs").status);
+}

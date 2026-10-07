@@ -17,8 +17,9 @@ rules:
     resources: [rproxypolicies/status, rproxyrules/status]
     verbs: [get, update, patch]
   # backends (EndpointSlices), certificates (Secrets), namespace selectors
+  # CA certificates (ConfigMaps with ca.crt: frontend client certificate validation, BackendTLSPolicy)
   - apiGroups: [""]
-    resources: [namespaces]
+    resources: [namespaces, configmaps]
     verbs: [get, list, watch]
   # managed mode: each Gateway's rproxy (Deployment, Service, ServiceAccount, its certificate and
   # control API Secrets) next to the Gateway, in the Gateway's namespace

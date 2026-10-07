@@ -8,7 +8,7 @@
 use std::sync::{Arc, RwLock};
 
 use futures::StreamExt;
-use k8s_openapi::api::core::v1::{Namespace, Pod, Secret, Service};
+use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Pod, Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::Ingress;
 use kube::api::{Api, DynamicObject};
@@ -32,6 +32,7 @@ pub struct Cache {
 	services: Store<Service>,
 	slices: Store<EndpointSlice>,
 	secrets: Store<Secret>,
+	config_maps: Store<ConfigMap>,
 	namespaces: Store<Namespace>,
 	pub pods: Store<Pod>,
 	ingresses: Option<Store<Ingress>>,
@@ -103,6 +104,7 @@ impl Cache {
 			services: spawn_watch(Api::all(client.clone()), changed.clone(), "Service"),
 			slices: spawn_watch(Api::all(client.clone()), changed.clone(), "EndpointSlice"),
 			secrets: spawn_watch(Api::all(client.clone()), changed.clone(), "Secret"),
+			config_maps: spawn_watch(Api::all(client.clone()), changed.clone(), "ConfigMap"),
 			namespaces: spawn_watch(Api::all(client.clone()), changed.clone(), "Namespace"),
 			pods: spawn_pod_watch(client, changed.clone()),
 			ingresses: migration.then(|| spawn_watch(Api::all(client.clone()), changed.clone(), "Ingress")),
@@ -167,6 +169,7 @@ impl Cache {
 		let _ = self.services.wait_until_ready().await;
 		let _ = self.slices.wait_until_ready().await;
 		let _ = self.secrets.wait_until_ready().await;
+		let _ = self.config_maps.wait_until_ready().await;
 		let _ = self.namespaces.wait_until_ready().await;
 		let _ = self.pods.wait_until_ready().await;
 		if let Some(i) = &self.ingresses {
@@ -195,6 +198,12 @@ impl Cache {
 			// only Secrets that can be certificates, to keep the snapshot small
 			if s.data.as_ref().is_some_and(|d| ["tls.crt", "ca.crt", "tls.ca", "users"].iter().any(|k| d.contains_key(*k))) {
 				w.secrets.insert(crate::render::world::key(&s.metadata), (*s).clone());
+			}
+		}
+		for c in self.config_maps.state() {
+			// CA certificates (frontend client certificate validation, BackendTLSPolicy)
+			if c.data.as_ref().is_some_and(|d| d.contains_key("ca.crt")) {
+				w.config_maps.insert(crate::render::world::key(&c.metadata), (*c).clone());
 			}
 		}
 		for i in self.ingresses.iter().flat_map(|s| s.state()) {
