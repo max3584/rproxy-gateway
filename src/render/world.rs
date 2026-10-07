@@ -23,6 +23,8 @@ pub struct World {
 	pub gateways: Vec<Gateway>,
 	pub listener_sets: Vec<ListenerSet>,
 	pub http_routes: Vec<HttpRoute>,
+	/// GRPCRoutes, as the HTTPRoutes they amount to (`GrpcRoute::to_http`).
+	pub grpc_routes: Vec<HttpRoute>,
 	pub tls_routes: Vec<L4Route>,
 	pub tcp_routes: Vec<L4Route>,
 	pub udp_routes: Vec<L4Route>,

@@ -99,6 +99,7 @@ rproxy runs with `RPROXY_API_ADDR=0.0.0.0`, `RPROXY_API_PORT=9443`, `RPROXY_TOKE
 | `retry` | `retry` (`attempts` is Gateway API's count + 1, `codes` become `status`, `backoff` `initial_interval`), the last middleware |
 | `ExtensionRef` (`RproxyMiddleware`) | that middleware (`spec` as it is) |
 | `timeouts.request` / `timeouts.backendRequest` | the route's `timeouts.request` / `timeouts.backend_request` |
+| GRPCRoute | Into the same `http` rule as HTTPRoutes on the port. A method match becomes a path match (`service` and `method`: `Path(/<service>/<method>)`; `service` only: `PathPrefix(/<service>/)`; `method` only or `RegularExpression`: `PathRegexp`). Header matches, filters (`RequestHeaderModifier`, `ResponseHeaderModifier`, `RequestMirror`, `ExtensionRef`) and backendRef filters as for HTTPRoute. h2c to the backends (the service's `protocol: h2c`). rproxy names start with `grpc:` |
 | Listener `TLS` (`tls.mode: Passthrough`) | a tcp rule, `tls.mode: sni`, `unmatched: reject`; `tls.routes` by TLSRoute host name |
 | `HTTPS` and `TLS` (Passthrough) on the same port | `tls.routes` (`passthrough: true`) of the `http` rule: only those names are not decrypted |
 | Listener `TLS` (`tls.mode: Terminate`) | a tcp rule, `tls.mode: terminate`, `tls.routes` by TLSRoute host name (those of Passthrough listeners on the same port with `passthrough: true`) |

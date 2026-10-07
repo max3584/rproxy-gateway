@@ -99,6 +99,7 @@ rproxy は `RPROXY_API_ADDR=0.0.0.0`、`RPROXY_API_PORT=9443`、`RPROXY_TOKEN_FI
 | `retry` | `retry`（`attempts` は Gateway API の回数 + 1、`codes` は `status`、`backoff` は `initial_interval`）。ミドルウェアの最後 |
 | `ExtensionRef`（`RproxyMiddleware`） | そのミドルウェア（`spec` をそのまま） |
 | `timeouts.request` / `timeouts.backendRequest` | ルートの `timeouts.request` / `timeouts.backend_request` |
+| GRPCRoute | 同じポートの HTTPRoute と同じ `http` のルールに。メソッドの一致はパスの一致にする（`service` と `method`：`Path(/<service>/<method>)`、`service` だけ：`PathPrefix(/<service>/)`、`method` だけ・`RegularExpression`：`PathRegexp`）。ヘッダの一致・フィルタ（`RequestHeaderModifier`・`ResponseHeaderModifier`・`RequestMirror`・`ExtensionRef`）・backendRef のフィルタは HTTPRoute と同じ。転送先とは h2c（サービスの `protocol: h2c`）。rproxy の名前は `grpc:` で始める |
 | リスナー `TLS`（`tls.mode: Passthrough`） | tcp のルール、`tls.mode: sni`、`unmatched: reject`。TLSRoute のホスト名ごとに `tls.routes` |
 | 同じポートの `HTTPS` と `TLS`（Passthrough） | `http` のルールの `tls.routes`（`passthrough: true`）。そのホスト名だけ復号しない |
 | リスナー `TLS`（`tls.mode: Terminate`） | tcp のルール、`tls.mode: terminate`、TLSRoute のホスト名ごとに `tls.routes`（同じポートの Passthrough のリスナーの分は `passthrough: true`） |

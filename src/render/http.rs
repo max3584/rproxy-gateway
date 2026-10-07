@@ -90,6 +90,41 @@ pub struct Output {
 	pub backends: BTreeMap<String, Vec<crate::render::world::Key>>,
 }
 
+impl Output {
+	/// Prefixes the names of everything it adds (routes, services, middlewares; the service and
+	/// middleware references follow), so two routes of different kinds with the same name do not clash.
+	pub fn prefix_names(&mut self, prefix: &str) {
+		let p = |n: &str| if n == RESPOND_500 { n.to_string() } else { format!("{prefix}{n}") };
+		for e in &mut self.entries {
+			e.route.name = p(&e.route.name);
+			e.route.service = e.route.service.as_deref().map(p);
+			e.route.middlewares = e.route.middlewares.iter().map(|m| p(m)).collect();
+		}
+		self.services = std::mem::take(&mut self.services)
+			.into_iter()
+			.map(|(k, mut v)| {
+				for srv in &mut v.servers {
+					srv.middlewares = srv.middlewares.iter().map(|m| p(m)).collect();
+				}
+				(p(&k), v)
+			})
+			.collect();
+		self.middlewares = std::mem::take(&mut self.middlewares)
+			.into_iter()
+			.map(|(k, mut v)| {
+				// a mirror names its service
+				if let Some(svc) = v.pointer_mut("/mirror/service") {
+					if let Some(s) = svc.as_str() {
+						*svc = Value::String(p(s));
+					}
+				}
+				(p(&k), v)
+			})
+			.collect();
+		self.backends = std::mem::take(&mut self.backends).into_iter().map(|(k, v)| (p(&k), v)).collect();
+	}
+}
+
 /// Quotes an argument of a `match` expression (backticks, or double quotes for a value with a backtick).
 fn quote(s: &str) -> Option<String> {
 	if !s.contains('`') {

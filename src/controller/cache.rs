@@ -50,6 +50,7 @@ pub const DYNAMIC_KINDS: &[(&str, &str)] = &[
 	(crate::k8s::gateway::GROUP, "GatewayClass"),
 	(crate::k8s::gateway::GROUP, "Gateway"),
 	(crate::k8s::gateway::GROUP, "HTTPRoute"),
+	(crate::k8s::gateway::GROUP, "GRPCRoute"),
 	(crate::k8s::gateway::GROUP, "TLSRoute"),
 	(crate::k8s::gateway::GROUP, "TCPRoute"),
 	(crate::k8s::gateway::GROUP, "UDPRoute"),

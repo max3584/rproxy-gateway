@@ -283,7 +283,7 @@ stringData: {{tls.crt: nope, tls.key: nope}}
   - {name: b, port: 443, protocol: HTTPS, hostname: b.example.com, tls: {certificateRefs: [{name: cert}]}}
   - {name: c, port: 8443, protocol: HTTPS, tls: {certificateRefs: [{name: broken}]}}
   - {name: d, port: 9443, protocol: HTTPS, tls: {certificateRefs: [{name: cert, namespace: other}]}}
-  - {name: e, port: 80, protocol: HTTP, allowedRoutes: {kinds: [{kind: GRPCRoute}]}}
+  - {name: e, port: 80, protocol: HTTP, allowedRoutes: {kinds: [{kind: TCPRoute}]}}
   - {name: f, port: 81, protocol: SCTP}
   - {name: g, port: 443, protocol: HTTP}"#)
 	);
@@ -1196,4 +1196,55 @@ spec:
 	let rules: Vec<String> = http["routes"].as_array().unwrap().iter().map(|r| r["match"].as_str().unwrap().to_string()).collect();
 	assert!(rules.iter().any(|r| r.contains("Host(`one.example.com`)")), "{rules:?}");
 	assert!(rules.iter().any(|r| r.contains("Host(`gw.example.com`)")), "{rules:?}");
+}
+
+#[test]
+fn grpc_routes() {
+	let yaml = format!(
+		"{BASE}{}{}",
+		gw("  - {name: http, port: 80, protocol: HTTP}"),
+		r#"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata: {name: grpc, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  hostnames: [grpc.example.com]
+  rules:
+    - matches: [{method: {service: echo.Echo, method: Hello}}]
+      filters: [{type: RequestHeaderModifier, requestHeaderModifier: {set: [{name: X-A, value: a}]}}]
+      backendRefs: [{name: web, port: 80}]
+    - matches: [{method: {service: echo.Echo}}, {method: {method: Bye}}, {method: {type: RegularExpression, service: "echo\\..*"}, headers: [{name: v, value: "2"}]}]
+      backendRefs: [{name: web, port: 80}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: grpc, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  hostnames: [web.example.com]
+  rules: [{backendRefs: [{name: web, port: 80}]}]
+"#
+	);
+	let p = plan(&yaml);
+	let grpc = p.parents.iter().find(|x| x.kind == RouteKind::Grpc).unwrap();
+	assert!(cond(&grpc.conds, "Accepted").status, "{:?}", grpc.conds);
+	assert_eq!(p.listeners[0].attached, 2);
+	let http = &p.rules_json()[0]["http"];
+	let routes = http["routes"].as_array().unwrap();
+	let m = |n: &str| routes.iter().find(|r| r["name"] == n).unwrap_or_else(|| panic!("{n}: {routes:#?}"))["match"].clone();
+	assert_eq!(m("grpc:default/grpc/r0/m0/h0"), "Host(`grpc.example.com`) && Path(`/echo.Echo/Hello`)");
+	assert_eq!(m("grpc:default/grpc/r1/m0/h0"), "Host(`grpc.example.com`) && (Path(`/echo.Echo`) || PathPrefix(`/echo.Echo/`))");
+	assert_eq!(m("grpc:default/grpc/r1/m1/h0"), "Host(`grpc.example.com`) && PathRegexp(`^(?:/[^/]+/Bye)$`)");
+	assert_eq!(
+		m("grpc:default/grpc/r1/m2/h0"),
+		"Host(`grpc.example.com`) && PathRegexp(`^(?:/(?:echo\\..*)/(?:[^/]+))$`) && Header(`v`, `2`)"
+	);
+	assert!(routes.iter().any(|r| r["name"] == "default/grpc/r0/m0/h0"), "the HTTPRoute of the same name stays apart");
+	// gRPC backends: HTTP/2 without TLS
+	assert_eq!(http["services"]["grpc:default/grpc/r0"]["protocol"], "h2c");
+	assert!(http["services"]["default/grpc/r0"].get("protocol").is_none());
+	let r0 = routes.iter().find(|r| r["name"] == "grpc:default/grpc/r0/m0/h0").unwrap();
+	assert!(http["middlewares"][r0["middlewares"][0].as_str().unwrap()]["headers"].is_object());
 }

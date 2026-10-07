@@ -21,6 +21,10 @@ impl World {
 			(crate::k8s::gateway::GROUP, "Gateway") => self.gateways.push(serde_json::from_value(obj).map_err(err)?),
 			(crate::k8s::gateway::GROUP, "ListenerSet") => self.listener_sets.push(serde_json::from_value(obj).map_err(err)?),
 			(crate::k8s::gateway::GROUP, "HTTPRoute") => self.http_routes.push(serde_json::from_value(obj).map_err(err)?),
+			(crate::k8s::gateway::GROUP, "GRPCRoute") => {
+				let g: crate::k8s::gateway::GrpcRoute = serde_json::from_value(obj).map_err(err)?;
+				self.grpc_routes.push(g.to_http());
+			}
 			(crate::k8s::gateway::GROUP, "TLSRoute") => self.tls_routes.push(serde_json::from_value(obj).map_err(err)?),
 			(crate::k8s::gateway::GROUP, "TCPRoute") => self.tcp_routes.push(serde_json::from_value(obj).map_err(err)?),
 			(crate::k8s::gateway::GROUP, "UDPRoute") => self.udp_routes.push(serde_json::from_value(obj).map_err(err)?),
