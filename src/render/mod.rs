@@ -698,6 +698,10 @@ fn conflicts(listeners: &mut [ListenerState]) {
 		let Some(b) = listeners[i].family else { continue };
 		for j in 0..i {
 			let Some(a) = listeners[j].family else { continue };
+			// a listener that lost a conflict itself takes nothing
+			if status::get(&listeners[j].conds, "Conflicted").is_some_and(|c| c.status) {
+				continue;
+			}
 			if listeners[j].port != listeners[i].port || a.protocol() != b.protocol() {
 				continue;
 			}
@@ -1148,8 +1152,8 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 	for (si, ls) in sets.iter().enumerate() {
 		let mine: Vec<ListenerPlan> =
 			listeners.iter().enumerate().filter(|(_, st)| st.owner == Owner::Set(si)).map(listener_plan).collect();
-		// accepted with at least one valid listener
-		let accepted = if mine.iter().any(|l| status::get(&l.conds, "Accepted").is_some_and(|c| c.status)) {
+		// accepted with at least one valid listener (accepted, with what it needs to be served)
+		let accepted = if mine.iter().any(|l| l.servable) {
 			Cond::ok("Accepted", "Accepted")
 		} else {
 			Cond::new("Accepted", false, "ListenersNotValid", "no listener of the ListenerSet is valid")
