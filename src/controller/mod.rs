@@ -20,6 +20,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::Context;
+use futures::StreamExt;
 use kube::api::{Api, DynamicObject, Patch, PatchParams};
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
@@ -100,6 +101,9 @@ const REDISCOVER: Duration = Duration::from_secs(30);
 
 /// Migration notes already logged (by digest), so each set is logged once.
 static NOTES_SEEN: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
+
+/// How many Gateways are brought up to date at once.
+const PARALLEL: usize = 16;
 
 /// What was last applied to a pod: (pod uid, set) → (hash of what was sent, etag rproxy answered).
 pub type Applied = HashMap<(String, String), (String, String, Vec<RuleView>)>;
@@ -290,7 +294,7 @@ async fn reconcile_all(
 		let (ns, name) = (gw.metadata.namespace.clone().unwrap_or_default(), gw.metadata.name.clone().unwrap_or_default());
 		let eps = match &cfg.mode {
 			Mode::Managed(_) => {
-				let id = provision::gateway_id(&ns, &name);
+				let id = provision::gateway_id(&ns, &name, gw.metadata.uid.as_deref().unwrap_or_default());
 				provision::pods(&pods_now, &ns, &[(provision::LABEL_GATEWAY.to_string(), id)].into())
 			}
 			Mode::Fleet(f) => provision::pods(&pods_now, &cfg.namespace, &provision::parse_selector(&f.selector)),
@@ -324,85 +328,21 @@ async fn reconcile_all(
 		}
 		Mode::Managed(_) => vec![],
 	};
-	let gateway_api_version = cache.resource("Gateway").map(|ar| ar.api_version);
-	for (gw, mut plan) in rendered {
-		let id = provision::gateway_id(&plan.namespace, &plan.name);
-		let infra = gw.spec.infrastructure.clone().unwrap_or_default();
-		let (addresses, endpoints) = match &cfg.mode {
-			// not accepted (an unsupported address type, parametersRef): nothing is deployed
-			_ if !plan.accepted() => (vec![], vec![]),
-			Mode::Managed(m) => {
-				keep_ids.push(id.clone());
-				let absent = state.absent.entry(format!("{}/{}", plan.namespace, provision::certs_secret_name(&id))).or_default();
-				let selector: BTreeMap<String, String> = [(provision::LABEL_GATEWAY.to_string(), id.clone())].into();
-				let eps = provision::pods(&pods_now, &plan.namespace, &selector);
-				let mut t = provision::Target::new(&plan);
-				t.labels = infra.labels.clone();
-				t.annotations = infra.annotations.clone();
-				t.owner = match (&gateway_api_version, &gw.metadata.uid) {
-					(Some(v), Some(uid)) => Some(provision::owner(v, &plan.name, uid)),
-					_ => None,
-				};
-				if plan.address_error.is_none() {
-					t.addresses = plan.addresses.clone();
-				}
-				let current_api = world.secrets.get(&(plan.namespace.clone(), provision::api_secret_name(&id)));
-				let applied = provision::apply_managed(client, &t, m, boot, current_api, absent).await;
-				let svc = match applied {
-					Ok(a) => {
-						provision::touch_pods(client, &eps, &a.certs).await;
-						a.service
-					}
-					Err(e) => {
-						if plan.address_error.is_none() && !plan.addresses.is_empty() && format!("{e:#}").contains("externalIPs") {
-							// the cluster refuses the address (validation, an admission policy)
-							plan.address_error = Some(format!("the Service cannot take the address: {e:#}"));
-						} else {
-							warn!(gateway = %plan.ruleset, error = format!("{e:#}"), "cannot deploy rproxy");
-						}
-						soon = true;
-						None
-					}
-				};
-				let addresses = match svc.as_ref() {
-					// the addresses asked for, once the Service has them
-					Some(_) if !plan.addresses.is_empty() && plan.address_error.is_none() => {
-						plan.addresses.iter().map(|a| ("IPAddress".to_string(), a.clone())).collect()
-					}
-					Some(s) => provision::service_addresses(s),
-					None => vec![],
-				};
-				(addresses, eps)
-			}
-			Mode::Fleet(f) => {
-				let eps = fleet_pods.clone();
-				let addrs = if f.addresses.is_empty() {
-					let mut a: Vec<String> = eps.iter().filter_map(|e| e.host_ip.clone()).collect();
-					a.sort();
-					a.dedup();
-					a
-				} else {
-					f.addresses.clone()
-				};
-				let addrs = if plan.addresses.is_empty() {
-					addrs
-				} else {
-					// the fleet's addresses are fixed: an address asked for must be one of them
-					if let Some(a) = plan.addresses.iter().find(|a| !addrs.contains(a)) {
-						plan.address_error.get_or_insert(format!("{a} is not an address of the rproxy fleet ({})", addrs.join(", ")));
-					}
-					plan.addresses.clone()
-				};
-				(
-					addrs
-						.into_iter()
-						.map(|a| (if a.parse::<std::net::IpAddr>().is_ok() { "IPAddress" } else { "Hostname" }.to_string(), a))
-						.collect(),
-					eps,
-				)
-			}
-		};
-		let addresses = if plan.address_error.is_some() { vec![] } else { addresses };
+	let pass = Pass {
+		client,
+		cache,
+		rp,
+		cfg,
+		boot,
+		world: &world,
+		pods_now: &pods_now,
+		fleet_pods: &fleet_pods,
+		gateway_api_version: cache.resource("Gateway").map(|ar| ar.api_version),
+		now: &now,
+	};
+	// each Gateway's part of the state, so the Gateways run side by side
+	let mut jobs = vec![];
+	for (gw, plan) in rendered {
 		if !plan.notes.is_empty() {
 			let digest = crate::pem::short_hash(plan.notes.join("\n").as_bytes());
 			if notes_seen.insert(digest) {
@@ -411,35 +351,34 @@ async fn reconcile_all(
 				}
 			}
 		}
-		let mut results = vec![];
-		for ep in &endpoints {
-			let (r, again) = sync_pod(rp, ep, &plan, &mut state.applied, &mut state.caps).await;
-			soon |= again;
-			results.push(r);
+		let id = provision::gateway_id(&plan.namespace, &plan.name, &plan.uid);
+		let absent_key = format!("{}/{}", plan.namespace, provision::certs_secret_name(&id));
+		let applied: Applied =
+			state.applied.iter().filter(|((_, set), _)| *set == plan.ruleset).map(|(k, v)| (k.clone(), v.clone())).collect();
+		let sub = Sub { applied, caps: state.caps.clone(), absent: state.absent.remove(&absent_key).unwrap_or_default() };
+		jobs.push(gateway_pass(&pass, gw, plan, sub));
+	}
+	let outs: Vec<GatewayOut> = futures::stream::iter(jobs).buffer_unordered(PARALLEL).collect().await;
+	for out in outs {
+		soon |= out.soon;
+		state.applied.retain(|(_, set), _| *set != out.plan.ruleset);
+		state.applied.extend(out.sub.applied);
+		state.caps.extend(out.sub.caps);
+		let id = provision::gateway_id(&out.plan.namespace, &out.plan.name, &out.plan.uid);
+		state.absent.insert(format!("{}/{}", out.plan.namespace, provision::certs_secret_name(&id)), out.sub.absent);
+		if cfg.migration.as_ref().is_some_and(|m| m.gateway == (out.plan.namespace.clone(), out.plan.name.clone())) {
+			migration_addresses = Some(out.addresses.clone());
 		}
-		if let Some(api) = dyn_api(client, cache, "Gateway", Some(&plan.namespace)) {
-			if cfg.migration.as_ref().is_some_and(|m| m.gateway == (plan.namespace.clone(), plan.name.clone())) {
-				migration_addresses = Some(addresses.clone());
-			}
-			let st = status::gateway_status(&plan, &addresses, &results, gw.status.as_ref(), &now);
-			for set in &plan.listener_sets {
-				write_listener_set_status(client, cache, &world, set, &results, &now).await;
-			}
-			if gw.status.as_ref() != Some(&st) {
-				if let Err(e) = patch_status(&api, &plan.name, st).await {
-					warn!(gateway = %plan.ruleset, error = %e, "cannot write Gateway status");
-				}
-			}
-		}
-		plans.push((plan, results));
+		keep_ids.extend(out.keep_id);
+		plans.push((out.plan, out.results));
 	}
 
 	*NOTES_SEEN.lock().unwrap() = notes_seen;
 
 	// Gateways that are gone
-	state
-		.absent
-		.retain(|name, _| name == provision::FLEET_CERTS_SECRET || keep_ids.iter().any(|id| provision::certs_secret_name(id) == *name));
+	state.absent.retain(|name, _| {
+		name == provision::FLEET_CERTS_SECRET || keep_ids.iter().any(|id| name.ends_with(&format!("/{}", provision::certs_secret_name(id))))
+	});
 	if let Err(e) = provision::collect_garbage(client, &keep_ids).await {
 		warn!(error = %e, "cannot remove rproxy of deleted Gateways");
 	}
@@ -550,6 +489,140 @@ async fn write_ancestors<'a>(
 			}
 		}
 	}
+}
+
+/// What every Gateway's pass reads.
+struct Pass<'a> {
+	client: &'a kube::Client,
+	cache: &'a cache::Cache,
+	rp: &'a Client,
+	cfg: &'a Config,
+	boot: &'a bootstrap::Bootstrap,
+	world: &'a render::world::World,
+	pods_now: &'a [std::sync::Arc<k8s_openapi::api::core::v1::Pod>],
+	fleet_pods: &'a [Endpoint],
+	gateway_api_version: Option<String>,
+	now: &'a str,
+}
+
+/// The part of `State` one Gateway's pass uses (taken out, run apart, put back).
+#[derive(Default)]
+struct Sub {
+	applied: Applied,
+	caps: HashMap<String, Capabilities>,
+	absent: BTreeMap<String, std::time::Instant>,
+}
+
+/// What one Gateway's pass gives back.
+struct GatewayOut {
+	plan: GatewayPlan,
+	results: Vec<PodSync>,
+	addresses: Vec<(String, String)>,
+	keep_id: Option<String>,
+	soon: bool,
+	sub: Sub,
+}
+
+/// One Gateway: deploys its rproxy (managed), applies its rule set to its pods, writes its status.
+async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan: GatewayPlan, mut sub: Sub) -> GatewayOut {
+	let mut soon = false;
+	let mut keep_id = None;
+	let id = provision::gateway_id(&plan.namespace, &plan.name, &plan.uid);
+	let infra = gw.spec.infrastructure.clone().unwrap_or_default();
+	let (addresses, endpoints) = match &p.cfg.mode {
+		// not accepted (an unsupported address type, parametersRef): nothing is deployed
+		_ if !plan.accepted() => (vec![], vec![]),
+		Mode::Managed(m) => {
+			keep_id = Some(id.clone());
+			let absent = &mut sub.absent;
+			let selector: BTreeMap<String, String> = [(provision::LABEL_GATEWAY.to_string(), id.clone())].into();
+			let eps = provision::pods(p.pods_now, &plan.namespace, &selector);
+			let mut t = provision::Target::new(&plan);
+			t.labels = infra.labels.clone();
+			t.annotations = infra.annotations.clone();
+			t.owner = match (&p.gateway_api_version, &gw.metadata.uid) {
+				(Some(v), Some(uid)) => Some(provision::owner(v, &plan.name, uid)),
+				_ => None,
+			};
+			if plan.address_error.is_none() {
+				t.addresses = plan.addresses.clone();
+			}
+			let current_api = p.world.secrets.get(&(plan.namespace.clone(), provision::api_secret_name(&id)));
+			let applied = provision::apply_managed(p.client, &t, m, p.boot, current_api, absent).await;
+			let svc = match applied {
+				Ok(a) => {
+					provision::touch_pods(p.client, &eps, &a.certs).await;
+					a.service
+				}
+				Err(e) => {
+					if plan.address_error.is_none() && !plan.addresses.is_empty() && format!("{e:#}").contains("externalIPs") {
+						// the cluster refuses the address (validation, an admission policy)
+						plan.address_error = Some(format!("the Service cannot take the address: {e:#}"));
+					} else {
+						warn!(gateway = %plan.ruleset, error = format!("{e:#}"), "cannot deploy rproxy");
+					}
+					soon = true;
+					None
+				}
+			};
+			let addresses = match svc.as_ref() {
+				// the addresses asked for, once the Service has them
+				Some(_) if !plan.addresses.is_empty() && plan.address_error.is_none() => {
+					plan.addresses.iter().map(|a| ("IPAddress".to_string(), a.clone())).collect()
+				}
+				Some(s) => provision::service_addresses(s),
+				None => vec![],
+			};
+			(addresses, eps)
+		}
+		Mode::Fleet(f) => {
+			let eps = p.fleet_pods.to_vec();
+			let addrs = if f.addresses.is_empty() {
+				let mut a: Vec<String> = eps.iter().filter_map(|e| e.host_ip.clone()).collect();
+				a.sort();
+				a.dedup();
+				a
+			} else {
+				f.addresses.clone()
+			};
+			let addrs = if plan.addresses.is_empty() {
+				addrs
+			} else {
+				// the fleet's addresses are fixed: an address asked for must be one of them
+				if let Some(a) = plan.addresses.iter().find(|a| !addrs.contains(a)) {
+					plan.address_error.get_or_insert(format!("{a} is not an address of the rproxy fleet ({})", addrs.join(", ")));
+				}
+				plan.addresses.clone()
+			};
+			(
+				addrs
+					.into_iter()
+					.map(|a| (if a.parse::<std::net::IpAddr>().is_ok() { "IPAddress" } else { "Hostname" }.to_string(), a))
+					.collect(),
+				eps,
+			)
+		}
+	};
+	let addresses = if plan.address_error.is_some() { vec![] } else { addresses };
+	let mut results = vec![];
+	for ep in &endpoints {
+		let (r, again) = sync_pod(p.rp, ep, &plan, &mut sub.applied, &mut sub.caps).await;
+		soon |= again;
+		results.push(r);
+	}
+	if let Some(api) = dyn_api(p.client, p.cache, "Gateway", Some(&plan.namespace)) {
+		let st = status::gateway_status(&plan, &addresses, &results, gw.status.as_ref(), p.now);
+		for set in &plan.listener_sets {
+			write_listener_set_status(p.client, p.cache, p.world, set, &results, p.now).await;
+		}
+		if gw.status.as_ref() != Some(&st) {
+			if let Err(e) = patch_status(&api, &plan.name, st).await {
+				warn!(gateway = %plan.ruleset, error = %e, "cannot write Gateway status");
+			}
+		}
+	}
+
+	GatewayOut { plan, results, addresses, keep_id, soon, sub }
 }
 
 /// RproxyPolicy and BackendTLSPolicy `status.ancestors`, RproxyRule `status`.
