@@ -25,10 +25,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # rproxy-api's Gateway API settings (#224, #226-#236) are on v04/gateway-features until it is
-  # merged; once the branch is gone, the jobs fall back to master (scripts/build-rproxy.sh and the
-  # rproxy job). Another ref (a release tag, a branch) by hand.
-  RPROXY_REF: ${{ inputs.rproxy_ref || 'v04/gateway-features' }}
+  # rproxy-api master has the rule sets (#28) and the Gateway API settings (#237); another ref
+  # (a release tag, a branch) by hand
+  RPROXY_REF: ${{ inputs.rproxy_ref || 'master' }}
 
 jobs:
   build:
