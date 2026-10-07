@@ -100,6 +100,8 @@ rproxy は `RPROXY_API_ADDR=0.0.0.0`、`RPROXY_API_PORT=9443`、`RPROXY_TOKEN_FI
 | `ExtensionRef`（`RproxyMiddleware`） | そのミドルウェア（`spec` をそのまま） |
 | `timeouts.request` / `timeouts.backendRequest` | ルートの `timeouts.request` / `timeouts.backend_request` |
 | GRPCRoute | 同じポートの HTTPRoute と同じ `http` のルールに。メソッドの一致はパスの一致にする（`service` と `method`：`Path(/<service>/<method>)`、`service` だけ：`PathPrefix(/<service>/)`、`method` だけ・`RegularExpression`：`PathRegexp`）。ヘッダの一致・フィルタ（`RequestHeaderModifier`・`ResponseHeaderModifier`・`RequestMirror`・`ExtensionRef`）・backendRef のフィルタは HTTPRoute と同じ。転送先とは h2c（サービスの `protocol: h2c`）。rproxy の名前は `grpc:` で始める |
+| BackendTLSPolicy | 対象の Service（`sectionName` でそのポート）に送る `servers` を `https://` にし、サービスの `tls`（`server_name` は `hostname`、`ca_file` は `caCertificateRefs` の ConfigMap の `ca.crt`、`wellKnownCACertificates: System` は rproxy の既定のルート、`subject_alt_names`）。同じ対象のポリシーは古いものが勝ち、ほかは `Accepted: False`（`Conflicted`）。ポートのものが Service 全体のものに勝つ。使える CA がなければ `Accepted: False`（`NoValidCACertificate`、`ResolvedRefs` は `InvalidKind` / `InvalidCACertificateRef`）で、その backend の分は 500。状態は `status.ancestors[]`（その Service に送るルートのある Gateway） |
+| Gateway の `spec.tls.backend.clientCertificateRef` | BackendTLSPolicy のサービスの `tls` の `cert_file` / `key_file`。Gateway の `ResolvedRefs`（`InvalidClientCertificateRef`・`RefNotPermitted`） |
 | リスナー `TLS`（`tls.mode: Passthrough`） | tcp のルール、`tls.mode: sni`、`unmatched: reject`。TLSRoute のホスト名ごとに `tls.routes` |
 | 同じポートの `HTTPS` と `TLS`（Passthrough） | `http` のルールの `tls.routes`（`passthrough: true`）。そのホスト名だけ復号しない |
 | リスナー `TLS`（`tls.mode: Terminate`） | tcp のルール、`tls.mode: terminate`、TLSRoute のホスト名ごとに `tls.routes`（同じポートの Passthrough のリスナーの分は `passthrough: true`） |

@@ -1250,3 +1250,120 @@ spec:
 	let r0 = routes.iter().find(|r| r["name"] == "grpc:default/grpc/r0/m0/h0").unwrap();
 	assert!(http["middlewares"][r0["middlewares"][0].as_str().unwrap()]["headers"].is_object());
 }
+
+#[test]
+fn backend_tls_policies() {
+	let (ca, _) = crate::pem::tests::pair("ca");
+	let (crt, key) = crate::pem::tests::pair("client");
+	let yaml = format!(
+		r#"{BASE}
+---
+apiVersion: v1
+kind: Secret
+metadata: {{name: client, namespace: default}}
+stringData:
+  tls.crt: |
+{}
+  tls.key: |
+{}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {{name: ca, namespace: default}}
+data:
+  ca.crt: |
+{}
+---
+apiVersion: v1
+kind: Service
+metadata: {{name: secure, namespace: default}}
+spec: {{ports: [{{name: https, port: 443}}]}}
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata: {{name: secure-1, namespace: default, labels: {{kubernetes.io/service-name: secure}}}}
+addressType: IPv4
+ports: [{{name: https, port: 8443}}]
+endpoints: [{{addresses: [10.0.5.1]}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {{name: broken, namespace: default}}
+spec: {{ports: [{{name: https, port: 443}}]}}
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata: {{name: broken-1, namespace: default, labels: {{kubernetes.io/service-name: broken}}}}
+addressType: IPv4
+ports: [{{name: https, port: 8443}}]
+endpoints: [{{addresses: [10.0.6.1]}}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: {{name: old, namespace: default, creationTimestamp: "2026-01-01T00:00:00Z"}}
+spec:
+  targetRefs: [{{group: "", kind: Service, name: secure}}]
+  validation:
+    caCertificateRefs: [{{group: "", kind: ConfigMap, name: ca}}]
+    hostname: abc.example.com
+    subjectAltNames: [{{type: URI, uri: "spiffe://abc.example.com/x"}}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: {{name: newer, namespace: default, creationTimestamp: "2026-01-02T00:00:00Z"}}
+spec:
+  targetRefs: [{{group: "", kind: Service, name: secure}}]
+  validation: {{wellKnownCACertificates: System, hostname: other.example.com}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: {{name: no-ca, namespace: default}}
+spec:
+  targetRefs: [{{group: "", kind: Service, name: broken, sectionName: https}}]
+  validation: {{caCertificateRefs: [{{group: "", kind: Secret, name: ca}}], hostname: abc.example.com}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {{name: gw, namespace: default}}
+spec:
+  gatewayClassName: rproxy
+  tls: {{backend: {{clientCertificateRef: {{name: client}}}}}}
+  listeners: [{{name: http, port: 80, protocol: HTTP}}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {{name: tls, namespace: default}}
+spec:
+  parentRefs: [{{name: gw}}]
+  rules:
+    - matches: [{{path: {{value: /secure}}}}]
+      backendRefs: [{{name: secure, port: 443}}]
+    - matches: [{{path: {{value: /broken}}}}]
+      backendRefs: [{{name: broken, port: 443}}]
+"#,
+		indent(&crt),
+		indent(&key),
+		indent(&ca)
+	);
+	let p = plan(&yaml);
+	assert!(cond(&p.conds, "ResolvedRefs").status, "the Gateway's client certificate");
+	let http = &p.rules_json()[0]["http"];
+	let svc = &http["services"]["default/tls/r0"];
+	assert_eq!(svc["servers"][0]["url"], "https://10.0.5.1:8443");
+	assert_eq!(svc["tls"]["server_name"], "abc.example.com", "the older policy wins");
+	assert_eq!(svc["tls"]["subject_alt_names"], json!(["spiffe://abc.example.com/x"]));
+	let ca_name = svc["tls"]["ca_file"].as_str().unwrap().rsplit('/').next().unwrap();
+	assert_eq!(String::from_utf8_lossy(&p.files[ca_name]).trim(), ca.trim());
+	assert!(svc["tls"]["cert_file"].as_str().is_some() && svc["tls"]["key_file"].as_str().is_some());
+	// no usable CA: nothing is sent to that backend
+	let broken = http["routes"].as_array().unwrap().iter().find(|r| r["name"] == "default/tls/r1/m0/h0").unwrap();
+	assert_eq!(broken["middlewares"], json!([http::RESPOND_500]));
+	let st = |n: &str| p.backend_tls.iter().find(|s| s.name == n).cloned();
+	assert!(cond(&st("old").unwrap().conds, "Accepted").status);
+	assert_eq!(st("old").unwrap().ancestor["name"], "gw");
+	assert_eq!(cond(&st("newer").unwrap().conds, "Accepted").reason, "Conflicted");
+	let no_ca = st("no-ca").unwrap();
+	assert_eq!(cond(&no_ca.conds, "Accepted").reason, "NoValidCACertificate");
+	assert_eq!(cond(&no_ca.conds, "ResolvedRefs").reason, "InvalidKind");
+	assert!(cond(&p.parents[0].conds, "ResolvedRefs").status, "the route's references are fine");
+}

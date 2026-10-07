@@ -22,6 +22,7 @@ pub struct World {
 	pub classes: Vec<GatewayClass>,
 	pub gateways: Vec<Gateway>,
 	pub listener_sets: Vec<ListenerSet>,
+	pub backend_tls_policies: Vec<crate::render::backend_tls::BackendTlsPolicy>,
 	pub http_routes: Vec<HttpRoute>,
 	/// GRPCRoutes, as the HTTPRoutes they amount to (`GrpcRoute::to_http`).
 	pub grpc_routes: Vec<HttpRoute>,
