@@ -364,6 +364,8 @@ pub fn deployment(t: &Target, m: &Managed, api_hash: &str) -> Deployment {
 			env("RPROXY_TOKEN_FILE", &format!("{API_DIR}/tokens.yaml")),
 			env("RPROXY_TLS_CERT", &format!("{API_DIR}/tls.crt")),
 			env("RPROXY_TLS_KEY", &format!("{API_DIR}/tls.key")),
+			// the kubelet mounts Secrets as root (0440, group fsGroup): rproxy may use root's files there
+			env("RPROXY_FILES_TRUSTED_DIRS", &format!("{CERT_DIR},{API_DIR}")),
 		]),
 		ports: Some(vec![ContainerPort { name: Some("api".into()), container_port: API_PORT.into(), ..Default::default() }]),
 		liveness_probe: Some(probe("/healthz")),

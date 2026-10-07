@@ -59,6 +59,10 @@ English: [en/SECURITY.md](en/SECURITY.md)
 
 rproxy はルールセットを、作ったトークンの名前のものにする（ほかの admin でないトークンは変えられない）。コントローラのトークンは値が変わっても名前はいつも `rproxy-gateway` なので、トークンを入れ替えても（rproxy の再起動のあとの PUT し直しも）同じ持ち主のまま。トークンの `allow_rulesets` は、fleet のものが `k8s/`、managed の Gateway ごとのものがその Gateway のルールセット（`k8s/<namespace>/<name>`）だけ。
 
+## rproxy のファイルの所有者の確認
+
+rproxy は、ルールや設定が指す証明書・鍵のファイルが rproxy のユーザーのものかを確かめる（`global.files.owner_check`）。kubelet は Secret のボリュームのファイルを root の持ち物（グループは fsGroup、モード 0440）にするので、コントローラは rproxy に `RPROXY_FILES_TRUSTED_DIRS` を渡し、そのディレクトリ（managed：`/var/run/rproxy-gateway/certs`・`/etc/rproxy-gateway/api`、fleet：それに `/etc/rproxy-gateway/api-tls`・`/etc/rproxy-gateway/token`）では root のファイルも使えるようにする。モードの確認（グループ・ほかの人が書けない、鍵はほかの人が読めない）はそのまま。
+
 ## イメージ
 
 `controller.image.digest`・`rproxy.image.digest`（`sha256:...`）でダイジェストに固定できる（タグより優先）。

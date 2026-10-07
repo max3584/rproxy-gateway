@@ -44,6 +44,8 @@ spec:
             - {name: RPROXY_TOKEN_FILE, value: /etc/rproxy-gateway/token/tokens.yaml}
             - {name: RPROXY_TLS_CERT, value: /etc/rproxy-gateway/api-tls/tls.crt}
             - {name: RPROXY_TLS_KEY, value: /etc/rproxy-gateway/api-tls/tls.key}
+            # the kubelet mounts Secrets as root: rproxy may use root's files in these directories
+            - {name: RPROXY_FILES_TRUSTED_DIRS, value: "/var/run/rproxy-gateway/certs,/etc/rproxy-gateway/api-tls,/etc/rproxy-gateway/token"}
           ports:
             - {name: api, containerPort: 9443}
           livenessProbe:
