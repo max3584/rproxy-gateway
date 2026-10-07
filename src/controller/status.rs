@@ -95,7 +95,11 @@ pub fn gateway_status(plan: &GatewayPlan, addresses: &[(String, String)], pods: 
 	let generation = plan.generation;
 	let prev = |path: &str| previous.and_then(|p| p.pointer(path));
 	let mut conds = plan.conds.clone();
-	let programmed = if addresses.is_empty() {
+	let programmed = if !plan.accepted() {
+		Cond::new("Programmed", false, "Invalid", "the Gateway is not accepted")
+	} else if let Some(e) = &plan.address_error {
+		Cond::new("Programmed", false, "AddressNotUsable", e.clone())
+	} else if addresses.is_empty() {
 		Cond::new("Programmed", false, "AddressNotAssigned", "waiting for an address (the rproxy Service)")
 	} else if synced(pods) == 0 {
 		let (rejected, m) = waiting(pods);

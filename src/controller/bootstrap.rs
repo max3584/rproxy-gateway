@@ -3,8 +3,14 @@
 //! - `rproxy-gateway-ca`: a CA (only the controller reads the key).
 //! - `rproxy-gateway-api-tls`: rproxy's control API certificate, issued by the CA
 //!   for `rproxy-api.rproxy-gateway.internal` (pods are reached by IP).
-//! - `rproxy-gateway-token`: the controller's token (`token`) and the token file
-//!   rproxy reads (`tokens.yaml`, only its SHA-256).
+//! - `rproxy-gateway-token`: the controller's master token (`token`) and the
+//!   token file the fleet's rproxy reads (`tokens.yaml`, only its SHA-256).
+//!
+//! Each managed Gateway's rproxy gets its own credentials in its own namespace
+//! (`provision::api_secret`): a control API certificate for its own name
+//! (`<id>.rproxy-api.rproxy-gateway.internal`) and a token derived from the
+//! master token (HMAC-SHA256 with the Gateway's id). Reading one Gateway's
+//! namespace does not give a way into another Gateway's rproxy.
 
 use std::collections::BTreeMap;
 
@@ -25,6 +31,9 @@ pub const TOKEN_SECRET: &str = "rproxy-gateway-token";
 /// What the controller needs to talk to rproxy.
 pub struct Bootstrap {
 	pub ca_pem: Vec<u8>,
+	/// The CA's key (issues each managed Gateway's control API certificate).
+	pub ca_key_pem: String,
+	/// The master token (the fleet's token; Gateways' tokens derive from it).
 	pub token: String,
 }
 
@@ -62,13 +71,13 @@ fn ca_params() -> anyhow::Result<rcgen::CertificateParams> {
 	Ok(params)
 }
 
-/// rproxy's control API certificate issued by the CA: (certificate PEM, key PEM).
-pub fn issue_api_cert(ca_key_pem: &str) -> anyhow::Result<(String, String)> {
+/// rproxy's control API certificate for `name` issued by the CA: (certificate PEM, key PEM).
+pub fn issue_api_cert(ca_key_pem: &str, name: &str) -> anyhow::Result<(String, String)> {
 	let ca_key = rcgen::KeyPair::from_pem(ca_key_pem)?;
 	let issuer = rcgen::Issuer::new(ca_params()?, ca_key);
 	let key = rcgen::KeyPair::generate()?;
-	let mut params = rcgen::CertificateParams::new(vec![API_SERVER_NAME.to_string()])?;
-	params.distinguished_name.push(rcgen::DnType::CommonName, API_SERVER_NAME);
+	let mut params = rcgen::CertificateParams::new(vec![name.to_string()])?;
+	params.distinguished_name.push(rcgen::DnType::CommonName, name);
 	params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
 	let cert = params.signed_by(&key, &issuer)?;
 	Ok((cert.pem(), key.serialize_pem()))
@@ -81,6 +90,12 @@ pub fn new_token() -> anyhow::Result<(String, String)> {
 	ring::rand::SystemRandom::new().fill(&mut bytes).map_err(|_| anyhow::anyhow!("no randomness"))?;
 	let token = crate::pem::hex(&bytes);
 	Ok((token.clone(), token_file(&token)))
+}
+
+/// The token of one target (a managed Gateway's id): HMAC-SHA256 of the master token.
+pub fn derive_token(master: &str, target: &str) -> String {
+	let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, master.as_bytes());
+	crate::pem::hex(ring::hmac::sign(&key, format!("rproxy-gateway/{target}").as_bytes()).as_ref())
 }
 
 /// rproxy's YAML token file for the controller's token.
@@ -107,7 +122,7 @@ pub async fn ensure(client: &kube::Client, ns: &str) -> anyhow::Result<Bootstrap
 	let ca_key = field(&ca, "tls.key").context("the CA Secret has no tls.key")?;
 	let current = api.get_opt(API_TLS_SECRET).await?;
 	if current.as_ref().and_then(|s| field(s, "ca.crt")).as_deref() != Some(ca_pem.as_slice()) {
-		let (crt, key) = issue_api_cert(std::str::from_utf8(&ca_key)?)?;
+		let (crt, key) = issue_api_cert(std::str::from_utf8(&ca_key)?, API_SERVER_NAME)?;
 		let s = secret(API_TLS_SECRET, ns, &[("tls.crt", crt.into_bytes()), ("tls.key", key.into_bytes()), ("ca.crt", ca_pem.clone())]);
 		info!(secret = API_TLS_SECRET, "issuing rproxy's control API certificate");
 		match current {
@@ -128,7 +143,7 @@ pub async fn ensure(client: &kube::Client, ns: &str) -> anyhow::Result<Bootstrap
 		}
 	};
 	let token = String::from_utf8(field(&tok, "token").context("the token Secret has no token")?)?;
-	Ok(Bootstrap { ca_pem, token: token.trim().to_string() })
+	Ok(Bootstrap { ca_pem, ca_key_pem: String::from_utf8(ca_key)?, token: token.trim().to_string() })
 }
 
 /// Creates `s`; if another replica created it first, reads that one.
@@ -148,7 +163,7 @@ mod tests {
 	#[test]
 	fn the_api_certificate_chains_to_the_ca() {
 		let (ca, ca_key) = new_ca().unwrap();
-		let (crt, key) = issue_api_cert(&ca_key).unwrap();
+		let (crt, key) = issue_api_cert(&ca_key, API_SERVER_NAME).unwrap();
 		crate::pem::check_pair(crt.as_bytes(), key.as_bytes()).unwrap();
 		// a client trusting the CA accepts the certificate for the fixed name
 		use rustls::client::danger::ServerCertVerifier;
@@ -160,6 +175,15 @@ mod tests {
 		let leaf = rustls_pki_types::CertificateDer::from_pem_slice(crt.as_bytes()).unwrap();
 		let name = rustls_pki_types::ServerName::try_from(API_SERVER_NAME).unwrap();
 		verifier.verify_server_cert(&leaf, &[], &name, &[], rustls_pki_types::UnixTime::now()).unwrap();
+	}
+
+	#[test]
+	fn derived_tokens() {
+		let a = derive_token("master", "default-web-abcdef");
+		assert_eq!(a.len(), 64);
+		assert_eq!(a, derive_token("master", "default-web-abcdef"));
+		assert_ne!(a, derive_token("master", "default-api-abcdef"));
+		assert_ne!(a, derive_token("other", "default-web-abcdef"));
 	}
 
 	#[test]

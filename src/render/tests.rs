@@ -915,3 +915,26 @@ spec: {ingressClassName: nginx}
 	let v = migrate::ingress_status(&[("IPAddress".into(), "10.0.0.1".into()), ("Hostname".into(), "lb.example.com".into())]);
 	assert_eq!(v, json!({"loadBalancer": {"ingress": [{"ip": "10.0.0.1"}, {"hostname": "lb.example.com"}]}}));
 }
+
+#[test]
+fn gateway_addresses_and_parameters() {
+	let with = |extra: &str| {
+		plan(&format!("{BASE}{}", gw("  - {name: http, port: 80, protocol: HTTP}").replace("spec:\n", &format!("spec:\n{extra}"))))
+	};
+	let p = with("  addresses: [{type: IPAddress, value: 192.0.2.10}, {value: \"2001:db8::1\"}, {type: IPAddress}]\n");
+	assert!(p.accepted());
+	assert_eq!(p.addresses, ["192.0.2.10", "2001:db8::1"]);
+	assert_eq!(p.address_error, None);
+	let p = with("  addresses: [{type: test/fake-invalid-type, value: x}, {value: 192.0.2.10}]\n");
+	assert_eq!(cond(&p.conds, "Accepted").reason, "UnsupportedAddress");
+	assert!(!p.accepted());
+	let p = with("  addresses: [{type: Hostname, value: gw.example.com}]\n");
+	assert_eq!(cond(&p.conds, "Accepted").reason, "UnsupportedAddress");
+	let p = with("  addresses: [{value: 0.0.0.0}, {value: 192.0.2.10}]\n");
+	assert!(p.accepted(), "accepted, but not programmed");
+	assert!(p.address_error.as_deref().is_some_and(|e| e.contains("0.0.0.0")));
+	let p = with("  infrastructure: {parametersRef: {group: invalid.io, kind: InvalidParameters, name: invalid}}\n");
+	assert_eq!((cond(&p.conds, "Accepted").status, cond(&p.conds, "Accepted").reason.as_str()), (false, "InvalidParameters"));
+	let p = with("  infrastructure: {labels: {a: b}, annotations: {c: d}}\n");
+	assert!(p.accepted());
+}

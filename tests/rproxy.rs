@@ -247,6 +247,7 @@ spec:
 		api_port: api,
 		certsync_port,
 		certs: None,
+		..Default::default()
 	};
 	let mut applied = Applied::new();
 	let mut caps_cache = HashMap::new();

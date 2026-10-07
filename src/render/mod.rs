@@ -117,6 +117,54 @@ pub struct GatewayPlan {
 	pub notes: Vec<String>,
 	/// The (protocol, port) of listeners that can be served (Service ports).
 	pub listener_ports: BTreeSet<(rp::Protocol, u16)>,
+	/// `spec.addresses`: the IP addresses asked for (empty: whatever the Service gets).
+	pub addresses: Vec<String>,
+	/// Why an address of `spec.addresses` cannot be used (`Programmed: False`, `AddressNotUsable`).
+	pub address_error: Option<String>,
+}
+
+impl GatewayPlan {
+	/// Whether the Gateway is accepted (else nothing is deployed or applied for it).
+	pub fn accepted(&self) -> bool {
+		status::get(&self.conds, "Accepted").is_none_or(|c| c.status)
+	}
+}
+
+/// Whether an IP address can be a Gateway's address: a unicast address that
+/// is not unspecified, loopback or link-local (Kubernetes refuses those as a
+/// Service's `externalIPs` too).
+pub fn usable_ip(ip: std::net::IpAddr) -> bool {
+	match ip {
+		std::net::IpAddr::V4(v4) => {
+			!(v4.is_unspecified() || v4.is_loopback() || v4.is_link_local() || v4.is_multicast() || v4.is_broadcast())
+		}
+		std::net::IpAddr::V6(v6) => !(v6.is_unspecified() || v6.is_loopback() || v6.is_multicast() || v6.is_unicast_link_local()),
+	}
+}
+
+/// `spec.addresses` → (the IPs asked for, why one cannot be used); `Err`: an
+/// address type that is not supported (`Accepted: False`, `UnsupportedAddress`).
+pub fn gateway_addresses(gw: &Gateway) -> Result<(Vec<String>, Option<String>), String> {
+	let mut ips = vec![];
+	let mut unusable = None;
+	for a in &gw.spec.addresses {
+		let kind = a.kind.as_deref().unwrap_or("IPAddress");
+		if kind != "IPAddress" {
+			return Err(format!("address type {kind} is not supported (IPAddress only)"));
+		}
+		if a.value.is_empty() {
+			// an address of this type, any value: the Service's
+			continue;
+		}
+		match a.value.parse::<std::net::IpAddr>() {
+			Ok(ip) if usable_ip(ip) => ips.push(ip.to_string()),
+			Ok(_) => {
+				unusable.get_or_insert(format!("{} cannot be used (unspecified, loopback, link-local or multicast)", a.value));
+			}
+			Err(_) => return Err(format!("{:?} is not an IP address", a.value)),
+		}
+	}
+	Ok((ips, unusable))
 }
 
 impl GatewayPlan {
@@ -758,13 +806,24 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 		listeners.iter().filter(|l| l.accepted && !l.unservable).filter_map(|l| l.family.map(|f| (f.protocol(), l.port))).collect();
 	let any = listeners.iter().any(|l| l.accepted);
 	let all = listeners.iter().all(|l| l.accepted);
-	plan.conds.push(if listeners.is_empty() || all {
+	let addresses = gateway_addresses(gw);
+	let params = gw.spec.infrastructure.as_ref().and_then(|i| i.parameters_ref.as_ref());
+	plan.conds.push(if let Some(p) = params {
+		// no parameters kind is supported
+		Cond::new("Accepted", false, "InvalidParameters", format!("parametersRef {}/{} {}: not supported", p.group, p.kind, p.name))
+	} else if let Err(e) = &addresses {
+		Cond::new("Accepted", false, "UnsupportedAddress", e.clone())
+	} else if listeners.is_empty() || all {
 		Cond::ok("Accepted", "Accepted")
 	} else if any {
 		Cond::new("Accepted", true, "ListenersNotValid", "some listeners are not valid")
 	} else {
 		Cond::new("Accepted", false, "ListenersNotValid", "no listener is valid")
 	});
+	if let Ok((ips, unusable)) = addresses {
+		plan.addresses = ips;
+		plan.address_error = unusable;
+	}
 	if opts.labels {
 		let labels: BTreeMap<String, String> = [
 			("gateway.networking.k8s.io/gateway-name".to_string(), gw_name.clone()),

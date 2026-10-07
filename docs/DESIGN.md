@@ -28,22 +28,26 @@ Gateway API / CRD ──watch──▶ rproxy-gateway ──PUT /rulesets/k8s/<n
 
 | mode | rproxy | アドレス（Gateway の `status.addresses`） |
 |---|---|---|
-| `managed`（既定） | コントローラが自分の namespace に Gateway ごとの Deployment と Service（`rproxy-<id>`、型は `--service-type`、既定 `LoadBalancer`）を作る。Gateway が消えたら消す | Service のロードバランサのアドレス（`ClusterIP` 型なら ClusterIP） |
+| `managed`（既定） | コントローラが Gateway の namespace に、Gateway ごとの Deployment・Service・ServiceAccount（`rproxy-<id>`、Service の型は `--service-type`、既定 `LoadBalancer`）と Secret（証明書 `rproxy-<id>-certs`、制御 API `rproxy-<id>-api`）を作る。どれも Gateway が持ち主（`ownerReferences`）で、Gateway が消えれば消える | `spec.addresses` があればそれ、なければ Service のロードバランサのアドレス（`ClusterIP` 型なら ClusterIP） |
 | `fleet` | 先に置いた rproxy の Pod（chart の `hostNetwork: true` の DaemonSet など、`--fleet-selector`）がすべての Gateway を受け持つ。コントローラはすべての Pod に同じセットを PUT する | `--fleet-address`、なければ Pod のノードの IP |
 
 - `<id>` は `<namespace>-<name>`（40 文字まで）とハッシュ 6 桁。
+- managed で作るものには、Gateway の `spec.infrastructure` の `labels`・`annotations`（Pod にも）と、`gateway.networking.k8s.io/gateway-name` のラベルを付ける（コントローラのラベルが優先。Pod を選ぶのに使う）。`spec.infrastructure.parametersRef` はどの種類も扱わないので、付けた Gateway は `Accepted: False`（`InvalidParameters`）。
+- `spec.addresses`：`IPAddress` だけ（ほかの型は `Accepted: False`、`UnsupportedAddress`）。managed では Service の `externalIPs` にする（kube-proxy がその IP への通信を rproxy に送る）。値のない項目は Service のアドレスのまま。unspecified・loopback・link-local・multicast の IP や、クラスタが Service に付けられない IP は `Programmed: False`（`AddressNotUsable`）。fleet では fleet のアドレス（`--fleet-address` かノードの IP）のどれかでなければ `AddressNotUsable`。
 - managed の Pod は非 root（65532）で、1024 未満のポートは `net.ipv4.ip_unprivileged_port_start=0`（namespace ごとの安全な sysctl）で受ける。
 - fleet で同じポートを 2 つの Gateway が使うと、後から来たほうのルールは rproxy が `409 already_exists` で断り、リスナーの `Programmed` が `False` になる。
 
 ## 制御 API の接続
 
-コントローラは最初に起動したとき、自分の namespace に次の Secret を作る（あれば読むだけ）。
+コントローラは最初に起動したとき、自分の namespace に次の Secret を作る（あれば読むだけ）。fleet の rproxy はこれを使う。
 
 | Secret | 中身 | 読む人 |
 |---|---|---|
 | `rproxy-gateway-ca` | CA の証明書と鍵 | コントローラ（rproxy の Pod は読めない） |
 | `rproxy-gateway-api-tls` | rproxy の制御 API の証明書（CA が `rproxy-api.rproxy-gateway.internal` に出す。Pod へは IP でつなぐので名前は固定） | rproxy（ボリューム） |
 | `rproxy-gateway-token` | コントローラのトークン（`token`）と、rproxy が読むトークンファイル（`tokens.yaml`、SHA-256 だけ。スコープは `rules:read`・`rules:write`・`acme:write`） | `token` はコントローラ、`tokens.yaml` は rproxy（ボリュームでその項目だけ） |
+
+managed の rproxy は、それぞれ Gateway の namespace の `rproxy-<id>-api` を使う：CA が `<id>.rproxy-api.rproxy-gateway.internal` に出した制御 API の証明書と、マスタートークンから導いたトークン（HMAC-SHA256、鍵がマスタートークンで中身が Gateway の id）のトークンファイル（`tokens.yaml`、SHA-256 だけ）。コントローラは Pod ごとにその名前とトークンでつなぐ。ある Gateway の namespace の Secret を読めても、ほかの Gateway の rproxy にもコントローラにもつなげない（マスタートークンと CA の鍵はコントローラの namespace だけ）。
 
 rproxy は `RPROXY_API_ADDR=0.0.0.0`、`RPROXY_API_PORT=9443`、`RPROXY_TOKEN_FILE`、`RPROXY_TLS_CERT` / `RPROXY_TLS_KEY` で動く（制御 API を loopback 以外で開くときに rproxy が求める 3 つ）。
 
@@ -62,7 +66,7 @@ rproxy は `RPROXY_API_ADDR=0.0.0.0`、`RPROXY_API_PORT=9443`、`RPROXY_TOKEN_FI
 | 形 | 選ばなかった理由 |
 |---|---|
 | certsync が Secret を watch する（前の形） | rproxy の Pod に namespace のすべての Secret を読む権限が要る。`resourceNames` では watch・list を名前で絞れない |
-| Gateway ごとに namespace を分ける | Gateway ごとに namespace・RBAC・トークンの Secret を配ることになる。fleet では使えない |
+| 1 つの namespace にすべての Gateway の rproxy を置く（前の形） | rproxy の Pod の近くに CA の鍵とマスタートークンがあり、すべての Gateway の制御 API を同じ証明書・トークンで開く。Gateway API の `infrastructure`（Gateway の namespace に作るもの）にも合わない |
 | 鍵を制御 API で送る | rproxy-api の設計 3.3（鍵をネットワークに流さない）に反する |
 
 ## 反映（ルールセット）

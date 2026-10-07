@@ -18,8 +18,20 @@ rules:
     verbs: [get, update, patch]
   # backends (EndpointSlices), certificates (Secrets), namespace selectors
   - apiGroups: [""]
-    resources: [services, secrets, namespaces]
+    resources: [namespaces]
     verbs: [get, list, watch]
+  # managed mode: each Gateway's rproxy (Deployment, Service, ServiceAccount, its certificate and
+  # control API Secrets) next to the Gateway, in the Gateway's namespace
+  - apiGroups: [""]
+    resources: [services, secrets, serviceaccounts]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # rproxy pods: the certificate Secret's hash as an annotation, so the kubelet updates the mounted files at once
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch, patch]
   - apiGroups: [discovery.k8s.io]
     resources: [endpointslices]
     verbs: [get, list, watch]
@@ -50,7 +62,7 @@ subjects:
     name: rproxy-gateway
     namespace: {{ .Release.Namespace }}
 ---
-# in its own namespace: the shared Secrets, the managed rproxy Deployments and Services
+# in its own namespace: leader election
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -58,17 +70,6 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels: {{- include "rproxy-gateway.labels" . | nindent 4 }}
 rules:
-  - apiGroups: [""]
-    resources: [secrets, services]
-    verbs: [get, list, watch, create, update, patch, delete]
-  - apiGroups: [apps]
-    resources: [deployments]
-    verbs: [get, list, watch, create, update, patch, delete]
-  # pods: the certificate Secret's hash as an annotation, so the kubelet updates the mounted files at once
-  - apiGroups: [""]
-    resources: [pods]
-    verbs: [get, list, watch, patch]
-  # leader election
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
     verbs: [get, create, update]

@@ -17,7 +17,7 @@ All three failures are the `add` of HeaderModifier (append after an existing val
 
 ## Claimed features (`supportedFeatures`)
 
-core (Gateway, HTTPRoute, ReferenceGrant, TLSRoute, TCPRoute, UDPRoute) plus `GatewayPort8080`, `GatewayHTTPListenerIsolation`, `HTTPRouteMethodMatching`, `HTTPRouteQueryParamMatching`, `HTTPRouteResponseHeaderModification`, `HTTPRoutePortRedirect`, `HTTPRouteSchemeRedirect`, `HTTPRoutePathRedirect`, `HTTPRoutePathRewrite`, `HTTPRouteParentRefPort`, `HTTPRouteDestinationPortMatching`, `HTTPRouteNamedRouteRule`, `HTTPRouteBackendProtocolWebSocket`, `HTTPRouteBackendTimeout`, `TLSRouteModeTerminate`, `TLSRouteModeMixed`. The GatewayClass `status.supportedFeatures` and `FEATURES` of `scripts/conformance.sh` are the same.
+core (Gateway, HTTPRoute, ReferenceGrant, TLSRoute, TCPRoute, UDPRoute) plus `GatewayPort8080`, `GatewayHTTPListenerIsolation`, `HTTPRouteMethodMatching`, `HTTPRouteQueryParamMatching`, `HTTPRouteResponseHeaderModification`, `HTTPRoutePortRedirect`, `HTTPRouteSchemeRedirect`, `HTTPRoutePathRedirect`, `HTTPRoutePathRewrite`, `HTTPRouteParentRefPort`, `HTTPRouteDestinationPortMatching`, `HTTPRouteNamedRouteRule`, `HTTPRouteBackendProtocolWebSocket`, `HTTPRouteBackendTimeout`, `TLSRouteModeTerminate`, `TLSRouteModeMixed`, `GatewayStaticAddresses` (`--usable-address=192.0.2.10`, `--unusable-address=0.0.0.0`), `GatewayAddressEmpty`, `GatewayInfrastructure`. The GatewayClass `status.supportedFeatures` and `FEATURES` of `scripts/conformance.sh` are the same.
 
 ## Not claimed
 
@@ -29,5 +29,4 @@ core (Gateway, HTTPRoute, ReferenceGrant, TLSRoute, TCPRoute, UDPRoute) plus `Ga
 | `HTTPRouteRequestTimeout` | rproxy's `timeouts.response` runs until the headers, not for the whole request |
 | `HTTPRouteBackendRequestHeaderModification` | filters per backendRef (rproxy has no per-server middlewares) |
 | `HTTPRouteCORS`, `HTTPRouteRetry*`, `HTTPRouteBackendProtocolH2C` | not mapped yet (CORS and retry exist as rproxy middlewares) |
-| `GatewayStaticAddresses`, `GatewayInfrastructure`, `GatewayAddressEmpty` | Gateway `addresses` / `infrastructure` not handled yet |
 | `ListenerSet`, `GatewayFrontendClientCertificateValidation`, `BackendTLSPolicy`, `GRPCRoute` | not yet |

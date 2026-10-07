@@ -32,6 +32,9 @@ kind: Gateway
 metadata: {name: e2e, namespace: e2e}
 spec:
   gatewayClassName: rproxy
+  infrastructure:
+    labels: {team: e2e}
+    annotations: {e2e.example.com/note: infrastructure}
   listeners:
     - {name: http, port: 80, protocol: HTTP}
     - name: https

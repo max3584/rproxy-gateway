@@ -57,9 +57,6 @@ struct ControllerArgs {
 	/// managed: the type of each Gateway's Service.
 	#[arg(long, env = "RPROXY_GATEWAY_SERVICE_TYPE", default_value = "LoadBalancer")]
 	service_type: String,
-	/// managed: the ServiceAccount of rproxy pods (certsync reads Secrets in this namespace).
-	#[arg(long, env = "RPROXY_GATEWAY_PROXY_SERVICE_ACCOUNT", default_value = "rproxy-gateway-proxy")]
-	proxy_service_account: String,
 	/// managed: imagePullPolicy of rproxy pods.
 	#[arg(long, env = "RPROXY_GATEWAY_IMAGE_PULL_POLICY", default_value = "IfNotPresent")]
 	image_pull_policy: String,
@@ -204,7 +201,6 @@ fn main() -> anyhow::Result<()> {
 					controller_image: a.controller_image,
 					replicas: a.replicas,
 					service_type: a.service_type,
-					service_account: a.proxy_service_account,
 					pull_policy: a.image_pull_policy,
 				}),
 			};

@@ -56,7 +56,6 @@ spec:
             - --image-pull-policy={{ .Values.rproxy.image.pullPolicy }}
             - --replicas={{ .Values.managed.replicas }}
             - --service-type={{ .Values.managed.serviceType }}
-            - --proxy-service-account=rproxy-gateway-proxy
             {{- end }}
             {{- if .Values.migration.migrateTo }}
             - --migrate-to={{ .Values.migration.migrateTo }}

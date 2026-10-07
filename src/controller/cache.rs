@@ -96,16 +96,15 @@ fn spawn_dyn_watch(client: &kube::Client, ar: &ApiResource, changed: Arc<Notify>
 }
 
 impl Cache {
-	/// Starts the watches; `own_ns` is where the controller's rproxy pods run.
-	/// `migration`: also watch Ingress and Traefik's CRDs.
-	pub async fn start(client: &kube::Client, own_ns: &str, migration: bool) -> anyhow::Result<Cache> {
+	/// Starts the watches. `migration`: also watch Ingress and Traefik's CRDs.
+	pub async fn start(client: &kube::Client, migration: bool) -> anyhow::Result<Cache> {
 		let changed = Arc::new(Notify::new());
 		let cache = Cache {
 			services: spawn_watch(Api::all(client.clone()), changed.clone(), "Service"),
 			slices: spawn_watch(Api::all(client.clone()), changed.clone(), "EndpointSlice"),
 			secrets: spawn_watch(Api::all(client.clone()), changed.clone(), "Secret"),
 			namespaces: spawn_watch(Api::all(client.clone()), changed.clone(), "Namespace"),
-			pods: spawn_pod_watch(client, own_ns, changed.clone()),
+			pods: spawn_pod_watch(client, changed.clone()),
 			ingresses: migration.then(|| spawn_watch(Api::all(client.clone()), changed.clone(), "Ingress")),
 			dynamic: RwLock::new(vec![]),
 			migration,
@@ -222,8 +221,9 @@ impl Cache {
 	}
 }
 
-fn spawn_pod_watch(client: &kube::Client, ns: &str, changed: Arc<Notify>) -> Store<Pod> {
-	let api: Api<Pod> = Api::namespaced(client.clone(), ns);
+/// rproxy pods: managed ones next to their Gateways (any namespace), the fleet in the controller's.
+fn spawn_pod_watch(client: &kube::Client, changed: Arc<Notify>) -> Store<Pod> {
+	let api: Api<Pod> = Api::all(client.clone());
 	let (reader, writer) = reflector::store();
 	let cfg = watcher::Config::default().labels("app.kubernetes.io/name=rproxy");
 	let stream = reflector::reflector(writer, watcher(api, cfg).default_backoff());

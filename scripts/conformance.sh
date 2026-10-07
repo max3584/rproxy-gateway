@@ -8,7 +8,8 @@ GATEWAY_API_VERSION=${GATEWAY_API_VERSION:-v1.6.3}
 REPORT=${REPORT:-$PWD/conformance-report.yaml}
 PROFILES=${PROFILES:-GATEWAY-HTTP,GATEWAY-TLS,GATEWAY-TCP,GATEWAY-UDP}
 # the extended features rproxy-gateway claims (src/controller/mod.rs SUPPORTED_FEATURES)
-FEATURES=${FEATURES:-Gateway,GatewayPort8080,GatewayHTTPListenerIsolation,HTTPRoute,ReferenceGrant,HTTPRouteMethodMatching,HTTPRouteQueryParamMatching,HTTPRouteResponseHeaderModification,HTTPRoutePortRedirect,HTTPRouteSchemeRedirect,HTTPRoutePathRedirect,HTTPRoutePathRewrite,TLSRoute,TLSRouteModeTerminate,TLSRouteModeMixed,TCPRoute,UDPRoute,HTTPRouteParentRefPort,HTTPRouteDestinationPortMatching,HTTPRouteNamedRouteRule,HTTPRouteBackendProtocolWebSocket,HTTPRouteBackendTimeout}
+# GatewayStaticAddresses: a usable address becomes the Service's externalIPs; 0.0.0.0 is refused
+FEATURES=${FEATURES:-Gateway,GatewayPort8080,GatewayHTTPListenerIsolation,HTTPRoute,ReferenceGrant,HTTPRouteMethodMatching,HTTPRouteQueryParamMatching,HTTPRouteResponseHeaderModification,HTTPRoutePortRedirect,HTTPRouteSchemeRedirect,HTTPRoutePathRedirect,HTTPRoutePathRewrite,TLSRoute,TLSRouteModeTerminate,TLSRouteModeMixed,TCPRoute,UDPRoute,HTTPRouteParentRefPort,HTTPRouteDestinationPortMatching,HTTPRouteNamedRouteRule,HTTPRouteBackendProtocolWebSocket,HTTPRouteBackendTimeout,GatewayStaticAddresses,GatewayAddressEmpty,GatewayInfrastructure}
 work=${RUNNER_TEMP:-/tmp}/rproxy-gateway-conformance
 mkdir -p "$work"
 
@@ -27,7 +28,8 @@ status=0
     --report-output="$REPORT" \
     --organization=max3584 --project=rproxy-gateway --url=https://github.com/max3584/rproxy-gateway \
     --version="${VERSION:-v0.4.0-dev}" --contact=https://github.com/max3584/rproxy-gateway/issues \
-    --cleanup-base-resources=false
+    --cleanup-base-resources=false \
+    --usable-address="${USABLE_ADDRESS:-192.0.2.10}" --unusable-address="${UNUSABLE_ADDRESS:-0.0.0.0}"
 ) 2>&1 | tee "$work/conformance.log" || status=$?
 echo "$status" > "$work/status"
 
