@@ -77,6 +77,16 @@ static NOTES_SEEN: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BT
 /// What was last applied to a pod: (pod uid, set) → (hash of what was sent, etag rproxy answered).
 pub type Applied = HashMap<(String, String), (String, String, Vec<RuleView>)>;
 
+/// What the leader remembers between passes (forgotten when it stops leading).
+#[derive(Default)]
+pub struct State {
+	pub applied: Applied,
+	/// rproxy's capabilities by pod uid.
+	pub caps: HashMap<String, Capabilities>,
+	/// Certificate Secret → files no rule needs any more, since when (`provision::with_linger`).
+	pub absent: HashMap<String, BTreeMap<String, std::time::Instant>>,
+}
+
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
 	let client = kube::Client::try_default().await.context("connecting to Kubernetes")?;
 	let boot = bootstrap::ensure(&client, &cfg.namespace).await.context("the controller's Secrets")?;
@@ -91,15 +101,13 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
 	}
 	cache.ready().await;
 	info!(controller = %cfg.controller_name, "started");
-	let mut applied = Applied::new();
-	let mut caps: HashMap<String, Capabilities> = HashMap::new();
+	let mut state = State::default();
 	let shutdown = shutdown_signal();
 	tokio::pin!(shutdown);
 	loop {
 		if !*leading.borrow_and_update() {
 			// a follower keeps its watches warm and waits; what it knew about pods is stale
-			applied.clear();
-			caps.clear();
+			state = State::default();
 			tokio::select! {
 				_ = leading.changed() => continue,
 				_ = &mut shutdown => return Ok(()),
@@ -107,7 +115,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
 		}
 		// a pass stops as soon as leadership is lost (another replica may be leading already)
 		let pass = tokio::select! {
-			r = reconcile_all(&client, &cache, &rp, &cfg, &mut applied, &mut caps) => Some(r),
+			r = reconcile_all(&client, &cache, &rp, &cfg, &mut state) => Some(r),
 			_ = lost(&mut leading) => None,
 			_ = &mut shutdown => {
 				if let Some(s) = &cfg.leader { leader::release(&lease_api, s).await; }
@@ -197,14 +205,7 @@ async fn patch_status(api: &Api<DynamicObject>, name: &str, status: Value) -> an
 }
 
 /// One pass over everything; `Ok(true)` asks for another pass soon.
-async fn reconcile_all(
-	client: &kube::Client,
-	cache: &cache::Cache,
-	rp: &Client,
-	cfg: &Config,
-	applied: &mut Applied,
-	caps: &mut HashMap<String, Capabilities>,
-) -> anyhow::Result<bool> {
+async fn reconcile_all(client: &kube::Client, cache: &cache::Cache, rp: &Client, cfg: &Config, state: &mut State) -> anyhow::Result<bool> {
 	let world = cache.snapshot();
 	let now = render::status::now();
 	let mut soon = false;
@@ -229,36 +230,63 @@ async fn reconcile_all(
 	let mut notes_seen = NOTES_SEEN.lock().unwrap().clone();
 	let mut plans: Vec<(GatewayPlan, Vec<PodSync>)> = vec![];
 	let mut keep_ids = vec![];
-	for gw in world.gateways.iter().filter(|g| classes.contains(&g.spec.gateway_class_name)) {
-		let opts = render::Options {
-			listen_addrs: cfg.listen_addrs.clone(),
-			cert_dir: provision::CERT_DIR.into(),
-			labels: true,
-			migration: cfg.migration.clone(),
-		};
-		let plan = render::render_gateway(&world, gw, &opts);
+	let opts = render::Options {
+		listen_addrs: cfg.listen_addrs.clone(),
+		cert_dir: provision::CERT_DIR.into(),
+		labels: true,
+		migration: cfg.migration.clone(),
+	};
+	let rendered: Vec<(&crate::k8s::gateway::Gateway, GatewayPlan)> = world
+		.gateways
+		.iter()
+		.filter(|g| classes.contains(&g.spec.gateway_class_name))
+		.map(|gw| (gw, render::render_gateway(&world, gw, &opts)))
+		.collect();
+	// fleet: one certificate Secret with every Gateway's files, mounted into every pod
+	let fleet_pods = match &cfg.mode {
+		Mode::Fleet(f) => {
+			let eps = provision::pods(&pods_now, &provision::parse_selector(&f.selector));
+			let mut files = BTreeMap::new();
+			for (_, plan) in &rendered {
+				files.extend(plan.files.iter().map(|(k, v)| (k.clone(), v.clone())));
+			}
+			let absent = state.absent.entry(provision::FLEET_CERTS_SECRET.into()).or_default();
+			match provision::apply_certs(client, &cfg.namespace, provision::FLEET_CERTS_SECRET, "fleet", None, &files, absent).await {
+				Ok(hash) => provision::touch_pods(client, &cfg.namespace, &eps, &hash).await,
+				Err(e) => {
+					warn!(error = format!("{e:#}"), "cannot write the fleet's certificate Secret");
+					soon = true;
+				}
+			}
+			eps
+		}
+		Mode::Managed(_) => vec![],
+	};
+	for (gw, plan) in rendered {
 		let id = provision::gateway_id(&plan.namespace, &plan.name);
 		keep_ids.push(id.clone());
 		let infra = gw.spec.infrastructure.clone().unwrap_or_default();
 		let (addresses, endpoints) = match &cfg.mode {
 			Mode::Managed(m) => {
-				let svc = match provision::apply_managed(client, &cfg.namespace, &plan, m, (&infra.labels, &infra.annotations)).await {
-					Ok(s) => s,
-					Err(e) => {
-						warn!(gateway = %plan.ruleset, error = format!("{e:#}"), "cannot deploy rproxy");
-						soon = true;
-						None
-					}
-				};
+				let absent = state.absent.entry(provision::certs_secret_name(&id)).or_default();
 				let selector: BTreeMap<String, String> = [(provision::LABEL_GATEWAY.to_string(), id.clone())].into();
-				(svc.as_ref().map(provision::service_addresses).unwrap_or_default(), provision::pods(&pods_now, &selector))
+				let eps = provision::pods(&pods_now, &selector);
+				let svc =
+					match provision::apply_managed(client, &cfg.namespace, &plan, m, (&infra.labels, &infra.annotations), absent).await {
+						Ok((s, hash)) => {
+							provision::touch_pods(client, &cfg.namespace, &eps, &hash).await;
+							s
+						}
+						Err(e) => {
+							warn!(gateway = %plan.ruleset, error = format!("{e:#}"), "cannot deploy rproxy");
+							soon = true;
+							None
+						}
+					};
+				(svc.as_ref().map(provision::service_addresses).unwrap_or_default(), eps)
 			}
 			Mode::Fleet(f) => {
-				if let Err(e) = provision::apply_certs(client, &cfg.namespace, &plan, "fleet").await {
-					warn!(gateway = %plan.ruleset, error = format!("{e:#}"), "cannot write the certificate Secret");
-					soon = true;
-				}
-				let eps = provision::pods(&pods_now, &provision::parse_selector(&f.selector));
+				let eps = fleet_pods.clone();
 				let addrs = if f.addresses.is_empty() {
 					let mut a: Vec<String> = eps.iter().filter_map(|e| e.host_ip.clone()).collect();
 					a.sort();
@@ -286,7 +314,7 @@ async fn reconcile_all(
 		}
 		let mut results = vec![];
 		for ep in &endpoints {
-			let (r, again) = sync_pod(rp, ep, &plan, applied, caps).await;
+			let (r, again) = sync_pod(rp, ep, &plan, &mut state.applied, &mut state.caps).await;
 			soon |= again;
 			results.push(r);
 		}
@@ -304,6 +332,9 @@ async fn reconcile_all(
 	*NOTES_SEEN.lock().unwrap() = notes_seen;
 
 	// Gateways that are gone
+	state
+		.absent
+		.retain(|name, _| name == provision::FLEET_CERTS_SECRET || keep_ids.iter().any(|id| provision::certs_secret_name(id) == *name));
 	if let Err(e) = provision::collect_garbage(client, &cfg.namespace, &keep_ids).await {
 		warn!(error = %e, "cannot remove rproxy of deleted Gateways");
 	}
@@ -517,7 +548,7 @@ pub async fn sync_pod(
 	applied.insert(key.clone(), (hash, answer.etag.clone(), rejected.clone()));
 	match rp.get_ruleset(addr, &plan.ruleset).await {
 		Ok(Some(set)) => {
-			// a rule failing on a file certsync has just written is tried again soon
+			// a rule failing on a file the kubelet has just written is tried again soon
 			let again = set.rules.iter().any(|r| r.state == "failed");
 			if again {
 				applied.remove(&key);

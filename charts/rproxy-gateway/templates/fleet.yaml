@@ -23,6 +23,8 @@ spec:
         app.kubernetes.io/component: fleet
     spec:
       serviceAccountName: rproxy-gateway-proxy
+      # rproxy and certsync do not use the Kubernetes API: certificates come as a mounted Secret
+      automountServiceAccountToken: false
       hostNetwork: {{ .Values.fleet.hostNetwork }}
       dnsPolicy: {{ if .Values.fleet.hostNetwork }}ClusterFirstWithHostNet{{ else }}ClusterFirst{{ end }}
       {{- with .Values.imagePullSecrets }}
@@ -59,10 +61,8 @@ spec:
         - name: certsync
           image: {{ include "rproxy-gateway.controllerImage" . }}
           imagePullPolicy: {{ .Values.controller.image.pullPolicy }}
-          args: [certsync, --selector=rproxy.max3584.net/certs-for=fleet, --dir=/var/run/rproxy-gateway/certs, --listen=0.0.0.0:9444]
-          env:
-            - name: POD_NAMESPACE
-              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+          # tells the controller which certificate files the kubelet has put in place
+          args: [certsync, --dir=/var/run/rproxy-gateway/certs, --listen=0.0.0.0:9444]
           ports:
             - {name: certsync, containerPort: 9444}
           securityContext:
@@ -70,7 +70,7 @@ spec:
             readOnlyRootFilesystem: true
             capabilities: {drop: [ALL]}
           volumeMounts:
-            - {name: certs, mountPath: /var/run/rproxy-gateway/certs}
+            - {name: certs, mountPath: /var/run/rproxy-gateway/certs, readOnly: true}
       volumes:
         - name: token
           secret:
@@ -78,8 +78,9 @@ spec:
             items: [{key: tokens.yaml, path: tokens.yaml}]
         - name: api-tls
           secret: {secretName: rproxy-gateway-api-tls}
+        # every Gateway's certificate files, written by the controller
         - name: certs
-          emptyDir: {medium: Memory}
+          secret: {secretName: rproxy-fleet-certs, defaultMode: 288, optional: true}  # 0440
       {{- with .Values.fleet.nodeSelector }}
       nodeSelector: {{- toYaml . | nindent 8 }}
       {{- end }}

@@ -8,16 +8,22 @@
 //!   `hostNetwork: true`, rproxy-api docs/DESIGN-v0.4.md 3.3) serve every
 //!   Gateway; the controller PUTs each Gateway's set to every pod.
 //!
-//! In both, a Gateway's certificate files are one Secret (`<name>-certs`,
-//! labelled `rproxy.max3584.net/certs-for`) that certsync watches.
+//! Certificate files reach rproxy as a Secret the controller writes and the
+//! kubelet mounts into the pod (`rproxy-<id>-certs` per Gateway; in fleet mode
+//! one `rproxy-fleet-certs` with every Gateway's files). rproxy pods have no
+//! ServiceAccount token and no RBAC: they cannot read any Secret through the
+//! API, only what is mounted. When the Secret changes, the controller sets an
+//! annotation on the pods, which makes the kubelet update the mounted files at
+//! once instead of at its next periodic sync.
 
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 use k8s_openapi::ByteString;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::core::v1::{
-	Capabilities, Container, ContainerPort, EmptyDirVolumeSource, EnvVar, HTTPGetAction, KeyToPath, Pod, PodSecurityContext, PodSpec,
-	PodTemplateSpec, Probe, Secret, SecretVolumeSource, SecurityContext, Service, ServicePort, ServiceSpec, Sysctl, Volume, VolumeMount,
+	Capabilities, Container, ContainerPort, EnvVar, HTTPGetAction, KeyToPath, Pod, PodSecurityContext, PodSpec, PodTemplateSpec, Probe,
+	Secret, SecretVolumeSource, SecurityContext, Service, ServicePort, ServiceSpec, Sysctl, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -32,6 +38,10 @@ pub const MANAGER: &str = "rproxy-gateway";
 pub const LABEL_GATEWAY: &str = "rproxy.max3584.net/gateway";
 pub const LABEL_CERTS_FOR: &str = "rproxy.max3584.net/certs-for";
 pub const ANNOTATION_GATEWAY: &str = "rproxy.max3584.net/gateway";
+/// On rproxy pods: the hash of the certificate Secret's content they should have mounted.
+pub const ANNOTATION_CERTS: &str = "rproxy.max3584.net/certs";
+/// The certificate Secret of fleet pods (every Gateway's files).
+pub const FLEET_CERTS_SECRET: &str = "rproxy-fleet-certs";
 /// The control API port of rproxy pods.
 pub const API_PORT: u16 = 9443;
 /// certsync's port (`GET /files`).
@@ -91,17 +101,63 @@ fn meta(name: &str, ns: &str, labels: BTreeMap<String, String>, gw: &str) -> Obj
 	}
 }
 
-/// The Secret holding a Gateway's certificate files.
-pub fn certs_secret(plan: &GatewayPlan, ns: &str, certs_for: &str) -> Secret {
-	let id = gateway_id(&plan.namespace, &plan.name);
-	let mut l = labels(&id);
-	l.remove("app.kubernetes.io/name");
+/// The name of a Gateway's certificate Secret (managed mode).
+pub fn certs_secret_name(id: &str) -> String {
+	format!("rproxy-{id}-certs")
+}
+
+/// A certificate Secret: `certs_for` is the Gateway's id or `fleet`.
+pub fn certs_secret(name: &str, ns: &str, certs_for: &str, gw: Option<&str>, data: &BTreeMap<String, Vec<u8>>) -> Secret {
+	let mut l: BTreeMap<String, String> = [("app.kubernetes.io/managed-by".to_string(), MANAGER.to_string())].into();
 	l.insert(LABEL_CERTS_FOR.into(), certs_for.into());
+	let mut metadata = ObjectMeta { name: Some(name.into()), namespace: Some(ns.into()), labels: Some(l), ..Default::default() };
+	if let Some(gw) = gw {
+		// garbage collection finds a Gateway's objects by this label
+		metadata.labels.get_or_insert_default().insert(LABEL_GATEWAY.into(), certs_for.into());
+		metadata.annotations = Some([(ANNOTATION_GATEWAY.to_string(), gw.to_string())].into());
+	}
 	Secret {
-		metadata: meta(&format!("rproxy-{id}-certs"), ns, l, &format!("{}/{}", plan.namespace, plan.name)),
-		data: Some(plan.files.iter().map(|(k, v)| (k.clone(), ByteString(v.clone()))).collect()),
+		metadata,
+		type_: Some("Opaque".into()),
+		data: Some(data.iter().map(|(k, v)| (k.clone(), ByteString(v.clone()))).collect()),
 		..Default::default()
 	}
+}
+
+/// What a certificate Secret holds: the files wanted now, and files it held that
+/// no rule wants any more for up to `certsync::LINGER` (`absent` remembers since when).
+pub fn with_linger(
+	wanted: &BTreeMap<String, Vec<u8>>,
+	current: &BTreeMap<String, Vec<u8>>,
+	absent: &mut BTreeMap<String, Instant>,
+	now: Instant,
+) -> BTreeMap<String, Vec<u8>> {
+	let mut out = wanted.clone();
+	absent.retain(|name, _| !wanted.contains_key(name) && current.contains_key(name));
+	for (name, content) in current {
+		if wanted.contains_key(name) {
+			continue;
+		}
+		let since = *absent.entry(name.clone()).or_insert(now);
+		if now.duration_since(since) < crate::certsync::LINGER {
+			out.insert(name.clone(), content.clone());
+		} else {
+			absent.remove(name);
+		}
+	}
+	out
+}
+
+/// A short hash of a Secret's content (the pods' annotation).
+pub fn content_hash(data: &BTreeMap<String, Vec<u8>>) -> String {
+	let mut all = vec![];
+	for (k, v) in data {
+		all.extend_from_slice(k.as_bytes());
+		all.push(0);
+		all.extend_from_slice(crate::pem::sha256_hex(v).as_bytes());
+		all.push(0);
+	}
+	crate::pem::short_hash(&all)
 }
 
 fn mount(name: &str, path: &str, ro: bool) -> VolumeMount {
@@ -161,19 +217,9 @@ pub fn deployment(plan: &GatewayPlan, ns: &str, m: &Managed, infra_labels: &BTre
 		name: "certsync".into(),
 		image: Some(m.controller_image.clone()),
 		image_pull_policy: Some(m.pull_policy.clone()),
-		args: Some(vec![
-			"certsync".into(),
-			"--namespace".into(),
-			ns.into(),
-			"--selector".into(),
-			format!("{LABEL_CERTS_FOR}={id}"),
-			"--dir".into(),
-			CERT_DIR.into(),
-			"--listen".into(),
-			format!("0.0.0.0:{CERTSYNC_PORT}"),
-		]),
+		args: Some(vec!["certsync".into(), "--dir".into(), CERT_DIR.into(), "--listen".into(), format!("0.0.0.0:{CERTSYNC_PORT}")]),
 		ports: Some(vec![ContainerPort { name: Some("certsync".into()), container_port: CERTSYNC_PORT.into(), ..Default::default() }]),
-		volume_mounts: Some(vec![mount("certs", CERT_DIR, false)]),
+		volume_mounts: Some(vec![mount("certs", CERT_DIR, true)]),
 		security_context: Some(restricted),
 		..Default::default()
 	};
@@ -192,6 +238,8 @@ pub fn deployment(plan: &GatewayPlan, ns: &str, m: &Managed, infra_labels: &BTre
 				metadata: Some(ObjectMeta { labels: Some(pod_labels), ..Default::default() }),
 				spec: Some(PodSpec {
 					service_account_name: Some(m.service_account.clone()),
+					// rproxy and certsync do not use the Kubernetes API
+					automount_service_account_token: Some(false),
 					security_context: Some(PodSecurityContext {
 						run_as_non_root: Some(true),
 						run_as_user: Some(65532),
@@ -211,7 +259,14 @@ pub fn deployment(plan: &GatewayPlan, ns: &str, m: &Managed, infra_labels: &BTre
 						secret_vol("api-tls", API_TLS_SECRET, None),
 						Volume {
 							name: "certs".into(),
-							empty_dir: Some(EmptyDirVolumeSource { medium: Some("Memory".into()), ..Default::default() }),
+							secret: Some(SecretVolumeSource {
+								secret_name: Some(certs_secret_name(&id)),
+								// readable by the pod's group (fsGroup), nobody else
+								default_mode: Some(0o440),
+								// the pod starts before the controller has written it
+								optional: Some(true),
+								..Default::default()
+							}),
 							..Default::default()
 						},
 					]),
@@ -256,24 +311,55 @@ fn pp() -> PatchParams {
 	PatchParams::apply(MANAGER).force()
 }
 
-/// Applies a Gateway's certificate Secret (`certs_for`: its id, or `fleet`).
-pub async fn apply_certs(client: &kube::Client, ns: &str, plan: &GatewayPlan, certs_for: &str) -> anyhow::Result<()> {
-	let s = certs_secret(plan, ns, certs_for);
-	let name = s.metadata.name.clone().unwrap_or_default();
-	Api::<Secret>::namespaced(client.clone(), ns).patch(&name, &pp(), &Patch::Apply(&s)).await?;
-	Ok(())
+/// Writes a certificate Secret (`wanted` and the files still lingering) when its
+/// content changed; returns the hash of what it holds.
+pub async fn apply_certs(
+	client: &kube::Client,
+	ns: &str,
+	name: &str,
+	certs_for: &str,
+	gw: Option<&str>,
+	wanted: &BTreeMap<String, Vec<u8>>,
+	absent: &mut BTreeMap<String, Instant>,
+) -> anyhow::Result<String> {
+	let api = Api::<Secret>::namespaced(client.clone(), ns);
+	let current = api.get_opt(name).await?;
+	let current_data: BTreeMap<String, Vec<u8>> =
+		current.as_ref().and_then(|s| s.data.clone()).unwrap_or_default().into_iter().map(|(k, v)| (k, v.0)).collect();
+	let data = with_linger(wanted, &current_data, absent, Instant::now());
+	let s = certs_secret(name, ns, certs_for, gw, &data);
+	let same_labels = current.as_ref().is_some_and(|c| c.metadata.labels == s.metadata.labels);
+	if current.is_none() || current_data != data || !same_labels {
+		api.patch(name, &pp(), &Patch::Apply(&s)).await?;
+	}
+	Ok(content_hash(&data))
 }
 
-/// Applies a Gateway's Deployment and Service; returns the Service (with its status).
+/// Sets `ANNOTATION_CERTS` on pods that do not have `hash` yet: the kubelet then
+/// updates their mounted Secret at once.
+pub async fn touch_pods(client: &kube::Client, ns: &str, pods: &[Endpoint], hash: &str) {
+	let api = Api::<Pod>::namespaced(client.clone(), ns);
+	for p in pods.iter().filter(|p| p.certs.as_deref() != Some(hash)) {
+		let patch = serde_json::json!({"metadata": {"annotations": {ANNOTATION_CERTS: hash}}});
+		if let Err(e) = api.patch(&p.pod, &PatchParams::default(), &Patch::Merge(&patch)).await {
+			tracing::debug!(pod = p.pod, error = %e, "cannot annotate the pod (its certificate files update at the kubelet's next sync)");
+		}
+	}
+}
+
+/// Applies a Gateway's certificate Secret, Deployment and Service; returns the
+/// Service (with its status) and the hash of the certificate Secret.
 pub async fn apply_managed(
 	client: &kube::Client,
 	ns: &str,
 	plan: &GatewayPlan,
 	m: &Managed,
 	infra: (&BTreeMap<String, String>, &BTreeMap<String, String>),
-) -> anyhow::Result<Option<Service>> {
+	absent: &mut BTreeMap<String, Instant>,
+) -> anyhow::Result<(Option<Service>, String)> {
 	let id = gateway_id(&plan.namespace, &plan.name);
-	apply_certs(client, ns, plan, &id).await?;
+	let gw = format!("{}/{}", plan.namespace, plan.name);
+	let hash = apply_certs(client, ns, &certs_secret_name(&id), &id, Some(&gw), &plan.files, absent).await?;
 	let d = deployment(plan, ns, m, infra.0);
 	let name = d.metadata.name.clone().unwrap_or_default();
 	Api::<Deployment>::namespaced(client.clone(), ns).patch(&name, &pp(), &Patch::Apply(&d)).await?;
@@ -281,10 +367,10 @@ pub async fn apply_managed(
 	if plan.ports().is_empty() {
 		// a Service needs a port; none until a listener is valid
 		let _ = svc_api.delete(&name, &DeleteParams::default()).await;
-		return Ok(None);
+		return Ok((None, hash));
 	}
 	let s = service(plan, ns, m, infra.1);
-	Ok(Some(svc_api.patch(&name, &pp(), &Patch::Apply(&s)).await?))
+	Ok((Some(svc_api.patch(&name, &pp(), &Patch::Apply(&s)).await?), hash))
 }
 
 /// Deletes managed objects of Gateways that are gone (`keep`: ids still in use).
@@ -347,6 +433,8 @@ pub struct Endpoint {
 	pub api_port: u16,
 	/// certsync's port.
 	pub certsync_port: u16,
+	/// The pod's `ANNOTATION_CERTS`.
+	pub certs: Option<String>,
 }
 
 /// Running pods matching `labels` (`key=value,...`).
@@ -370,6 +458,7 @@ pub fn pods(store: &[std::sync::Arc<Pod>], selector: &BTreeMap<String, String>) 
 				host_ip: st.host_ip.clone(),
 				api_port: API_PORT,
 				certsync_port: CERTSYNC_PORT,
+				certs: p.metadata.annotations.as_ref().and_then(|a| a.get(ANNOTATION_CERTS)).cloned(),
 			})
 		})
 		.collect();
@@ -417,17 +506,46 @@ mod tests {
 			pull_policy: "IfNotPresent".into(),
 		};
 		let p = plan();
+		let id = gateway_id("default", "web");
 		let d = deployment(&p, "rproxy-gateway-system", &m, &BTreeMap::new());
 		let spec = d.spec.unwrap();
 		assert_eq!(spec.replicas, Some(2));
 		let pod = spec.template.spec.unwrap();
 		assert_eq!(pod.containers.len(), 2);
-		assert!(pod.containers[1].args.as_ref().unwrap().contains(&format!("{LABEL_CERTS_FOR}={}", gateway_id("default", "web"))));
+		assert_eq!(pod.automount_service_account_token, Some(false));
+		let certs = pod.volumes.unwrap().into_iter().find(|v| v.name == "certs").unwrap().secret.unwrap();
+		assert_eq!(certs.secret_name, Some(certs_secret_name(&id)));
+		assert_eq!(certs.default_mode, Some(0o440));
+		assert!(pod.containers.iter().all(|c| c.volume_mounts.iter().flatten().all(|v| v.read_only == Some(true))));
 		let s = service(&p, "rproxy-gateway-system", &m, &BTreeMap::new());
 		let ports = s.spec.unwrap().ports.unwrap();
 		assert_eq!((ports[0].port, ports[0].protocol.as_deref()), (443, Some("TCP")));
-		let c = certs_secret(&p, "ns", "fleet");
-		assert_eq!(c.metadata.labels.unwrap()[LABEL_CERTS_FOR], "fleet");
+		let c = certs_secret(FLEET_CERTS_SECRET, "ns", "fleet", None, &p.files);
+		let l = c.metadata.labels.unwrap();
+		assert_eq!(l[LABEL_CERTS_FOR], "fleet");
+		assert!(!l.contains_key(LABEL_GATEWAY), "the fleet Secret is not one Gateway's");
+		let c = certs_secret(&certs_secret_name(&id), "ns", &id, Some("default/web"), &p.files);
+		assert_eq!(c.metadata.labels.unwrap()[LABEL_GATEWAY], id);
 		assert_eq!(parse_selector("a=b, c=d"), [("a".to_string(), "b".to_string()), ("c".to_string(), "d".to_string())].into());
+	}
+
+	#[test]
+	fn old_files_linger() {
+		let t0 = Instant::now();
+		let mut absent = BTreeMap::new();
+		let f = |names: &[&str]| -> BTreeMap<String, Vec<u8>> { names.iter().map(|n| (n.to_string(), n.as_bytes().to_vec())).collect() };
+		let out = with_linger(&f(&["b.crt"]), &f(&["a.crt"]), &mut absent, t0);
+		assert_eq!(out, f(&["a.crt", "b.crt"]), "a.crt stays for a while");
+		let out = with_linger(&f(&["b.crt"]), &out, &mut absent, t0 + crate::certsync::LINGER / 2);
+		assert_eq!(out, f(&["a.crt", "b.crt"]));
+		let out = with_linger(&f(&["b.crt"]), &out, &mut absent, t0 + crate::certsync::LINGER);
+		assert_eq!(out, f(&["b.crt"]));
+		assert!(absent.is_empty());
+		// wanted again: no longer absent
+		let mut absent = BTreeMap::new();
+		with_linger(&f(&[]), &f(&["a.crt"]), &mut absent, t0);
+		with_linger(&f(&["a.crt"]), &f(&["a.crt"]), &mut absent, t0);
+		assert!(absent.is_empty());
+		assert_ne!(content_hash(&f(&["a.crt"])), content_hash(&f(&["b.crt"])));
 	}
 }

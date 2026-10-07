@@ -9,7 +9,7 @@ rproxy-api の docs/DESIGN-v0.4.md 3.（#28）を形にしたもの。ここに�
 ```
 Gateway API / CRD ──watch──▶ rproxy-gateway ──PUT /rulesets/k8s/<ns>/<name>──▶ rproxy（制御 API、HTTPS + トークン）
                                    │                                              ▲
-                                   └──証明書の Secret（<id>-certs）──▶ certsync ──ファイル──┘（同じ Pod の emptyDir）
+                                   └──証明書の Secret（<id>-certs）──kubelet がボリュームに──┘（rproxy の Pod は API を使わない）
 ```
 
 - rproxy と話すのは制御 API だけ（`GET /capabilities`、`GET /readyz`、`GET` / `PUT` / `DELETE /rulesets/{name}`）。rproxy は Kubernetes の API を知らない。
@@ -41,18 +41,29 @@ Gateway API / CRD ──watch──▶ rproxy-gateway ──PUT /rulesets/k8s/<n
 
 | Secret | 中身 | 読む人 |
 |---|---|---|
-| `rproxy-gateway-ca` | CA の証明書と鍵 | コントローラ |
-| `rproxy-gateway-api-tls` | rproxy の制御 API の証明書（CA が `rproxy-api.rproxy-gateway.internal` に出す。Pod へは IP でつなぐので名前は固定） | rproxy |
-| `rproxy-gateway-token` | コントローラのトークン（`token`）と、rproxy が読むトークンファイル（`tokens.yaml`、SHA-256 だけ。スコープは `rules:read`・`rules:write`・`acme:write`） | `token` はコントローラ、`tokens.yaml` は rproxy |
+| `rproxy-gateway-ca` | CA の証明書と鍵 | コントローラ（rproxy の Pod は読めない） |
+| `rproxy-gateway-api-tls` | rproxy の制御 API の証明書（CA が `rproxy-api.rproxy-gateway.internal` に出す。Pod へは IP でつなぐので名前は固定） | rproxy（ボリューム） |
+| `rproxy-gateway-token` | コントローラのトークン（`token`）と、rproxy が読むトークンファイル（`tokens.yaml`、SHA-256 だけ。スコープは `rules:read`・`rules:write`・`acme:write`） | `token` はコントローラ、`tokens.yaml` は rproxy（ボリュームでその項目だけ） |
 
 rproxy は `RPROXY_API_ADDR=0.0.0.0`、`RPROXY_API_PORT=9443`、`RPROXY_TOKEN_FILE`、`RPROXY_TLS_CERT` / `RPROXY_TLS_KEY` で動く（制御 API を loopback 以外で開くときに rproxy が求める 3 つ）。
 
-## 証明書（certsync）
+## 証明書（Secret のボリューム、certsync）
 
 - `certificateRefs` の Secret は、rproxy のホストのファイルにして `cert_file` / `key_file` で指す（鍵を制御 API に流さない。rproxy-api の設計 3.3）。
 - ファイル名は中身のハッシュ（`<sha256 の先頭 16 桁>.crt` / `.key`）。中身が変わればパスが変わり、ルールの変更として rproxy に届く。
-- コントローラは Gateway ごとの証明書を 1 つの Secret（`rproxy-<id>-certs`、ラベル `rproxy.max3584.net/certs-for`）にまとめる。rproxy の Pod の中の `certsync`（このイメージの `rproxy-gateway certsync`）がそれを watch して、rproxy と共有する `emptyDir`（`/var/run/rproxy-gateway/certs`）に書く。
-- コントローラは PUT の前に certsync の `GET /files` でファイルが揃ったかを確かめる（揃うまで `Programmed: False`、理由 `Pending`）。どの Secret にもなくなったファイルは 5 分残してから消す（古いルールが読み直しても困らないように）。
+- コントローラは Gateway ごとの証明書を 1 つの Secret（`rproxy-<id>-certs`）にまとめ、kubelet がそれを rproxy の Pod に Secret のボリューム（`/var/run/rproxy-gateway/certs`、読むだけ、モード 0440）としてつなぐ。fleet では、すべての Gateway の証明書を 1 つの Secret（`rproxy-fleet-certs`）にまとめ、DaemonSet の Pod につなぐ（Secret は 1 MiB まで）。
+- rproxy の Pod は Kubernetes の API を使わない：ServiceAccount のトークンをつながず（`automountServiceAccountToken: false`）、RBAC もない。参照された証明書だけが、コントローラの書いた Secret を通して Pod に届く。同じ namespace のほかの Secret（CA の鍵、コントローラのトークン、ほかの Gateway の証明書）は読めない。
+- Secret を書き換えたら、コントローラは Pod に注釈（`rproxy.max3584.net/certs`、中身のハッシュ）を付ける。kubelet は Pod の更新を受けてボリュームをすぐに更新する（注釈がなくても、kubelet の定期の同期（1 分ほど）で更新される）。
+- 同じ Pod の `certsync`（このイメージの `rproxy-gateway certsync`）は、そのディレクトリのファイル名を `GET /files` で返すだけ（API は使わない）。コントローラは PUT の前にファイルが揃ったかを確かめる（揃うまで `Programmed: False`、理由 `Pending`）。
+- どのルールも使わなくなったファイルは、5 分 Secret に残してから外す（古いルールが読み直しても困らないように）。
+
+### 選ばなかった形
+
+| 形 | 選ばなかった理由 |
+|---|---|
+| certsync が Secret を watch する（前の形） | rproxy の Pod に namespace のすべての Secret を読む権限が要る。`resourceNames` では watch・list を名前で絞れない |
+| Gateway ごとに namespace を分ける | Gateway ごとに namespace・RBAC・トークンの Secret を配ることになる。fleet では使えない |
+| 鍵を制御 API で送る | rproxy-api の設計 3.3（鍵をネットワークに流さない）に反する |
 
 ## 反映（ルールセット）
 
@@ -60,7 +71,7 @@ rproxy は `RPROXY_API_ADDR=0.0.0.0`、`RPROXY_API_PORT=9443`、`RPROXY_TOKEN_FI
 2. `GET /readyz` が ready になるまで待つ（`features.readyz` がない rproxy は待たない）。
 3. `GET /rulesets/{name}`。前回 PUT したものと同じ内容・同じ etag なら何もしない。違えば（中身が変わった、rproxy が再起動してセットがない、ほかの誰かが変えた）`PUT /rulesets/{name}`。`generation` は Gateway の `metadata.generation`（rproxy にあるほうが大きければそちら。作り直した Gateway が `stale_generation` にならないように）、`If-Match` は今の etag。
 4. rproxy が 1 つのルールを断ったら（`400`、`rules[i]: ...`）、そのルールを外して残りを PUT し直す（RproxyRule や移行したルートの 1 つの誤りでセット全体を止めない）。断られたルールは `Accepted: False`（`Invalid`）として状態に書く。
-5. PUT のあとの `GET /rulesets/{name}` のルールの `conditions` から状態を書く。`failed` のルールがあれば、少し後にもう一度 PUT する（certsync が書いたばかりのファイルなど）。
+5. PUT のあとの `GET /rulesets/{name}` のルールの `conditions` から状態を書く。`failed` のルールがあれば、少し後にもう一度 PUT する（kubelet が書いたばかりのファイルなど）。
 
 ## 変換（Gateway API → rproxy）
 

@@ -67,7 +67,7 @@ spec:
 | コマンド | 内容 |
 |---|---|
 | `rproxy-gateway controller` | コントローラ（フラグは `--help`。すべて `RPROXY_GATEWAY_*` の環境変数でも指定できる） |
-| `rproxy-gateway certsync` | rproxy の Pod の中で、証明書の Secret を rproxy が読むファイルにする |
+| `rproxy-gateway certsync` | rproxy の Pod の中で、ボリュームの証明書のファイルが揃ったかをコントローラに答える（API は使わない） |
 | `rproxy-gateway crds` | 自前の CRD の YAML を出す（chart の `crds/` と同じ） |
 | `rproxy-gateway render -f <files>` | マニフェストからルールセットを描く（クラスタも rproxy も要らない。移行の下見にも） |
 

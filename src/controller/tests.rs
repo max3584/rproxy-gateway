@@ -142,8 +142,15 @@ async fn sets_are_put_once_and_again_after_a_restart() {
 	let fake = Arc::new(Mutex::new(Fake::default()));
 	let port = start(fake.clone()).await;
 	let rp = Client::new(None, "secret").unwrap();
-	let ep =
-		Endpoint { pod: "rproxy-0".into(), uid: "u1".into(), ip: "127.0.0.1".into(), host_ip: None, api_port: port, certsync_port: port };
+	let ep = Endpoint {
+		pod: "rproxy-0".into(),
+		uid: "u1".into(),
+		ip: "127.0.0.1".into(),
+		host_ip: None,
+		api_port: port,
+		certsync_port: port,
+		certs: None,
+	};
 	let mut applied = Applied::new();
 	let mut caps = HashMap::new();
 
@@ -189,8 +196,15 @@ async fn waits_for_certificate_files_and_reports_failures() {
 	let fake = Arc::new(Mutex::new(Fake::default()));
 	let port = start(fake.clone()).await;
 	let rp = Client::new(None, "secret").unwrap();
-	let ep =
-		Endpoint { pod: "rproxy-0".into(), uid: "u1".into(), ip: "127.0.0.1".into(), host_ip: None, api_port: port, certsync_port: port };
+	let ep = Endpoint {
+		pod: "rproxy-0".into(),
+		uid: "u1".into(),
+		ip: "127.0.0.1".into(),
+		host_ip: None,
+		api_port: port,
+		certsync_port: port,
+		certs: None,
+	};
 	let mut applied = Applied::new();
 	let mut caps = HashMap::new();
 	let p = plan(443, &["abc.crt", "abc.key"]);
@@ -233,8 +247,15 @@ async fn a_wrong_token_is_reported() {
 	let fake = Arc::new(Mutex::new(Fake::default()));
 	let port = start(fake.clone()).await;
 	let rp = Client::new(None, "wrong").unwrap();
-	let ep =
-		Endpoint { pod: "rproxy-0".into(), uid: "u1".into(), ip: "127.0.0.1".into(), host_ip: None, api_port: port, certsync_port: port };
+	let ep = Endpoint {
+		pod: "rproxy-0".into(),
+		uid: "u1".into(),
+		ip: "127.0.0.1".into(),
+		host_ip: None,
+		api_port: port,
+		certsync_port: port,
+		certs: None,
+	};
 	let (r, _) = sync_pod(&rp, &ep, &plan(80, &[]), &mut Applied::new(), &mut HashMap::new()).await;
 	assert!(matches!(&r, PodSync::NotReady(m) if m.contains("401")), "{r:?}");
 }
@@ -244,8 +265,15 @@ async fn a_refused_rule_does_not_stop_the_others() {
 	let fake = Arc::new(Mutex::new(Fake::default()));
 	let port = start(fake.clone()).await;
 	let rp = Client::new(None, "secret").unwrap();
-	let ep =
-		Endpoint { pod: "rproxy-0".into(), uid: "u1".into(), ip: "127.0.0.1".into(), host_ip: None, api_port: port, certsync_port: port };
+	let ep = Endpoint {
+		pod: "rproxy-0".into(),
+		uid: "u1".into(),
+		ip: "127.0.0.1".into(),
+		host_ip: None,
+		api_port: port,
+		certsync_port: port,
+		certs: None,
+	};
 	let mut p = plan(80, &[]);
 	p.raw = vec![json!({"protocol": "tcp", "listen_addr": "0.0.0.0", "listen_port": 25, "remote_addr": "bad name", "remote_port": 25})];
 	let mut applied = Applied::new();

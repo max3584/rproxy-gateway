@@ -67,7 +67,7 @@ spec:
 | Command | What it does |
 |---|---|
 | `rproxy-gateway controller` | the controller (flags: `--help`; every flag can also be set as an `RPROXY_GATEWAY_*` environment variable) |
-| `rproxy-gateway certsync` | in rproxy's pod, writes certificate Secrets as the files rproxy reads |
+| `rproxy-gateway certsync` | in rproxy's pod, tells the controller which mounted certificate files are in place (no API access) |
 | `rproxy-gateway crds` | prints the CRDs' YAML (the same as the chart's `crds/`) |
 | `rproxy-gateway render -f <files>` | renders rule sets from manifests (no cluster, no rproxy; also a preview for migration) |
 

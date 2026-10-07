@@ -23,7 +23,7 @@ With `--migrate-to <namespace>/<name>`, the controller reads Ingress and Traefik
 |---|---|
 | IngressRoute `match` | as it is (rproxy's `match` is Traefik v3 syntax). v2 `Headers`, `HeadersRegexp`, `HostHeader`, `Query(a=b)` are rewritten. v2 placeholders (`{name:regex}`) and other matchers are left out |
 | IngressRoute `services` (Services; port by number or name) | `servers` with the pod IPs of the EndpointSlices. `scheme` (else https for port 443 or a port name starting with https), `weight`, `passHostHeader: false`. `TraefikService` is left out |
-| IngressRoute `tls.secretName` | certificate files (certsync) |
+| IngressRoute `tls.secretName` | certificate files (a mounted Secret) |
 | `tls.certResolver` | `{acme: <resolver>, domains: [...]}` (`domains`, else the `Host()` names). rproxy's settings file needs that resolver in `global.acme` |
 | `tls.options` (TLSOption) | `tls.options` (`minVersion`, `cipherSuites`), `client_auth` (`tls.ca` / `ca.crt` of the `clientAuth.secretNames` Secrets as a file), `alpn`. `maxVersion`, `curvePreferences`, `sniStrict` are left out |
 | Middleware | rproxy middlewares (`redirectScheme`, `redirectRegex`, `stripPrefix`, `addPrefix`, `replacePath(Regex)`, `headers`, `rateLimit`, `inFlightReq`, `ipAllowList`, `basicAuth` (the Secret's `users` as an htpasswd file), `forwardAuth`, `compress`, `retry`, `circuitBreaker`, `errors`, `buffering`, the CrowdSec plugin; `chain` is expanded) |
