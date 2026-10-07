@@ -73,6 +73,8 @@ pub const SUPPORTED_FEATURES: &[&str] = &[
 	"HTTPRouteBackendProtocolH2C",
 	"GatewayFrontendClientCertificateValidation",
 	"ListenerSet",
+	"GRPCRoute",
+	"GRPCRouteNamedRouteRule",
 ];
 
 #[derive(Clone, Debug)]
@@ -780,8 +782,7 @@ async fn write_route_status(
 	let mut ours: BTreeMap<(RouteKind, String, String), Vec<Value>> = BTreeMap::new();
 	let previous_of = |kind: RouteKind, ns: &str, name: &str| -> Option<Value> {
 		match kind {
-			RouteKind::Http => world
-				.http_routes
+			RouteKind::Http | RouteKind::Grpc => if kind == RouteKind::Grpc { &world.grpc_routes } else { &world.http_routes }
 				.iter()
 				.find(|r| r.metadata.namespace.as_deref() == Some(ns) && r.metadata.name.as_deref() == Some(name))
 				.and_then(|r| r.status.clone()),
@@ -817,13 +818,15 @@ async fn write_route_status(
 	}
 	// routes with our entries but nothing from us now
 	let mut all: Vec<(RouteKind, String, String, Option<Value>)> = vec![];
-	for r in &world.http_routes {
-		all.push((
-			RouteKind::Http,
-			r.metadata.namespace.clone().unwrap_or_default(),
-			r.metadata.name.clone().unwrap_or_default(),
-			r.status.clone(),
-		));
+	for (kind, list) in [(RouteKind::Http, &world.http_routes), (RouteKind::Grpc, &world.grpc_routes)] {
+		for r in list {
+			all.push((
+				kind,
+				r.metadata.namespace.clone().unwrap_or_default(),
+				r.metadata.name.clone().unwrap_or_default(),
+				r.status.clone(),
+			));
+		}
 	}
 	for (kind, list) in [(RouteKind::Tls, &world.tls_routes), (RouteKind::Tcp, &world.tcp_routes), (RouteKind::Udp, &world.udp_routes)] {
 		for r in list {

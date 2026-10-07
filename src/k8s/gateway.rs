@@ -531,3 +531,102 @@ pub struct ReferenceGrantTo {
 	#[serde(default)]
 	pub name: Option<String>,
 }
+
+/// A GRPCRoute (read, then turned into the HTTPRoute it amounts to: `to_http`).
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct GrpcRoute {
+	#[serde(default)]
+	pub metadata: ObjectMeta,
+	pub spec: GrpcRouteSpec,
+	#[serde(default)]
+	pub status: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GrpcRouteSpec {
+	#[serde(default)]
+	pub parent_refs: Vec<ParentReference>,
+	#[serde(default)]
+	pub hostnames: Vec<String>,
+	#[serde(default)]
+	pub rules: Vec<GrpcRouteRule>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GrpcRouteRule {
+	#[serde(default)]
+	pub name: Option<String>,
+	#[serde(default)]
+	pub matches: Vec<GrpcRouteMatch>,
+	/// The same shape as HTTPRoute's (RequestHeaderModifier, ResponseHeaderModifier, RequestMirror, ExtensionRef).
+	#[serde(default)]
+	pub filters: Vec<HttpRouteFilter>,
+	#[serde(default)]
+	pub backend_refs: Vec<HttpBackendRef>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct GrpcRouteMatch {
+	#[serde(default)]
+	pub method: Option<GrpcMethodMatch>,
+	#[serde(default)]
+	pub headers: Vec<ValueMatch>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct GrpcMethodMatch {
+	/// `Exact` (the default) or `RegularExpression`.
+	#[serde(default, rename = "type")]
+	pub kind: Option<String>,
+	#[serde(default)]
+	pub service: Option<String>,
+	#[serde(default)]
+	pub method: Option<String>,
+}
+
+impl GrpcRoute {
+	/// The HTTPRoute this GRPCRoute amounts to: a gRPC call is a `POST /<service>/<method>`
+	/// over HTTP/2, so a method match is a path match.
+	pub fn to_http(&self) -> HttpRoute {
+		let rules = self
+			.spec
+			.rules
+			.iter()
+			.map(|r| HttpRouteRule {
+				name: r.name.clone(),
+				matches: r.matches.iter().map(grpc_match).collect(),
+				filters: r.filters.clone(),
+				backend_refs: r.backend_refs.clone(),
+				timeouts: None,
+				retry: None,
+			})
+			.collect();
+		HttpRoute {
+			metadata: self.metadata.clone(),
+			spec: HttpRouteSpec { parent_refs: self.spec.parent_refs.clone(), hostnames: self.spec.hostnames.clone(), rules },
+			status: self.status.clone(),
+		}
+	}
+}
+
+fn grpc_match(m: &GrpcRouteMatch) -> HttpRouteMatch {
+	let path = m.method.as_ref().and_then(|mm| {
+		let exact = mm.kind.as_deref().unwrap_or("Exact") == "Exact";
+		match (exact, mm.service.as_deref(), mm.method.as_deref()) {
+			(_, None, None) => None,
+			(true, Some(s), Some(me)) => Some(HttpPathMatch { kind: Some("Exact".into()), value: Some(format!("/{s}/{me}")) }),
+			(true, Some(s), None) => Some(HttpPathMatch { kind: Some("PathPrefix".into()), value: Some(format!("/{s}/")) }),
+			(true, None, Some(me)) => Some(HttpPathMatch {
+				kind: Some("RegularExpression".into()),
+				value: Some(format!("/[^/]+/{}", crate::render::http::regex_escape(me))),
+			}),
+			(false, s, me) => Some(HttpPathMatch {
+				kind: Some("RegularExpression".into()),
+				value: Some(format!("/(?:{})/(?:{})", s.unwrap_or("[^/]+"), me.unwrap_or("[^/]+"))),
+			}),
+		}
+	});
+	HttpRouteMatch { path, headers: m.headers.clone(), query_params: vec![], method: None }
+}

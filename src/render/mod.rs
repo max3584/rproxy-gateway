@@ -141,6 +141,7 @@ pub fn needs(have: bool, what: &str, feature: &str) -> Result<(), String> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RouteKind {
 	Http,
+	Grpc,
 	Tls,
 	Tcp,
 	Udp,
@@ -150,6 +151,7 @@ impl RouteKind {
 	pub fn kind(self) -> &'static str {
 		match self {
 			RouteKind::Http => "HTTPRoute",
+			RouteKind::Grpc => "GRPCRoute",
 			RouteKind::Tls => "TLSRoute",
 			RouteKind::Tcp => "TCPRoute",
 			RouteKind::Udp => "UDPRoute",
@@ -342,7 +344,7 @@ enum Family {
 impl Family {
 	fn route_kinds(self) -> &'static [&'static str] {
 		match self {
-			Family::Http | Family::Https => &["HTTPRoute"],
+			Family::Http | Family::Https => &["HTTPRoute", "GRPCRoute"],
 			Family::TlsPassthrough | Family::TlsTerminate => &["TLSRoute"],
 			Family::Tcp => &["TCPRoute"],
 			Family::Udp => &["UDPRoute"],
@@ -774,14 +776,10 @@ struct RouteInfo<'a> {
 
 fn routes(world: &World) -> Vec<RouteInfo<'_>> {
 	let mut out = vec![];
-	for (i, r) in world.http_routes.iter().enumerate() {
-		out.push(RouteInfo {
-			kind: RouteKind::Http,
-			index: i,
-			meta: &r.metadata,
-			parent_refs: &r.spec.parent_refs,
-			hostnames: &r.spec.hostnames,
-		});
+	for (kind, list) in [(RouteKind::Http, &world.http_routes), (RouteKind::Grpc, &world.grpc_routes)] {
+		for (i, r) in list.iter().enumerate() {
+			out.push(RouteInfo { kind, index: i, meta: &r.metadata, parent_refs: &r.spec.parent_refs, hostnames: &r.spec.hostnames });
+		}
 	}
 	for (kind, list) in [(RouteKind::Tls, &world.tls_routes), (RouteKind::Tcp, &world.tcp_routes), (RouteKind::Udp, &world.udp_routes)] {
 		for (i, r) in list.iter().enumerate() {
@@ -789,6 +787,16 @@ fn routes(world: &World) -> Vec<RouteInfo<'_>> {
 		}
 	}
 	out
+}
+
+/// An HTTPRoute, or a GRPCRoute as the HTTPRoute it amounts to.
+fn http_route(world: &World, kind: RouteKind, index: usize) -> &HttpRoute {
+	if kind == RouteKind::Grpc { &world.grpc_routes[index] } else { &world.http_routes[index] }
+}
+
+/// What `http::build` needs for a route of `kind`.
+fn http_ctx<'a>(world: &'a World, opts: &'a Options, scheme: &'static str, port: u16, kind: RouteKind) -> http::Ctx<'a> {
+	http::Ctx { world, scheme, port, features: &opts.features, kind: kind.kind(), grpc: kind == RouteKind::Grpc }
 }
 
 fn l4_route(world: &World, kind: RouteKind, index: usize) -> &crate::k8s::gateway::L4Route {
@@ -943,28 +951,25 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 		}
 		if has(Family::Http) || has(Family::Https) {
 			let https = has(Family::Https);
-			let ctx = http::Ctx {
-				world,
-				scheme: if https { "https" } else { "http" },
-				port: *port,
-				features: &opts.features,
-				kind: "HTTPRoute",
-				grpc: false,
-			};
 			let mut entries = vec![];
 			let mut services = BTreeMap::new();
 			let mut middlewares = BTreeMap::new();
-			for a in attachments.iter().filter(|a| a.kind == RouteKind::Http && mine(a)) {
-				let route: &HttpRoute = &world.http_routes[a.route];
+			for a in attachments.iter().filter(|a| matches!(a.kind, RouteKind::Http | RouteKind::Grpc) && mine(a)) {
+				let ctx = http_ctx(world, opts, if https { "https" } else { "http" }, *port, a.kind);
+				let route: &HttpRoute = http_route(world, a.kind, a.route);
 				let mut out = http::build(&ctx, route, a.hosts.as_deref(), &exclusions(&listeners, a.listener));
-				let several = attachments.iter().filter(|b| b.kind == RouteKind::Http && b.route == a.route && mine(b)).count() > 1;
+				if a.kind == RouteKind::Grpc {
+					// names apart from an HTTPRoute of the same namespace and name
+					out.prefix_names("grpc:");
+				}
+				let several = attachments.iter().filter(|b| b.kind == a.kind && b.route == a.route && mine(b)).count() > 1;
 				if several {
 					// one rproxy route per listener: names stay unique
 					for e in &mut out.entries {
 						e.route.name = format!("{}@{}", e.route.name, listeners[a.listener].label);
 					}
 				}
-				let entry = results.entry((RouteKind::Http, a.route)).or_insert((None, None));
+				let entry = results.entry((a.kind, a.route)).or_insert((None, None));
 				if entry.0.is_none() {
 					entry.0 = out.resolved.clone();
 				}
@@ -980,7 +985,7 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 				for (svc, b) in out.backends {
 					http_services.insert((key.clone(), svc), b);
 				}
-				carried.push((RouteKind::Http, a.route, a.listener));
+				carried.push((a.kind, a.route, a.listener));
 			}
 			let routes = http::assign_priorities(&mut entries);
 			rule.http = Some(rp::Http { routes, default: None, services, middlewares });
@@ -1045,7 +1050,7 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 		}
 		for (kind, ri, li) in carried {
 			let route_meta = match kind {
-				RouteKind::Http => &world.http_routes[ri].metadata,
+				RouteKind::Http | RouteKind::Grpc => &http_route(world, kind, ri).metadata,
 				k => &l4_route(world, k, ri).metadata,
 			};
 			for (p, owner) in plan.parents.iter_mut().zip(&owners).filter(|(p, _)| {
@@ -1065,9 +1070,12 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 	// route conditions: ResolvedRefs, unsupported values
 	for p in plan.parents.iter_mut() {
 		let index = match p.kind {
-			RouteKind::Http => world.http_routes.iter().position(|r| {
-				r.metadata.namespace.as_deref() == Some(p.namespace.as_str()) && r.metadata.name.as_deref() == Some(p.name.as_str())
-			}),
+			RouteKind::Http | RouteKind::Grpc => {
+				let list = if p.kind == RouteKind::Grpc { &world.grpc_routes } else { &world.http_routes };
+				list.iter().position(|r| {
+					r.metadata.namespace.as_deref() == Some(p.namespace.as_str()) && r.metadata.name.as_deref() == Some(p.name.as_str())
+				})
+			}
 			k => {
 				let list = match k {
 					RouteKind::Tls => &world.tls_routes,
@@ -1082,9 +1090,9 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 		let (resolved, unsupported) = index.and_then(|i| results.get(&(p.kind, i)).cloned()).unwrap_or_else(|| {
 			// not carried by any rule: still check its references
 			let resolved = index.and_then(|i| match p.kind {
-				RouteKind::Http => {
-					let ctx = http::Ctx { world, scheme: "http", port: 80, features: &opts.features, kind: "HTTPRoute", grpc: false };
-					http::build(&ctx, &world.http_routes[i], None, &[]).resolved
+				RouteKind::Http | RouteKind::Grpc => {
+					let ctx = http_ctx(world, opts, "http", 80, p.kind);
+					http::build(&ctx, http_route(world, p.kind, i), None, &[]).resolved
 				}
 				RouteKind::Tls => l4::destination(world, &world.tls_routes[i]).1,
 				k => l4::targets(world, k.kind(), l4_route(world, k, i)).resolved,
