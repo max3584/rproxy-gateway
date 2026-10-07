@@ -25,7 +25,7 @@ use tracing::{debug, info, warn};
 
 use crate::render::{self, GatewayPlan, RouteKind};
 use crate::rproxy::client::{ApiError, Client};
-use crate::rproxy::model::Capabilities;
+use crate::rproxy::model::{Capabilities, RuleView};
 use provision::{Endpoint, Mode};
 use status::PodSync;
 
@@ -57,16 +57,21 @@ pub struct Config {
 	pub listen_addrs: Vec<String>,
 	pub resync: Duration,
 	pub health: SocketAddr,
+	/// Ingress / Traefik migration (off when `None`).
+	pub migration: Option<render::migrate::Settings>,
 }
 
+/// Migration notes already logged (by digest), so each set is logged once.
+static NOTES_SEEN: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
+
 /// What was last applied to a pod: (pod uid, set) → (hash of what was sent, etag rproxy answered).
-pub type Applied = HashMap<(String, String), (String, String)>;
+pub type Applied = HashMap<(String, String), (String, String, Vec<RuleView>)>;
 
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
 	let client = kube::Client::try_default().await.context("connecting to Kubernetes")?;
 	let boot = bootstrap::ensure(&client, &cfg.namespace).await.context("the controller's Secrets")?;
 	let rp = Client::new(Some(&boot.ca_pem), &boot.token)?;
-	let cache = cache::Cache::start(&client, &cfg.namespace, &[]).await?;
+	let cache = cache::Cache::start(&client, &cfg.namespace, cfg.migration.is_some()).await?;
 	tokio::spawn(health(cfg.health));
 	cache.ready().await;
 	info!(controller = %cfg.controller_name, "started");
@@ -149,10 +154,16 @@ async fn reconcile_all(
 	}
 
 	let pods_now = cache.pods.state();
+	let mut notes_seen = NOTES_SEEN.lock().unwrap().clone();
 	let mut plans: Vec<(GatewayPlan, Vec<PodSync>)> = vec![];
 	let mut keep_ids = vec![];
 	for gw in world.gateways.iter().filter(|g| classes.contains(&g.spec.gateway_class_name)) {
-		let opts = render::Options { listen_addrs: cfg.listen_addrs.clone(), cert_dir: provision::CERT_DIR.into(), labels: true };
+		let opts = render::Options {
+			listen_addrs: cfg.listen_addrs.clone(),
+			cert_dir: provision::CERT_DIR.into(),
+			labels: true,
+			migration: cfg.migration.clone(),
+		};
 		let plan = render::render_gateway(&world, gw, &opts);
 		let id = provision::gateway_id(&plan.namespace, &plan.name);
 		keep_ids.push(id.clone());
@@ -193,6 +204,14 @@ async fn reconcile_all(
 				)
 			}
 		};
+		if !plan.notes.is_empty() {
+			let digest = crate::pem::short_hash(plan.notes.join("\n").as_bytes());
+			if notes_seen.insert(digest) {
+				for n in &plan.notes {
+					warn!(gateway = %plan.ruleset, note = %n, "migration: not converted");
+				}
+			}
+		}
 		let mut results = vec![];
 		for ep in &endpoints {
 			let (r, again) = sync_pod(rp, ep, &plan, applied, caps).await;
@@ -209,6 +228,8 @@ async fn reconcile_all(
 		}
 		plans.push((plan, results));
 	}
+
+	*NOTES_SEEN.lock().unwrap() = notes_seen;
 
 	// Gateways that are gone
 	if let Err(e) = provision::collect_garbage(client, &cfg.namespace, &keep_ids).await {
@@ -371,12 +392,14 @@ pub async fn sync_pod(
 		Err(e) => return (PodSync::NotReady(format!("pod {}: {e:#}", ep.pod)), true),
 	};
 	let key = (ep.uid.clone(), plan.ruleset.clone());
-	if let (Some(cur), Some((h, etag))) = (&current, applied.get(&key)) {
+	if let (Some(cur), Some((h, etag, rejected))) = (&current, applied.get(&key)) {
 		if *h == hash && cur.etag == *etag {
-			return (PodSync::Synced(cur.rules.clone()), false);
+			let mut views = cur.rules.clone();
+			views.extend(rejected.iter().cloned());
+			return (PodSync::Synced(views), false);
 		}
 	}
-	let if_match = current.as_ref().map(|c| c.etag.clone());
+	let mut if_match = current.as_ref().map(|c| c.etag.clone());
 	let mut generation = plan.generation;
 	if let Some(cur) = &current {
 		// a Gateway created again starts at generation 1; rproxy refuses a lower one
@@ -384,36 +407,84 @@ pub async fn sync_pod(
 			generation = cur.generation;
 		}
 	}
-	debug!(pod = ep.pod, set = plan.ruleset, generation, "PUT rule set");
-	match rp.put_ruleset(addr, &plan.ruleset, generation, &rules, if_match.as_deref()).await {
-		Ok(answer) => {
-			for r in answer.results.iter().filter(|r| r.error.is_some()) {
-				info!(pod = ep.pod, set = plan.ruleset, rule = r.rule, error = r.error.as_deref().unwrap_or(""), "rule not running");
-			}
-			applied.insert(key, (hash, answer.etag.clone()));
-			match rp.get_ruleset(addr, &plan.ruleset).await {
-				Ok(Some(set)) => {
-					// a rule failing on a file certsync has just written is tried again soon
-					let again = set.rules.iter().any(|r| r.state == "failed");
-					if again {
-						applied.remove(&(ep.uid.clone(), plan.ruleset.clone()));
-					}
-					(PodSync::Synced(set.rules), again)
+	// rules rproxy refuses (`rules[i]: ...`) are left out and the rest is PUT again,
+	// so one bad rule (an RproxyRule, a migrated route) does not stop the whole set
+	let mut rejected: Vec<RuleView> = vec![];
+	let answer = loop {
+		debug!(pod = ep.pod, set = plan.ruleset, generation, rules = rules.len(), "PUT rule set");
+		match rp.put_ruleset(addr, &plan.ruleset, generation, &rules, if_match.as_deref()).await {
+			Ok(answer) => break answer,
+			Err(e) => match e.downcast_ref::<ApiError>() {
+				Some(a) if a.code == "precondition_failed" || a.code == "stale_generation" => {
+					return (PodSync::Pending(format!("pod {}: {a}", ep.pod)), true);
 				}
-				Ok(None) => (PodSync::Pending(format!("pod {}: the rule set disappeared", ep.pod)), true),
-				Err(e) => (PodSync::NotReady(format!("pod {}: {e:#}", ep.pod)), true),
-			}
+				Some(a) if a.status.is_client_error() => {
+					match refused_index(&a.message).filter(|i| *i < rules.len() && rejected.len() < 32) {
+						Some(i) => {
+							let rule = rules.remove(i);
+							warn!(pod = ep.pod, set = plan.ruleset, error = %a, "rproxy refused a rule; applying the others");
+							rejected.push(refused_view(&rule, &a.message));
+							if_match = None;
+							if let Ok(Some(cur)) = rp.get_ruleset(addr, &plan.ruleset).await {
+								if_match = Some(cur.etag);
+							}
+						}
+						None => {
+							warn!(pod = ep.pod, set = plan.ruleset, error = %a, "rproxy refused the rule set");
+							return (PodSync::Rejected(a.to_string()), false);
+						}
+					}
+				}
+				_ => return (PodSync::NotReady(format!("pod {}: {e:#}", ep.pod)), true),
+			},
 		}
-		Err(e) => match e.downcast_ref::<ApiError>() {
-			Some(a) if a.code == "precondition_failed" || a.code == "stale_generation" => {
-				(PodSync::Pending(format!("pod {}: {a}", ep.pod)), true)
+	};
+	for r in answer.results.iter().filter(|r| r.error.is_some()) {
+		info!(pod = ep.pod, set = plan.ruleset, rule = r.rule, error = r.error.as_deref().unwrap_or(""), "rule not running");
+	}
+	applied.insert(key.clone(), (hash, answer.etag.clone(), rejected.clone()));
+	match rp.get_ruleset(addr, &plan.ruleset).await {
+		Ok(Some(set)) => {
+			// a rule failing on a file certsync has just written is tried again soon
+			let again = set.rules.iter().any(|r| r.state == "failed");
+			if again {
+				applied.remove(&key);
 			}
-			Some(a) if a.status.is_client_error() => {
-				warn!(pod = ep.pod, set = plan.ruleset, error = %a, "rproxy refused the rule set");
-				(PodSync::Rejected(a.to_string()), false)
-			}
-			_ => (PodSync::NotReady(format!("pod {}: {e:#}", ep.pod)), true),
-		},
+			let mut views = set.rules;
+			views.extend(rejected);
+			(PodSync::Synced(views), again)
+		}
+		Ok(None) => (PodSync::Pending(format!("pod {}: the rule set disappeared", ep.pod)), true),
+		Err(e) => (PodSync::NotReady(format!("pod {}: {e:#}", ep.pod)), true),
+	}
+}
+
+/// The index in `rules[3]: ...` (rproxy's errors for one rule of a set).
+fn refused_index(message: &str) -> Option<usize> {
+	let rest = message.strip_prefix("rules[")?;
+	rest[..rest.find(']')?].parse().ok()
+}
+
+/// A rule view for a rule rproxy refused: `failed`, `Accepted: False`.
+fn refused_view(rule: &Value, message: &str) -> RuleView {
+	let protocol = if rule["protocol"].as_str().is_some_and(|p| p.eq_ignore_ascii_case("udp")) {
+		crate::rproxy::model::Protocol::Udp
+	} else {
+		crate::rproxy::model::Protocol::Tcp
+	};
+	let cond = |kind: &str| crate::rproxy::model::RuleCondition {
+		kind: kind.into(),
+		status: "False".into(),
+		reason: "Invalid".into(),
+		message: message.into(),
+	};
+	RuleView {
+		protocol,
+		listen_addr: rule["listen_addr"].as_str().unwrap_or_default().into(),
+		listen_port: rule["listen_port"].as_u64().and_then(|p| u16::try_from(p).ok()).unwrap_or(0),
+		state: "failed".into(),
+		error: Some(message.into()),
+		conditions: vec![cond("Accepted"), cond("Programmed")],
 	}
 }
 

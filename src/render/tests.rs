@@ -666,3 +666,184 @@ spec:
 	assert_eq!(r1["middlewares"], json!([http::RESPOND_500]));
 	assert_eq!(cond(&p.parents[0].conds, "ResolvedRefs").reason, "BackendNotFound");
 }
+
+fn migrate_opts() -> Options {
+	let mut eps = migrate::Settings::default_entry_points();
+	eps.insert("pg".into(), (rp::Protocol::Tcp, 5432));
+	eps.insert("dns".into(), (rp::Protocol::Udp, 53));
+	Options {
+		migration: Some(migrate::Settings { gateway: ("default".into(), "gw".into()), entry_points: eps, ingress_class: "rproxy".into() }),
+		..Default::default()
+	}
+}
+
+#[test]
+fn traefik_and_ingress_migration() {
+	let (crt, key) = crate::pem::tests::pair("app.example.com");
+	let yaml = format!(
+		"{BASE}{L4_BASE}\n---\napiVersion: v1\nkind: Secret\nmetadata: {{name: cert, namespace: default}}\nstringData:\n  tls.crt: |\n{}\n  tls.key: |\n{}\n---\napiVersion: v1\nkind: Secret\nmetadata: {{name: users, namespace: default}}\nstringData: {{users: \"admin:$apr1$x$y\"}}\n{}{}",
+		indent(&crt),
+		indent(&key),
+		gw("  - {name: http, port: 80, protocol: HTTP}"),
+		r#"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: native, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  hostnames: [native.example.com]
+  rules: [{backendRefs: [{name: web, port: 80}]}]
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata: {name: secure, namespace: default}
+spec:
+  chain:
+    middlewares: [{name: hsts}, {name: auth}]
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata: {name: hsts, namespace: default}
+spec: {headers: {stsSeconds: 300}}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata: {name: auth, namespace: default}
+spec: {basicAuth: {secret: users}}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata: {name: to-https, namespace: default}
+spec: {redirectScheme: {scheme: https, permanent: true}}
+---
+apiVersion: traefik.io/v1alpha1
+kind: TLSOption
+metadata: {name: modern, namespace: default}
+spec: {minVersion: VersionTLS13, sniStrict: true}
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata: {name: app, namespace: default}
+spec:
+  entryPoints: [websecure]
+  routes:
+    - match: Host(`app.example.com`) && PathPrefix(`/api`)
+      kind: Rule
+      middlewares: [{name: secure}]
+      services: [{name: web, port: 80}]
+    - match: HostRegexp(`{sub:[a-z]+}.example.com`) || Headers(`X-A`, `1`)
+      services: [{name: web, port: http}]
+    - match: Weird(`x`)
+      services: [{name: web, port: 80}]
+  tls:
+    secretName: cert
+    options: {name: modern}
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata: {name: redirect, namespace: default}
+spec:
+  entryPoints: [web]
+  routes:
+    - match: Host(`app.example.com`)
+      middlewares: [{name: to-https}]
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRouteTCP
+metadata: {name: pg, namespace: default}
+spec:
+  entryPoints: [pg]
+  routes: [{match: HostSNI(`*`), services: [{name: db, port: 5432, proxyProtocol: {version: 2}}]}]
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRouteTCP
+metadata: {name: reg, namespace: default}
+spec:
+  entryPoints: [websecure]
+  routes: [{match: HostSNI(`registry.example.com`), services: [{name: tls, port: 443}]}]
+  tls: {passthrough: true}
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRouteUDP
+metadata: {name: dns, namespace: default}
+spec:
+  entryPoints: [dns]
+  routes: [{services: [{name: db, port: 5432}]}]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: {name: legacy, namespace: default}
+spec:
+  ingressClassName: rproxy
+  rules:
+    - host: legacy.example.com
+      http:
+        paths:
+          - {path: /, pathType: Prefix, backend: {service: {name: web, port: {number: 80}}}}
+          - {path: /exact, pathType: Exact, backend: {service: {name: web, port: {name: http}}}}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: {name: other-class, namespace: default}
+spec:
+  ingressClassName: nginx
+  rules: [{host: x.example.com, http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: web, port: {number: 80}}}}]}}]
+"#
+	);
+	let w = world(&yaml);
+	let p = render_gateway(&w, &w.gateways[0], &migrate_opts());
+	let rules = p.rules_json();
+	let rule = |proto: &str, port: u16| {
+		rules
+			.iter()
+			.find(|r| r["protocol"] == proto && r["listen_port"] == port)
+			.cloned()
+			.unwrap_or_else(|| panic!("no {proto}/{port}: {rules:#?}"))
+	};
+	// port 80: the Gateway's HTTPRoute, the redirect IngressRoute and the Ingress together
+	let web = rule("tcp", 80);
+	let names: Vec<&str> = web["http"]["routes"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect();
+	assert!(names.contains(&"default/native/r0/m0/h0"), "{names:?}");
+	assert!(names.contains(&"traefik/default/redirect/r0"), "{names:?}");
+	assert!(names.contains(&"ingress/default/legacy/r0/p0"), "{names:?}");
+	assert!(!names.iter().any(|n| n.contains("other-class")));
+	assert_eq!(web["http"]["middlewares"]["traefik/default/to-https"], json!({"redirect_scheme": {"scheme": "https", "permanent": true}}));
+	let exact = web["http"]["routes"].as_array().unwrap().iter().find(|r| r["name"] == "ingress/default/legacy/r0/p1").unwrap().clone();
+	assert_eq!(exact["match"], "Host(`legacy.example.com`) && Path(`/exact`)");
+	// port 443: TLS IngressRoute with a chain, TLSOption, the passthrough IngressRouteTCP
+	let secure = rule("tcp", 443);
+	assert_eq!(secure["tls"]["mode"], "terminate");
+	assert_eq!(secure["tls"]["options"], json!({"min_version": "1.3"}));
+	assert_eq!(
+		secure["tls"]["routes"],
+		json!([{"server_names": ["registry.example.com"], "remote_addr": "10.96.0.30", "remote_port": 443, "passthrough": true}])
+	);
+	let api = secure["http"]["routes"].as_array().unwrap().iter().find(|r| r["name"] == "traefik/default/app/r0").unwrap().clone();
+	assert_eq!(api["middlewares"], json!(["traefik/default/hsts", "traefik/default/auth"]));
+	let auth = &secure["http"]["middlewares"]["traefik/default/auth"]["basic_auth"];
+	let file = auth["users_file"].as_str().unwrap().rsplit('/').next().unwrap().to_string();
+	assert_eq!(p.files[&file], b"admin:$apr1$x$y");
+	let second = secure["http"]["routes"].as_array().unwrap().iter().find(|r| r["name"] == "traefik/default/app/r1");
+	assert!(second.is_none(), "v2 placeholders are not converted");
+	assert!(p.notes.iter().any(|n| n.contains("Weird")), "{:?}", p.notes);
+	assert!(p.notes.iter().any(|n| n.contains("sniStrict")), "{:?}", p.notes);
+	// L4
+	let pg = rule("tcp", 5432);
+	assert_eq!(pg["targets"].as_array().unwrap().len(), 2);
+	assert_eq!(pg["source_ip"], "proxy_v2");
+	assert_eq!(rule("udp", 53)["targets"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn traefik_rules() {
+	assert_eq!(migrate::translate_rule("Host(`a`) && Headers(`X`, `1`)").unwrap(), "Host(`a`) && Header(`X`, `1`)");
+	assert_eq!(migrate::translate_rule("Query(`a=b`) || HostHeader(\"x\")").unwrap(), "Query(`a`, `b`) || Host(`x`)");
+	assert!(migrate::translate_rule("Host(`{x:.+}`)").is_err());
+	assert!(migrate::translate_rule("Foo(`x`)").is_err());
+	assert_eq!(migrate::translate_rule("!ClientIP(`10.0.0.0/8`)").unwrap(), "!ClientIP(`10.0.0.0/8`)");
+	assert_eq!(
+		migrate::Settings::parse_entry_points(&["web=8080".into(), "dns=53/udp".into()]).unwrap(),
+		[("dns".to_string(), (rp::Protocol::Udp, 53)), ("web".to_string(), (rp::Protocol::Tcp, 8080))].into()
+	);
+}

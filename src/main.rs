@@ -78,6 +78,39 @@ struct ControllerArgs {
 	/// Where `/healthz` is answered.
 	#[arg(long, env = "RPROXY_GATEWAY_HEALTH_ADDR", default_value = "0.0.0.0:8081")]
 	health_addr: SocketAddr,
+	#[command(flatten)]
+	migration: MigrationArgs,
+}
+
+/// Migration from Ingress and Traefik (read only).
+#[derive(clap::Args, Debug)]
+struct MigrationArgs {
+	/// Read Ingress (of `--ingress-class`) and Traefik IngressRoute* / Middleware / TLSOption into this Gateway's rule set (`namespace/name`).
+	#[arg(long, env = "RPROXY_GATEWAY_MIGRATE_TO")]
+	migrate_to: Option<String>,
+	/// The Ingress class read.
+	#[arg(long, env = "RPROXY_GATEWAY_INGRESS_CLASS", default_value = "rproxy")]
+	ingress_class: String,
+	/// Traefik entry points: `name=port[/udp]` (default `web=80`, `websecure=443`).
+	#[arg(long = "traefik-entrypoint", env = "RPROXY_GATEWAY_TRAEFIK_ENTRYPOINTS", value_delimiter = ',')]
+	traefik_entrypoints: Vec<String>,
+}
+
+impl MigrationArgs {
+	fn settings(&self) -> anyhow::Result<Option<render::migrate::Settings>> {
+		let Some(to) = &self.migrate_to else { return Ok(None) };
+		let (ns, name) = to.split_once('/').ok_or_else(|| anyhow::anyhow!("--migrate-to: namespace/name"))?;
+		let entry_points = if self.traefik_entrypoints.is_empty() {
+			render::migrate::Settings::default_entry_points()
+		} else {
+			render::migrate::Settings::parse_entry_points(&self.traefik_entrypoints).map_err(anyhow::Error::msg)?
+		};
+		Ok(Some(render::migrate::Settings {
+			gateway: (ns.to_string(), name.to_string()),
+			entry_points,
+			ingress_class: self.ingress_class.clone(),
+		}))
+	}
 }
 
 #[derive(clap::Args, Debug)]
@@ -88,6 +121,8 @@ struct RenderArgs {
 	/// GatewayClass controller name to render for.
 	#[arg(long, default_value = "rproxy.max3584.net/gateway-controller")]
 	controller_name: String,
+	#[command(flatten)]
+	migration: MigrationArgs,
 }
 
 fn init_logging(format: &str) {
@@ -110,7 +145,8 @@ fn render_files(args: &RenderArgs) -> anyhow::Result<()> {
 		world.classes.iter().filter(|c| c.spec.controller_name == args.controller_name).filter_map(|c| c.metadata.name.clone()).collect();
 	let mut out = serde_json::Map::new();
 	for gw in world.gateways.iter().filter(|g| classes.is_empty() || classes.contains(&g.spec.gateway_class_name)) {
-		let plan = render::render_gateway(&world, gw, &render::Options::default());
+		let opts = render::Options { migration: args.migration.settings()?, ..Default::default() };
+		let plan = render::render_gateway(&world, gw, &opts);
 		let listeners: Vec<serde_json::Value> = plan
 			.listeners
 			.iter()
@@ -127,6 +163,7 @@ fn render_files(args: &RenderArgs) -> anyhow::Result<()> {
 				"generation": plan.generation,
 				"rules": plan.rules_json(),
 				"files": plan.files.keys().collect::<Vec<_>>(),
+				"notes": plan.notes,
 				"listeners": listeners,
 				"routes": routes,
 			}),
@@ -169,6 +206,7 @@ fn main() -> anyhow::Result<()> {
 				listen_addrs: a.listen_addr,
 				resync: Duration::from_secs(a.resync_secs.max(5)),
 				health: a.health_addr,
+				migration: a.migration.settings()?,
 			};
 			tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(controller::run(cfg))
 		}

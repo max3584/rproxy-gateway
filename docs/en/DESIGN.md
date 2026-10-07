@@ -51,7 +51,8 @@ rproxy runs with `RPROXY_API_ADDR=0.0.0.0`, `RPROXY_API_PORT=9443`, `RPROXY_TOKE
 1. The pod's `GET /capabilities` (without `features.rulesets`: `Programmed: False`, "needs rproxy v0.4.0 or later"). Without `features.labels`, `labels` are left out.
 2. Wait until `GET /readyz` is ready (not for an rproxy without `features.readyz`).
 3. `GET /rulesets/{name}`. When the content and the etag are what was last PUT, nothing happens. Otherwise (the content changed, rproxy restarted and lost the set, someone else changed it) `PUT /rulesets/{name}`: `generation` is the Gateway's `metadata.generation` (or rproxy's, if larger, so a Gateway created again does not get `stale_generation`), `If-Match` is the current etag.
-4. Status is written from the `conditions` of the rules in `GET /rulesets/{name}` after the PUT. When a rule is `failed`, the set is PUT again a little later (e.g. a file certsync has just written).
+4. When rproxy refuses one rule (`400`, `rules[i]: ...`), that rule is left out and the rest is PUT again (one mistake in an RproxyRule or a migrated route does not stop the whole set). The refused rule is reported as `Accepted: False` (`Invalid`).
+5. Status is written from the `conditions` of the rules in `GET /rulesets/{name}` after the PUT. When a rule is `failed`, the set is PUT again a little later (e.g. a file certsync has just written).
 
 ## Mapping (Gateway API → rproxy)
 

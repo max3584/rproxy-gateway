@@ -85,6 +85,8 @@ pub struct Tls {
 	pub options: Option<Value>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub client_auth: Option<Value>,
+	#[serde(skip_serializing_if = "Vec::is_empty")]
+	pub alpn: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -143,6 +145,8 @@ pub struct HttpDefault {
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct Service {
 	pub servers: Vec<Server>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub pass_host_header: Option<bool>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub timeouts: Option<Value>,
 	#[serde(skip_serializing_if = "Option::is_none")]
