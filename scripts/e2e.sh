@@ -89,8 +89,9 @@ retry 60 sh -c "curl -sf --cacert $work/tls2.crt --resolve secure.example.com:44
 
 echo "== rproxy next to the Gateway: infrastructure metadata, no Secret access"
 sa=$(kubectl -n e2e get pods -l app.kubernetes.io/name=rproxy -o jsonpath='{.items[0].spec.serviceAccountName}')
-test "$(kubectl auth can-i get secrets -n e2e --as="system:serviceaccount:e2e:$sa")" = no
-test "$(kubectl auth can-i get secrets -n $NS --as="system:serviceaccount:e2e:$sa")" = no
+# can-i exits 1 for "no" (and the ERR trap runs in command substitutions)
+test "$(kubectl auth can-i get secrets -n e2e --as="system:serviceaccount:e2e:$sa" || true)" = no
+test "$(kubectl auth can-i get secrets -n $NS --as="system:serviceaccount:e2e:$sa" || true)" = no
 test "$(kubectl -n e2e get pods -l app.kubernetes.io/name=rproxy -o jsonpath='{.items[0].spec.automountServiceAccountToken}')" = false
 test "$(kubectl -n e2e get pods -l gateway.networking.k8s.io/gateway-name=e2e,team=e2e -o jsonpath='{.items[0].metadata.annotations.e2e\.example\.com/note}')" = infrastructure
 test "$(kubectl -n e2e get svc -l gateway.networking.k8s.io/gateway-name=e2e,team=e2e -o name | wc -l)" = 1
