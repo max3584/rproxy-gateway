@@ -1,0 +1,138 @@
+name: Release
+
+# On a v* tag (the version of Cargo.toml and charts/rproxy-gateway/Chart.yaml):
+# - the controller image ghcr.io/max3584/rproxy-gateway:<version> (linux/amd64, linux/arm64)
+# - the rproxy image ghcr.io/max3584/rproxy-gateway/rproxy:<RPROXY_VERSION> from rproxy-api's
+#   release binaries (static musl)
+# - the Helm chart as an OCI artifact (oci://ghcr.io/max3584/charts/rproxy-gateway) and on the release
+# Binaries are built in Alpine containers (static musl; aarch64 with cargo-zigbuild).
+# The first release (v0.4.0) ships together with rproxy v0.4.0.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "build everything, push nothing"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # the rproxy release the rproxy image is made from
+  RPROXY_VERSION: v0.4.0
+  PUSH: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    container: alpine:3.24
+    strategy:
+      matrix:
+        include:
+          - {target: x86_64-unknown-linux-musl, arch: amd64}
+          - {target: aarch64-unknown-linux-musl, arch: arm64}
+    steps:
+      - name: packages
+        run: apk add --no-cache bash git tar zstd curl gcc musl-dev zig cargo-zigbuild
+      - uses: actions/checkout@v4
+      - name: version
+        shell: bash
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          c=$(sed -n 's/^version: \(.*\)/\1/p' charts/rproxy-gateway/Chart.yaml)
+          if [ "$GITHUB_REF_TYPE" = tag ] && { [ "v$v" != "$GITHUB_REF_NAME" ] || [ "$c" != "$v" ]; }; then
+            echo "::error::tag $GITHUB_REF_NAME, Cargo.toml $v and Chart.yaml $c differ"; exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: build
+        shell: bash
+        run: |
+          if [ "${{ matrix.target }}" = x86_64-unknown-linux-musl ]; then
+            cargo build --locked --release --target ${{ matrix.target }}
+          else
+            cargo zigbuild --locked --release --target ${{ matrix.target }}
+          fi
+          mkdir -p dist/${{ matrix.arch }}
+          cp target/${{ matrix.target }}/release/rproxy-gateway dist/${{ matrix.arch }}/
+          curl -sfLo dist/${{ matrix.arch }}/rproxy-api \
+            "https://github.com/max3584/rproxy-api/releases/download/$RPROXY_VERSION/rproxy-api-$RPROXY_VERSION-${{ matrix.target }}" \
+            || echo "::warning::rproxy-api $RPROXY_VERSION has no ${{ matrix.target }} binary yet"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist
+
+  images:
+    name: images and chart
+    needs: build
+    # buildx and the registry login run on the runner VM (no Rust is built here)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - run: chmod +x dist/*/* && ls -lR dist
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: env.PUSH == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: version
+        run: |
+          echo "VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_ENV"
+          echo "RPROXY_TAG=${RPROXY_VERSION#v}" >> "$GITHUB_ENV"
+      - name: controller image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ env.PUSH == 'true' }}
+          tags: ghcr.io/max3584/rproxy-gateway:${{ env.VERSION }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/max3584/rproxy-gateway
+            org.opencontainers.image.licenses=MIT
+      - name: rproxy image
+        if: hashFiles('dist/amd64/rproxy-api') != ''
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.rproxy
+          platforms: linux/amd64,linux/arm64
+          push: ${{ env.PUSH == 'true' }}
+          tags: ghcr.io/max3584/rproxy-gateway/rproxy:${{ env.RPROXY_TAG }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/max3584/rproxy-api
+            org.opencontainers.image.licenses=MIT
+      - name: chart
+        run: |
+          helm lint charts/rproxy-gateway
+          helm package charts/rproxy-gateway -d dist/chart
+          if [ "$PUSH" = true ]; then
+            echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+            helm push "dist/chart/rproxy-gateway-$VERSION.tgz" oci://ghcr.io/max3584/charts
+          fi
+      - name: release
+        if: env.PUSH == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/chart/rproxy-gateway-${{ env.VERSION }}.tgz
+            charts/rproxy-gateway/crds/rproxy.max3584.net.yaml

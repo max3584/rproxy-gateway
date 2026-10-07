@@ -58,7 +58,7 @@ pub fn listener_conds(plan: &GatewayPlan, i: usize, pods: &[PodSync]) -> Vec<Con
 	let l = &plan.listeners[i];
 	let mut conds = l.conds.clone();
 	let accepted = status::get(&conds, "Accepted").is_some_and(|c| c.status);
-	let programmed = match (&l.rule_key, accepted) {
+	let programmed = match (&l.rule_key, accepted && l.servable) {
 		(Some(key), true) if synced(pods) > 0 => match rule_cond(pods, key, "Programmed") {
 			Some(c) if c.status == "True" => Cond::ok("Programmed", "Programmed"),
 			Some(c) => {
@@ -73,6 +73,7 @@ pub fn listener_conds(plan: &GatewayPlan, i: usize, pods: &[PodSync]) -> Vec<Con
 		}
 		// accepted, but nothing attached yet that needs a rule (TLS, TCP, UDP)
 		(None, true) => Cond::ok("Programmed", "Programmed"),
+		_ if accepted => Cond::new("Programmed", false, "Invalid", "no usable certificate"),
 		_ => Cond::new("Programmed", false, "Invalid", "the listener is not accepted"),
 	};
 	if let Some(key) = &l.rule_key {
@@ -258,6 +259,7 @@ mod tests {
 				attached: 1,
 				conds: vec![Cond::ok("Accepted", "Accepted"), Cond::ok("ResolvedRefs", "ResolvedRefs")],
 				rule_key: Some("tcp/0.0.0.0:80".into()),
+				servable: true,
 			}],
 			..Default::default()
 		}

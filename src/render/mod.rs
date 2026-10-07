@@ -89,6 +89,8 @@ pub struct ListenerPlan {
 	pub conds: Vec<Cond>,
 	/// The rule serving the listener (none when it is not accepted).
 	pub rule_key: Option<String>,
+	/// Accepted and with what it needs (certificates) to be programmed.
+	pub servable: bool,
 }
 
 /// Everything about one Gateway.
@@ -113,6 +115,8 @@ pub struct GatewayPlan {
 	pub policies: Vec<policy::PolicyStatus>,
 	/// What migration could not convert.
 	pub notes: Vec<String>,
+	/// The (protocol, port) of listeners that can be served (Service ports).
+	pub listener_ports: BTreeSet<(rp::Protocol, u16)>,
 }
 
 impl GatewayPlan {
@@ -124,6 +128,7 @@ impl GatewayPlan {
 	/// The (protocol, port) pairs rproxy listens on (for the Service), ranges of RproxyRules included.
 	pub fn ports(&self) -> BTreeSet<(rp::Protocol, u16)> {
 		let mut out: BTreeSet<_> = self.rules.iter().map(|r| (r.protocol, r.listen_port)).collect();
+		out.extend(self.listener_ports.iter().copied());
 		for r in &self.raw {
 			let protocol =
 				if r["protocol"].as_str().is_some_and(|p| p.eq_ignore_ascii_case("udp")) { rp::Protocol::Udp } else { rp::Protocol::Tcp };
@@ -220,6 +225,9 @@ struct ListenerState<'a> {
 	/// Certificate files (cert, key) for HTTPS and terminating TLS listeners.
 	certs: Vec<(String, String)>,
 	accepted: bool,
+	/// Accepted but with nothing to serve with (no usable certificate): routes
+	/// attach, but no rule is made.
+	unservable: bool,
 	attached: i32,
 }
 
@@ -291,6 +299,7 @@ fn validate_listener<'a>(
 		supported_kinds: vec![],
 		certs: vec![],
 		accepted: true,
+		unservable: false,
 		attached: 0,
 	};
 	let tls_mode = l.tls.as_ref().and_then(|t| t.mode.clone()).unwrap_or_else(|| "Terminate".into());
@@ -358,11 +367,8 @@ fn validate_listener<'a>(
 			resolved = Cond::new("ResolvedRefs", false, "InvalidCertificateRef", "the listener terminates TLS and needs certificateRefs");
 		}
 		if st.certs.is_empty() {
-			// nothing to serve with: the listener is not programmed
-			st.accepted = false;
-			if st.conds.iter().all(|c| c.kind != "Accepted") {
-				st.conds.push(Cond::new("Accepted", false, "InvalidCertificateRef", "no usable certificate"));
-			}
+			// nothing to serve with: routes still attach, the listener is not programmed
+			st.unservable = true;
 		}
 	}
 	if st.conds.iter().all(|c| c.kind != "Accepted") {
@@ -424,7 +430,7 @@ fn exclusions(listeners: &[ListenerState], i: usize) -> Vec<String> {
 	listeners
 		.iter()
 		.enumerate()
-		.filter(|(j, o)| *j != i && o.accepted && o.port == listeners[i].port && o.family == listeners[i].family)
+		.filter(|(j, o)| *j != i && o.accepted && !o.unservable && o.port == listeners[i].port && o.family == listeners[i].family)
 		.filter_map(|(_, o)| o.l.hostname.clone())
 		.filter(|h| match me {
 			None => true,
@@ -518,7 +524,7 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 	// one rule per (protocol, port)
 	let mut groups: BTreeMap<(rp::Protocol, u16), Vec<usize>> = BTreeMap::new();
 	for (i, st) in listeners.iter().enumerate() {
-		if let (true, Some(f)) = (st.accepted, st.family) {
+		if let (true, false, Some(f)) = (st.accepted, st.unservable, st.family) {
 			groups.entry((f.protocol(), st.port)).or_default().push(i);
 		}
 	}
@@ -551,7 +557,9 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 			if entry.0.is_none() {
 				entry.0 = resolved;
 			}
-			let Some(dest) = dest else { continue };
+			// no usable backend: connections for its names are accepted and closed (Gateway API
+			// expects a reset, not a refused connection), through a port nothing listens on
+			let dest = dest.unwrap_or(backends::Endpoint { addr: "127.0.0.1".into(), port: 1 });
 			let names: Vec<String> = a.hosts.clone().unwrap_or_default().iter().map(|h| hostname::to_rproxy(h)).collect();
 			if names.is_empty() {
 				continue;
@@ -569,7 +577,14 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 			let mut middlewares = BTreeMap::new();
 			for a in attachments.iter().filter(|a| a.kind == RouteKind::Http && mine(a)) {
 				let route: &HttpRoute = &world.http_routes[a.route];
-				let out = http::build(&ctx, route, a.hosts.as_deref(), &exclusions(&listeners, a.listener));
+				let mut out = http::build(&ctx, route, a.hosts.as_deref(), &exclusions(&listeners, a.listener));
+				let several = attachments.iter().filter(|b| b.kind == RouteKind::Http && b.route == a.route && mine(b)).count() > 1;
+				if several {
+					// one rproxy route per listener: names stay unique
+					for e in &mut out.entries {
+						e.route.name = format!("{}@{}", e.route.name, listeners[a.listener].l.name);
+					}
+				}
 				let entry = results.entry((RouteKind::Http, a.route)).or_insert((None, None));
 				if entry.0.is_none() {
 					entry.0 = out.resolved.clone();
@@ -613,7 +628,19 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 			// TCP or UDP: the routes' backends together
 			let kind = if has(Family::Udp) { RouteKind::Udp } else { RouteKind::Tcp };
 			let mut targets: Vec<rp::Target> = vec![];
+			// several routes on one TCP / UDP listener: the oldest gets the traffic (all are accepted)
+			let oldest = attachments
+				.iter()
+				.filter(|a| a.kind == kind && mine(a))
+				.min_by_key(|a| {
+					let m = &l4_route(world, kind, a.route).metadata;
+					(m.creation_timestamp.as_ref().map(|t| t.0.to_string()), m.namespace.clone(), m.name.clone())
+				})
+				.map(|a| a.route);
 			for a in attachments.iter().filter(|a| a.kind == kind && mine(a)) {
+				if Some(a.route) != oldest {
+					continue;
+				}
 				let out = l4::targets(world, kind.kind(), l4_route(world, kind, a.route));
 				let entry = results.entry((kind, a.route)).or_insert((None, None));
 				if entry.0.is_none() {
@@ -723,11 +750,18 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 			attached: st.attached,
 			conds: st.conds.clone(),
 			rule_key: listener_keys.get(&i).cloned(),
+			servable: st.accepted && !st.unservable,
 		})
 		.collect();
+	// Service ports: every listener that can be served, with or without a rule yet
+	plan.listener_ports =
+		listeners.iter().filter(|l| l.accepted && !l.unservable).filter_map(|l| l.family.map(|f| (f.protocol(), l.port))).collect();
 	let any = listeners.iter().any(|l| l.accepted);
-	plan.conds.push(if any || listeners.is_empty() {
+	let all = listeners.iter().all(|l| l.accepted);
+	plan.conds.push(if listeners.is_empty() || all {
 		Cond::ok("Accepted", "Accepted")
+	} else if any {
+		Cond::new("Accepted", true, "ListenersNotValid", "some listeners are not valid")
 	} else {
 		Cond::new("Accepted", false, "ListenersNotValid", "no listener is valid")
 	});

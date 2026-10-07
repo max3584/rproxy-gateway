@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use futures::StreamExt;
 use http_body_util::Full;
 use hyper::body::Bytes;
@@ -129,7 +130,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
 		}
 	});
 	let present: Arc<Mutex<Option<BTreeSet<String>>>> = Arc::new(Mutex::new(None));
-	tokio::spawn(serve(args.listen, present.clone()));
+	let listener = tokio::net::TcpListener::bind(args.listen).await.with_context(|| format!("listen on {}", args.listen))?;
+	tokio::spawn(serve(listener, present.clone()));
 	store.wait_until_ready().await?;
 	info!(dir = %args.dir.display(), selector = %args.selector, "certsync started");
 	let mut absent = BTreeMap::new();
@@ -143,14 +145,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
 	}
 }
 
-async fn serve(addr: SocketAddr, present: Arc<Mutex<Option<BTreeSet<String>>>>) {
-	let listener = match tokio::net::TcpListener::bind(addr).await {
-		Ok(l) => l,
-		Err(e) => {
-			warn!(%addr, error = %e, "cannot listen");
-			return;
-		}
-	};
+/// Answers `GET /files` (the names in `present`; 503 until it is set) and `GET /healthz`.
+pub async fn serve(listener: tokio::net::TcpListener, present: Arc<Mutex<Option<BTreeSet<String>>>>) {
 	loop {
 		let Ok((tcp, _)) = listener.accept().await else { continue };
 		let present = present.clone();

@@ -39,3 +39,24 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: tests
         run: cargo test --locked --all-targets
+
+  lint:
+    name: chart + scripts
+    runs-on: ubuntu-latest
+    container: alpine:3.24
+    steps:
+      - name: packages
+        run: apk add --no-cache bash git helm shellcheck
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck scripts/*.sh
+      - name: helm lint
+        run: |
+          helm lint charts/rproxy-gateway
+          helm lint charts/rproxy-gateway --set fleet.enabled=true --set migration.migrateTo=default/gw --set migration.createIngressClass=true
+      - name: helm template
+        run: |
+          for args in "" "--set fleet.enabled=true" "--set migration.migrateTo=default/gw"; do
+            # shellcheck disable=SC2086
+            helm template t charts/rproxy-gateway -n rproxy-gateway-system $args > /dev/null
+          done

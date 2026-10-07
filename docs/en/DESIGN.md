@@ -75,7 +75,10 @@ rproxy runs with `RPROXY_API_ADDR=0.0.0.0`, `RPROXY_API_PORT=9443`, `RPROXY_TOKE
 | Listener `TLS` (`tls.mode: Terminate`) | a tcp rule, `tls.mode: terminate`, `tls.routes` by TLSRoute host name (those of Passthrough listeners on the same port with `passthrough: true`) |
 | TLSRoute destination | a `tls.routes` entry has one destination, so the Service's ClusterIP (kube-proxy spreads over the pods; the first pod for a headless Service). With several backendRefs, the one with the largest weight |
 | Listener `TCP` / `UDP` | a tcp / udp rule, `targets` (the pod IPs of all backends of the TCPRoutes / UDPRoutes, weights spread over the pods) |
-| A `TLS` / `TCP` / `UDP` listener nothing attaches to | no rule (the port stays closed; the listener is `Programmed: True`) |
+| A `TLS` / `TCP` / `UDP` listener nothing attaches to | no rule (the listener is `Programmed: True`; the Service has the port) |
+| A TLSRoute without a usable backend | its names go to `127.0.0.1:1` (accepted, then closed: Gateway API expects a reset, not a refused connection) |
+| Several routes on one TCP / UDP listener | all `Accepted`, the traffic goes to the oldest |
+| An `HTTPS` listener without a usable certificate | routes attach (counted in `attachedRoutes`), no rule is made (`ResolvedRefs: False`, `Programmed: False`) |
 
 ### rproxy's CRDs (`rproxy.max3584.net/v1alpha1`)
 

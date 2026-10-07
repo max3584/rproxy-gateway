@@ -46,6 +46,13 @@ pub const SUPPORTED_FEATURES: &[&str] = &[
 	"TLSRoute",
 	"TCPRoute",
 	"UDPRoute",
+	"TLSRouteModeTerminate",
+	"TLSRouteModeMixed",
+	"HTTPRouteParentRefPort",
+	"HTTPRouteDestinationPortMatching",
+	"HTTPRouteNamedRouteRule",
+	"HTTPRouteBackendProtocolWebSocket",
+	"HTTPRouteBackendTimeout",
 ];
 
 #[derive(Clone, Debug)]

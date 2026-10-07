@@ -46,7 +46,7 @@ struct ControllerArgs {
 	#[arg(long, env = "RPROXY_GATEWAY_MODE", default_value = "managed", value_parser = ["managed", "fleet"])]
 	mode: String,
 	/// managed: the rproxy image.
-	#[arg(long, env = "RPROXY_GATEWAY_RPROXY_IMAGE", default_value = "ghcr.io/max3584/rproxy-api:0.4.0")]
+	#[arg(long, env = "RPROXY_GATEWAY_RPROXY_IMAGE", default_value = "ghcr.io/max3584/rproxy-gateway/rproxy:0.4.0")]
 	rproxy_image: String,
 	/// managed: this controller's image (runs certsync next to rproxy).
 	#[arg(long, env = "RPROXY_GATEWAY_IMAGE", default_value = concat!("ghcr.io/max3584/rproxy-gateway:", env!("CARGO_PKG_VERSION")))]
