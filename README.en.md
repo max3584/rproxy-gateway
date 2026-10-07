@@ -34,7 +34,7 @@ Decisions and the mapping tables: [docs/en/DESIGN.md](docs/en/DESIGN.md). Gatewa
 ## Installing
 
 ```bash
-# Gateway API's CRDs (standard channel)
+# Gateway API's CRDs (standard channel; experimental-install.yaml for HTTPRoute retries)
 kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.3/standard-install.yaml
 # the controller (CRDs, RBAC, GatewayClass rproxy)
 helm install rproxy-gateway oci://ghcr.io/max3584/charts/rproxy-gateway -n rproxy-gateway-system --create-namespace

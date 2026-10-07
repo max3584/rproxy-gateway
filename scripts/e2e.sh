@@ -7,6 +7,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 CLUSTER=${CLUSTER:-rproxy-gateway}
 GATEWAY_API_VERSION=${GATEWAY_API_VERSION:-v1.6.3}
+# standard (what README installs) or experimental (conformance.sh)
+GATEWAY_API_CHANNEL=${GATEWAY_API_CHANNEL:-standard}
 TRAEFIK_CRDS=${TRAEFIK_CRDS:-https://raw.githubusercontent.com/traefik/traefik/v3.7.14/docs/content/reference/dynamic-configuration/kubernetes-crd-definition-v1.yml}
 NS=rproxy-gateway-system
 work=${RUNNER_TEMP:-/tmp}/rproxy-gateway-e2e
@@ -41,7 +43,7 @@ docker build -q -t rproxy:e2e --build-arg TARGETARCH=amd64 -f Dockerfile.rproxy 
 echo "== cluster"
 kind get clusters | grep -qx "$CLUSTER" || kind create cluster --name "$CLUSTER" --wait 180s
 kind load docker-image --name "$CLUSTER" rproxy-gateway:e2e rproxy:e2e
-kubectl apply --server-side -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/$GATEWAY_API_VERSION/standard-install.yaml" > /dev/null
+kubectl apply --server-side -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/$GATEWAY_API_VERSION/$GATEWAY_API_CHANNEL-install.yaml" > /dev/null
 # the runner reaches ClusterIPs (Gateway addresses) through the kind node (kube-proxy there)
 node_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CLUSTER-control-plane")
 svc_cidr=$(kubectl get svc kubernetes -o jsonpath='{.spec.clusterIP}' | awk -F. '{print $1"."$2".0.0/16"}')

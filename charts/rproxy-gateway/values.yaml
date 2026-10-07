@@ -1,6 +1,6 @@
 # rproxy-gateway: Gateway API controller for rproxy (docs/DESIGN.md).
 # Gateway API's CRDs are not part of this chart: install them first
-# (https://gateway-api.sigs.k8s.io/guides/#installing-gateway-api, v1.6 standard channel).
+# (https://gateway-api.sigs.k8s.io/guides/#installing-gateway-api, v1.6 standard channel; the experimental channel for HTTPRoute retries).
 
 controller:
   image:

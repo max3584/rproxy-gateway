@@ -73,6 +73,7 @@ pub const SUPPORTED_FEATURES: &[&str] = &[
 	"HTTPRouteRequestPercentageMirror",
 	"HTTPRouteBackendProtocolH2C",
 	"GatewayFrontendClientCertificateValidation",
+	"GatewayFrontendClientCertificateValidationInsecureFallback",
 	"ListenerSet",
 	"GRPCRoute",
 	"GRPCRouteNamedRouteRule",

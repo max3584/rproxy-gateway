@@ -34,7 +34,7 @@ English: [README.en.md](README.en.md)
 ## 入れ方
 
 ```bash
-# Gateway API の CRD（standard channel）
+# Gateway API の CRD（standard channel。HTTPRoute の retry を使うなら experimental-install.yaml）
 kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.3/standard-install.yaml
 # コントローラ（CRD、RBAC、GatewayClass rproxy）
 helm install rproxy-gateway oci://ghcr.io/max3584/charts/rproxy-gateway -n rproxy-gateway-system --create-namespace
