@@ -13,7 +13,7 @@ work=${RUNNER_TEMP:-/tmp}/rproxy-gateway-e2e
 mkdir -p "$work"
 
 dump() {
-  echo "::group::controller log"; kubectl -n $NS logs deploy/rproxy-gateway --tail=300 || true; echo "::endgroup::"
+  echo "::group::controller log"; kubectl -n $NS logs -l app.kubernetes.io/name=rproxy-gateway --prefix --tail=300 || true; echo "::endgroup::"
   echo "::group::rproxy pods"; kubectl -n $NS get pods -o wide || true
   for p in $(kubectl -n $NS get pods -l app.kubernetes.io/name=rproxy -o name 2>/dev/null); do
     kubectl -n $NS logs "$p" --all-containers --tail=200 || true
@@ -103,6 +103,14 @@ fi
 echo "== rproxy restart: the controller applies the rule set again"
 kubectl -n $NS delete pod -l app.kubernetes.io/name=rproxy --wait=true > /dev/null
 retry 120 sh -c "curl -sf -H 'Host: e2e.example.com' http://$addr/again > /dev/null"
+
+echo "== controller failover: another replica takes the Lease and carries on"
+leader=$(kubectl -n $NS get lease rproxy-gateway -o jsonpath='{.spec.holderIdentity}')
+echo "leader: $leader"
+kubectl -n $NS delete pod "$leader" --wait=false > /dev/null
+retry 120 sh -c "h=\$(kubectl -n $NS get lease rproxy-gateway -o jsonpath='{.spec.holderIdentity}'); test -n \"\$h\" && test \"\$h\" != $leader"
+kubectl -n $NS delete pod -l app.kubernetes.io/name=rproxy --wait=true > /dev/null
+retry 120 sh -c "curl -sf -H 'Host: e2e.example.com' http://$addr/after-failover > /dev/null"
 
 echo "== Gateway deleted: its rproxy goes"
 kubectl -n e2e delete gateway e2e > /dev/null

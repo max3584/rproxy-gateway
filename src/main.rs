@@ -78,6 +78,15 @@ struct ControllerArgs {
 	/// Where `/healthz` is answered.
 	#[arg(long, env = "RPROXY_GATEWAY_HEALTH_ADDR", default_value = "0.0.0.0:8081")]
 	health_addr: SocketAddr,
+	/// Leader election: run several replicas, one of which acts (a Lease in the controller's namespace).
+	#[arg(long, env = "RPROXY_GATEWAY_LEADER_ELECT", default_value_t = true, action = clap::ArgAction::Set)]
+	leader_elect: bool,
+	/// The Lease's name.
+	#[arg(long, env = "RPROXY_GATEWAY_LEADER_LEASE", default_value = "rproxy-gateway")]
+	leader_lease: String,
+	/// This replica's name in the Lease (default: the pod name, `POD_NAME`, else the host name).
+	#[arg(long, env = "POD_NAME")]
+	leader_identity: Option<String>,
 	#[command(flatten)]
 	migration: MigrationArgs,
 }
@@ -207,6 +216,16 @@ fn main() -> anyhow::Result<()> {
 				resync: Duration::from_secs(a.resync_secs.max(5)),
 				health: a.health_addr,
 				migration: a.migration.settings()?,
+				leader: a.leader_elect.then(|| {
+					let identity = a
+						.leader_identity
+						.clone()
+						.filter(|s| !s.is_empty())
+						.or_else(|| std::fs::read_to_string("/etc/hostname").ok().map(|h| h.trim().to_string()))
+						.filter(|s| !s.is_empty())
+						.unwrap_or_else(|| format!("rproxy-gateway-{}", std::process::id()));
+					controller::leader::Settings::new(&a.leader_lease, &identity)
+				}),
 			};
 			tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(controller::run(cfg))
 		}

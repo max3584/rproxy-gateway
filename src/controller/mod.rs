@@ -9,6 +9,7 @@
 
 pub mod bootstrap;
 pub mod cache;
+pub mod leader;
 pub mod provision;
 pub mod status;
 #[cfg(test)]
@@ -66,6 +67,8 @@ pub struct Config {
 	pub health: SocketAddr,
 	/// Ingress / Traefik migration (off when `None`).
 	pub migration: Option<render::migrate::Settings>,
+	/// Leader election (`None`: this replica always leads, for a single replica).
+	pub leader: Option<leader::Settings>,
 }
 
 /// Migration notes already logged (by digest), so each set is logged once.
@@ -80,14 +83,41 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
 	let rp = Client::new(Some(&boot.ca_pem), &boot.token)?;
 	let cache = cache::Cache::start(&client, &cfg.namespace, cfg.migration.is_some()).await?;
 	tokio::spawn(health(cfg.health));
+	let (leading_tx, mut leading) = tokio::sync::watch::channel(cfg.leader.is_none());
+	let lease_api: Api<k8s_openapi::api::coordination::v1::Lease> = Api::namespaced(client.clone(), &cfg.namespace);
+	if let Some(s) = cfg.leader.clone() {
+		info!(lease = s.lease, identity = s.identity, "leader election");
+		tokio::spawn(leader::run(lease_api.clone(), s, leading_tx));
+	}
 	cache.ready().await;
 	info!(controller = %cfg.controller_name, "started");
 	let mut applied = Applied::new();
 	let mut caps: HashMap<String, Capabilities> = HashMap::new();
+	let shutdown = shutdown_signal();
+	tokio::pin!(shutdown);
 	loop {
-		let soon = match reconcile_all(&client, &cache, &rp, &cfg, &mut applied, &mut caps).await {
-			Ok(soon) => soon,
-			Err(e) => {
+		if !*leading.borrow_and_update() {
+			// a follower keeps its watches warm and waits; what it knew about pods is stale
+			applied.clear();
+			caps.clear();
+			tokio::select! {
+				_ = leading.changed() => continue,
+				_ = &mut shutdown => return Ok(()),
+			}
+		}
+		// a pass stops as soon as leadership is lost (another replica may be leading already)
+		let pass = tokio::select! {
+			r = reconcile_all(&client, &cache, &rp, &cfg, &mut applied, &mut caps) => Some(r),
+			_ = lost(&mut leading) => None,
+			_ = &mut shutdown => {
+				if let Some(s) = &cfg.leader { leader::release(&lease_api, s).await; }
+				return Ok(());
+			}
+		};
+		let soon = match pass {
+			None => continue,
+			Some(Ok(soon)) => soon,
+			Some(Err(e)) => {
 				warn!(error = format!("{e:#}"), "reconcile failed");
 				true
 			}
@@ -96,10 +126,45 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
 		tokio::select! {
 			_ = cache.changed.notified() => {}
 			_ = tokio::time::sleep(wait) => {}
+			_ = lost(&mut leading) => continue,
+			_ = &mut shutdown => {
+				if let Some(s) = &cfg.leader { leader::release(&lease_api, s).await; }
+				return Ok(());
+			}
 		}
 		// let a burst of changes settle
 		tokio::time::sleep(Duration::from_millis(250)).await;
 	}
+}
+
+/// Resolves when this replica stops leading.
+async fn lost(leading: &mut tokio::sync::watch::Receiver<bool>) {
+	while *leading.borrow_and_update() {
+		if leading.changed().await.is_err() {
+			// the elector is gone (a single replica without election never changes)
+			std::future::pending::<()>().await;
+		}
+	}
+}
+
+/// SIGTERM or Ctrl-C.
+async fn shutdown_signal() {
+	#[cfg(unix)]
+	{
+		let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+			Ok(t) => t,
+			Err(_) => return std::future::pending().await,
+		};
+		tokio::select! {
+			_ = term.recv() => {}
+			_ = tokio::signal::ctrl_c() => {}
+		}
+	}
+	#[cfg(not(unix))]
+	{
+		let _ = tokio::signal::ctrl_c().await;
+	}
+	info!("shutting down");
 }
 
 async fn health(addr: SocketAddr) {
