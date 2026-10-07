@@ -8,6 +8,9 @@ controller:
     # defaults to the chart's appVersion
     tag: ""
     pullPolicy: IfNotPresent
+  # replicas elect a leader with a Lease (rproxy-gateway in the release namespace); one acts at a time
+  replicas: 2
+  leaderElection: true
   # GatewayClass spec.controllerName this controller handles
   controllerName: rproxy.max3584.net/gateway-controller
   logFormat: json

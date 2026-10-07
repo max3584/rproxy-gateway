@@ -16,6 +16,14 @@ Gateway API / CRD ──watch──▶ rproxy-gateway ──PUT /rulesets/k8s/<n
 - Gateway 1 つが rproxy のルールセット 1 つ（`k8s/<Gateway の namespace>/<Gateway の名前>`）。(プロトコル, アドレス, ポート) 1 つがルール 1 つで、同じポートのリスナー（ホスト名が違う）は 1 つのルールにまとめる。
 - ひとつのループが、変更のたび（少し待ってまとめる）と `--resync-secs`（既定 30 秒）ごとに、担当するすべての Gateway を描き直す。描いた内容が前回と同じで、Pod のセットの etag も前回 PUT したときのままなら PUT しない。
 
+## 冗長化（リーダー選出）
+
+- コントローラは複数動かせる（chart の既定は 2 レプリカ、`controller.replicas`）。どのレプリカも watch を続けるが、反映（PUT）・状態の書き込み・rproxy の配置をするのは、コントローラの namespace の Lease（`coordination.k8s.io/v1`、名前 `rproxy-gateway`、`--leader-lease`）を持つ 1 つだけ。
+- リーダーは 5 秒ごとに Lease を更新する。Lease は最後の更新から 15 秒有効。持ち主がいないか 15 秒更新のない Lease は、ほかのレプリカが取る（書き込みは `resourceVersion` つきなので、2 つが同時に取ることはない）。
+- 10 秒更新できなかったリーダーは自分から降りる（ほかが取れるようになる 15 秒より前に止まる）。降りたときは途中の反映もそこでやめる。止めるとき（SIGTERM）は Lease を手放すので、すぐにほかのレプリカが引き継ぐ。
+- 引き継いだレプリカは rproxy の今のルールセットを読み、etag が違えば PUT し直す（`If-Match`）。同時に 2 つが書いても、rproxy の `If-Match` と `generation` が古いほうを断る。
+- レプリカ 1 つで動かすなら `--leader-elect=false`（chart の `controller.leaderElection: false`）。
+
 ## rproxy の置き方（`--mode`）
 
 | mode | rproxy | アドレス（Gateway の `status.addresses`） |

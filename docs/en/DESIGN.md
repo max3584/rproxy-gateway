@@ -16,6 +16,14 @@ Gateway API / CRDs ──watch──▶ rproxy-gateway ──PUT /rulesets/k8s/<
 - One Gateway is one rproxy rule set (`k8s/<Gateway namespace>/<Gateway name>`). One (protocol, address, port) is one rule; listeners on the same port (different host names) merge into one rule.
 - One loop renders every Gateway it handles on each change (debounced) and every `--resync-secs` (30 seconds by default). When what it renders is the same as last time and the pod's set still has the etag of the last PUT, nothing is PUT.
 
+## High availability (leader election)
+
+- Several controller replicas can run (the chart runs 2 by default, `controller.replicas`). Every replica keeps its watches, but only the one holding the Lease in the controller's namespace (`coordination.k8s.io/v1`, named `rproxy-gateway`, `--leader-lease`) applies rule sets, writes status and deploys rproxy.
+- The leader renews the Lease every 5 seconds; it is held for 15 seconds after the last renewal. Another replica takes a Lease that has no holder or was not renewed for 15 seconds (writes carry the `resourceVersion`, so two replicas cannot both take it).
+- A leader that could not renew for 10 seconds steps down by itself (it stops before another replica can take over at 15 seconds), abandoning the pass in progress. On shutdown (SIGTERM) it gives the Lease up, so another replica takes over at once.
+- The new leader reads rproxy's current rule sets and PUTs again where the etag differs (`If-Match`). Should two replicas ever write at once, rproxy's `If-Match` and `generation` refuse the stale one.
+- To run a single replica, use `--leader-elect=false` (chart: `controller.leaderElection: false`).
+
 ## Where rproxy runs (`--mode`)
 
 | mode | rproxy | Address (Gateway `status.addresses`) |

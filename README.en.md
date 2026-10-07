@@ -58,6 +58,7 @@ spec:
 ```
 
 - By default (managed), the controller creates one rproxy Deployment and `LoadBalancer` Service per Gateway in its namespace (`managed.serviceType`, `managed.replicas`).
+- The controller runs 2 replicas by default; they elect a leader with a Lease and only it applies rule sets (docs/en/DESIGN.md, "High availability").
 - With `fleet.enabled=true`, the chart's DaemonSet (`hostNetwork: true`) runs rproxy, which serves every Gateway.
 - Chart values: [charts/rproxy-gateway/values.yaml](charts/rproxy-gateway/values.yaml).
 

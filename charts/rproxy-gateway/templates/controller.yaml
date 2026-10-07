@@ -7,10 +7,12 @@ metadata:
     {{- include "rproxy-gateway.labels" . | nindent 4 }}
     app.kubernetes.io/name: rproxy-gateway
 spec:
-  # one controller: it renders and PUTs every Gateway's rule set
-  replicas: 1
+  # replicas elect a leader (a Lease): one renders and PUTs every Gateway's rule set,
+  # the others take over within ~15 s when it goes
+  replicas: {{ .Values.controller.replicas }}
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
   selector:
     matchLabels:
       app.kubernetes.io/name: rproxy-gateway
@@ -40,6 +42,7 @@ spec:
             - --controller-name={{ .Values.controller.controllerName }}
             - --resync-secs={{ .Values.controller.resyncSeconds }}
             - --listen-addr={{ join "," .Values.rproxy.listenAddresses }}
+            - --leader-elect={{ .Values.controller.leaderElection }}
             {{- if .Values.fleet.enabled }}
             - --mode=fleet
             - --fleet-selector=app.kubernetes.io/name=rproxy,app.kubernetes.io/component=fleet
@@ -68,6 +71,8 @@ spec:
           env:
             - name: POD_NAMESPACE
               valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
             - name: RPROXY_GATEWAY_LOG_FORMAT
               value: {{ .Values.controller.logFormat | quote }}
           ports:
@@ -87,6 +92,31 @@ spec:
       {{- with .Values.controller.tolerations }}
       tolerations: {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.controller.affinity }}
-      affinity: {{- toYaml . | nindent 8 }}
+      {{- if .Values.controller.affinity }}
+      affinity: {{- toYaml .Values.controller.affinity | nindent 8 }}
+      {{- else if gt (int .Values.controller.replicas) 1 }}
+      # replicas on different nodes when there are several
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels: {app.kubernetes.io/name: rproxy-gateway}
       {{- end }}
+{{- if gt (int .Values.controller.replicas) 1 }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: rproxy-gateway
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rproxy-gateway.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rproxy-gateway
+{{- end }}
