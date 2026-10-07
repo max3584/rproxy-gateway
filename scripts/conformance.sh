@@ -32,6 +32,8 @@ status=0
     --usable-address="${USABLE_ADDRESS:-192.0.2.10}" --unusable-address="${UNUSABLE_ADDRESS:-0.0.0.0}"
 ) 2>&1 | tee "$work/conformance.log" || status=$?
 echo "$status" > "$work/status"
+# the controllers' logs (both replicas) for the artifact
+kubectl -n rproxy-gateway-system logs -l app.kubernetes.io/name=rproxy-gateway --prefix --tail=-1 > "$work/controller.log" 2>&1 || true
 
 # core tests that failed, by profile (CI fails on these: core is 100%; extended is reported)
 : > "$work/core-failures"

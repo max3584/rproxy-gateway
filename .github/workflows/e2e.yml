@@ -149,6 +149,7 @@ jobs:
           path: |
             conformance-report.yaml
             ${{ runner.temp }}/rproxy-gateway-conformance/conformance.log
+            ${{ runner.temp }}/rproxy-gateway-conformance/controller.log
       # core must pass (a regression fails the job); extended failures are reported, not blocking
       - name: core
         run: |
