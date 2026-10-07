@@ -59,6 +59,43 @@ pub struct GatewaySpec {
 	pub infrastructure: Option<GatewayInfrastructure>,
 	#[serde(default)]
 	pub tls: Option<GatewayTlsConfig>,
+	#[serde(default)]
+	pub allowed_listeners: Option<AllowedListeners>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct AllowedListeners {
+	#[serde(default)]
+	pub namespaces: Option<RouteNamespaces>,
+}
+
+/// A ListenerSet: listeners added to a Gateway from another object (GEP-1713).
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ListenerSet {
+	#[serde(default)]
+	pub metadata: ObjectMeta,
+	pub spec: ListenerSetSpec,
+	#[serde(default)]
+	pub status: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListenerSetSpec {
+	pub parent_ref: ParentGatewayReference,
+	#[serde(default)]
+	pub listeners: Vec<Listener>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ParentGatewayReference {
+	#[serde(default)]
+	pub group: Option<String>,
+	#[serde(default)]
+	pub kind: Option<String>,
+	pub name: String,
+	#[serde(default)]
+	pub namespace: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

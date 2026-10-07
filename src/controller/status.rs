@@ -5,7 +5,7 @@
 use serde_json::{Value, json};
 
 use crate::render::status::{self, Cond, to_k8s};
-use crate::render::{GatewayPlan, ParentStatus};
+use crate::render::{GatewayPlan, ListenerPlan, ListenerSetPlan, ParentStatus};
 use crate::rproxy::model::RuleView;
 
 /// What happened on one rproxy pod.
@@ -54,9 +54,9 @@ fn waiting(pods: &[PodSync]) -> (bool, String) {
 }
 
 /// The listener conditions after rproxy's answer.
-pub fn listener_conds(plan: &GatewayPlan, i: usize, pods: &[PodSync]) -> Vec<Cond> {
-	let l = &plan.listeners[i];
+pub fn listener_conds(l: &ListenerPlan, pods: &[PodSync]) -> Vec<Cond> {
 	let mut conds = l.conds.clone();
+	let conflict = status::get(&conds, "Conflicted").filter(|c| c.status).map(|c| c.reason.clone());
 	let accepted = status::get(&conds, "Accepted").is_some_and(|c| c.status);
 	let programmed = match (&l.rule_key, accepted && l.servable) {
 		(Some(key), true) if synced(pods) > 0 => match rule_cond(pods, key, "Programmed") {
@@ -74,7 +74,10 @@ pub fn listener_conds(plan: &GatewayPlan, i: usize, pods: &[PodSync]) -> Vec<Con
 		// accepted, but nothing attached yet that needs a rule (TLS, TCP, UDP)
 		(None, true) => Cond::ok("Programmed", "Programmed"),
 		_ if accepted => Cond::new("Programmed", false, "Invalid", "no usable certificate"),
-		_ => Cond::new("Programmed", false, "Invalid", "the listener is not accepted"),
+		_ => match conflict {
+			Some(reason) => Cond::new("Programmed", false, &reason, "conflicts with another listener"),
+			None => Cond::new("Programmed", false, "Invalid", "the listener is not accepted"),
+		},
 	};
 	if let Some(key) = &l.rule_key {
 		if let Some(c) = rule_cond(pods, key, "ResolvedRefs") {
@@ -108,11 +111,22 @@ pub fn gateway_status(plan: &GatewayPlan, addresses: &[(String, String)], pods: 
 		Cond::ok("Programmed", "Programmed")
 	};
 	status::set(&mut conds, programmed);
-	let listeners: Vec<Value> = plan
-		.listeners
+	let mut out = json!({
+		"addresses": addresses.iter().map(|(t, v)| json!({"type": t, "value": v})).collect::<Vec<_>>(),
+		"conditions": to_k8s(&conds, generation, prev("/conditions"), now),
+		"listeners": listeners_status(&plan.listeners, pods, generation, previous, now),
+	});
+	if !plan.listener_sets.is_empty() || previous.is_some_and(|p| p.get("attachedListenerSets").is_some()) {
+		out["attachedListenerSets"] = json!(plan.attached_listener_sets);
+	}
+	out
+}
+
+/// `status.listeners` of a Gateway or a ListenerSet.
+fn listeners_status(listeners: &[ListenerPlan], pods: &[PodSync], generation: i64, previous: Option<&Value>, now: &str) -> Vec<Value> {
+	listeners
 		.iter()
-		.enumerate()
-		.map(|(i, l)| {
+		.map(|l| {
 			let prev_conds = previous
 				.and_then(|p| p["listeners"].as_array())
 				.and_then(|a| a.iter().find(|x| x["name"] == l.name.as_str()))
@@ -121,14 +135,26 @@ pub fn gateway_status(plan: &GatewayPlan, addresses: &[(String, String)], pods: 
 				"name": l.name,
 				"supportedKinds": l.supported_kinds,
 				"attachedRoutes": l.attached,
-				"conditions": to_k8s(&listener_conds(plan, i, pods), generation, prev_conds, now),
+				"conditions": to_k8s(&listener_conds(l, pods), generation, prev_conds, now),
 			})
 		})
-		.collect();
+		.collect()
+}
+
+/// A ListenerSet's `status`: `Accepted`, `Programmed` (accepted and the Gateway's rproxy has the set), listeners.
+pub fn listener_set_status(set: &ListenerSetPlan, pods: &[PodSync], previous: Option<&Value>, now: &str) -> Value {
+	let mut conds = vec![set.accepted.clone()];
+	conds.push(if !set.accepted.status {
+		Cond::new("Programmed", false, &set.accepted.reason, set.accepted.message.clone())
+	} else if synced(pods) > 0 {
+		Cond::ok("Programmed", "Programmed")
+	} else {
+		let (rejected, m) = waiting(pods);
+		Cond::new("Programmed", false, if rejected { "Invalid" } else { "Pending" }, m)
+	});
 	json!({
-		"addresses": addresses.iter().map(|(t, v)| json!({"type": t, "value": v})).collect::<Vec<_>>(),
-		"conditions": to_k8s(&conds, generation, prev("/conditions"), now),
-		"listeners": listeners,
+		"conditions": to_k8s(&conds, set.generation, previous.map(|p| &p["conditions"]), now),
+		"listeners": listeners_status(&set.listeners, pods, set.generation, previous, now),
 	})
 }
 

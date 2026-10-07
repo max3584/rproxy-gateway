@@ -72,6 +72,7 @@ pub const SUPPORTED_FEATURES: &[&str] = &[
 	"HTTPRouteRequestPercentageMirror",
 	"HTTPRouteBackendProtocolH2C",
 	"GatewayFrontendClientCertificateValidation",
+	"ListenerSet",
 ];
 
 #[derive(Clone, Debug)]
@@ -416,6 +417,9 @@ async fn reconcile_all(
 				migration_addresses = Some(addresses.clone());
 			}
 			let st = status::gateway_status(&plan, &addresses, &results, gw.status.as_ref(), &now);
+			for set in &plan.listener_sets {
+				write_listener_set_status(client, cache, &world, set, &results, &now).await;
+			}
 			if gw.status.as_ref() != Some(&st) {
 				if let Err(e) = patch_status(&api, &plan.name, st).await {
 					warn!(gateway = %plan.ruleset, error = %e, "cannot write Gateway status");
@@ -455,6 +459,33 @@ async fn reconcile_all(
 	write_route_status(client, cache, &world, &plans, cfg, &now).await;
 	write_crd_status(client, cache, &world, &plans, cfg, &now).await;
 	Ok(soon)
+}
+
+/// A ListenerSet's `status` (written by the controller of the Gateway it names).
+async fn write_listener_set_status(
+	client: &kube::Client,
+	cache: &cache::Cache,
+	world: &render::world::World,
+	set: &render::ListenerSetPlan,
+	pods: &[PodSync],
+	now: &str,
+) {
+	let prev = world
+		.listener_sets
+		.iter()
+		.find(|ls| {
+			ls.metadata.namespace.as_deref() == Some(set.namespace.as_str()) && ls.metadata.name.as_deref() == Some(set.name.as_str())
+		})
+		.and_then(|ls| ls.status.clone());
+	let st = status::listener_set_status(set, pods, prev.as_ref(), now);
+	if prev.as_ref() == Some(&st) {
+		return;
+	}
+	if let Some(api) = dyn_api(client, cache, "ListenerSet", Some(&set.namespace)) {
+		if let Err(e) = patch_status(&api, &set.name, st).await {
+			warn!(listenerset = format!("{}/{}", set.namespace, set.name), error = %e, "cannot write ListenerSet status");
+		}
+	}
 }
 
 /// `status.loadBalancer` of the Ingresses read into the migration Gateway's set: its addresses.

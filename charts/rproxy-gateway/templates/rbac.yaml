@@ -5,10 +5,10 @@ metadata:
   labels: {{- include "rproxy-gateway.labels" . | nindent 4 }}
 rules:
   - apiGroups: [gateway.networking.k8s.io]
-    resources: [gatewayclasses, gateways, httproutes, tlsroutes, tcproutes, udproutes, referencegrants]
+    resources: [gatewayclasses, gateways, httproutes, tlsroutes, tcproutes, udproutes, referencegrants, listenersets]
     verbs: [get, list, watch]
   - apiGroups: [gateway.networking.k8s.io]
-    resources: [gatewayclasses/status, gateways/status, httproutes/status, tlsroutes/status, tcproutes/status, udproutes/status]
+    resources: [gatewayclasses/status, gateways/status, httproutes/status, tlsroutes/status, tcproutes/status, udproutes/status, listenersets/status]
     verbs: [get, update, patch]
   - apiGroups: [rproxy.max3584.net]
     resources: [rproxymiddlewares, rproxypolicies, rproxyrules]

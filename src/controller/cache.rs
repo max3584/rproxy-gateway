@@ -54,6 +54,7 @@ pub const DYNAMIC_KINDS: &[(&str, &str)] = &[
 	(crate::k8s::gateway::GROUP, "TCPRoute"),
 	(crate::k8s::gateway::GROUP, "UDPRoute"),
 	(crate::k8s::gateway::GROUP, "ReferenceGrant"),
+	(crate::k8s::gateway::GROUP, "ListenerSet"),
 	(crate::k8s::crd::GROUP, "RproxyMiddleware"),
 	(crate::k8s::crd::GROUP, "RproxyPolicy"),
 	(crate::k8s::crd::GROUP, "RproxyRule"),
