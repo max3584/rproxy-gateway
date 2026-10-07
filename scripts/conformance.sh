@@ -33,6 +33,14 @@ status=0
 ) 2>&1 | tee "$work/conformance.log" || status=$?
 echo "$status" > "$work/status"
 
+# core tests that failed, by profile (CI fails on these: core is 100%; extended is reported)
+: > "$work/core-failures"
+if [ -f "$REPORT" ]; then
+  yq -r '.profiles[] | select(.core.result != "success") | .name + ": " + ((.core.failedTests // []) | join(", "))' "$REPORT" > "$work/core-failures"
+else
+  echo "no report" > "$work/core-failures"
+fi
+
 # a short summary: top-level and sub-test results
 passed=$(grep -cE '^\s*--- PASS' "$work/conformance.log" || true)
 failed=$(grep -cE '^\s*--- FAIL' "$work/conformance.log" || true)
@@ -45,6 +53,11 @@ skipped=$(grep -cE '^\s*--- SKIP' "$work/conformance.log" || true)
   if [ "$failed" -gt 0 ]; then
     echo "### Failed"
     grep -E '^\s*--- FAIL' "$work/conformance.log" | sed 's/^\s*--- FAIL: /- /' | head -100
+    echo
+  fi
+  if [ -s "$work/core-failures" ]; then
+    echo "### Core failures"
+    sed 's/^/- /' "$work/core-failures"
     echo
   fi
   if [ -f "$REPORT" ]; then

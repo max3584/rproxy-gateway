@@ -18,9 +18,11 @@ English: [README.en.md](README.en.md)
 | リソース | rproxy |
 |---|---|
 | `GatewayClass`（`controllerName: rproxy.max3584.net/gateway-controller`） | `Accepted`、`supportedFeatures` |
-| `Gateway` のリスナー `HTTP`・`HTTPS`・`TLS`（Passthrough / Terminate）・`TCP`・`UDP` | (プロトコル, アドレス, ポート) ごとに 1 つのルール。同じポートのリスナーはまとめる |
-| `HTTPRoute` | `http.routes`（path・header・query・method の一致、Gateway API の優先の順）、ヘッダの書き換え、リダイレクト、URL の書き換え、重み、`RproxyMiddleware`（ExtensionRef） |
-| `TLSRoute`・`TCPRoute`・`UDPRoute` | `tls.routes`（SNI）、`targets` |
+| `Gateway` のリスナー `HTTP`・`HTTPS`・`TLS`（Passthrough / Terminate）・`TCP`・`UDP` | (プロトコル, アドレス, ポート) ごとに 1 つのルール。同じポートのリスナーはまとめる。`spec.addresses`、`infrastructure`、クライアント証明書の検証（`tls.frontend`）、backend へのクライアント証明書（`tls.backend`） |
+| `ListenerSet` | Gateway のリスナーに足す（`allowedListeners`） |
+| `HTTPRoute`・`GRPCRoute` | `http.routes`（path・header・query・method の一致、Gateway API の優先の順）、ヘッダの書き換え（`add` も）、リダイレクト（301〜308）、URL・Host の書き換え、CORS、ミラー、retry、タイムアウト、backendRef ごとのフィルタ、重み、h2c の backend、`RproxyMiddleware`（ExtensionRef） |
+| `BackendTLSPolicy` | backend への TLS（CA・SNI・SAN） |
+| `TLSRoute`・`TCPRoute`・`UDPRoute` | `tls.routes`（SNI、名前ごとに Pod の `targets`）、`targets` |
 | `ReferenceGrant` | ほかの namespace の Service・Secret |
 | backend | EndpointSlice の Pod の IP（rproxy が振り分けとヘルスチェックをする） |
 | 状態 | Gateway・リスナー・ルートの `Accepted`・`Programmed`・`ResolvedRefs`（rproxy のルールの `conditions` から） |
