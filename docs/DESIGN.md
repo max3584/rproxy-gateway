@@ -88,15 +88,21 @@ rproxy は `RPROXY_API_ADDR=0.0.0.0`、`RPROXY_API_PORT=9443`、`RPROXY_TOKEN_FI
 | 同じポートの、より具体的なホスト名のリスナー | ワイルドカード・ホスト名なしのリスナーのルートに `!Host(...)` を足して、そのホスト名を取らない（リスナーの分離） |
 | `backendRefs` | Service の EndpointSlice の ready な Pod の IP（ClusterIP ではない）を `servers` に。`weight` は Pod の数で割って配る。ExternalName は名前のまま |
 | 使える backend がない | `respond`（500） |
-| `RequestHeaderModifier` / `ResponseHeaderModifier` | `headers`（`set`・`remove`。`add` は `set` になる） |
-| `RequestRedirect` | `redirect_regex`（301 / 302。ポートは Gateway API の決まり：scheme を変えたらそのスキームの既定、変えなければリスナーのポート） |
-| `URLRewrite` の path | `replace_path`（ReplaceFullPath）、`replace_path_regex`（ReplacePrefixMatch） |
+| 一部の backendRef が無効 | その backendRef の重みの分だけ rproxy が 500 で答える（`servers[]` の `status: 500`） |
+| backend の Service のポートの `appProtocol: kubernetes.io/h2c` | サービスの `protocol: h2c`（転送先と前置きからの HTTP/2） |
+| `RequestHeaderModifier` / `ResponseHeaderModifier` | `headers`（`set`・`add`・`remove`。`add` は既にある値の後ろに `,` で足す） |
+| `RequestRedirect` | `redirect_regex`（`status` に 301・302・303・307・308。ポートは Gateway API の決まり：scheme を変えたらそのスキームの既定、変えなければリスナーのポート） |
+| `URLRewrite` | hostname は `replace_host`、path は `replace_path`（ReplaceFullPath）・`replace_path_regex`（ReplacePrefixMatch） |
+| `CORS` | `cors`（`allow_origins`・`allow_methods`・`allow_headers`・`expose_headers`・`allow_credentials`・`max_age`、`maxAge` の既定は 5） |
+| `RequestMirror` | `mirror`（ミラー先の Pod の IP のサービスを作る。`percent` / `fraction`）。ミラー先が見つからなければ `ResolvedRefs: False` でミラーだけ外す |
+| backendRef の `filters` | その backend の `servers[].middlewares`（`RequestHeaderModifier`・`ResponseHeaderModifier`・`URLRewrite`。ReplacePrefixMatch は規則の path の接頭辞が 1 つのときだけ） |
+| `retry` | `retry`（`attempts` は Gateway API の回数 + 1、`codes` は `status`、`backoff` は `initial_interval`）。ミドルウェアの最後 |
 | `ExtensionRef`（`RproxyMiddleware`） | そのミドルウェア（`spec` をそのまま） |
-| `timeouts.backendRequest`（なければ `request`） | サービスの `timeouts.response` |
+| `timeouts.request` / `timeouts.backendRequest` | ルートの `timeouts.request` / `timeouts.backend_request` |
 | リスナー `TLS`（`tls.mode: Passthrough`） | tcp のルール、`tls.mode: sni`、`unmatched: reject`。TLSRoute のホスト名ごとに `tls.routes` |
 | 同じポートの `HTTPS` と `TLS`（Passthrough） | `http` のルールの `tls.routes`（`passthrough: true`）。そのホスト名だけ復号しない |
 | リスナー `TLS`（`tls.mode: Terminate`） | tcp のルール、`tls.mode: terminate`、TLSRoute のホスト名ごとに `tls.routes`（同じポートの Passthrough のリスナーの分は `passthrough: true`） |
-| TLSRoute の宛先 | `tls.routes` の 1 つの項目は宛先が 1 つなので、Service の ClusterIP（kube-proxy が Pod に配る。headless なら最初の Pod）。backendRefs が複数なら weight の最も大きいもの |
+| TLSRoute の宛先 | `tls.routes[].targets`：すべての backend の Pod の IP（weight を Pod の数で配る） |
 | リスナー `TCP` / `UDP` | tcp / udp のルール、`targets`（TCPRoute / UDPRoute のすべての backend の Pod の IP、weight を Pod の数で配る） |
 | 何もつながっていない `TLS` / `TCP` / `UDP` のリスナー | ルールを作らない（リスナーは `Programmed: True`。Service のポートはある） |
 | 使える backend のない TLSRoute | その名前は `127.0.0.1:1` へ（つないでから閉じる。Gateway API は接続の拒否ではなくリセットを求める） |
@@ -111,7 +117,15 @@ rproxy は `RPROXY_API_ADDR=0.0.0.0`、`RPROXY_API_PORT=9443`、`RPROXY_TOKEN_FI
 | `RproxyPolicy` | `spec.targetRefs`（同じ namespace の Gateway、`sectionName` でそのリスナー、Service）に、ルールの `limits`・`bandwidth`・`geoip`・`outlierDetection`・`allowFrom`・`crowdsec` を足す（GEP-713）。Service を指すと、その Service に送る L4 のルール（`outlierDetection` は `http` のサービスにも）。同じ項目を複数のポリシーが決めたら古いほうが勝つ。状態は `status.ancestors[]`（見つからないリスナーは `Accepted: False`、`TargetNotFound`） |
 | `RproxyRule` | `spec.rule` はルールそのもの（`POST /rules` の本文）。`spec.parentRef` の Gateway のルールセットに足す。ほかの namespace の Gateway には、その namespace の ReferenceGrant（from `rproxy.max3584.net/RproxyRule`、to `Gateway`）が要る。同じキーのルールが既にあれば `Accepted: False`（`Conflicted`）。状態は rproxy のルールの `conditions` を写す |
 
-できないもの（ルートは `Accepted: False`、理由 `UnsupportedValue`）：`URLRewrite` の hostname、`RequestMirror`、`CORS` フィルタ、backendRef ごとのフィルタ、リダイレクトの 303 / 307 / 308。
+できないもの（ルートは `Accepted: False`、理由 `UnsupportedValue`）：backendRef の `RequestMirror`・`CORS`・`RequestRedirect` フィルタ、`ExternalAuth`。
+
+### rproxy の機能（`features`）
+
+上の新しい設定（`headers` の `add`、リダイレクトの `status`、ルートの `timeouts`、`replace_host`、`servers[].middlewares`、`cors`、`retry` の `status`、`mirror`、サービスの `protocol`・`tls`、`tls.routes[].targets`、`servers[].status`）は rproxy v0.4.0 の機能（rproxy-api docs/API.md の「Gateway API 向けの L7・TLS」）。コントローラは Gateway の rproxy の Pod の `GET /capabilities` の `features` を読み、すべての Pod にある設定だけを使う。
+
+- 足りない設定を使うルートは `Accepted: False`（`UnsupportedValue`、足りない `features` の名前を書く）。ほかのルートはそのまま動く。
+- 前の形で同じことができるものは前の形にする：`timeouts.backendRequest` はサービスの `timeouts.response`、TLSRoute の宛先は Service の ClusterIP（weight の最も大きい backendRef）、一部が無効な backendRefs は有効なものだけ。
+- まだ聞いていない Pod（作ったばかり）は v0.4.0 のすべてがあるものとして描き、聞いたあとの次の反映で直す。
 
 ## 状態
 

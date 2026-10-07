@@ -17,16 +17,11 @@ All three failures are the `add` of HeaderModifier (append after an existing val
 
 ## Claimed features (`supportedFeatures`)
 
-core (Gateway, HTTPRoute, ReferenceGrant, TLSRoute, TCPRoute, UDPRoute) plus `GatewayPort8080`, `GatewayHTTPListenerIsolation`, `HTTPRouteMethodMatching`, `HTTPRouteQueryParamMatching`, `HTTPRouteResponseHeaderModification`, `HTTPRoutePortRedirect`, `HTTPRouteSchemeRedirect`, `HTTPRoutePathRedirect`, `HTTPRoutePathRewrite`, `HTTPRouteParentRefPort`, `HTTPRouteDestinationPortMatching`, `HTTPRouteNamedRouteRule`, `HTTPRouteBackendProtocolWebSocket`, `HTTPRouteBackendTimeout`, `TLSRouteModeTerminate`, `TLSRouteModeMixed`, `GatewayStaticAddresses` (`--usable-address=192.0.2.10`, `--unusable-address=0.0.0.0`), `GatewayAddressEmpty`, `GatewayInfrastructure`. The GatewayClass `status.supportedFeatures` and `FEATURES` of `scripts/conformance.sh` are the same.
+core (Gateway, HTTPRoute, ReferenceGrant, TLSRoute, TCPRoute, UDPRoute) plus `GatewayPort8080`, `GatewayHTTPListenerIsolation`, `HTTPRouteMethodMatching`, `HTTPRouteQueryParamMatching`, `HTTPRouteResponseHeaderModification`, `HTTPRoutePortRedirect`, `HTTPRouteSchemeRedirect`, `HTTPRoutePathRedirect`, `HTTPRoutePathRewrite`, `TLSRouteModeTerminate`, `TLSRouteModeMixed`, `HTTPRouteParentRefPort`, `HTTPRouteDestinationPortMatching`, `HTTPRouteNamedRouteRule`, `HTTPRouteBackendProtocolWebSocket`, `HTTPRouteBackendTimeout`, `GatewayStaticAddresses`, `GatewayAddressEmpty`, `GatewayInfrastructure`, `HTTPRoute303RedirectStatusCode`, `HTTPRoute307RedirectStatusCode`, `HTTPRoute308RedirectStatusCode`, `HTTPRouteRequestTimeout`, `HTTPRouteHostRewrite`, `HTTPRouteBackendRequestHeaderModification`, `HTTPRouteCORS`, `HTTPRouteRetry`, `HTTPRouteRetryBackendTimeout`, `HTTPRouteRetryConnectionError`, `HTTPRouteRequestMirror`, `HTTPRouteRequestMultipleMirrors`, `HTTPRouteRequestPercentageMirror`, `HTTPRouteBackendProtocolH2C`. `GatewayStaticAddresses` runs with `--usable-address=192.0.2.10` and `--unusable-address=0.0.0.0`. The GatewayClass `status.supportedFeatures` and `FEATURES` of `scripts/conformance.sh` are the same (a unit test checks). The newer HTTPRoute features need the `features` of rproxy v0.4.0 (docs/en/DESIGN.md, "rproxy features").
 
 ## Not claimed
 
 | Feature | Why |
 |---|---|
-| `HTTPRouteHostRewrite` | rproxy sets `Host` from the client or the backend URL (no way to rewrite it) |
-| `HTTPRouteRequestMirror` and friends | rproxy has no mirroring |
-| `HTTPRoute303/307/308RedirectStatusCode` | `redirect_regex` answers 301 / 302 (308 / 307 for methods other than GET) |
-| `HTTPRouteRequestTimeout` | rproxy's `timeouts.response` runs until the headers, not for the whole request |
-| `HTTPRouteBackendRequestHeaderModification` | filters per backendRef (rproxy has no per-server middlewares) |
-| `HTTPRouteCORS`, `HTTPRouteRetry*`, `HTTPRouteBackendProtocolH2C` | not mapped yet (CORS and retry exist as rproxy middlewares) |
 | `ListenerSet`, `GatewayFrontendClientCertificateValidation`, `BackendTLSPolicy`, `GRPCRoute` | not yet |
+| `HTTPRouteExternalAuth`, `GatewayHTTPSListenerDetectMisdirectedRequests`, Mesh | no way in rproxy, or outside this controller |

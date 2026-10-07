@@ -294,3 +294,15 @@ async fn a_refused_rule_does_not_stop_the_others() {
 	assert!(matches!(&r, PodSync::Synced(v) if v.len() == 2), "{r:?}");
 	assert_eq!(fake.lock().unwrap().puts.len(), 2);
 }
+
+#[test]
+fn supported_features_match_the_conformance_script() {
+	let script = include_str!("../../scripts/conformance.sh");
+	let line = script.lines().find(|l| l.starts_with("FEATURES=${FEATURES:-")).expect("FEATURES in scripts/conformance.sh");
+	let list = line.trim_start_matches("FEATURES=${FEATURES:-").trim_end_matches('}');
+	let mut script_features: Vec<&str> = list.split(',').collect();
+	let mut ours: Vec<&str> = super::SUPPORTED_FEATURES.to_vec();
+	script_features.sort();
+	ours.sort();
+	assert_eq!(script_features, ours, "SUPPORTED_FEATURES and scripts/conformance.sh FEATURES differ");
+}

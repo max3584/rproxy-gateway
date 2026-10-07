@@ -175,7 +175,7 @@ impl Ctx<'_> {
 			None => "http".into(),
 		};
 		let servers: Vec<rp::Server> =
-			eps.iter().map(|e| rp::Server { url: format!("{scheme}://{}", e.authority()), weight: None }).collect();
+			eps.iter().map(|e| rp::Server { url: format!("{scheme}://{}", e.authority()), ..Default::default() }).collect();
 		if servers.is_empty() {
 			self.note(format!("service {ns}/{}: no ready endpoints", r.name));
 			return None;
@@ -645,6 +645,7 @@ pub fn render(world: &World, settings: &Settings, opts: &Options) -> Out {
 					priority: r.priority.filter(|p| *p != 0),
 					service,
 					middlewares: mws,
+					timeouts: None,
 				};
 				match &ir.spec.tls {
 					Some(tls) => {
@@ -742,6 +743,7 @@ pub fn render(world: &World, settings: &Settings, opts: &Options) -> Out {
 						priority: None,
 						service: Some(sname),
 						middlewares: vec![],
+						timeouts: None,
 					};
 					if secure { port.tls_routes.push(route) } else { port.routes.push(route) }
 				}
@@ -863,7 +865,13 @@ pub fn apply_port(
 			.filter(|t| t.passthrough == Some(true) && !t.names.is_empty() && t.dest.is_some())
 			.map(|t| {
 				let d = t.dest.clone().unwrap();
-				rp::TlsRoute { server_names: t.names.clone(), remote_addr: d.addr, remote_port: d.port, passthrough: true }
+				rp::TlsRoute {
+					server_names: t.names.clone(),
+					remote_addr: d.addr,
+					remote_port: d.port,
+					passthrough: true,
+					..Default::default()
+				}
 			})
 			.collect();
 		let rest: Vec<&str> =
@@ -949,6 +957,7 @@ pub fn apply_port(
 					remote_addr: d.addr,
 					remote_port: d.port,
 					passthrough: terminate && t.passthrough == Some(true),
+					..Default::default()
 				})
 			})
 			.collect();
