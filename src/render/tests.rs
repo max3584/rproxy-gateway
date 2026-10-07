@@ -408,3 +408,261 @@ fn durations() {
 	assert_eq!(duration_ms(""), None);
 	assert_eq!(duration_ms("5x"), None);
 }
+
+const L4_BASE: &str = r#"
+---
+apiVersion: v1
+kind: Service
+metadata: {name: db, namespace: default}
+spec: {clusterIP: 10.96.0.20, ports: [{port: 5432}]}
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata: {name: db-1, namespace: default, labels: {kubernetes.io/service-name: db}}
+addressType: IPv4
+ports: [{port: 5432}]
+endpoints: [{addresses: [10.0.2.1]}, {addresses: [10.0.2.2]}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: tls, namespace: default}
+spec: {clusterIP: 10.96.0.30, ports: [{port: 443}]}
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata: {name: tls-1, namespace: default, labels: {kubernetes.io/service-name: tls}}
+addressType: IPv4
+ports: [{port: 8443}]
+endpoints: [{addresses: [10.0.3.1]}]
+"#;
+
+#[test]
+fn tcp_udp_and_tls_routes() {
+	let yaml = format!(
+		"{BASE}{L4_BASE}{}{}",
+		gw(r#"  - {name: pg, port: 5432, protocol: TCP}
+  - {name: dns, port: 53, protocol: UDP}
+  - {name: dnstcp, port: 53, protocol: TCP}
+  - {name: sni, port: 8443, protocol: TLS, hostname: "*.example.com", tls: {mode: Passthrough}}
+  - {name: empty, port: 9000, protocol: TCP}"#),
+		r#"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata: {name: pg, namespace: default}
+spec:
+  parentRefs: [{name: gw, sectionName: pg}]
+  rules: [{backendRefs: [{name: db, port: 5432}]}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: UDPRoute
+metadata: {name: dns, namespace: default}
+spec:
+  parentRefs: [{name: gw, sectionName: dns}]
+  rules: [{backendRefs: [{name: db, port: 5432}]}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TLSRoute
+metadata: {name: t, namespace: default}
+spec:
+  parentRefs: [{name: gw, sectionName: sni}]
+  hostnames: [a.example.com, "*.b.example.com", other.net]
+  rules: [{backendRefs: [{name: tls, port: 443}]}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata: {name: wrong, namespace: default}
+spec:
+  parentRefs: [{name: gw, sectionName: sni}]
+  rules: [{backendRefs: [{name: db, port: 5432}]}]
+"#
+	);
+	let p = plan(&yaml);
+	let rules = p.rules_json();
+	let rule = |proto: &str, port: u16| rules.iter().find(|r| r["protocol"] == proto && r["listen_port"] == port).cloned();
+	assert_eq!(rule("tcp", 5432).unwrap()["targets"], json!([{"addr": "10.0.2.1", "port": 5432}, {"addr": "10.0.2.2", "port": 5432}]));
+	assert_eq!(rule("udp", 53).unwrap()["targets"].as_array().unwrap().len(), 2);
+	assert!(rule("tcp", 53).is_none(), "a TCP listener without routes has no rule");
+	let sni = rule("tcp", 8443).unwrap();
+	assert_eq!(sni["tls"]["mode"], "sni");
+	assert_eq!(sni["tls"]["unmatched"], "reject");
+	assert_eq!(
+		sni["tls"]["routes"],
+		json!([{"server_names": ["a.example.com", "**.b.example.com"], "remote_addr": "10.96.0.30", "remote_port": 443}])
+	);
+	let wrong = p.parents.iter().find(|x| x.name == "wrong").unwrap();
+	assert_eq!(cond(&wrong.conds, "Accepted").reason, "NotAllowedByListeners");
+	let l = |n: &str| p.listeners.iter().find(|x| x.name == n).unwrap();
+	assert_eq!(l("pg").rule_key.as_deref(), Some("tcp/0.0.0.0:5432"));
+	assert_eq!(l("dns").rule_key.as_deref(), Some("udp/0.0.0.0:53"));
+	assert!(!cond(&l("dnstcp").conds, "Conflicted").status, "TCP and UDP share a port");
+	assert_eq!(l("empty").rule_key, None);
+	assert_eq!(l("sni").supported_kinds[0].kind, "TLSRoute");
+	assert_eq!(p.ports().len(), 3);
+}
+
+#[test]
+fn tls_passthrough_next_to_https() {
+	let (crt, key) = crate::pem::tests::pair("example.com");
+	let yaml = format!(
+		"{BASE}{L4_BASE}\n---\napiVersion: v1\nkind: Secret\nmetadata: {{name: cert, namespace: default}}\nstringData:\n  tls.crt: |\n{}\n  tls.key: |\n{}\n{}{}",
+		indent(&crt),
+		indent(&key),
+		gw(r#"  - {name: https, port: 443, protocol: HTTPS, hostname: www.example.com, tls: {certificateRefs: [{name: cert}]}}
+  - {name: pass, port: 443, protocol: TLS, hostname: registry.example.com, tls: {mode: Passthrough}}"#),
+		r#"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TLSRoute
+metadata: {name: reg, namespace: default}
+spec:
+  parentRefs: [{name: gw, sectionName: pass}]
+  rules: [{backendRefs: [{name: tls, port: 443}]}]
+"#
+	);
+	let p = plan(&yaml);
+	let rules = p.rules_json();
+	assert_eq!(rules.len(), 1);
+	let tls = &rules[0]["tls"];
+	assert_eq!(tls["mode"], "terminate");
+	assert_eq!(
+		tls["routes"],
+		json!([{"server_names": ["registry.example.com"], "remote_addr": "10.96.0.30", "remote_port": 443, "passthrough": true}])
+	);
+	assert!(rules[0]["http"].is_object());
+	assert!(p.listeners.iter().all(|l| !cond(&l.conds, "Conflicted").status));
+}
+
+#[test]
+fn policies_and_raw_rules() {
+	let yaml = format!(
+		"{BASE}{L4_BASE}{}{}",
+		gw(r#"  - {name: http, port: 80, protocol: HTTP}
+  - {name: pg, port: 5432, protocol: TCP}"#),
+		r#"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata: {name: pg, namespace: default}
+spec:
+  parentRefs: [{name: gw, sectionName: pg}]
+  rules: [{backendRefs: [{name: db, port: 5432}]}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: web, namespace: default}
+spec:
+  parentRefs: [{name: gw, sectionName: http}]
+  rules: [{backendRefs: [{name: web, port: 80}]}]
+---
+apiVersion: rproxy.max3584.net/v1alpha1
+kind: RproxyPolicy
+metadata: {name: old, namespace: default, creationTimestamp: "2026-01-01T00:00:00Z"}
+spec:
+  targetRefs: [{group: gateway.networking.k8s.io, kind: Gateway, name: gw, sectionName: pg}]
+  limits: {max_connections: 100}
+  allowFrom: [10.0.0.0/8]
+---
+apiVersion: rproxy.max3584.net/v1alpha1
+kind: RproxyPolicy
+metadata: {name: new, namespace: default, creationTimestamp: "2026-02-01T00:00:00Z"}
+spec:
+  targetRefs:
+    - {group: gateway.networking.k8s.io, kind: Gateway, name: gw}
+    - {group: "", kind: Service, name: web}
+  limits: {max_connections: 5}
+  crowdsec: true
+  outlierDetection: {consecutive_5xx: 5}
+---
+apiVersion: rproxy.max3584.net/v1alpha1
+kind: RproxyPolicy
+metadata: {name: missing, namespace: default}
+spec:
+  targetRefs: [{group: gateway.networking.k8s.io, kind: Gateway, name: gw, sectionName: nope}]
+  crowdsec: true
+---
+apiVersion: rproxy.max3584.net/v1alpha1
+kind: RproxyRule
+metadata: {name: smtp, namespace: default, generation: 2}
+spec:
+  parentRef: {name: gw}
+  rule: {protocol: tcp, listen_addr: 0.0.0.0, listen_port: 25, remote_addr: mail.internal, remote_port: 25, starttls: smtp}
+---
+apiVersion: rproxy.max3584.net/v1alpha1
+kind: RproxyRule
+metadata: {name: clash, namespace: default}
+spec:
+  parentRef: {name: gw}
+  rule: {protocol: tcp, listen_addr: 0.0.0.0, listen_port: 80, remote_addr: x, remote_port: 1}
+---
+apiVersion: rproxy.max3584.net/v1alpha1
+kind: RproxyRule
+metadata: {name: foreign, namespace: other}
+spec:
+  parentRef: {name: gw, namespace: default}
+  rule: {protocol: udp, listen_addr: 0.0.0.0, listen_port: 9999, remote_addr: x, remote_port: 1}
+---
+apiVersion: rproxy.max3584.net/v1alpha1
+kind: RproxyMiddleware
+metadata: {name: limit, namespace: default}
+spec: {rate_limit: {average: 10}}
+"#
+	);
+	let p = plan(&yaml);
+	let rules = p.rules_json();
+	let rule = |port: u16| rules.iter().find(|r| r["listen_port"] == port).unwrap().clone();
+	let pg = rule(5432);
+	assert_eq!(pg["limits"], json!({"max_connections": 100}), "the oldest policy wins");
+	assert_eq!(pg["allow_from"], json!(["10.0.0.0/8"]));
+	assert_eq!(pg["crowdsec"], true);
+	assert_eq!(pg["outlier_detection"], json!({"consecutive_5xx": 5}));
+	let web = rule(80);
+	assert_eq!(web["limits"], json!({"max_connections": 5}));
+	assert!(web.get("outlier_detection").is_none());
+	assert_eq!(web["http"]["services"]["default/web/r0"]["outlier_detection"], json!({"consecutive_5xx": 5}));
+	let smtp = rule(25);
+	assert_eq!(smtp["starttls"], "smtp");
+	assert_eq!(smtp["labels"]["gateway.networking.k8s.io/gateway-name"], "gw");
+	let raw = |n: &str| p.raw_status.iter().find(|s| s.name == n).unwrap();
+	assert_eq!(raw("smtp").rule_key.as_deref(), Some("tcp/0.0.0.0:25"));
+	assert_eq!(cond(&raw("clash").conds, "Accepted").reason, "Conflicted");
+	assert_eq!(cond(&raw("foreign").conds, "Accepted").reason, "RefNotPermitted");
+	let pol = |n: &str| p.policies.iter().find(|s| s.name == n).unwrap();
+	assert!(pol("old").conds[0].status);
+	assert_eq!(pol("missing").conds[0].reason, "TargetNotFound");
+	assert!(p.ports().contains(&(rp::Protocol::Tcp, 25)));
+}
+
+#[test]
+fn extension_ref_middlewares() {
+	let yaml = format!(
+		"{BASE}{}{}",
+		gw("  - {name: http, port: 80, protocol: HTTP}"),
+		r#"
+---
+apiVersion: rproxy.max3584.net/v1alpha1
+kind: RproxyMiddleware
+metadata: {name: limit, namespace: default}
+spec: {rate_limit: {average: 10}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: web, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  rules:
+    - filters: [{type: ExtensionRef, extensionRef: {group: rproxy.max3584.net, kind: RproxyMiddleware, name: limit}}]
+      backendRefs: [{name: web, port: 80}]
+    - matches: [{path: {value: /x}}]
+      filters: [{type: ExtensionRef, extensionRef: {group: rproxy.max3584.net, kind: RproxyMiddleware, name: nope}}]
+      backendRefs: [{name: web, port: 80}]
+"#
+	);
+	let p = plan(&yaml);
+	let http = &p.rules_json()[0]["http"];
+	let r0 = http["routes"].as_array().unwrap().iter().find(|r| r["name"] == "default/web/r0/m0/h0").unwrap().clone();
+	assert_eq!(http["middlewares"][r0["middlewares"][0].as_str().unwrap()], json!({"rate_limit": {"average": 10}}));
+	let r1 = http["routes"].as_array().unwrap().iter().find(|r| r["name"] == "default/web/r1/m0/h0").unwrap().clone();
+	assert_eq!(r1["middlewares"], json!([http::RESPOND_500]));
+	assert_eq!(cond(&p.parents[0].conds, "ResolvedRefs").reason, "BackendNotFound");
+}

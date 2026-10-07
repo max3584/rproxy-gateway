@@ -87,6 +87,26 @@ pub fn resolve(world: &World, route_kind: &str, route_ns: &str, b: &BackendRef) 
 	Ok(out)
 }
 
+/// One address for a backend that rproxy can only send to as a whole (a
+/// `tls.routes` entry has one destination): the Service's ClusterIP, or the
+/// first ready endpoint of a headless Service.
+pub fn service_address(world: &World, route_kind: &str, route_ns: &str, b: &BackendRef) -> Result<Option<Endpoint>, RefError> {
+	let eps = resolve(world, route_kind, route_ns, b)?;
+	let ns = b.namespace.as_deref().unwrap_or(route_ns);
+	let spec = world.services.get(&(ns.to_string(), b.name.clone())).and_then(|s| s.spec.clone()).unwrap_or_default();
+	let port = b.port.and_then(|p| u16::try_from(p).ok()).unwrap_or(0);
+	match spec.cluster_ip.as_deref() {
+		Some(ip) if ip != "None" && !ip.is_empty() && spec.type_.as_deref() != Some("ExternalName") => {
+			if eps.is_empty() {
+				// no ready pod: nothing would answer
+				return Ok(None);
+			}
+			Ok(Some(Endpoint { addr: ip.to_string(), port }))
+		}
+		_ => Ok(eps.into_iter().next()),
+	}
+}
+
 /// Weights of each endpoint so that each backend gets its `weight` share
 /// (spread evenly over its endpoints): `None` when all are equal.
 pub fn spread(backends: &[(u32, Vec<Endpoint>)]) -> Vec<(Endpoint, Option<u32>)> {

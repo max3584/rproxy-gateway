@@ -11,6 +11,8 @@
 pub mod backends;
 pub mod hostname;
 pub mod http;
+pub mod l4;
+pub mod policy;
 pub mod status;
 pub mod world;
 
@@ -100,17 +102,33 @@ pub struct GatewayPlan {
 	pub parents: Vec<ParentStatus>,
 	/// The Gateway's `Accepted` (and why not).
 	pub conds: Vec<Cond>,
+	/// RproxyRules added to the set (verbatim).
+	pub raw: Vec<Value>,
+	pub raw_status: Vec<policy::RawStatus>,
+	/// RproxyPolicy status for this Gateway.
+	pub policies: Vec<policy::PolicyStatus>,
 }
 
 impl GatewayPlan {
 	/// The rules as the JSON sent to rproxy.
 	pub fn rules_json(&self) -> Vec<Value> {
-		self.rules.iter().map(|r| serde_json::to_value(r).expect("a rule serializes")).collect()
+		self.rules.iter().map(|r| serde_json::to_value(r).expect("a rule serializes")).chain(self.raw.iter().cloned()).collect()
 	}
 
-	/// The (protocol, port) pairs rproxy listens on (for the Service).
+	/// The (protocol, port) pairs rproxy listens on (for the Service), ranges of RproxyRules included.
 	pub fn ports(&self) -> BTreeSet<(rp::Protocol, u16)> {
-		self.rules.iter().map(|r| (r.protocol, r.listen_port)).collect()
+		let mut out: BTreeSet<_> = self.rules.iter().map(|r| (r.protocol, r.listen_port)).collect();
+		for r in &self.raw {
+			let protocol =
+				if r["protocol"].as_str().is_some_and(|p| p.eq_ignore_ascii_case("udp")) { rp::Protocol::Udp } else { rp::Protocol::Tcp };
+			let Some(start) = r["listen_port"].as_u64().and_then(|p| u16::try_from(p).ok()) else { continue };
+			let end = r["listen_port_end"].as_u64().and_then(|p| u16::try_from(p).ok()).unwrap_or(start).max(start);
+			// a Service holds a limited number of ports
+			for port in (start..=end).take(100) {
+				out.insert((protocol, port));
+			}
+		}
+		out
 	}
 }
 
@@ -150,11 +168,40 @@ pub fn duration_ms(s: &str) -> Option<u64> {
 enum Family {
 	Http,
 	Https,
+	TlsPassthrough,
+	TlsTerminate,
+	Tcp,
+	Udp,
 }
 
 impl Family {
 	fn route_kinds(self) -> &'static [&'static str] {
-		&["HTTPRoute"]
+		match self {
+			Family::Http | Family::Https => &["HTTPRoute"],
+			Family::TlsPassthrough | Family::TlsTerminate => &["TLSRoute"],
+			Family::Tcp => &["TCPRoute"],
+			Family::Udp => &["UDPRoute"],
+		}
+	}
+
+	fn protocol(self) -> rp::Protocol {
+		if self == Family::Udp { rp::Protocol::Udp } else { rp::Protocol::Tcp }
+	}
+
+	/// Whether listeners of the two families can share a port (one rproxy rule).
+	fn shares_with(self, other: Family) -> bool {
+		use Family::*;
+		self.protocol() != other.protocol()
+			|| self == other
+			|| matches!(
+				(self, other),
+				(Https, TlsPassthrough) | (TlsPassthrough, Https) | (TlsTerminate, TlsPassthrough) | (TlsPassthrough, TlsTerminate)
+			)
+	}
+
+	/// Whether listeners of this family are told apart by host name.
+	fn by_hostname(self) -> bool {
+		!matches!(self, Family::Tcp | Family::Udp)
 	}
 }
 
@@ -164,7 +211,7 @@ struct ListenerState<'a> {
 	family: Option<Family>,
 	conds: Vec<Cond>,
 	supported_kinds: Vec<RouteGroupKind>,
-	/// Certificate files (cert, key) for HTTPS.
+	/// Certificate files (cert, key) for HTTPS and terminating TLS listeners.
 	certs: Vec<(String, String)>,
 	accepted: bool,
 	attached: i32,
@@ -240,9 +287,14 @@ fn validate_listener<'a>(
 		accepted: true,
 		attached: 0,
 	};
+	let tls_mode = l.tls.as_ref().and_then(|t| t.mode.clone()).unwrap_or_else(|| "Terminate".into());
 	let family = match l.protocol.as_str() {
 		"HTTP" => Some(Family::Http),
 		"HTTPS" => Some(Family::Https),
+		"TLS" if tls_mode == "Passthrough" => Some(Family::TlsPassthrough),
+		"TLS" => Some(Family::TlsTerminate),
+		"TCP" => Some(Family::Tcp),
+		"UDP" => Some(Family::Udp),
 		_ => None,
 	};
 	let Some(family) = family else {
@@ -276,12 +328,12 @@ fn validate_listener<'a>(
 		resolved =
 			Cond::new("ResolvedRefs", false, "InvalidRouteKinds", format!("route kinds not supported: {}", invalid_kinds.join(", ")));
 	}
-	if family == Family::Https {
+	if family == Family::Https && tls_mode != "Terminate" {
+		st.accepted = false;
+		st.conds.push(Cond::new("Accepted", false, "UnsupportedValue", "HTTPS listeners terminate TLS (tls.mode Terminate)"));
+	}
+	if matches!(family, Family::Https | Family::TlsTerminate) {
 		let tls = l.tls.clone().unwrap_or_default();
-		if tls.mode.as_deref().unwrap_or("Terminate") != "Terminate" {
-			st.accepted = false;
-			st.conds.push(Cond::new("Accepted", false, "UnsupportedValue", "HTTPS listeners terminate TLS (tls.mode Terminate)"));
-		}
 		for r in &tls.certificate_refs {
 			match certificate(world, gw_ns, r, files, opts) {
 				Ok(pair) => {
@@ -297,11 +349,11 @@ fn validate_listener<'a>(
 			}
 		}
 		if tls.certificate_refs.is_empty() && resolved.status {
-			resolved = Cond::new("ResolvedRefs", false, "InvalidCertificateRef", "an HTTPS listener needs certificateRefs");
+			resolved = Cond::new("ResolvedRefs", false, "InvalidCertificateRef", "the listener terminates TLS and needs certificateRefs");
 		}
 		if st.certs.is_empty() {
 			// nothing to serve with: the listener is not programmed
-			st.accepted = st.accepted && false;
+			st.accepted = false;
 			if st.conds.iter().all(|c| c.kind != "Accepted") {
 				st.conds.push(Cond::new("Accepted", false, "InvalidCertificateRef", "no usable certificate"));
 			}
@@ -317,19 +369,17 @@ fn validate_listener<'a>(
 /// Marks conflicting listeners (same port, protocols that cannot share it, or the same host name).
 fn conflicts(listeners: &mut [ListenerState]) {
 	for i in 0..listeners.len() {
-		if listeners[i].family.is_none() {
-			continue;
-		}
+		let Some(b) = listeners[i].family else { continue };
 		for j in 0..i {
-			if listeners[j].family.is_none() || listeners[j].port != listeners[i].port {
+			let Some(a) = listeners[j].family else { continue };
+			if listeners[j].port != listeners[i].port || a.protocol() != b.protocol() {
 				continue;
 			}
-			let (a, b) = (listeners[j].family, listeners[i].family);
-			let reason = if a != b {
+			let same_host = listeners[j].l.hostname.as_deref().map(str::to_ascii_lowercase)
+				== listeners[i].l.hostname.as_deref().map(str::to_ascii_lowercase);
+			let reason = if !a.shares_with(b) {
 				Some("ProtocolConflict")
-			} else if listeners[j].l.hostname.as_deref().map(str::to_ascii_lowercase)
-				== listeners[i].l.hostname.as_deref().map(str::to_ascii_lowercase)
-			{
+			} else if (same_host || !b.by_hostname()) && a == b {
 				Some("HostnameConflict")
 			} else {
 				None
@@ -379,9 +429,46 @@ fn exclusions(listeners: &[ListenerState], i: usize) -> Vec<String> {
 
 /// One route attached to a listener.
 struct Attachment {
+	kind: RouteKind,
 	route: usize,
 	listener: usize,
 	hosts: Option<Vec<String>>,
+}
+
+/// The parts of a route attachment needs.
+struct RouteInfo<'a> {
+	kind: RouteKind,
+	index: usize,
+	meta: &'a k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta,
+	parent_refs: &'a [ParentReference],
+	hostnames: &'a [String],
+}
+
+fn routes(world: &World) -> Vec<RouteInfo<'_>> {
+	let mut out = vec![];
+	for (i, r) in world.http_routes.iter().enumerate() {
+		out.push(RouteInfo {
+			kind: RouteKind::Http,
+			index: i,
+			meta: &r.metadata,
+			parent_refs: &r.spec.parent_refs,
+			hostnames: &r.spec.hostnames,
+		});
+	}
+	for (kind, list) in [(RouteKind::Tls, &world.tls_routes), (RouteKind::Tcp, &world.tcp_routes), (RouteKind::Udp, &world.udp_routes)] {
+		for (i, r) in list.iter().enumerate() {
+			out.push(RouteInfo { kind, index: i, meta: &r.metadata, parent_refs: &r.spec.parent_refs, hostnames: &r.spec.hostnames });
+		}
+	}
+	out
+}
+
+fn l4_route(world: &World, kind: RouteKind, index: usize) -> &crate::k8s::gateway::L4Route {
+	match kind {
+		RouteKind::Tls => &world.tls_routes[index],
+		RouteKind::Tcp => &world.tcp_routes[index],
+		_ => &world.udp_routes[index],
+	}
 }
 
 /// Renders one Gateway.
@@ -399,97 +486,188 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 	let mut listeners: Vec<ListenerState> = gw.spec.listeners.iter().map(|l| validate_listener(world, gw, l, &mut files, opts)).collect();
 	conflicts(&mut listeners);
 
-	// HTTPRoutes
+	// attach routes
 	let mut attachments: Vec<Attachment> = vec![];
-	for (ri, route) in world.http_routes.iter().enumerate() {
-		let rns = route.metadata.namespace.clone().unwrap_or_default();
-		for p in route.spec.parent_refs.iter().filter(|p| refers_to(p, &rns, &gw_ns, &gw_name)) {
-			let accepted = attach(world, &gw_ns, &mut listeners, p, RouteKind::Http, &rns, &route.spec.hostnames, |li, hosts| {
-				attachments.push(Attachment { route: ri, listener: li, hosts })
+	for r in routes(world) {
+		let rns = r.meta.namespace.clone().unwrap_or_default();
+		for p in r.parent_refs.iter().filter(|p| refers_to(p, &rns, &gw_ns, &gw_name)) {
+			let accepted = attach(world, &gw_ns, &mut listeners, p, r.kind, &rns, r.hostnames, |li, hosts| {
+				attachments.push(Attachment { kind: r.kind, route: r.index, listener: li, hosts })
 			});
 			plan.parents.push(ParentStatus {
-				kind: RouteKind::Http,
+				kind: r.kind,
 				namespace: rns.clone(),
-				name: route.metadata.name.clone().unwrap_or_default(),
-				generation: route.metadata.generation.unwrap_or(0),
+				name: r.meta.name.clone().unwrap_or_default(),
+				generation: r.meta.generation.unwrap_or(0),
 				parent_ref: p.clone(),
 				conds: vec![accepted],
 				rule_keys: BTreeSet::new(),
 			});
 		}
 	}
+	for (i, st) in listeners.iter_mut().enumerate() {
+		st.attached = attachments.iter().filter(|a| a.listener == i).map(|a| (a.kind, a.route)).collect::<BTreeSet<_>>().len() as i32;
+	}
 
-	// one rule per port
-	let mut ports: BTreeMap<u16, Vec<usize>> = BTreeMap::new();
+	// one rule per (protocol, port)
+	let mut groups: BTreeMap<(rp::Protocol, u16), Vec<usize>> = BTreeMap::new();
 	for (i, st) in listeners.iter().enumerate() {
-		if st.accepted {
-			ports.entry(st.port).or_default().push(i);
+		if let (true, Some(f)) = (st.accepted, st.family) {
+			groups.entry((f.protocol(), st.port)).or_default().push(i);
 		}
 	}
-	let mut route_results: BTreeMap<usize, (Option<Cond>, Option<String>)> = BTreeMap::new();
-	for (port, members) in &ports {
-		let family = listeners[members[0]].family.expect("accepted listeners have a family");
-		let key = rp::rule_key(rp::Protocol::Tcp, &opts.listen_addrs[0], *port);
-		let ctx = http::Ctx { world, scheme: if family == Family::Https { "https" } else { "http" }, port: *port };
-		let mut entries = vec![];
-		let mut services = BTreeMap::new();
-		let mut middlewares = BTreeMap::new();
-		for a in attachments.iter().filter(|a| members.contains(&a.listener)) {
-			let route: &HttpRoute = &world.http_routes[a.route];
-			let out = http::build(&ctx, route, a.hosts.as_deref(), &exclusions(&listeners, a.listener));
-			let entry = route_results.entry(a.route).or_insert((None, None));
+	// per route: (ResolvedRefs, unsupported)
+	let mut results: BTreeMap<(RouteKind, usize), (Option<Cond>, Option<String>)> = BTreeMap::new();
+	let mut listener_keys: BTreeMap<usize, String> = BTreeMap::new();
+	let mut l4_services: BTreeMap<String, Vec<world::Key>> = BTreeMap::new();
+	let mut http_services: BTreeMap<(String, String), Vec<world::Key>> = BTreeMap::new();
+	for ((protocol, port), members) in &groups {
+		let key = rp::rule_key(*protocol, &opts.listen_addrs[0], *port);
+		let has = |f: Family| members.iter().any(|i| listeners[*i].family == Some(f));
+		let mine = |a: &Attachment| members.contains(&a.listener);
+		let mut rule = new_rule(*protocol, *port, opts);
+		let mut carried: Vec<(RouteKind, usize, usize)> = vec![];
+		let mut certificates: Vec<rp::Certificate> = vec![];
+		for i in members {
+			for (crt, k) in &listeners[*i].certs {
+				let c = rp::Certificate { cert_file: Some(crt.clone()), key_file: Some(k.clone()), ..Default::default() };
+				if !certificates.contains(&c) {
+					certificates.push(c);
+				}
+			}
+		}
+		// TLS routes by server name (passthrough, or terminated on a TLS listener)
+		let mut tls_routes: Vec<rp::TlsRoute> = vec![];
+		for a in attachments.iter().filter(|a| a.kind == RouteKind::Tls && mine(a)) {
+			let route = l4_route(world, RouteKind::Tls, a.route);
+			let (dest, resolved) = l4::destination(world, route);
+			let entry = results.entry((RouteKind::Tls, a.route)).or_insert((None, None));
 			if entry.0.is_none() {
-				entry.0 = out.resolved.clone();
+				entry.0 = resolved;
 			}
-			if entry.1.is_none() {
-				entry.1 = out.unsupported.clone();
-			}
-			if out.unsupported.is_some() {
+			let Some(dest) = dest else { continue };
+			let names: Vec<String> = a.hosts.clone().unwrap_or_default().iter().map(|h| hostname::to_rproxy(h)).collect();
+			if names.is_empty() {
 				continue;
 			}
-			entries.extend(out.entries);
-			services.extend(out.services);
-			middlewares.extend(out.middlewares);
-			let rname = route.metadata.name.clone().unwrap_or_default();
-			let rns = route.metadata.namespace.clone().unwrap_or_default();
-			for p in plan.parents.iter_mut().filter(|p| p.kind == RouteKind::Http && p.namespace == rns && p.name == rname) {
-				if listeners_for(&listeners, &p.parent_ref).contains(&a.listener) {
+			let passthrough =
+				listeners[a.listener].family == Some(Family::TlsPassthrough) && (has(Family::Https) || has(Family::TlsTerminate));
+			tls_routes.push(rp::TlsRoute { server_names: names, remote_addr: dest.addr.clone(), remote_port: dest.port, passthrough });
+			carried.push((RouteKind::Tls, a.route, a.listener));
+		}
+		if has(Family::Http) || has(Family::Https) {
+			let https = has(Family::Https);
+			let ctx = http::Ctx { world, scheme: if https { "https" } else { "http" }, port: *port };
+			let mut entries = vec![];
+			let mut services = BTreeMap::new();
+			let mut middlewares = BTreeMap::new();
+			for a in attachments.iter().filter(|a| a.kind == RouteKind::Http && mine(a)) {
+				let route: &HttpRoute = &world.http_routes[a.route];
+				let out = http::build(&ctx, route, a.hosts.as_deref(), &exclusions(&listeners, a.listener));
+				let entry = results.entry((RouteKind::Http, a.route)).or_insert((None, None));
+				if entry.0.is_none() {
+					entry.0 = out.resolved.clone();
+				}
+				if entry.1.is_none() {
+					entry.1 = out.unsupported.clone();
+				}
+				if out.unsupported.is_some() {
+					continue;
+				}
+				entries.extend(out.entries);
+				services.extend(out.services);
+				middlewares.extend(out.middlewares);
+				for (svc, b) in out.backends {
+					http_services.insert((key.clone(), svc), b);
+				}
+				carried.push((RouteKind::Http, a.route, a.listener));
+			}
+			let routes = http::assign_priorities(&mut entries);
+			rule.http = Some(rp::Http { routes, default: None, services, middlewares });
+			if https {
+				let passthrough: Vec<rp::TlsRoute> = tls_routes.into_iter().filter(|r| r.passthrough).collect();
+				rule.tls = Some(rp::Tls { mode: "terminate", certificates, routes: passthrough, ..Default::default() });
+			}
+		} else if has(Family::TlsPassthrough) || has(Family::TlsTerminate) {
+			if tls_routes.is_empty() {
+				// nothing to send to: no rule (the port stays closed)
+				continue;
+			}
+			let first = &tls_routes[0];
+			rule.targets = vec![rp::Target { addr: first.remote_addr.clone(), port: first.remote_port, weight: None }];
+			let terminate = has(Family::TlsTerminate);
+			rule.tls = Some(rp::Tls {
+				mode: if terminate { "terminate" } else { "sni" },
+				routes: tls_routes,
+				certificates: if terminate { certificates } else { vec![] },
+				unmatched: Some("reject"),
+				..Default::default()
+			});
+		} else {
+			// TCP or UDP: the routes' backends together
+			let kind = if has(Family::Udp) { RouteKind::Udp } else { RouteKind::Tcp };
+			let mut targets: Vec<rp::Target> = vec![];
+			for a in attachments.iter().filter(|a| a.kind == kind && mine(a)) {
+				let out = l4::targets(world, kind.kind(), l4_route(world, kind, a.route));
+				let entry = results.entry((kind, a.route)).or_insert((None, None));
+				if entry.0.is_none() {
+					entry.0 = out.resolved.clone();
+				}
+				l4_services.entry(key.clone()).or_default().extend(out.services);
+				for t in out.targets {
+					if !targets.iter().any(|x| x.addr == t.addr && x.port == t.port) {
+						targets.push(t);
+					}
+				}
+				carried.push((kind, a.route, a.listener));
+			}
+			if targets.is_empty() {
+				continue;
+			}
+			rule.targets = targets;
+		}
+		for (kind, ri, li) in carried {
+			let route_meta = match kind {
+				RouteKind::Http => &world.http_routes[ri].metadata,
+				k => &l4_route(world, k, ri).metadata,
+			};
+			for p in plan.parents.iter_mut().filter(|p| {
+				p.kind == kind && Some(&p.namespace) == route_meta.namespace.as_ref() && Some(&p.name) == route_meta.name.as_ref()
+			}) {
+				if listeners_for(&listeners, &p.parent_ref).contains(&li) {
 					p.rule_keys.insert(key.clone());
 				}
 			}
 		}
-		let routes = http::assign_priorities(&mut entries);
-		let mut rule = new_rule(rp::Protocol::Tcp, *port, opts);
-		rule.http = Some(rp::Http { routes, default: None, services, middlewares });
-		if family == Family::Https {
-			let mut certificates: Vec<rp::Certificate> = vec![];
-			// listeners with a host name first, so a client without SNI gets the catch-all's certificate last
-			for i in members {
-				for (crt, key) in &listeners[*i].certs {
-					let c = rp::Certificate { cert_file: Some(crt.clone()), key_file: Some(key.clone()), ..Default::default() };
-					if !certificates.contains(&c) {
-						certificates.push(c);
-					}
-				}
-			}
-			rule.tls = Some(rp::Tls { mode: "terminate", certificates, ..Default::default() });
-		}
 		for i in members {
-			listeners[*i].attached = attachments.iter().filter(|a| a.listener == *i).map(|a| a.route).collect::<BTreeSet<_>>().len() as i32;
+			listener_keys.insert(*i, key.clone());
 		}
 		plan.rules.push(rule);
 	}
 
 	// route conditions: ResolvedRefs, unsupported values
 	for p in plan.parents.iter_mut() {
-		let ri = world.http_routes.iter().position(|r| {
-			r.metadata.namespace.as_deref() == Some(p.namespace.as_str()) && r.metadata.name.as_deref() == Some(p.name.as_str())
-		});
-		let (resolved, unsupported) = ri.and_then(|ri| route_results.get(&ri).cloned()).unwrap_or_else(|| {
-			// not attached anywhere: still check its references
-			let resolved = ri.and_then(|ri| {
-				let ctx = http::Ctx { world, scheme: "http", port: 80 };
-				http::build(&ctx, &world.http_routes[ri], None, &[]).resolved
+		let index = match p.kind {
+			RouteKind::Http => world.http_routes.iter().position(|r| {
+				r.metadata.namespace.as_deref() == Some(p.namespace.as_str()) && r.metadata.name.as_deref() == Some(p.name.as_str())
+			}),
+			k => {
+				let list = match k {
+					RouteKind::Tls => &world.tls_routes,
+					RouteKind::Tcp => &world.tcp_routes,
+					_ => &world.udp_routes,
+				};
+				list.iter().position(|r| {
+					r.metadata.namespace.as_deref() == Some(p.namespace.as_str()) && r.metadata.name.as_deref() == Some(p.name.as_str())
+				})
+			}
+		};
+		let (resolved, unsupported) = index.and_then(|i| results.get(&(p.kind, i)).cloned()).unwrap_or_else(|| {
+			// not carried by any rule: still check its references
+			let resolved = index.and_then(|i| match p.kind {
+				RouteKind::Http => http::build(&http::Ctx { world, scheme: "http", port: 80 }, &world.http_routes[i], None, &[]).resolved,
+				RouteKind::Tls => l4::destination(world, &world.tls_routes[i]).1,
+				k => l4::targets(world, k.kind(), l4_route(world, k, i)).resolved,
 			});
 			(resolved, None)
 		});
@@ -501,14 +679,28 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 		p.conds.push(resolved.unwrap_or_else(|| Cond::ok("ResolvedRefs", "ResolvedRefs")));
 	}
 
+	// rproxy's own resources
+	let by_name: BTreeMap<String, String> = listener_keys.iter().map(|(i, k)| (listeners[*i].l.name.clone(), k.clone())).collect();
+	plan.policies = policy::apply(
+		world,
+		gw,
+		&mut plan.rules,
+		&policy::Targets { listeners: &by_name, l4_services: &l4_services, http_services: &http_services },
+	);
+	let taken: Vec<String> = plan.rules.iter().map(|r| r.key()).collect();
+	let (raw, raw_status) = policy::raw_rules(world, gw, &taken);
+	plan.raw = raw;
+	plan.raw_status = raw_status;
+
 	plan.listeners = listeners
 		.iter()
-		.map(|st| ListenerPlan {
+		.enumerate()
+		.map(|(i, st)| ListenerPlan {
 			name: st.l.name.clone(),
 			supported_kinds: st.supported_kinds.clone(),
 			attached: st.attached,
 			conds: st.conds.clone(),
-			rule_key: st.accepted.then(|| rp::rule_key(rp::Protocol::Tcp, &opts.listen_addrs[0], st.port)),
+			rule_key: listener_keys.get(&i).cloned(),
 		})
 		.collect();
 	let any = listeners.iter().any(|l| l.accepted);
@@ -518,10 +710,24 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 		Cond::new("Accepted", false, "ListenersNotValid", "no listener is valid")
 	});
 	if opts.labels {
+		let labels: BTreeMap<String, String> = [
+			("gateway.networking.k8s.io/gateway-name".to_string(), gw_name.clone()),
+			("gateway.networking.k8s.io/gateway-namespace".to_string(), gw_ns.clone()),
+			("app.kubernetes.io/managed-by".to_string(), "rproxy-gateway".to_string()),
+		]
+		.into();
 		for r in &mut plan.rules {
-			r.labels.insert("gateway.networking.k8s.io/gateway-name".into(), gw_name.clone());
-			r.labels.insert("gateway.networking.k8s.io/gateway-namespace".into(), gw_ns.clone());
-			r.labels.insert("app.kubernetes.io/managed-by".into(), "rproxy-gateway".into());
+			r.labels.extend(labels.clone());
+		}
+		for r in &mut plan.raw {
+			if let Some(o) = r.as_object_mut() {
+				let l = o.entry("labels").or_insert_with(|| Value::Object(Default::default()));
+				if let Some(l) = l.as_object_mut() {
+					for (k, v) in &labels {
+						l.entry(k.clone()).or_insert_with(|| Value::String(v.clone()));
+					}
+				}
+			}
 		}
 	}
 	plan.files = files;

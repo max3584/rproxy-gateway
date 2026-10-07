@@ -69,6 +69,20 @@ rproxy は `RPROXY_API_ADDR=0.0.0.0`、`RPROXY_API_PORT=9443`、`RPROXY_TOKEN_FI
 | `URLRewrite` の path | `replace_path`（ReplaceFullPath）、`replace_path_regex`（ReplacePrefixMatch） |
 | `ExtensionRef`（`RproxyMiddleware`） | そのミドルウェア（`spec` をそのまま） |
 | `timeouts.backendRequest`（なければ `request`） | サービスの `timeouts.response` |
+| リスナー `TLS`（`tls.mode: Passthrough`） | tcp のルール、`tls.mode: sni`、`unmatched: reject`。TLSRoute のホスト名ごとに `tls.routes` |
+| 同じポートの `HTTPS` と `TLS`（Passthrough） | `http` のルールの `tls.routes`（`passthrough: true`）。そのホスト名だけ復号しない |
+| リスナー `TLS`（`tls.mode: Terminate`） | tcp のルール、`tls.mode: terminate`、TLSRoute のホスト名ごとに `tls.routes`（同じポートの Passthrough のリスナーの分は `passthrough: true`） |
+| TLSRoute の宛先 | `tls.routes` の 1 つの項目は宛先が 1 つなので、Service の ClusterIP（kube-proxy が Pod に配る。headless なら最初の Pod）。backendRefs が複数なら weight の最も大きいもの |
+| リスナー `TCP` / `UDP` | tcp / udp のルール、`targets`（TCPRoute / UDPRoute のすべての backend の Pod の IP、weight を Pod の数で配る） |
+| 何もつながっていない `TLS` / `TCP` / `UDP` のリスナー | ルールを作らない（ポートは閉じたまま。リスナーは `Programmed: True`） |
+
+### rproxy の CRD（`rproxy.max3584.net/v1alpha1`）
+
+| CRD | 使い方 |
+|---|---|
+| `RproxyMiddleware` | `spec` は rproxy の `http.middlewares.<名前>` の形（例 `{rate_limit: {average: 10}}`）。HTTPRoute の `ExtensionRef` フィルタで使う。見つからなければそのルールは 500 で、`ResolvedRefs: False` |
+| `RproxyPolicy` | `spec.targetRefs`（同じ namespace の Gateway、`sectionName` でそのリスナー、Service）に、ルールの `limits`・`bandwidth`・`geoip`・`outlierDetection`・`allowFrom`・`crowdsec` を足す（GEP-713）。Service を指すと、その Service に送る L4 のルール（`outlierDetection` は `http` のサービスにも）。同じ項目を複数のポリシーが決めたら古いほうが勝つ。状態は `status.ancestors[]`（見つからないリスナーは `Accepted: False`、`TargetNotFound`） |
+| `RproxyRule` | `spec.rule` はルールそのもの（`POST /rules` の本文）。`spec.parentRef` の Gateway のルールセットに足す。ほかの namespace の Gateway には、その namespace の ReferenceGrant（from `rproxy.max3584.net/RproxyRule`、to `Gateway`）が要る。同じキーのルールが既にあれば `Accepted: False`（`Conflicted`）。状態は rproxy のルールの `conditions` を写す |
 
 できないもの（ルートは `Accepted: False`、理由 `UnsupportedValue`）：`URLRewrite` の hostname、`RequestMirror`、`CORS` フィルタ、backendRef ごとのフィルタ、リダイレクトの 303 / 307 / 308。
 

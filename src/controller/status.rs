@@ -71,6 +71,8 @@ pub fn listener_conds(plan: &GatewayPlan, i: usize, pods: &[PodSync]) -> Vec<Con
 			let (rejected, m) = waiting(pods);
 			Cond::new("Programmed", false, if rejected { "Invalid" } else { "Pending" }, m)
 		}
+		// accepted, but nothing attached yet that needs a rule (TLS, TCP, UDP)
+		(None, true) => Cond::ok("Programmed", "Programmed"),
 		_ => Cond::new("Programmed", false, "Invalid", "the listener is not accepted"),
 	};
 	if let Some(key) = &l.rule_key {
@@ -170,6 +172,49 @@ fn same_parent(v: &Value, p: &crate::k8s::gateway::ParentReference) -> bool {
 pub fn route_parents(previous: Option<&Value>, ours: Vec<Value>, controller: &str) -> Vec<Value> {
 	let mut out: Vec<Value> = previous
 		.and_then(|s| s["parents"].as_array())
+		.into_iter()
+		.flatten()
+		.filter(|e| e["controllerName"] != controller)
+		.cloned()
+		.collect();
+	out.extend(ours);
+	out
+}
+
+/// An RproxyRule's `status` (its rule's conditions from rproxy).
+pub fn raw_status(st: &crate::render::policy::RawStatus, pods: &[PodSync], previous: Option<&Value>, now: &str) -> Value {
+	let mut conds = st.conds.clone();
+	if let (Some(key), true) = (&st.rule_key, status::get(&conds, "Accepted").is_some_and(|c| c.status)) {
+		if synced(pods) == 0 {
+			let (_, m) = waiting(pods);
+			status::set(&mut conds, Cond::new("Programmed", false, "Pending", m));
+		}
+		for kind in ["Accepted", "Programmed", "ResolvedRefs", "BackendsHealthy"] {
+			if let Some(c) = rule_cond(pods, key, kind) {
+				status::set(&mut conds, Cond::new(kind, c.status == "True", &c.reason, c.message));
+			}
+		}
+	}
+	json!({ "conditions": to_k8s(&conds, st.generation, previous.map(|p| &p["conditions"]), now) })
+}
+
+/// An RproxyPolicy's `status.ancestors[]` entry.
+pub fn policy_entry(p: &crate::render::policy::PolicyStatus, controller: &str, previous: Option<&Value>, now: &str) -> Value {
+	let prev = previous
+		.and_then(|s| s["ancestors"].as_array())
+		.and_then(|a| a.iter().find(|e| e["controllerName"] == controller && e["ancestorRef"] == p.ancestor))
+		.map(|e| &e["conditions"]);
+	json!({
+		"ancestorRef": p.ancestor,
+		"controllerName": controller,
+		"conditions": to_k8s(&p.conds, p.generation, prev, now),
+	})
+}
+
+/// The policy's new `status.ancestors`: other controllers' entries kept, ours replaced.
+pub fn policy_ancestors(previous: Option<&Value>, ours: Vec<Value>, controller: &str) -> Vec<Value> {
+	let mut out: Vec<Value> = previous
+		.and_then(|s| s["ancestors"].as_array())
 		.into_iter()
 		.flatten()
 		.filter(|e| e["controllerName"] != controller)
