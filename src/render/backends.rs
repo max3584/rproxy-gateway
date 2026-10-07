@@ -87,6 +87,13 @@ pub fn resolve(world: &World, route_kind: &str, route_ns: &str, b: &BackendRef) 
 	Ok(out)
 }
 
+/// The name of the Service port a backendRef names (`Some(None)`: an unnamed port; `None`: no such Service or port).
+pub fn port_name(world: &World, route_ns: &str, b: &BackendRef) -> Option<Option<String>> {
+	let ns = b.namespace.as_deref().unwrap_or(route_ns);
+	let svc = world.services.get(&(ns.to_string(), b.name.clone()))?;
+	svc.spec.as_ref()?.ports.iter().flatten().find(|p| Some(p.port) == b.port).map(|p| p.name.clone())
+}
+
 /// The `appProtocol` of the Service port a backendRef names (`kubernetes.io/h2c`, `kubernetes.io/ws`, ...).
 pub fn app_protocol(world: &World, route_ns: &str, b: &BackendRef) -> Option<String> {
 	let ns = b.namespace.as_deref().unwrap_or(route_ns);

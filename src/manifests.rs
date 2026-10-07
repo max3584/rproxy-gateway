@@ -20,6 +20,7 @@ impl World {
 			(crate::k8s::gateway::GROUP, "GatewayClass") => self.classes.push(serde_json::from_value(obj).map_err(err)?),
 			(crate::k8s::gateway::GROUP, "Gateway") => self.gateways.push(serde_json::from_value(obj).map_err(err)?),
 			(crate::k8s::gateway::GROUP, "ListenerSet") => self.listener_sets.push(serde_json::from_value(obj).map_err(err)?),
+			(crate::k8s::gateway::GROUP, "BackendTLSPolicy") => self.backend_tls_policies.push(serde_json::from_value(obj).map_err(err)?),
 			(crate::k8s::gateway::GROUP, "HTTPRoute") => self.http_routes.push(serde_json::from_value(obj).map_err(err)?),
 			(crate::k8s::gateway::GROUP, "GRPCRoute") => {
 				let g: crate::k8s::gateway::GrpcRoute = serde_json::from_value(obj).map_err(err)?;

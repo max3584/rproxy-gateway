@@ -8,6 +8,7 @@
 //!   (written by `certsync`), named by a hash of their content; key material is
 //!   never sent over the control API.
 
+pub mod backend_tls;
 pub mod backends;
 pub mod hostname;
 pub mod http;
@@ -229,6 +230,8 @@ pub struct GatewayPlan {
 	pub listener_sets: Vec<ListenerSetPlan>,
 	/// `status.attachedListenerSets`.
 	pub attached_listener_sets: i32,
+	/// BackendTLSPolicy status for this Gateway (the policies of the backends its routes send to).
+	pub backend_tls: Vec<policy::PolicyStatus>,
 }
 
 impl GatewayPlan {
@@ -791,8 +794,15 @@ fn http_route(world: &World, kind: RouteKind, index: usize) -> &HttpRoute {
 }
 
 /// What `http::build` needs for a route of `kind`.
-fn http_ctx<'a>(world: &'a World, opts: &'a Options, scheme: &'static str, port: u16, kind: RouteKind) -> http::Ctx<'a> {
-	http::Ctx { world, scheme, port, features: &opts.features, kind: kind.kind(), grpc: kind == RouteKind::Grpc }
+fn http_ctx<'a>(
+	world: &'a World,
+	opts: &'a Options,
+	tls: &'a backend_tls::Index,
+	scheme: &'static str,
+	port: u16,
+	kind: RouteKind,
+) -> http::Ctx<'a> {
+	http::Ctx { world, scheme, port, features: &opts.features, kind: kind.kind(), grpc: kind == RouteKind::Grpc, backend_tls: Some(tls) }
 }
 
 fn l4_route(world: &World, kind: RouteKind, index: usize) -> &crate::k8s::gateway::L4Route {
@@ -832,6 +842,11 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 			listeners: vec![],
 		});
 	}
+	// TLS to backends: the Gateway's client certificate, the BackendTLSPolicies
+	let client_cert = backend_tls::client_certificate(world, gw, &mut files, opts);
+	let client_files = client_cert.as_ref().and_then(|r| r.as_ref().ok()).cloned();
+	let tls_index = backend_tls::index(world, client_files.as_ref(), &mut files, opts);
+	let mut tls_used: BTreeSet<world::Key> = BTreeSet::new();
 	// the Gateway's listeners first, then the ListenerSets' (earlier ones win conflicts)
 	let mut listeners: Vec<ListenerState> = gw
 		.spec
@@ -951,7 +966,7 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 			let mut services = BTreeMap::new();
 			let mut middlewares = BTreeMap::new();
 			for a in attachments.iter().filter(|a| matches!(a.kind, RouteKind::Http | RouteKind::Grpc) && mine(a)) {
-				let ctx = http_ctx(world, opts, if https { "https" } else { "http" }, *port, a.kind);
+				let ctx = http_ctx(world, opts, &tls_index, if https { "https" } else { "http" }, *port, a.kind);
 				let route: &HttpRoute = http_route(world, a.kind, a.route);
 				let mut out = http::build(&ctx, route, a.hosts.as_deref(), &exclusions(&listeners, a.listener));
 				if a.kind == RouteKind::Grpc {
@@ -975,6 +990,7 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 				if out.unsupported.is_some() {
 					continue;
 				}
+				tls_used.extend(out.tls_policies.iter().cloned());
 				entries.extend(out.entries);
 				services.extend(out.services);
 				middlewares.extend(out.middlewares);
@@ -1087,7 +1103,7 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 			// not carried by any rule: still check its references
 			let resolved = index.and_then(|i| match p.kind {
 				RouteKind::Http | RouteKind::Grpc => {
-					let ctx = http_ctx(world, opts, "http", 80, p.kind);
+					let ctx = http_ctx(world, opts, &tls_index, "http", 80, p.kind);
 					http::build(&ctx, http_route(world, p.kind, i), None, &[]).resolved
 				}
 				RouteKind::Tls => l4::destination(world, &world.tls_routes[i]).1,
@@ -1192,6 +1208,23 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 		}
 	}
 	plan.attached_listener_sets = plan.listener_sets.iter().filter(|ls| ls.accepted.status).count() as i32;
+	match client_cert {
+		Some(Ok(_)) => plan.conds.push(Cond::ok("ResolvedRefs", "ResolvedRefs")),
+		Some(Err(c)) => plan.conds.push(c),
+		None => {}
+	}
+	let ancestor = serde_json::json!({"group": GROUP, "kind": "Gateway", "namespace": gw_ns, "name": gw_name});
+	for key in &tls_used {
+		if let Some(st) = tls_index.states.get(key) {
+			plan.backend_tls.push(policy::PolicyStatus {
+				namespace: key.0.clone(),
+				name: key.1.clone(),
+				generation: st.generation,
+				ancestor: ancestor.clone(),
+				conds: st.conds.clone(),
+			});
+		}
+	}
 	// client certificates not enforced somewhere (rproxy does not ask for them then)
 	let frontend = gw.spec.tls.as_ref().and_then(|t| t.frontend.as_ref());
 	let insecure = frontend.is_some_and(|f| {

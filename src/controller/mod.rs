@@ -76,6 +76,9 @@ pub const SUPPORTED_FEATURES: &[&str] = &[
 	"ListenerSet",
 	"GRPCRoute",
 	"GRPCRouteNamedRouteRule",
+	"BackendTLSPolicy",
+	"BackendTLSPolicySANValidation",
+	"GatewayBackendClientCertificate",
 ];
 
 #[derive(Clone, Debug)]
@@ -514,25 +517,23 @@ async fn write_ingress_status(
 	}
 }
 
-/// RproxyPolicy `status.ancestors` and RproxyRule `status`.
-async fn write_crd_status(
+/// `status.ancestors` of policies of `kind` (GEP-713): ours replaced, other controllers' kept.
+async fn write_ancestors<'a>(
 	client: &kube::Client,
 	cache: &cache::Cache,
-	world: &render::world::World,
-	plans: &[(GatewayPlan, Vec<PodSync>)],
+	kind: &str,
+	policies: &[(render::world::Key, Option<Value>)],
+	entries: impl Iterator<Item = &'a render::policy::PolicyStatus>,
 	cfg: &Config,
 	now: &str,
 ) {
-	let mut ancestors: BTreeMap<(String, String), Vec<Value>> = BTreeMap::new();
-	for p in &world.policies {
-		let key = (p.metadata.namespace.clone().unwrap_or_default(), p.metadata.name.clone().unwrap_or_default());
-		let prev = p.status.as_ref().and_then(|s| serde_json::to_value(s).ok());
-		for (plan, _) in plans {
-			for ps in plan.policies.iter().filter(|ps| ps.namespace == key.0 && ps.name == key.1) {
-				ancestors.entry(key.clone()).or_default().push(status::policy_entry(ps, &cfg.controller_name, prev.as_ref(), now));
-			}
-		}
-		let mine = ancestors.remove(&key).unwrap_or_default();
+	let entries: Vec<&render::policy::PolicyStatus> = entries.collect();
+	for (key, prev) in policies {
+		let mine: Vec<Value> = entries
+			.iter()
+			.filter(|ps| ps.namespace == key.0 && ps.name == key.1)
+			.map(|ps| status::policy_entry(ps, &cfg.controller_name, prev.as_ref(), now))
+			.collect();
 		let had = prev
 			.as_ref()
 			.and_then(|s| s["ancestors"].as_array())
@@ -544,12 +545,32 @@ async fn write_crd_status(
 		if prev.as_ref().map(|p| &p["ancestors"]) == Some(&new["ancestors"]) {
 			continue;
 		}
-		if let Some(api) = dyn_api(client, cache, "RproxyPolicy", Some(&key.0)) {
+		if let Some(api) = dyn_api(client, cache, kind, Some(&key.0)) {
 			if let Err(e) = patch_status(&api, &key.1, new).await {
-				warn!(policy = format!("{}/{}", key.0, key.1), error = %e, "cannot write RproxyPolicy status");
+				warn!(kind, policy = format!("{}/{}", key.0, key.1), error = %e, "cannot write policy status");
 			}
 		}
 	}
+}
+
+/// RproxyPolicy and BackendTLSPolicy `status.ancestors`, RproxyRule `status`.
+async fn write_crd_status(
+	client: &kube::Client,
+	cache: &cache::Cache,
+	world: &render::world::World,
+	plans: &[(GatewayPlan, Vec<PodSync>)],
+	cfg: &Config,
+	now: &str,
+) {
+	let rproxy_policies: Vec<(render::world::Key, Option<Value>)> = world
+		.policies
+		.iter()
+		.map(|p| (render::world::key(&p.metadata), p.status.as_ref().and_then(|s| serde_json::to_value(s).ok())))
+		.collect();
+	write_ancestors(client, cache, "RproxyPolicy", &rproxy_policies, plans.iter().flat_map(|(p, _)| &p.policies), cfg, now).await;
+	let tls_policies: Vec<(render::world::Key, Option<Value>)> =
+		world.backend_tls_policies.iter().map(|p| (render::world::key(&p.metadata), p.status.clone())).collect();
+	write_ancestors(client, cache, "BackendTLSPolicy", &tls_policies, plans.iter().flat_map(|(p, _)| &p.backend_tls), cfg, now).await;
 	for r in &world.raw_rules {
 		let (ns, name) = (r.metadata.namespace.clone().unwrap_or_default(), r.metadata.name.clone().unwrap_or_default());
 		let prev = r.status.as_ref().and_then(|s| serde_json::to_value(s).ok());

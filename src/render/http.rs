@@ -33,6 +33,8 @@ pub struct Ctx<'a> {
 	pub kind: &'static str,
 	/// A GRPCRoute: backends speak HTTP/2 (h2c).
 	pub grpc: bool,
+	/// The BackendTLSPolicies (TLS to backends).
+	pub backend_tls: Option<&'a crate::render::backend_tls::Index>,
 }
 
 /// One rproxy route before priorities are given.
@@ -88,6 +90,8 @@ pub struct Output {
 	pub unsupported: Option<String>,
 	/// rproxy service name → the Services it sends to (for RproxyPolicy).
 	pub backends: BTreeMap<String, Vec<crate::render::world::Key>>,
+	/// The BackendTLSPolicies of the backends sent to.
+	pub tls_policies: std::collections::BTreeSet<crate::render::world::Key>,
 }
 
 impl Output {
@@ -525,10 +529,44 @@ pub fn build(ctx: &Ctx, route: &HttpRoute, hosts: Option<&[String]>, exclusions:
 		let mut server_mws: Vec<Vec<String>> = vec![];
 		let mut fixed_500: Vec<bool> = vec![];
 		let mut protocols: Vec<Option<String>> = vec![];
+		let mut schemes: Vec<&'static str> = vec![];
+		let mut service_tls: Option<Value> = None;
 		let mut any_valid = false;
 		for (bi, b) in rule.backend_refs.iter().enumerate() {
 			let weight = b.backend.weight.unwrap_or(1).max(0) as u32;
-			match backends::resolve(ctx.world, ctx.kind, &ns, &b.backend) {
+			// TLS to the backend (BackendTLSPolicy); a policy without a usable CA: nothing may be sent there
+			let svc_ns = b.backend.namespace.clone().unwrap_or_else(|| ns.clone());
+			let policy = backends::port_name(ctx.world, &ns, &b.backend)
+				.and_then(|port| ctx.backend_tls.and_then(|i| i.get(&svc_ns, &b.backend.name, port.as_deref())).cloned());
+			if let Some(i) = ctx.backend_tls {
+				// the policies naming the Service get status for this Gateway (conflicted ones too)
+				out.tls_policies.extend(i.naming(&svc_ns, &b.backend.name).cloned());
+			}
+			let resolved = match (&policy, backends::resolve(ctx.world, ctx.kind, &ns, &b.backend)) {
+				(Some((key, crate::render::backend_tls::Tls::Invalid)), Ok(_)) => {
+					out.tls_policies.insert(key.clone());
+					Err(None)
+				}
+				(_, Ok(eps)) => Ok(eps),
+				(_, Err(e)) => Err(Some(e)),
+			};
+			let mut scheme = "http";
+			if let Some((key, crate::render::backend_tls::Tls::Use(tls))) = &policy {
+				if resolved.is_ok() {
+					out.tls_policies.insert(key.clone());
+					match crate::render::needs(ctx.features.service_tls, "TLS to backends (BackendTLSPolicy)", "services tls") {
+						Ok(()) => {
+							scheme = "https";
+							// one TLS setting per rproxy service: the first backend's
+							service_tls.get_or_insert_with(|| tls.clone());
+						}
+						Err(e) => {
+							out.unsupported.get_or_insert(format!("rule {i}: {e}"));
+						}
+					}
+				}
+			}
+			match resolved {
 				Ok(eps) => {
 					let svc = (b.backend.namespace.clone().unwrap_or_else(|| ns.clone()), b.backend.name.clone());
 					out.backends.entry(base.clone()).or_default().push(svc);
@@ -548,17 +586,21 @@ pub fn build(ctx: &Ctx, route: &HttpRoute, hosts: Option<&[String]>, exclusions:
 						}
 					}
 					protocols.push(backends::app_protocol(ctx.world, &ns, &b.backend));
+					schemes.push(scheme);
 					any_valid = true;
 					weighted.push((weight, eps));
 					server_mws.push(names);
 					fixed_500.push(false);
 				}
 				Err(e) => {
-					out.resolved.get_or_insert(e);
+					if let Some(e) = e {
+						out.resolved.get_or_insert(e);
+					}
 					if ctx.features.server_status && weight > 0 {
 						weighted.push((weight, vec![Endpoint { addr: String::new(), port: 0 }]));
 						server_mws.push(vec![]);
 						fixed_500.push(true);
+						schemes.push("http");
 					}
 				}
 			}
@@ -570,7 +612,7 @@ pub fn build(ctx: &Ctx, route: &HttpRoute, hosts: Option<&[String]>, exclusions:
 					rp::Server { status: Some(500), weight, ..Default::default() }
 				} else {
 					rp::Server {
-						url: format!("http://{}", ep.authority()),
+						url: format!("{}://{}", schemes[g], ep.authority()),
 						weight,
 						middlewares: server_mws[g].clone(),
 						..Default::default()
@@ -582,7 +624,7 @@ pub fn build(ctx: &Ctx, route: &HttpRoute, hosts: Option<&[String]>, exclusions:
 		let service = if servers.is_empty() || !any_valid {
 			None
 		} else {
-			let mut svc = rp::Service { servers, ..Default::default() };
+			let mut svc = rp::Service { servers, tls: service_tls.clone(), ..Default::default() };
 			if let Some(t) = &rule.timeouts {
 				match timeouts(ctx, t) {
 					Ok((on_route, on_service)) => {
@@ -725,7 +767,7 @@ mod tests {
 	fn redirects() {
 		let world = World::default();
 		let features = crate::render::Features::default();
-		let ctx = Ctx { world: &world, scheme: "http", port: 80, features: &features, kind: "HTTPRoute", grpc: false };
+		let ctx = Ctx { world: &world, scheme: "http", port: 80, features: &features, kind: "HTTPRoute", grpc: false, backend_tls: None };
 		let r = RequestRedirect { scheme: Some("https".into()), status_code: Some(301), ..Default::default() };
 		let v = redirect(&ctx, &r, &m(None)).unwrap();
 		assert_eq!(v[0]["redirect_regex"]["replacement"], "https://${1}${2}${3}");
@@ -735,7 +777,8 @@ mod tests {
 			path: Some(PathModifier { kind: "ReplacePrefixMatch".into(), replace_prefix_match: Some("/".into()), replace_full_path: None }),
 			..Default::default()
 		};
-		let ctx8080 = Ctx { world: &world, scheme: "http", port: 8080, features: &features, kind: "HTTPRoute", grpc: false };
+		let ctx8080 =
+			Ctx { world: &world, scheme: "http", port: 8080, features: &features, kind: "HTTPRoute", grpc: false, backend_tls: None };
 		let v = redirect(&ctx8080, &r, &m(Some(("PathPrefix", "/old/")))).unwrap();
 		assert_eq!(v.len(), 2);
 		assert_eq!(v[0]["redirect_regex"]["regex"], "^[a-z]+://([^/?]*?)(?::[0-9]+)?/old(/[^?]*)(\\?.*)?$");
@@ -746,7 +789,7 @@ mod tests {
 		assert_eq!(v[0]["redirect_regex"]["permanent"], false);
 		// an older rproxy: 301 and 302 only
 		let old = crate::render::Features { redirect_status: false, ..Default::default() };
-		let ctx_old = Ctx { world: &world, scheme: "http", port: 80, features: &old, kind: "HTTPRoute", grpc: false };
+		let ctx_old = Ctx { world: &world, scheme: "http", port: 80, features: &old, kind: "HTTPRoute", grpc: false, backend_tls: None };
 		let e = redirect(&ctx_old, &RequestRedirect { status_code: Some(303), ..Default::default() }, &m(None)).unwrap_err();
 		assert!(e.contains("redirect_status"), "{e}");
 		let v = redirect(&ctx_old, &RequestRedirect { status_code: Some(301), ..Default::default() }, &m(None)).unwrap();
@@ -765,13 +808,13 @@ mod tests {
 		};
 		let world = World::default();
 		let features = crate::render::Features::default();
-		let ctx = Ctx { world: &world, scheme: "http", port: 80, features: &features, kind: "HTTPRoute", grpc: false };
+		let ctx = Ctx { world: &world, scheme: "http", port: 80, features: &features, kind: "HTTPRoute", grpc: false, backend_tls: None };
 		let v = rewrite(&ctx, &f, &m(Some(("PathPrefix", "/old")))).unwrap();
 		assert_eq!(v, vec![json!({"replace_path_regex": {"regex": "^/old(/.*)?$", "replacement": "/new${1}"}})]);
 		let host = crate::k8s::gateway::UrlRewrite { hostname: Some("one.example.org".into()), path: None };
 		assert_eq!(rewrite(&ctx, &host, &m(None)).unwrap(), vec![json!({"replace_host": {"host": "one.example.org"}})]);
 		let old = crate::render::Features { replace_host: false, ..Default::default() };
-		let ctx_old = Ctx { world: &world, scheme: "http", port: 80, features: &old, kind: "HTTPRoute", grpc: false };
+		let ctx_old = Ctx { world: &world, scheme: "http", port: 80, features: &old, kind: "HTTPRoute", grpc: false, backend_tls: None };
 		assert!(rewrite(&ctx_old, &host, &m(None)).is_err());
 		assert_eq!(regex_escape("/a.b$"), "/a\\.b\\$");
 	}
