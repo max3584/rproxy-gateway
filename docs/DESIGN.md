@@ -49,6 +49,8 @@ Gateway API / CRD ──watch──▶ rproxy-gateway ──PUT /rulesets/k8s/<n
 
 managed の rproxy は、それぞれ Gateway の namespace の `rproxy-<id>-api` を使う：CA が `<id>.rproxy-api.rproxy-gateway.internal` に出した制御 API の証明書と、マスタートークンから導いたトークン（HMAC-SHA256、鍵がマスタートークンで中身が Gateway の id）のトークンファイル（`tokens.yaml`、SHA-256 だけ）。コントローラは Pod ごとにその名前とトークンでつなぐ。ある Gateway の namespace の Secret を読めても、ほかの Gateway の rproxy にもコントローラにもつなげない（マスタートークンと CA の鍵はコントローラの namespace だけ）。
 
+rproxy には `RPROXY_FILES_TRUSTED_DIRS`（Secret のボリュームのディレクトリ。kubelet が root のファイルにするため。[SECURITY.md](SECURITY.md)）も渡す。
+
 rproxy は `RPROXY_API_ADDR=0.0.0.0`、`RPROXY_API_PORT=9443`、`RPROXY_TOKEN_FILE`、`RPROXY_TLS_CERT` / `RPROXY_TLS_KEY` で動く（制御 API を loopback 以外で開くときに rproxy が求める 3 つ）。
 
 ## 証明書（Secret のボリューム、certsync）

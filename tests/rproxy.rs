@@ -45,7 +45,11 @@ struct Rproxy {
 impl Rproxy {
 	fn start(bin: &Path, dir: &Path, api: u16) -> Rproxy {
 		let tokens = dir.join("tokens.yaml");
-		std::fs::write(&tokens, rproxy_gateway::controller::bootstrap::token_file(TOKEN)).unwrap();
+		std::fs::write(
+			&tokens,
+			rproxy_gateway::controller::bootstrap::token_file(TOKEN, rproxy_gateway::controller::bootstrap::FLEET_RULESETS),
+		)
+		.unwrap();
 		let log = std::fs::File::create(dir.join(format!("rproxy-{api}.log"))).unwrap();
 		let child = Command::new(bin)
 			.env("RPROXY_API_ADDR", "127.0.0.1")
@@ -260,6 +264,12 @@ spec:
 	let plan = render::render_gateway(&world, &world.gateways[0], &opts);
 	for (name, content) in &plan.files {
 		std::fs::write(certs.join(name), content).unwrap();
+		// as the kubelet mounts the Secret (mode 0440): keys readable by nobody else
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+			std::fs::set_permissions(certs.join(name), std::fs::Permissions::from_mode(0o440)).unwrap();
+		}
 	}
 	// certsync's GET /files (the directory the kubelet mounts the Secret into)
 	let certsync = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -125,7 +125,7 @@ pub fn new_token() -> anyhow::Result<(String, String)> {
 	let mut bytes = [0u8; 32];
 	ring::rand::SystemRandom::new().fill(&mut bytes).map_err(|_| anyhow::anyhow!("no randomness"))?;
 	let token = crate::pem::hex(&bytes);
-	Ok((token.clone(), token_file(&token)))
+	Ok((token.clone(), token_file(&token, FLEET_RULESETS)))
 }
 
 /// The token of one target (a managed Gateway's id): HMAC-SHA256 of the master token.
@@ -135,12 +135,20 @@ pub fn derive_token(master: &str, target: &str) -> String {
 }
 
 /// rproxy's YAML token file for the controller's token.
-pub fn token_file(token: &str) -> String {
+/// The token is named `rproxy-gateway` whatever its value: rproxy makes the token's name
+/// the owner of the rule sets it creates, so a rotated token (same name) still owns them.
+/// `allow_rulesets`: the rule set name prefixes it may change (`k8s/`; a managed Gateway's
+/// own set).
+pub fn token_file(token: &str, allow_rulesets: &str) -> String {
 	format!(
-		"# written by rproxy-gateway: the controller's token (rule sets; ACME certificates for Traefik certResolver)\ntokens:\n  - name: rproxy-gateway\n    sha256: {}\n    scopes: [rules:read, rules:write, acme:write]\n",
-		crate::pem::sha256_hex(token.as_bytes())
+		"# written by rproxy-gateway: the controller's token (rule sets; ACME certificates for Traefik certResolver)\ntokens:\n  - name: rproxy-gateway\n    sha256: {}\n    scopes: [rules:read, rules:write, acme:write]\n    allow_rulesets: [\"{}\"]\n",
+		crate::pem::sha256_hex(token.as_bytes()),
+		allow_rulesets
 	)
 }
+
+/// The rule sets the fleet's token may change: every Gateway's.
+pub const FLEET_RULESETS: &str = "k8s/";
 
 /// Creates the Secrets that are missing; reads them all.
 pub async fn ensure(client: &kube::Client, ns: &str) -> anyhow::Result<Bootstrap> {
@@ -175,12 +183,21 @@ pub async fn ensure(client: &kube::Client, ns: &str) -> anyhow::Result<Bootstrap
 	let tok = match api.get_opt(TOKEN_SECRET).await? {
 		Some(s) => s,
 		None => {
-			let (token, file) = new_token()?;
+			let (token, _) = new_token()?;
+			let file = token_file(&token, FLEET_RULESETS);
 			info!(secret = TOKEN_SECRET, "creating the controller's token");
 			create_or_get(&api, &pp, secret(TOKEN_SECRET, ns, &[("token", token.into_bytes()), ("tokens.yaml", file.into_bytes())])).await?
 		}
 	};
 	let token = String::from_utf8(field(&tok, "token").context("the token Secret has no token")?)?;
+	// the token file follows the controller's version (a rotated token is a new Secret)
+	let file = token_file(token.trim(), FLEET_RULESETS);
+	if field(&tok, "tokens.yaml").as_deref() != Some(file.as_bytes()) {
+		let mut s = tok.clone();
+		s.data.get_or_insert_default().insert("tokens.yaml".into(), ByteString(file.into_bytes()));
+		info!(secret = TOKEN_SECRET, "writing the fleet's token file again");
+		api.replace(TOKEN_SECRET, &pp, &s).await?;
+	}
 	Ok(Bootstrap { ca_pem, ca_key_pem: String::from_utf8(ca_key)?, token: token.trim().to_string() })
 }
 
@@ -245,5 +262,7 @@ mod tests {
 		assert_eq!(token.len(), 64);
 		assert!(file.contains(&crate::pem::sha256_hex(token.as_bytes())));
 		assert!(file.contains("rules:write"));
+		assert!(file.contains("allow_rulesets: [\"k8s/\"]"), "{file}");
+		assert!(token_file(&token, "k8s/default/web").contains("allow_rulesets: [\"k8s/default/web\"]"));
 	}
 }
