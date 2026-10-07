@@ -30,6 +30,17 @@ fn refused(reason: &str, message: String) -> RefError {
 /// Resolves `b`, referenced from a route of `route_kind` in `route_ns`.
 /// The endpoints may be empty (a Service without ready pods).
 pub fn resolve(world: &World, route_kind: &str, route_ns: &str, b: &BackendRef) -> Result<Vec<Endpoint>, RefError> {
+	resolve_with(world, route_kind, route_ns, b, world.allow_external_name)
+}
+
+/// `resolve`; `external_name`: whether ExternalName Services may be backends.
+pub fn resolve_with(
+	world: &World,
+	route_kind: &str,
+	route_ns: &str,
+	b: &BackendRef,
+	external_name: bool,
+) -> Result<Vec<Endpoint>, RefError> {
 	let group = b.group.as_deref().unwrap_or("");
 	let kind = b.kind.as_deref().unwrap_or("Service");
 	if !(group.is_empty() && kind == "Service") {
@@ -47,6 +58,13 @@ pub fn resolve(world: &World, route_kind: &str, route_ns: &str, b: &BackendRef) 
 	};
 	let spec = svc.spec.clone().unwrap_or_default();
 	if spec.type_.as_deref() == Some("ExternalName") {
+		if !external_name {
+			// it can name anything (the API server, other namespaces' Services, metadata endpoints)
+			return Err(refused(
+				"UnsupportedValue",
+				format!("Service {ns}/{}: ExternalName Services are off (the controller's --allow-external-name-services)", b.name),
+			));
+		}
 		let host = spec.external_name.unwrap_or_default();
 		let Ok(port) = u16::try_from(port) else {
 			return Err(refused("BackendNotFound", format!("Service {ns}/{}: port {port}", b.name)));

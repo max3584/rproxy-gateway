@@ -163,7 +163,16 @@ pub fn apply(world: &World, gw: &Gateway, rules: &mut [rp::Rule], targets: &Targ
 }
 
 /// The RproxyRules naming `gw`: rules to add (JSON) and their status.
-pub fn raw_rules(world: &World, gw: &Gateway, taken: &[String]) -> (Vec<Value>, Vec<RawStatus>) {
+/// What RproxyRules may do in a Gateway's set.
+pub struct RawLimits<'a> {
+	/// Whether they are read at all (fleet mode: off unless asked for).
+	pub enabled: bool,
+	/// Files they may name (`*_file`): the Gateway's own, in the certificate directory.
+	pub cert_dir: &'a str,
+	pub files: &'a std::collections::BTreeSet<String>,
+}
+
+pub fn raw_rules(world: &World, gw: &Gateway, taken: &[String], limits: &RawLimits) -> (Vec<Value>, Vec<RawStatus>) {
 	let gw_ns = gw.metadata.namespace.clone().unwrap_or_default();
 	let gw_name = gw.metadata.name.clone().unwrap_or_default();
 	let mut rules = vec![];
@@ -200,7 +209,23 @@ pub fn raw_rules(world: &World, gw: &Gateway, taken: &[String]) -> (Vec<Value>, 
 			status.push(st);
 			continue;
 		}
+		if !limits.enabled {
+			st.conds.push(Cond::new(
+				"Accepted",
+				false,
+				"NotAllowed",
+				"RproxyRules are off for this Gateway (fleet mode: --fleet-rproxy-rules)",
+			));
+			status.push(st);
+			continue;
+		}
 		let rule = Value::Object(r.spec.rule.0.clone());
+		// files on the rproxy host: only the Gateway's own certificate files
+		if let Some(path) = crate::render::foreign_file(&rule, limits.cert_dir, limits.files) {
+			st.conds.push(Cond::new("Accepted", false, "Invalid", format!("{path}: rules may only name this Gateway's certificate files")));
+			status.push(st);
+			continue;
+		}
 		let protocol = match rule["protocol"].as_str().map(str::to_ascii_lowercase).as_deref() {
 			Some("tcp") => rp::Protocol::Tcp,
 			Some("udp") => rp::Protocol::Udp,

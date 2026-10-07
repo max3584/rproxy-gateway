@@ -53,6 +53,9 @@ pub struct Settings {
 	pub entry_points: BTreeMap<String, (rp::Protocol, u16)>,
 	/// Ingresses of this class are read.
 	pub ingress_class: String,
+	/// References to other namespaces (services, middlewares, TLS options) without a
+	/// ReferenceGrant (Traefik's `allowCrossNamespace`; off by default, as in Traefik).
+	pub allow_cross_namespace: bool,
 }
 
 impl Settings {
@@ -124,9 +127,35 @@ struct Ctx<'a> {
 	/// The port (rule) being filled, for middlewares that add services.
 	port: (rp::Protocol, u16),
 	entry_points: BTreeMap<String, (rp::Protocol, u16)>,
+	allow_cross_namespace: bool,
+}
+
+/// Whether a ReferenceGrant in `to_ns` lets Traefik objects of `from_ns` refer to (`to_group`, `to_kind`, `name`).
+fn traefik_granted(world: &World, from_ns: &str, to: (&str, &str, &str, &str)) -> bool {
+	let (to_group, to_kind, to_ns, name) = to;
+	world.grants.iter().filter(|g| g.metadata.namespace.as_deref() == Some(to_ns)).any(|g| {
+		g.spec.from.iter().any(|f| {
+			crate::k8s::traefik::GROUPS.contains(&f.group.as_str())
+				&& matches!(f.kind.as_str(), "IngressRoute" | "IngressRouteTCP" | "IngressRouteUDP" | "Middleware")
+				&& f.namespace == from_ns
+		}) && g.spec.to.iter().any(|t| t.group == to_group && t.kind == to_kind && t.name.as_deref().is_none_or(|n| n == name))
+	})
 }
 
 impl Ctx<'_> {
+	/// Whether an object in `from_ns` may refer to one in `to_ns` (same namespace, a
+	/// ReferenceGrant, or `allow_cross_namespace`); notes a refusal.
+	fn cross(&mut self, from_ns: &str, to: (&str, &str, &str, &str)) -> bool {
+		let (_, kind, to_ns, name) = to;
+		if from_ns == to_ns || self.allow_cross_namespace || traefik_granted(self.world, from_ns, to) {
+			return true;
+		}
+		self.note(format!(
+			"{kind} {to_ns}/{name}: referred to from namespace {from_ns} without a ReferenceGrant (or --migration-allow-cross-namespace); left out"
+		));
+		false
+	}
+
 	fn note(&mut self, s: String) {
 		if !self.out.notes.contains(&s) {
 			self.out.notes.push(s);
@@ -168,6 +197,9 @@ impl Ctx<'_> {
 			return None;
 		}
 		let ns = r.namespace.clone().unwrap_or_else(|| route_ns.to_string());
+		if !self.cross(route_ns, ("", "Service", &ns, &r.name)) {
+			return None;
+		}
 		let (eps, port_label, https) = self.endpoints(&ns, r)?;
 		let scheme = match r.scheme.as_deref() {
 			Some(s) => s.to_string(),
@@ -219,6 +251,9 @@ impl Ctx<'_> {
 		let mut dest = None;
 		for r in refs {
 			let ns = r.namespace.clone().unwrap_or_else(|| route_ns.to_string());
+			if !self.cross(route_ns, ("", "Service", &ns, &r.name)) {
+				continue;
+			}
 			if let Some((eps, port, _)) = self.endpoints(&ns, r) {
 				if dest.is_none() {
 					let b = BackendRef { name: r.name.clone(), namespace: Some(ns.clone()), port: port.parse().ok(), ..Default::default() };
@@ -237,6 +272,9 @@ impl Ctx<'_> {
 		for (ns, name) in refs {
 			let ns = ns.clone().unwrap_or_else(|| route_ns.to_string());
 			let name = name.split('@').next().unwrap_or(name).to_string();
+			if !self.cross(route_ns, ("traefik.io", "Middleware", &ns, &name)) {
+				continue;
+			}
 			let key = format!("traefik/{ns}/{name}");
 			if self.out.ports.get(&self.port).is_some_and(|p| p.middlewares.contains_key(&key)) {
 				out.push(key);
@@ -293,6 +331,9 @@ impl Ctx<'_> {
 		if let Some(o) = &tls.options {
 			let ns = o.namespace.clone().unwrap_or_else(|| route_ns.to_string());
 			let name = o.name.split('@').next().unwrap_or(&o.name).to_string();
+			if !self.cross(route_ns, ("traefik.io", "TLSOption", &ns, &name)) {
+				return;
+			}
 			match self.world.migration.tls_options.get(&(ns.clone(), name.clone())).cloned() {
 				Some(opt) => self.tls_option(&ns, &name, &Value::Object(opt.spec), key),
 				None if name == "default" => {}
@@ -591,7 +632,14 @@ fn sni_regexp(regex: &str) -> Option<String> {
 
 /// Renders the migrated resources.
 pub fn render(world: &World, settings: &Settings, opts: &Options) -> Out {
-	let mut ctx = Ctx { world, opts, out: Out::default(), port: (rp::Protocol::Tcp, 0), entry_points: settings.entry_points.clone() };
+	let mut ctx = Ctx {
+		world,
+		opts,
+		out: Out::default(),
+		port: (rp::Protocol::Tcp, 0),
+		entry_points: settings.entry_points.clone(),
+		allow_cross_namespace: settings.allow_cross_namespace,
+	};
 	let m = &world.migration;
 
 	// IngressRoute
@@ -693,7 +741,8 @@ pub fn render(world: &World, settings: &Settings, opts: &Options) -> Out {
 					}
 				}
 			}
-			if let Some(b) = spec.default_backend.as_ref().and_then(|b| b.service.clone()) {
+			// a default backend applies to the whole port: only the Gateway's own namespace sets it
+			if let Some(b) = spec.default_backend.as_ref().and_then(|b| b.service.clone()).filter(|_| ns == settings.gateway.0) {
 				let r = ServiceRef { name: b.name.clone(), port: b.port.as_ref().and_then(port_value), ..Default::default() };
 				if let Some((name, svc)) = ctx.service(&ns, &r) {
 					let p = ctx.port(key);
@@ -718,6 +767,11 @@ pub fn render(world: &World, settings: &Settings, opts: &Options) -> Out {
 						parts.push(format!("Host(`{}`)", h.to_ascii_lowercase()));
 					}
 					let p = path.path.clone().unwrap_or_else(|| "/".into());
+					// embedded in a match expression: no quotes, backticks or control characters
+					if p.chars().any(|c| c == '`' || c == '"' || c.is_control()) || !p.starts_with('/') {
+						ctx.note(format!("Ingress {ns}/{iname}: path {p:?} is not a plain path; left out"));
+						continue;
+					}
 					match path.path_type.as_str() {
 						"Exact" => parts.push(format!("Path(`{p}`)")),
 						"Prefix" => {

@@ -75,6 +75,20 @@ struct ControllerArgs {
 	/// Where `/healthz` is answered.
 	#[arg(long, env = "RPROXY_GATEWAY_HEALTH_ADDR", default_value = "0.0.0.0:8081")]
 	health_addr: SocketAddr,
+	/// IP ranges Gateways' `spec.addresses` may take (managed mode: the Service's
+	/// `externalIPs`). Empty: static addresses are off. Never include the Service or pod ranges.
+	#[arg(long, env = "RPROXY_GATEWAY_ADDRESS_CIDR", value_delimiter = ',')]
+	address_cidr: Vec<rproxy_gateway::render::Cidr>,
+	/// Let ExternalName Services be backends (they can name anything: the API server, other namespaces).
+	#[arg(long, env = "RPROXY_GATEWAY_ALLOW_EXTERNAL_NAME_SERVICES")]
+	allow_external_name_services: bool,
+	/// Annotation prefixes of `spec.infrastructure.annotations` let onto the Service even if
+	/// they steer addresses or load balancers (`metallb.universe.tf/`, `service.beta.kubernetes.io/`, ...).
+	#[arg(long, env = "RPROXY_GATEWAY_SERVICE_ANNOTATION_PREFIX", value_delimiter = ',')]
+	service_annotation_prefix: Vec<String>,
+	/// fleet: read RproxyRules (off by default: fleet pods are shared by every Gateway).
+	#[arg(long, env = "RPROXY_GATEWAY_FLEET_RPROXY_RULES")]
+	fleet_rproxy_rules: bool,
 	/// Leader election: run several replicas, one of which acts (a Lease in the controller's namespace).
 	#[arg(long, env = "RPROXY_GATEWAY_LEADER_ELECT", default_value_t = true, action = clap::ArgAction::Set)]
 	leader_elect: bool,
@@ -97,6 +111,10 @@ struct MigrationArgs {
 	/// The Ingress class read.
 	#[arg(long, env = "RPROXY_GATEWAY_INGRESS_CLASS", default_value = "rproxy")]
 	ingress_class: String,
+	/// Let Ingress and Traefik objects refer to services, middlewares and TLS options in other
+	/// namespaces without a ReferenceGrant (Traefik's `allowCrossNamespace`; off by default).
+	#[arg(long, env = "RPROXY_GATEWAY_MIGRATION_ALLOW_CROSS_NAMESPACE")]
+	migration_allow_cross_namespace: bool,
 	/// Traefik entry points: `name=port[/udp]` (default `web=80`, `websecure=443`).
 	#[arg(long = "traefik-entrypoint", env = "RPROXY_GATEWAY_TRAEFIK_ENTRYPOINTS", value_delimiter = ',')]
 	traefik_entrypoints: Vec<String>,
@@ -115,6 +133,7 @@ impl MigrationArgs {
 			gateway: (ns.to_string(), name.to_string()),
 			entry_points,
 			ingress_class: self.ingress_class.clone(),
+			allow_cross_namespace: self.migration_allow_cross_namespace,
 		}))
 	}
 }
@@ -212,6 +231,10 @@ fn main() -> anyhow::Result<()> {
 				resync: Duration::from_secs(a.resync_secs.max(5)),
 				health: a.health_addr,
 				migration: a.migration.settings()?,
+				address_cidrs: a.address_cidr.clone(),
+				allow_external_name: a.allow_external_name_services,
+				service_annotations: a.service_annotation_prefix.clone(),
+				fleet_rproxy_rules: a.fleet_rproxy_rules,
 				leader: a.leader_elect.then(|| {
 					let identity = a
 						.leader_identity

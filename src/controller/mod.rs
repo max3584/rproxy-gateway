@@ -93,6 +93,15 @@ pub struct Config {
 	pub health: SocketAddr,
 	/// Ingress / Traefik migration (off when `None`).
 	pub migration: Option<render::migrate::Settings>,
+	/// The ranges `spec.addresses` may take (empty: static addresses are off).
+	pub address_cidrs: Vec<render::Cidr>,
+	/// ExternalName Services may be backends.
+	pub allow_external_name: bool,
+	/// Annotation prefixes of `spec.infrastructure` allowed onto the Service besides the
+	/// ones that are not address or load balancer settings.
+	pub service_annotations: Vec<String>,
+	/// Fleet mode: RproxyRules are read (off by default: fleet pods are shared by every Gateway).
+	pub fleet_rproxy_rules: bool,
 	/// Leader election (`None`: this replica always leads, for a single replica).
 	pub leader: Option<leader::Settings>,
 }
@@ -259,7 +268,9 @@ async fn reconcile_all(
 	boot: &bootstrap::Bootstrap,
 	state: &mut State,
 ) -> anyhow::Result<bool> {
-	let world = cache.snapshot();
+	let mut world = cache.snapshot();
+	world.allow_external_name = cfg.allow_external_name;
+	let world = world;
 	let now = render::status::now();
 	let mut soon = false;
 
@@ -290,6 +301,8 @@ async fn reconcile_all(
 		labels: true,
 		migration: cfg.migration.clone(),
 		features: render::Features::default(),
+		address_cidrs: cfg.address_cidrs.clone(),
+		raw_rules: !matches!(cfg.mode, Mode::Fleet(_)) || cfg.fleet_rproxy_rules,
 	};
 	let mut rendered: Vec<(&crate::k8s::gateway::Gateway, GatewayPlan)> = vec![];
 	for gw in world.gateways.iter().filter(|g| classes.contains(&g.spec.gateway_class_name)) {
@@ -558,6 +571,7 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 			let mut t = provision::Target::new(&plan);
 			t.labels = infra.labels.clone();
 			t.annotations = infra.annotations.clone();
+			t.service_annotations = p.cfg.service_annotations.clone();
 			t.owner = match (&p.gateway_api_version, &gw.metadata.uid) {
 				(Some(v), Some(uid)) => Some(provision::owner(v, &plan.name, uid)),
 				_ => None,

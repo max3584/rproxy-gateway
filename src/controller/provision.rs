@@ -129,6 +129,30 @@ pub struct Target<'a> {
 	pub annotations: BTreeMap<String, String>,
 	/// `spec.addresses` (IP addresses) the Service takes (`externalIPs`).
 	pub addresses: Vec<String>,
+	/// Annotation prefixes let onto the Service though they steer addresses (`--service-annotation-prefix`).
+	pub service_annotations: Vec<String>,
+}
+
+/// Annotation prefixes of `spec.infrastructure` kept off the Service: they ask load
+/// balancers for addresses (a tenant could take an address that is not theirs).
+pub const SERVICE_ANNOTATION_DENY: &[&str] = &[
+	"metallb.universe.tf/",
+	"metallb.io/",
+	"lbipam.cilium.io/",
+	"io.cilium/",
+	"service.beta.kubernetes.io/",
+	"service.kubernetes.io/",
+	"cloud.google.com/",
+	"networking.gke.io/",
+	"kube-vip.io/",
+	"purelb.io/",
+	"load-balancer.hetzner.cloud/",
+	"loadbalancer.openstack.org/",
+];
+
+/// Whether an infrastructure annotation may go onto the Service.
+pub fn service_annotation_allowed(key: &str, allow: &[String]) -> bool {
+	allow.iter().any(|p| key.starts_with(p.as_str())) || !SERVICE_ANNOTATION_DENY.iter().any(|p| key.starts_with(p))
 }
 
 impl<'a> Target<'a> {
@@ -140,6 +164,7 @@ impl<'a> Target<'a> {
 			labels: BTreeMap::new(),
 			annotations: BTreeMap::new(),
 			addresses: vec![],
+			service_annotations: vec![],
 		}
 	}
 
@@ -402,7 +427,13 @@ pub fn service(t: &Target, m: &Managed) -> Service {
 		})
 		.collect();
 	Service {
-		metadata: t.meta(&object_name(&t.id), labels(&t.id)),
+		metadata: {
+			let mut meta = t.meta(&object_name(&t.id), labels(&t.id));
+			if let Some(a) = meta.annotations.as_mut() {
+				a.retain(|k, _| k == ANNOTATION_GATEWAY || service_annotation_allowed(k, &t.service_annotations));
+			}
+			meta
+		},
 		spec: Some(ServiceSpec {
 			type_: Some(m.service_type.clone()),
 			selector: Some(labels(&t.id)),
@@ -684,7 +715,13 @@ mod tests {
 		let api = vols.iter().find(|v| v.name == "api").unwrap().secret.clone().unwrap();
 		assert!(api.items.unwrap().iter().all(|i| i.key != "ca.crt"));
 		assert!(pod.containers.iter().all(|c| c.volume_mounts.iter().flatten().all(|v| v.read_only == Some(true))));
+		t.annotations.insert("metallb.universe.tf/loadBalancerIPs".into(), "10.96.0.10".into());
 		let s = service(&t, &m);
+		assert!(
+			!s.metadata.annotations.as_ref().unwrap().contains_key("metallb.universe.tf/loadBalancerIPs"),
+			"address steering stays off the Service"
+		);
+		assert!(service_annotation_allowed("metallb.universe.tf/x", &["metallb.universe.tf/".to_string()]));
 		assert_eq!(s.metadata.labels.as_ref().unwrap()["team"], "a");
 		assert_eq!(s.metadata.annotations.as_ref().unwrap()["note"], "x");
 		let spec = s.spec.unwrap();

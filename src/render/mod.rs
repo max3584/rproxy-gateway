@@ -41,6 +41,48 @@ pub struct Options {
 	pub migration: Option<migrate::Settings>,
 	/// What the Gateway's rproxy pods take.
 	pub features: Features,
+	/// The ranges `spec.addresses` may take (managed mode: the Service's `externalIPs`).
+	/// Empty: static addresses are off (a tenant could otherwise take any IP in the cluster).
+	pub address_cidrs: Vec<Cidr>,
+	/// Whether RproxyRules are read (fleet mode: off unless the controller is told so).
+	pub raw_rules: bool,
+}
+
+/// An IP range (`10.0.0.0/24`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cidr {
+	pub addr: std::net::IpAddr,
+	pub len: u8,
+}
+
+impl std::str::FromStr for Cidr {
+	type Err = String;
+	fn from_str(s: &str) -> Result<Cidr, String> {
+		let (a, l) = s.split_once('/').unwrap_or((s, ""));
+		let addr: std::net::IpAddr = a.trim().parse().map_err(|_| format!("{s:?}: not an IP range"))?;
+		let max = if addr.is_ipv4() { 32 } else { 128 };
+		let len = if l.is_empty() { max } else { l.trim().parse::<u8>().map_err(|_| format!("{s:?}: not an IP range"))? };
+		if len > max {
+			return Err(format!("{s:?}: prefix length over {max}"));
+		}
+		Ok(Cidr { addr, len })
+	}
+}
+
+impl Cidr {
+	pub fn contains(&self, ip: std::net::IpAddr) -> bool {
+		match (self.addr, ip) {
+			(std::net::IpAddr::V4(a), std::net::IpAddr::V4(b)) => {
+				let mask = if self.len == 0 { 0 } else { u32::MAX << (32 - u32::from(self.len)) };
+				u32::from(a) & mask == u32::from(b) & mask
+			}
+			(std::net::IpAddr::V6(a), std::net::IpAddr::V6(b)) => {
+				let mask = if self.len == 0 { 0 } else { u128::MAX << (128 - u32::from(self.len)) };
+				u128::from(a) & mask == u128::from(b) & mask
+			}
+			_ => false,
+		}
+	}
 }
 
 impl Default for Options {
@@ -51,6 +93,8 @@ impl Default for Options {
 			labels: true,
 			migration: None,
 			features: Features::default(),
+			address_cidrs: vec![],
+			raw_rules: true,
 		}
 	}
 }
@@ -260,6 +304,59 @@ pub fn usable_ip(ip: std::net::IpAddr) -> bool {
 		}
 		std::net::IpAddr::V6(v6) => !(v6.is_unspecified() || v6.is_loopback() || v6.is_multicast() || v6.is_unicast_link_local()),
 	}
+}
+
+/// The first file path in `v` (`*_file`, `file`, `*_path`) that is not one of `names` in
+/// `cert_dir`: tenant-written settings (RproxyRule, RproxyMiddleware) may not read other
+/// files of the rproxy host, such as another Gateway's keys.
+pub fn foreign_file(v: &Value, cert_dir: &str, names: &BTreeSet<String>) -> Option<String> {
+	match v {
+		Value::Object(m) => m.iter().find_map(|(k, x)| match x {
+			Value::String(path) if k.ends_with("_file") || k == "file" || k.ends_with("_path") => {
+				let ok = path.strip_prefix(cert_dir).and_then(|p| p.strip_prefix('/')).is_some_and(|n| names.contains(n));
+				(!ok).then(|| path.clone())
+			}
+			_ => foreign_file(x, cert_dir, names),
+		}),
+		Value::Array(a) => a.iter().find_map(|x| foreign_file(x, cert_dir, names)),
+		_ => None,
+	}
+}
+
+/// Why an address asked for may not be taken: outside `--address-cidr` (static
+/// addresses are off without it), or an address another Service already has
+/// (taking a ClusterIP as an external IP would capture that Service's traffic).
+fn address_policy(world: &World, gw: &Gateway, ips: &[String], opts: &Options) -> Option<String> {
+	let gw_name = gw.metadata.name.clone().unwrap_or_default();
+	let gw_ns = gw.metadata.namespace.clone().unwrap_or_default();
+	for a in ips {
+		let Ok(ip) = a.parse::<std::net::IpAddr>() else { continue };
+		if !opts.address_cidrs.iter().any(|c| c.contains(ip)) {
+			return Some(if opts.address_cidrs.is_empty() {
+				format!("{a}: static addresses are off (the controller's --address-cidr)")
+			} else {
+				format!("{a}: outside the ranges the controller allows (--address-cidr)")
+			});
+		}
+		for ((ns, name), svc) in &world.services {
+			let ours = *ns == gw_ns
+				&& svc.metadata.labels.as_ref().and_then(|l| l.get("gateway.networking.k8s.io/gateway-name")) == Some(&gw_name);
+			if ours {
+				continue;
+			}
+			let spec = svc.spec.clone().unwrap_or_default();
+			let mut taken: Vec<String> = spec.cluster_ips.unwrap_or_default();
+			taken.extend(spec.cluster_ip);
+			taken.extend(spec.external_ips.unwrap_or_default());
+			for i in svc.status.as_ref().and_then(|s| s.load_balancer.as_ref()).and_then(|l| l.ingress.as_ref()).into_iter().flatten() {
+				taken.extend(i.ip.clone());
+			}
+			if taken.iter().any(|t| t.parse::<std::net::IpAddr>().ok() == Some(ip)) {
+				return Some(format!("{a}: Service {ns}/{name} has that address"));
+			}
+		}
+	}
+	None
 }
 
 /// `spec.addresses` → (the IPs asked for, why one cannot be used); `Err`: an
@@ -817,11 +914,21 @@ fn http_ctx<'a>(
 	world: &'a World,
 	opts: &'a Options,
 	tls: &'a backend_tls::Index,
+	files: &'a BTreeSet<String>,
 	scheme: &'static str,
 	port: u16,
 	kind: RouteKind,
 ) -> http::Ctx<'a> {
-	http::Ctx { world, scheme, port, features: &opts.features, kind: kind.kind(), grpc: kind == RouteKind::Grpc, backend_tls: Some(tls) }
+	http::Ctx {
+		world,
+		scheme,
+		port,
+		features: &opts.features,
+		kind: kind.kind(),
+		grpc: kind == RouteKind::Grpc,
+		backend_tls: Some(tls),
+		files: Some((&opts.cert_dir, files)),
+	}
 }
 
 fn l4_route(world: &World, kind: RouteKind, index: usize) -> &crate::k8s::gateway::L4Route {
@@ -914,6 +1021,8 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 		st.attached = attachments.iter().filter(|a| a.listener == i).map(|a| (a.kind, a.route)).collect::<BTreeSet<_>>().len() as i32;
 	}
 
+	// the files the Gateway's tenant-written settings may name (its own certificates)
+	let own_files: BTreeSet<String> = files.keys().cloned().collect();
 	// one rule per (protocol, port)
 	let mut groups: BTreeMap<(rp::Protocol, u16), Vec<usize>> = BTreeMap::new();
 	for (i, st) in listeners.iter().enumerate() {
@@ -985,7 +1094,7 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 			let mut services = BTreeMap::new();
 			let mut middlewares = BTreeMap::new();
 			for a in attachments.iter().filter(|a| matches!(a.kind, RouteKind::Http | RouteKind::Grpc) && mine(a)) {
-				let ctx = http_ctx(world, opts, &tls_index, if https { "https" } else { "http" }, *port, a.kind);
+				let ctx = http_ctx(world, opts, &tls_index, &own_files, if https { "https" } else { "http" }, *port, a.kind);
 				let route: &HttpRoute = http_route(world, a.kind, a.route);
 				let mut out = http::build(&ctx, route, a.hosts.as_deref(), &exclusions(&listeners, a.listener));
 				if a.kind == RouteKind::Grpc {
@@ -1122,7 +1231,7 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 			// not carried by any rule: still check its references
 			let resolved = index.and_then(|i| match p.kind {
 				RouteKind::Http | RouteKind::Grpc => {
-					let ctx = http_ctx(world, opts, &tls_index, "http", 80, p.kind);
+					let ctx = http_ctx(world, opts, &tls_index, &own_files, "http", 80, p.kind);
 					http::build(&ctx, http_route(world, p.kind, i), None, &[]).resolved
 				}
 				RouteKind::Tls => l4::destination(world, &world.tls_routes[i]).1,
@@ -1167,7 +1276,9 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 		&policy::Targets { listeners: &by_name, l4_services: &l4_services, http_services: &http_services },
 	);
 	let taken: Vec<String> = plan.rules.iter().map(|r| r.key()).collect();
-	let (raw, raw_status) = policy::raw_rules(world, gw, &taken);
+	let file_names: BTreeSet<String> = files.keys().cloned().collect();
+	let limits = policy::RawLimits { enabled: opts.raw_rules, cert_dir: &opts.cert_dir, files: &file_names };
+	let (raw, raw_status) = policy::raw_rules(world, gw, &taken, &limits);
 	plan.raw = raw;
 	plan.raw_status = raw_status;
 
@@ -1220,6 +1331,9 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 	if let Ok((ips, unusable)) = addresses {
 		plan.addresses = ips;
 		plan.address_error = unusable;
+		if plan.address_error.is_none() {
+			plan.address_error = address_policy(world, gw, &plan.addresses, opts);
+		}
 	}
 	if !plan.accepted() {
 		for ls in plan.listener_sets.iter_mut().filter(|ls| ls.accepted.status) {
