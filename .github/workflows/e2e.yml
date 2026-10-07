@@ -25,7 +25,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # rproxy-api master has the rule sets (#28); another ref (a release tag, a branch) by hand
+  # rproxy-api master has the rule sets (#28) and the Gateway API settings (#237); another ref
+  # (a release tag, a branch) by hand
   RPROXY_REF: ${{ inputs.rproxy_ref || 'master' }}
 
 jobs:
@@ -147,8 +148,12 @@ jobs:
           path: |
             conformance-report.yaml
             ${{ runner.temp }}/rproxy-gateway-conformance/conformance.log
-      # the report is the deliverable (docs/CONFORMANCE.md lists the known failures, e.g. the
-      # `add` of header modifiers that rproxy's headers middleware lacks): shown, not blocking
-      - name: result
+            ${{ runner.temp }}/rproxy-gateway-conformance/controller.log
+      # core must pass (a regression fails the job); extended failures are reported, not blocking
+      - name: core
+        run: |
+          f="$RUNNER_TEMP/rproxy-gateway-conformance/core-failures"
+          if [ -s "$f" ]; then echo "::error::Gateway API conformance: core tests failed"; cat "$f"; exit 1; fi
+      - name: extended
         continue-on-error: true
         run: exit "$(cat "$RUNNER_TEMP/rproxy-gateway-conformance/status")"

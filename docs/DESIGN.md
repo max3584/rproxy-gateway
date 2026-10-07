@@ -137,7 +137,10 @@ rproxy は `RPROXY_API_ADDR=0.0.0.0`、`RPROXY_API_PORT=9443`、`RPROXY_TOKEN_FI
 | 書くところ | 中身 |
 |---|---|
 | GatewayClass | `Accepted`、`SupportedVersion`、`supportedFeatures` |
-| Gateway | `addresses`、`Accepted`、`Programmed`（アドレスがあり、1 つ以上の Pod に反映できた）。`observedGeneration` は Gateway の generation |
+| Gateway | `addresses`、`Accepted`（`UnsupportedAddress`、`InvalidParameters`、`ListenersNotValid`）、`Programmed`（アドレスがあり、1 つ以上の Pod に反映できた。`AddressNotUsable`）、`ResolvedRefs`（`tls.backend` があるとき）、`InsecureFrontendValidationMode`、`attachedListenerSets`。`observedGeneration` は Gateway の generation |
+| ListenerSet | `Accepted`、`Programmed`、`listeners`（Gateway のリスナーと同じ） |
+| BackendTLSPolicy・RproxyPolicy | `status.ancestors[]`（Gateway ごと、ほかのコントローラの項目は残す） |
+| Ingress（移行） | `status.loadBalancer.ingress`（移行先の Gateway のアドレス） |
 | リスナー | `Accepted`（`UnsupportedProtocol`、`ProtocolConflict`、`HostnameConflict`、証明書がない）、`ResolvedRefs`（`InvalidCertificateRef`、`RefNotPermitted`、`InvalidRouteKinds`）、`Conflicted`、`Programmed`（rproxy のルールの `Programmed`）、`supportedKinds`、`attachedRoutes` |
 | ルートの `status.parents[]` | `Accepted`（`NotAllowedByListeners`、`NoMatchingListenerHostname`、`NoMatchingParent`、`UnsupportedValue`）、`ResolvedRefs`（`BackendNotFound`、`RefNotPermitted`、`InvalidKind`）。rproxy のルールの `Accepted` / `ResolvedRefs` が `False` ならそれも書く。ほかのコントローラの項目は残す |
 

@@ -137,7 +137,10 @@ The newer settings above (`add` of `headers`, a redirect's `status`, route `time
 | Where | Contents |
 |---|---|
 | GatewayClass | `Accepted`, `SupportedVersion`, `supportedFeatures` |
-| Gateway | `addresses`, `Accepted`, `Programmed` (an address, and applied to at least one pod). `observedGeneration` is the Gateway's generation |
+| Gateway | `addresses`, `Accepted` (`UnsupportedAddress`, `InvalidParameters`, `ListenersNotValid`), `Programmed` (an address, and applied to at least one pod; `AddressNotUsable`), `ResolvedRefs` (with `tls.backend`), `InsecureFrontendValidationMode`, `attachedListenerSets`. `observedGeneration` is the Gateway's generation |
+| ListenerSet | `Accepted`, `Programmed`, `listeners` (as the Gateway's listeners) |
+| BackendTLSPolicy, RproxyPolicy | `status.ancestors[]` (per Gateway; other controllers' entries are kept) |
+| Ingress (migration) | `status.loadBalancer.ingress` (the target Gateway's addresses) |
 | Listeners | `Accepted` (`UnsupportedProtocol`, `ProtocolConflict`, `HostnameConflict`, no certificate), `ResolvedRefs` (`InvalidCertificateRef`, `RefNotPermitted`, `InvalidRouteKinds`), `Conflicted`, `Programmed` (the rproxy rule's `Programmed`), `supportedKinds`, `attachedRoutes` |
 | Route `status.parents[]` | `Accepted` (`NotAllowedByListeners`, `NoMatchingListenerHostname`, `NoMatchingParent`, `UnsupportedValue`), `ResolvedRefs` (`BackendNotFound`, `RefNotPermitted`, `InvalidKind`). When the rproxy rule's `Accepted` / `ResolvedRefs` is `False`, that too. Entries of other controllers are kept |
 

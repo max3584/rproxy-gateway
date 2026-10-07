@@ -18,9 +18,11 @@ A Kubernetes controller for [rproxy](https://github.com/max3584/rproxy-api). It 
 | Resource | rproxy |
 |---|---|
 | `GatewayClass` (`controllerName: rproxy.max3584.net/gateway-controller`) | `Accepted`, `supportedFeatures` |
-| `Gateway` listeners `HTTP`, `HTTPS`, `TLS` (Passthrough / Terminate), `TCP`, `UDP` | one rule per (protocol, address, port); listeners on the same port merge |
-| `HTTPRoute` | `http.routes` (path, header, query and method matches in Gateway API's precedence), header modifiers, redirects, URL rewrites, weights, `RproxyMiddleware` (ExtensionRef) |
-| `TLSRoute`, `TCPRoute`, `UDPRoute` | `tls.routes` (SNI), `targets` |
+| `Gateway` listeners `HTTP`, `HTTPS`, `TLS` (Passthrough / Terminate), `TCP`, `UDP` | one rule per (protocol, address, port); listeners on the same port merge. `spec.addresses`, `infrastructure`, client certificate validation (`tls.frontend`), client certificates to backends (`tls.backend`) |
+| `ListenerSet` | listeners added to a Gateway (`allowedListeners`) |
+| `HTTPRoute`, `GRPCRoute` | `http.routes` (path, header, query and method matches in Gateway API's precedence), header modifiers (`add` too), redirects (301 to 308), URL and host rewrites, CORS, mirroring, retries, timeouts, filters per backendRef, weights, h2c backends, `RproxyMiddleware` (ExtensionRef) |
+| `BackendTLSPolicy` | TLS to backends (CA, SNI, SAN) |
+| `TLSRoute`, `TCPRoute`, `UDPRoute` | `tls.routes` (SNI, pod `targets` per name), `targets` |
 | `ReferenceGrant` | Services and Secrets in other namespaces |
 | Backends | the pod IPs from EndpointSlices (rproxy balances and health-checks them) |
 | Status | `Accepted`, `Programmed`, `ResolvedRefs` of Gateways, listeners and routes (from the rproxy rules' `conditions`) |
