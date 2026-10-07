@@ -236,8 +236,11 @@ pub fn client_certificate(
 		)));
 	}
 	let ns = r.namespace.as_deref().unwrap_or(gw_ns);
-	if !world.granted((GROUP, "Gateway", gw_ns), ("", "Secret", ns, &r.name)) {
-		return Some(Err(bad("RefNotPermitted", format!("Secret {ns}/{}: no ReferenceGrant allows the reference", r.name))));
+	if !world.granted((GROUP, "Gateway", gw_ns), ("", "Secret", ns, &r.name)) || (ns != gw_ns && !opts.cross_namespace_secrets) {
+		return Some(Err(bad(
+			"RefNotPermitted",
+			format!("Secret {ns}/{}: no ReferenceGrant allows the reference (or --cross-namespace-secrets is off)", r.name),
+		)));
 	}
 	let Some(secret) = world.secrets.get(&(ns.to_string(), r.name.clone())) else {
 		return Some(Err(bad("InvalidClientCertificateRef", format!("Secret {ns}/{} not found", r.name))));

@@ -53,7 +53,10 @@ async fn handle(fake: Arc<Mutex<Fake>>, req: Request<hyper::body::Incoming>) -> 
 	let mut f = fake.lock().unwrap();
 	match (method.as_str(), path.as_str()) {
 		("GET", "/readyz") => reply(200, json!({"ready": true})),
-		("GET", "/files") => reply(200, json!(f.files)),
+		("POST", "/files") => {
+			let asked: Vec<String> = serde_json::from_slice(&body).unwrap_or_default();
+			reply(200, json!(asked.into_iter().filter(|n| f.files.contains(n)).collect::<Vec<_>>()))
+		}
 		("GET", "/capabilities") => {
 			reply(200, json!({"version": "0.4.0", "features": {"rulesets": true, "labels": true, "conditions": true, "readyz": true}}))
 		}

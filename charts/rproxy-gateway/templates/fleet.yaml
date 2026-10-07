@@ -25,6 +25,8 @@ spec:
       serviceAccountName: rproxy-gateway-proxy
       # rproxy and certsync do not use the Kubernetes API: certificates come as a mounted Secret
       automountServiceAccountToken: false
+      securityContext:
+        seccompProfile: {type: RuntimeDefault}
       hostNetwork: {{ .Values.fleet.hostNetwork }}
       dnsPolicy: {{ if .Values.fleet.hostNetwork }}ClusterFirstWithHostNet{{ else }}ClusterFirst{{ end }}
       {{- with .Values.imagePullSecrets }}
@@ -35,7 +37,9 @@ spec:
           image: {{ include "rproxy-gateway.rproxyImage" . }}
           imagePullPolicy: {{ .Values.rproxy.image.pullPolicy }}
           env:
-            - {name: RPROXY_API_ADDR, value: "0.0.0.0"}
+            # the pod's IP (with hostNetwork, the node's): not every interface
+            - name: RPROXY_API_ADDR
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
             - {name: RPROXY_API_PORT, value: "9443"}
             - {name: RPROXY_TOKEN_FILE, value: /etc/rproxy-gateway/token/tokens.yaml}
             - {name: RPROXY_TLS_CERT, value: /etc/rproxy-gateway/api-tls/tls.crt}
@@ -63,6 +67,10 @@ spec:
           imagePullPolicy: {{ .Values.controller.image.pullPolicy }}
           # tells the controller which certificate files the kubelet has put in place
           args: [certsync, --dir=/var/run/rproxy-gateway/certs, --listen=0.0.0.0:9444]
+          env:
+            # listen on the pod's IP only
+            - name: POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
           ports:
             - {name: certsync, containerPort: 9444}
           securityContext:

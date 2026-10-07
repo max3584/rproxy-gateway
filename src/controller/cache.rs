@@ -24,18 +24,62 @@ use crate::render::world::World;
 /// A watched dynamic kind.
 struct DynKind {
 	kind: &'static str,
-	store: Store<DynamicObject>,
+	store: Multi<DynamicObject>,
+}
+
+/// One watch per namespace watched (or one for all namespaces), read as one.
+pub struct Multi<K: kube::Resource + 'static>(Vec<Store<K>>)
+where
+	K::DynamicType: Eq + std::hash::Hash + Clone;
+
+impl<K: kube::Resource + Clone + 'static> Multi<K>
+where
+	K::DynamicType: Eq + std::hash::Hash + Clone,
+{
+	pub fn state(&self) -> Vec<Arc<K>> {
+		self.0.iter().flat_map(|s| s.state()).collect()
+	}
+
+	async fn wait_until_ready(&self) {
+		for s in &self.0 {
+			let _ = s.wait_until_ready().await;
+		}
+	}
+}
+
+/// The namespaces watched: `None` for all (`--watch-namespaces` empty).
+pub type Scope = Option<Vec<String>>;
+
+/// An API for each namespace of `scope` (or one for all).
+fn apis<K>(client: &kube::Client, scope: &Scope) -> Vec<Api<K>>
+where
+	K: kube::Resource<Scope = k8s_openapi::NamespaceResourceScope>,
+	K::DynamicType: Default,
+{
+	match scope {
+		None => vec![Api::all(client.clone())],
+		Some(nss) => nss.iter().map(|ns| Api::namespaced(client.clone(), ns)).collect(),
+	}
+}
+
+fn watch_all<K>(client: &kube::Client, scope: &Scope, changed: &Arc<Notify>, what: &'static str) -> Multi<K>
+where
+	K: kube::Resource<Scope = k8s_openapi::NamespaceResourceScope> + Clone + DeserializeOwned + std::fmt::Debug + Send + Sync + 'static,
+	K::DynamicType: Default + Eq + std::hash::Hash + Clone,
+{
+	Multi(apis::<K>(client, scope).into_iter().map(|api| spawn_watch(api, changed.clone(), what)).collect())
 }
 
 pub struct Cache {
 	pub changed: Arc<Notify>,
-	services: Store<Service>,
-	slices: Store<EndpointSlice>,
-	secrets: Store<Secret>,
-	config_maps: Store<ConfigMap>,
+	services: Multi<Service>,
+	slices: Multi<EndpointSlice>,
+	secrets: Multi<Secret>,
+	config_maps: Multi<ConfigMap>,
 	namespaces: Store<Namespace>,
-	pub pods: Store<Pod>,
-	ingresses: Option<Store<Ingress>>,
+	pub pods: Multi<Pod>,
+	ingresses: Option<Multi<Ingress>>,
+	scope: Scope,
 	/// The watched dynamic kinds and their resources (found by discovery; for status patches).
 	dynamic: RwLock<Vec<(DynKind, ApiResource)>>,
 	/// Whether Traefik's kinds are wanted (migration).
@@ -81,8 +125,16 @@ where
 	reader
 }
 
-fn spawn_dyn_watch(client: &kube::Client, ar: &ApiResource, changed: Arc<Notify>) -> Store<DynamicObject> {
-	let api: Api<DynamicObject> = Api::all_with(client.clone(), ar);
+fn spawn_dyn_watch(client: &kube::Client, ar: &ApiResource, scope: &Scope, changed: Arc<Notify>) -> Multi<DynamicObject> {
+	// GatewayClass is the one cluster-scoped kind read
+	let apis: Vec<Api<DynamicObject>> = match scope {
+		Some(nss) if ar.kind != "GatewayClass" => nss.iter().map(|ns| Api::namespaced_with(client.clone(), ns, ar)).collect(),
+		_ => vec![Api::all_with(client.clone(), ar)],
+	};
+	Multi(apis.into_iter().map(|api| spawn_dyn_watch_one(api, ar, changed.clone())).collect())
+}
+
+fn spawn_dyn_watch_one(api: Api<DynamicObject>, ar: &ApiResource, changed: Arc<Notify>) -> Store<DynamicObject> {
 	let writer = reflector::store::Writer::new(ar.clone());
 	let reader = writer.as_reader();
 	let stream = reflector::reflector(writer, watcher(api, watcher::Config::default()).default_backoff());
@@ -100,19 +152,21 @@ fn spawn_dyn_watch(client: &kube::Client, ar: &ApiResource, changed: Arc<Notify>
 }
 
 impl Cache {
-	/// Starts the watches. `migration`: also watch Ingress and Traefik's CRDs.
-	pub async fn start(client: &kube::Client, migration: bool) -> anyhow::Result<Cache> {
+	/// Starts the watches. `migration`: also watch Ingress and Traefik's CRDs. `scope`:
+	/// the namespaces watched (`None`: all).
+	pub async fn start(client: &kube::Client, migration: bool, scope: Scope) -> anyhow::Result<Cache> {
 		let changed = Arc::new(Notify::new());
 		let cache = Cache {
-			services: spawn_watch(Api::all(client.clone()), changed.clone(), "Service"),
-			slices: spawn_watch(Api::all(client.clone()), changed.clone(), "EndpointSlice"),
-			secrets: spawn_watch(Api::all(client.clone()), changed.clone(), "Secret"),
-			config_maps: spawn_watch(Api::all(client.clone()), changed.clone(), "ConfigMap"),
+			services: watch_all(client, &scope, &changed, "Service"),
+			slices: watch_all(client, &scope, &changed, "EndpointSlice"),
+			secrets: watch_all(client, &scope, &changed, "Secret"),
+			config_maps: watch_all(client, &scope, &changed, "ConfigMap"),
 			namespaces: spawn_watch(Api::all(client.clone()), changed.clone(), "Namespace"),
-			pods: spawn_pod_watch(client, changed.clone()),
-			ingresses: migration.then(|| spawn_watch(Api::all(client.clone()), changed.clone(), "Ingress")),
+			pods: Multi(apis::<Pod>(client, &scope).into_iter().map(|api| spawn_pod_watch(api, changed.clone())).collect()),
+			ingresses: migration.then(|| watch_all(client, &scope, &changed, "Ingress")),
 			dynamic: RwLock::new(vec![]),
 			migration,
+			scope,
 			changed,
 		};
 		cache.rediscover(client, true).await?;
@@ -149,7 +203,7 @@ impl Cache {
 			match groups.iter().find(|(g, k, _)| g == group && k == kind) {
 				Some((_, _, ar)) => {
 					info!(kind, version = %ar.version, "watching");
-					let store = spawn_dyn_watch(client, ar, self.changed.clone());
+					let store = spawn_dyn_watch(client, ar, &self.scope, self.changed.clone());
 					if !first {
 						// a new kind: render once it has listed
 						let _ = store.wait_until_ready().await;
@@ -178,7 +232,7 @@ impl Cache {
 		if let Some(i) = &self.ingresses {
 			let _ = i.wait_until_ready().await;
 		}
-		let stores: Vec<Store<DynamicObject>> = self.dynamic.read().unwrap().iter().map(|(d, _)| d.store.clone()).collect();
+		let stores: Vec<Store<DynamicObject>> = self.dynamic.read().unwrap().iter().flat_map(|(d, _)| d.store.0.clone()).collect();
 		for s in stores {
 			let _ = s.wait_until_ready().await;
 		}
@@ -234,8 +288,7 @@ impl Cache {
 }
 
 /// rproxy pods: managed ones next to their Gateways (any namespace), the fleet in the controller's.
-fn spawn_pod_watch(client: &kube::Client, changed: Arc<Notify>) -> Store<Pod> {
-	let api: Api<Pod> = Api::all(client.clone());
+fn spawn_pod_watch(api: Api<Pod>, changed: Arc<Notify>) -> Store<Pod> {
 	let (reader, writer) = reflector::store();
 	let cfg = watcher::Config::default().labels("app.kubernetes.io/name=rproxy");
 	let stream = reflector::reflector(writer, watcher(api, cfg).default_backoff());

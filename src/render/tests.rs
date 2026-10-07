@@ -775,7 +775,12 @@ fn migrate_opts() -> Options {
 	eps.insert("pg".into(), (rp::Protocol::Tcp, 5432));
 	eps.insert("dns".into(), (rp::Protocol::Udp, 53));
 	Options {
-		migration: Some(migrate::Settings { gateway: ("default".into(), "gw".into()), entry_points: eps, ingress_class: "rproxy".into() }),
+		migration: Some(migrate::Settings {
+			gateway: ("default".into(), "gw".into()),
+			entry_points: eps,
+			ingress_class: "rproxy".into(),
+			allow_cross_namespace: false,
+		}),
 		..Default::default()
 	}
 }
@@ -1018,13 +1023,28 @@ spec: {ingressClassName: nginx}
 
 #[test]
 fn gateway_addresses_and_parameters() {
-	let with = |extra: &str| {
-		plan(&format!("{BASE}{}", gw("  - {name: http, port: 80, protocol: HTTP}").replace("spec:\n", &format!("spec:\n{extra}"))))
+	let yaml_with =
+		|extra: &str| format!("{BASE}{}", gw("  - {name: http, port: 80, protocol: HTTP}").replace("spec:\n", &format!("spec:\n{extra}")));
+	let allowed = Options { address_cidrs: vec!["192.0.2.0/24".parse().unwrap(), "2001:db8::/32".parse().unwrap()], ..Default::default() };
+	let with_opts = |extra: &str, opts: &Options| {
+		let w = world(&yaml_with(extra));
+		render_gateway(&w, &w.gateways[0], opts)
 	};
+	let with = |extra: &str| with_opts(extra, &allowed);
 	let p = with("  addresses: [{type: IPAddress, value: 192.0.2.10}, {value: \"2001:db8::1\"}, {type: IPAddress}]\n");
 	assert!(p.accepted());
 	assert_eq!(p.addresses, ["192.0.2.10", "2001:db8::1"]);
 	assert_eq!(p.address_error, None);
+	// static addresses are off by default; outside the ranges; another Service's address
+	let p = with_opts("  addresses: [{value: 192.0.2.10}]\n", &Options::default());
+	assert!(p.address_error.as_deref().is_some_and(|e| e.contains("static addresses are off")));
+	let p = with("  addresses: [{value: 10.96.0.10}]\n");
+	assert!(p.address_error.as_deref().is_some_and(|e| e.contains("outside")));
+	let taken = yaml_with("  addresses: [{value: 192.0.2.53}]\n")
+		+ "\n---\napiVersion: v1\nkind: Service\nmetadata: {name: dns, namespace: kube-system}\nspec: {clusterIP: 192.0.2.53, ports: [{port: 53}]}\n";
+	let w = world(&taken);
+	let p = render_gateway(&w, &w.gateways[0], &allowed);
+	assert!(p.address_error.as_deref().is_some_and(|e| e.contains("kube-system/dns")), "{:?}", p.address_error);
 	let p = with("  addresses: [{type: test/fake-invalid-type, value: x}, {value: 192.0.2.10}]\n");
 	assert_eq!(cond(&p.conds, "Accepted").reason, "UnsupportedAddress");
 	assert!(!p.accepted());
@@ -1378,4 +1398,155 @@ spec:
 	assert_eq!(cond(&no_ca.conds, "Accepted").reason, "NoValidCACertificate");
 	assert_eq!(cond(&no_ca.conds, "ResolvedRefs").reason, "InvalidKind");
 	assert!(cond(&p.parents[0].conds, "ResolvedRefs").status, "the route's references are fine");
+}
+
+#[test]
+fn migration_respects_namespaces() {
+	let yaml = format!(
+		"{BASE}{}{}",
+		gw("  - {name: http, port: 80, protocol: HTTP}"),
+		r#"
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata: {name: sneaky, namespace: default}
+spec:
+  entryPoints: [web]
+  routes:
+    - match: Host(`a.example.com`)
+      kind: Rule
+      services: [{name: api, namespace: other, port: 8000}]
+      middlewares: [{name: strip, namespace: other}]
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata: {name: strip, namespace: other}
+spec: {stripPrefix: {prefixes: [/x]}}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: {name: evil, namespace: other}
+spec:
+  ingressClassName: rproxy
+  defaultBackend: {service: {name: api, port: {number: 8000}}}
+  rules:
+    - http:
+        paths: [{path: "/`) || PathPrefix(`/", pathType: ImplementationSpecific, backend: {service: {name: api, port: {number: 8000}}}}]
+"#
+	);
+	let w = world(&yaml);
+	let p = render_gateway(&w, &w.gateways[0], &migrate_opts());
+	let text = serde_json::to_string(&p.rules_json()).unwrap();
+	assert!(!text.contains("10.1.0.1"), "no cross-namespace service without a grant: {text}");
+	assert!(!text.contains("traefik/other/strip"), "no cross-namespace middleware");
+	assert!(p.notes.iter().any(|n| n.contains("without a ReferenceGrant")), "{:?}", p.notes);
+	assert!(p.notes.iter().any(|n| n.contains("not a plain path")), "{:?}", p.notes);
+	assert!(p.rules_json()[0]["http"].get("default").is_none(), "no default backend from another namespace: {text}");
+	// a ReferenceGrant from Traefik's kinds allows it
+	let granted = format!(
+		"{yaml}\n---\napiVersion: gateway.networking.k8s.io/v1beta1\nkind: ReferenceGrant\nmetadata: {{name: g, namespace: other}}\nspec:\n  from: [{{group: traefik.io, kind: IngressRoute, namespace: default}}]\n  to: [{{group: \"\", kind: Service}}]\n"
+	);
+	let w = world(&granted);
+	let p = render_gateway(&w, &w.gateways[0], &migrate_opts());
+	assert!(serde_json::to_string(&p.rules_json()).unwrap().contains("10.1.0.1"));
+	// and so does --migration-allow-cross-namespace
+	let w = world(&yaml);
+	let mut opts = migrate_opts();
+	opts.migration.as_mut().unwrap().allow_cross_namespace = true;
+	let p = render_gateway(&w, &w.gateways[0], &opts);
+	let text = serde_json::to_string(&p.rules_json()).unwrap();
+	assert!(text.contains("10.1.0.1") && text.contains("traefik/other/strip"));
+}
+
+#[test]
+fn tenant_settings_cannot_reach_other_files_or_names() {
+	let yaml = format!(
+		"{BASE}{}{}",
+		gw("  - {name: http, port: 80, protocol: HTTP}"),
+		r#"
+---
+apiVersion: rproxy.max3584.net/v1alpha1
+kind: RproxyRule
+metadata: {name: steal, namespace: default}
+spec:
+  parentRef: {name: gw}
+  rule:
+    protocol: tcp
+    listen_addr: 0.0.0.0
+    listen_port: 8443
+    targets: [{addr: 10.0.0.1, port: 443}]
+    tls: {mode: terminate, certificates: [{cert_file: /var/run/rproxy-gateway/certs/0123456789abcdef.crt, key_file: /var/run/rproxy-gateway/certs/0123456789abcdef.key}]}
+---
+apiVersion: rproxy.max3584.net/v1alpha1
+kind: RproxyRule
+metadata: {name: plain, namespace: default}
+spec:
+  parentRef: {name: gw}
+  rule: {protocol: tcp, listen_addr: 0.0.0.0, listen_port: 9000, targets: [{addr: 10.0.0.1, port: 9000}]}
+---
+apiVersion: rproxy.max3584.net/v1alpha1
+kind: RproxyMiddleware
+metadata: {name: auth, namespace: default}
+spec: {basic_auth: {users_file: /etc/shadow}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: outside, namespace: default}
+spec: {type: ExternalName, externalName: kubernetes.default.svc.cluster.local, ports: [{port: 443}]}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: mw, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  rules:
+    - matches: [{path: {value: /mw}}]
+      filters: [{type: ExtensionRef, extensionRef: {group: rproxy.max3584.net, kind: RproxyMiddleware, name: auth}}]
+      backendRefs: [{name: web, port: 80}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: ext, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  rules: [{backendRefs: [{name: outside, port: 443}]}]
+"#
+	);
+	let p = plan(&yaml);
+	let raw = |n: &str| p.raw_status.iter().find(|s| s.name == n).unwrap().clone();
+	assert_eq!(cond(&raw("steal").conds, "Accepted").reason, "Invalid", "another Gateway's key");
+	assert!(p.raw.iter().all(|r| r["listen_port"] != 8443));
+	assert!(p.raw.iter().any(|r| r["listen_port"] == 9000));
+	let mw = p.parents.iter().find(|x| x.name == "mw").unwrap();
+	assert_eq!(cond(&mw.conds, "Accepted").reason, "UnsupportedValue", "a middleware naming /etc/shadow");
+	let ext = p.parents.iter().find(|x| x.name == "ext").unwrap();
+	assert!(!cond(&ext.conds, "ResolvedRefs").status, "ExternalName is off by default");
+	assert!(!serde_json::to_string(&p.rules_json()).unwrap().contains("kubernetes.default"));
+	// allowed by the controller's setting
+	let mut w = world(&yaml);
+	w.allow_external_name = true;
+	let p2 = render_gateway(&w, &w.gateways[0], &Options::default());
+	assert!(serde_json::to_string(&p2.rules_json()).unwrap().contains("kubernetes.default"));
+	// fleet mode: RproxyRules off
+	let w = world(&yaml);
+	let p3 = render_gateway(&w, &w.gateways[0], &Options { raw_rules: false, ..Default::default() });
+	assert!(p3.raw.is_empty());
+	assert!(p3.raw_status.iter().all(|s| cond(&s.conds, "Accepted").reason == "NotAllowed"));
+}
+
+#[test]
+fn cross_namespace_secrets_can_be_turned_off() {
+	let (crt, key) = crate::pem::tests::pair("example.com");
+	let yaml = format!(
+		"{BASE}\n---\napiVersion: v1\nkind: Secret\nmetadata: {{name: cert, namespace: other}}\nstringData:\n  tls.crt: |\n{}\n  tls.key: |\n{}\n---\napiVersion: gateway.networking.k8s.io/v1beta1\nkind: ReferenceGrant\nmetadata: {{name: g, namespace: other}}\nspec:\n  from: [{{group: gateway.networking.k8s.io, kind: Gateway, namespace: default}}]\n  to: [{{group: \"\", kind: Secret}}]\n{}",
+		indent(&crt),
+		indent(&key),
+		gw("  - {name: https, port: 443, protocol: HTTPS, tls: {certificateRefs: [{name: cert, namespace: other}]}}")
+	);
+	let w = world(&yaml);
+	let on = render_gateway(&w, &w.gateways[0], &Options::default());
+	assert!(cond(&on.listeners[0].conds, "ResolvedRefs").status);
+	let off = render_gateway(&w, &w.gateways[0], &Options { cross_namespace_secrets: false, ..Default::default() });
+	assert_eq!(cond(&off.listeners[0].conds, "ResolvedRefs").reason, "RefNotPermitted");
+	assert!(off.files.is_empty(), "no key copied");
 }

@@ -29,11 +29,11 @@ Gateway API / CRD ──watch──▶ rproxy-gateway ──PUT /rulesets/k8s/<n
 | mode | rproxy | アドレス（Gateway の `status.addresses`） |
 |---|---|---|
 | `managed`（既定） | コントローラが Gateway の namespace に、Gateway ごとの Deployment・Service・ServiceAccount（`rproxy-<id>`、Service の型は `--service-type`、既定 `LoadBalancer`）と Secret（証明書 `rproxy-<id>-certs`、制御 API `rproxy-<id>-api`）を作る。どれも Gateway が持ち主（`ownerReferences`）で、Gateway が消えれば消える | `spec.addresses` があればそれ、なければ Service のロードバランサのアドレス（`ClusterIP` 型なら ClusterIP） |
-| `fleet` | 先に置いた rproxy の Pod（chart の `hostNetwork: true` の DaemonSet など、`--fleet-selector`）がすべての Gateway を受け持つ。コントローラはすべての Pod に同じセットを PUT する | `--fleet-address`、なければ Pod のノードの IP |
+| `fleet`（1 つの信頼の範囲のため。[SECURITY.md](SECURITY.md)） | 先に置いた rproxy の Pod（chart の `hostNetwork: true` の DaemonSet など、`--fleet-selector`）がすべての Gateway を受け持つ。コントローラはすべての Pod に同じセットを PUT する | `--fleet-address`、なければ Pod のノードの IP |
 
 - `<id>` は `<namespace>-<name>`（40 文字まで）とハッシュ 6 桁。
 - managed で作るものには、Gateway の `spec.infrastructure` の `labels`・`annotations`（Pod にも）と、`gateway.networking.k8s.io/gateway-name` のラベルを付ける（コントローラのラベルが優先。Pod を選ぶのに使う）。`spec.infrastructure.parametersRef` はどの種類も扱わないので、付けた Gateway は `Accepted: False`（`InvalidParameters`）。
-- `spec.addresses`：`IPAddress` だけ（ほかの型は `Accepted: False`、`UnsupportedAddress`）。managed では Service の `externalIPs` にする（kube-proxy がその IP への通信を rproxy に送る）。値のない項目は Service のアドレスのまま。unspecified・loopback・link-local・multicast の IP や、クラスタが Service に付けられない IP は `Programmed: False`（`AddressNotUsable`）。fleet では fleet のアドレス（`--fleet-address` かノードの IP）のどれかでなければ `AddressNotUsable`。
+- `spec.addresses`：`IPAddress` だけ（ほかの型は `Accepted: False`、`UnsupportedAddress`）。managed では Service の `externalIPs` にする（既定では使えない：`--address-cidr` の範囲だけで、ほかの Service の IP は取れない。[SECURITY.md](SECURITY.md)）（kube-proxy がその IP への通信を rproxy に送る）。値のない項目は Service のアドレスのまま。unspecified・loopback・link-local・multicast の IP や、クラスタが Service に付けられない IP は `Programmed: False`（`AddressNotUsable`）。fleet では fleet のアドレス（`--fleet-address` かノードの IP）のどれかでなければ `AddressNotUsable`。
 - managed の Pod は非 root（65532）で、1024 未満のポートは `net.ipv4.ip_unprivileged_port_start=0`（namespace ごとの安全な sysctl）で受ける。
 - fleet で同じポートを 2 つの Gateway が使うと、後から来たほうのルールは rproxy が `409 already_exists` で断り、リスナーの `Programmed` が `False` になる。
 
@@ -58,7 +58,7 @@ rproxy は `RPROXY_API_ADDR=0.0.0.0`、`RPROXY_API_PORT=9443`、`RPROXY_TOKEN_FI
 - コントローラは Gateway ごとの証明書を 1 つの Secret（`rproxy-<id>-certs`）にまとめ、kubelet がそれを rproxy の Pod に Secret のボリューム（`/var/run/rproxy-gateway/certs`、読むだけ、モード 0440）としてつなぐ。fleet では、すべての Gateway の証明書を 1 つの Secret（`rproxy-fleet-certs`）にまとめ、DaemonSet の Pod につなぐ（Secret は 1 MiB まで）。
 - rproxy の Pod は Kubernetes の API を使わない：ServiceAccount のトークンをつながず（`automountServiceAccountToken: false`）、RBAC もない。参照された証明書だけが、コントローラの書いた Secret を通して Pod に届く。同じ namespace のほかの Secret（CA の鍵、コントローラのトークン、ほかの Gateway の証明書）は読めない。
 - Secret を書き換えたら、コントローラは Pod に注釈（`rproxy.max3584.net/certs`、中身のハッシュ）を付ける。kubelet は Pod の更新を受けてボリュームをすぐに更新する（注釈がなくても、kubelet の定期の同期（1 分ほど）で更新される）。
-- 同じ Pod の `certsync`（このイメージの `rproxy-gateway certsync`）は、そのディレクトリのファイル名を `GET /files` で返すだけ（API は使わない）。コントローラは PUT の前にファイルが揃ったかを確かめる（揃うまで `Programmed: False`、理由 `Pending`）。
+- 同じ Pod の `certsync`（このイメージの `rproxy-gateway certsync`）は、コントローラが送った名前（中身のハッシュ）のうちそのディレクトリにあるものを `POST /files` で返すだけ（一覧は返さない。API は使わない。Pod の IP で待ち受ける）。コントローラは PUT の前にファイルが揃ったかを確かめる（揃うまで `Programmed: False`、理由 `Pending`）。
 - どのルールも使わなくなったファイルは、5 分 Secret に残してから外す（古いルールが読み直しても困らないように）。
 
 ### 選ばなかった形
@@ -86,7 +86,7 @@ rproxy は `RPROXY_API_ADDR=0.0.0.0`、`RPROXY_API_PORT=9443`、`RPROXY_TOKEN_FI
 | HTTPRoute の `matches` | `match` の式：`Host`（`*.example.com` は `**.example.com`）、`Path`（Exact）、`Path(p) \|\| PathPrefix(p/)`（PathPrefix、区切りの `/` で合わせる）、`PathRegexp(^(?:re)$)`、`Method`、`Header` / `HeaderRegexp`、`Query` / `QueryRegexp` |
 | ルールの優先 | Gateway API の順（ホスト名の具体さ → Exact → 長い PathPrefix → method → ヘッダの数 → クエリの数 → 古いルート → namespace/name → 書いた順）を `priority` に直す |
 | 同じポートの、より具体的なホスト名のリスナー | ワイルドカード・ホスト名なしのリスナーのルートに `!Host(...)` を足して、そのホスト名を取らない（リスナーの分離） |
-| `backendRefs` | Service の EndpointSlice の ready な Pod の IP（ClusterIP ではない）を `servers` に。`weight` は Pod の数で割って配る。ExternalName は名前のまま |
+| `backendRefs` | Service の EndpointSlice の ready な Pod の IP（ClusterIP ではない）を `servers` に。`weight` は Pod の数で割って配る。ExternalName は名前のまま（既定では使えない：`--allow-external-name-services`） |
 | 使える backend がない | `respond`（500） |
 | 一部の backendRef が無効 | その backendRef の重みの分だけ rproxy が 500 で答える（`servers[]` の `status: 500`） |
 | backend の Service のポートの `appProtocol: kubernetes.io/h2c` | サービスの `protocol: h2c`（転送先と前置きからの HTTP/2） |

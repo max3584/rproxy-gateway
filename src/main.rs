@@ -57,6 +57,9 @@ struct ControllerArgs {
 	/// managed: the type of each Gateway's Service.
 	#[arg(long, env = "RPROXY_GATEWAY_SERVICE_TYPE", default_value = "LoadBalancer")]
 	service_type: String,
+	/// managed: make a NetworkPolicy per Gateway so only the controller reaches rproxy's control API and certsync.
+	#[arg(long, env = "RPROXY_GATEWAY_NETWORK_POLICY", default_value_t = true, action = clap::ArgAction::Set)]
+	network_policy: bool,
 	/// managed: imagePullPolicy of rproxy pods.
 	#[arg(long, env = "RPROXY_GATEWAY_IMAGE_PULL_POLICY", default_value = "IfNotPresent")]
 	image_pull_policy: String,
@@ -75,6 +78,28 @@ struct ControllerArgs {
 	/// Where `/healthz` is answered.
 	#[arg(long, env = "RPROXY_GATEWAY_HEALTH_ADDR", default_value = "0.0.0.0:8081")]
 	health_addr: SocketAddr,
+	/// IP ranges Gateways' `spec.addresses` may take (managed mode: the Service's
+	/// `externalIPs`). Empty: static addresses are off. Never include the Service or pod ranges.
+	#[arg(long, env = "RPROXY_GATEWAY_ADDRESS_CIDR", value_delimiter = ',')]
+	address_cidr: Vec<rproxy_gateway::render::Cidr>,
+	/// Let ExternalName Services be backends (they can name anything: the API server, other namespaces).
+	#[arg(long, env = "RPROXY_GATEWAY_ALLOW_EXTERNAL_NAME_SERVICES")]
+	allow_external_name_services: bool,
+	/// Annotation prefixes of `spec.infrastructure.annotations` let onto the Service even if
+	/// they steer addresses or load balancers (`metallb.universe.tf/`, `service.beta.kubernetes.io/`, ...).
+	#[arg(long, env = "RPROXY_GATEWAY_SERVICE_ANNOTATION_PREFIX", value_delimiter = ',')]
+	service_annotation_prefix: Vec<String>,
+	/// Watch only these namespaces (and the controller's own); empty: all. With a list, the chart
+	/// gives the controller Roles in those namespaces instead of a ClusterRole for namespaced objects.
+	#[arg(long, env = "RPROXY_GATEWAY_WATCH_NAMESPACES", value_delimiter = ',')]
+	watch_namespaces: Vec<String>,
+	/// Let certificateRefs (and the backend client certificate) name Secrets of other namespaces when
+	/// a ReferenceGrant allows it. Managed mode copies those keys into the Gateway's namespace.
+	#[arg(long, env = "RPROXY_GATEWAY_CROSS_NAMESPACE_SECRETS", default_value_t = true, action = clap::ArgAction::Set)]
+	cross_namespace_secrets: bool,
+	/// fleet: read RproxyRules (off by default: fleet pods are shared by every Gateway).
+	#[arg(long, env = "RPROXY_GATEWAY_FLEET_RPROXY_RULES")]
+	fleet_rproxy_rules: bool,
 	/// Leader election: run several replicas, one of which acts (a Lease in the controller's namespace).
 	#[arg(long, env = "RPROXY_GATEWAY_LEADER_ELECT", default_value_t = true, action = clap::ArgAction::Set)]
 	leader_elect: bool,
@@ -97,6 +122,10 @@ struct MigrationArgs {
 	/// The Ingress class read.
 	#[arg(long, env = "RPROXY_GATEWAY_INGRESS_CLASS", default_value = "rproxy")]
 	ingress_class: String,
+	/// Let Ingress and Traefik objects refer to services, middlewares and TLS options in other
+	/// namespaces without a ReferenceGrant (Traefik's `allowCrossNamespace`; off by default).
+	#[arg(long, env = "RPROXY_GATEWAY_MIGRATION_ALLOW_CROSS_NAMESPACE")]
+	migration_allow_cross_namespace: bool,
 	/// Traefik entry points: `name=port[/udp]` (default `web=80`, `websecure=443`).
 	#[arg(long = "traefik-entrypoint", env = "RPROXY_GATEWAY_TRAEFIK_ENTRYPOINTS", value_delimiter = ',')]
 	traefik_entrypoints: Vec<String>,
@@ -115,6 +144,7 @@ impl MigrationArgs {
 			gateway: (ns.to_string(), name.to_string()),
 			entry_points,
 			ingress_class: self.ingress_class.clone(),
+			allow_cross_namespace: self.migration_allow_cross_namespace,
 		}))
 	}
 }
@@ -202,6 +232,7 @@ fn main() -> anyhow::Result<()> {
 					replicas: a.replicas,
 					service_type: a.service_type,
 					pull_policy: a.image_pull_policy,
+					network_policy: a.network_policy.then(|| a.namespace.clone()),
 				}),
 			};
 			let cfg = controller::Config {
@@ -212,6 +243,12 @@ fn main() -> anyhow::Result<()> {
 				resync: Duration::from_secs(a.resync_secs.max(5)),
 				health: a.health_addr,
 				migration: a.migration.settings()?,
+				address_cidrs: a.address_cidr.clone(),
+				allow_external_name: a.allow_external_name_services,
+				service_annotations: a.service_annotation_prefix.clone(),
+				fleet_rproxy_rules: a.fleet_rproxy_rules,
+				cross_namespace_secrets: a.cross_namespace_secrets,
+				watch_namespaces: a.watch_namespaces.clone(),
 				leader: a.leader_elect.then(|| {
 					let identity = a
 						.leader_identity

@@ -26,6 +26,9 @@ pub fn server_name_for(target: &str) -> String {
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The most an answer body may hold (rule sets of a Gateway are far smaller).
+const BODY_LIMIT: usize = 8 << 20;
+
 /// How to reach rproxy pods.
 #[derive(Clone)]
 pub struct Client {
@@ -135,7 +138,12 @@ impl Client {
 			};
 			let status = resp.status();
 			let headers = resp.headers().clone();
-			let body = resp.into_body().collect().await?.to_bytes();
+			// a pod is not trusted to bound what it sends
+			let body = http_body_util::Limited::new(resp.into_body(), BODY_LIMIT)
+				.collect()
+				.await
+				.map_err(|e| anyhow!("{addr}: answer: {e}"))?
+				.to_bytes();
 			anyhow::Ok((status, headers, body))
 		};
 		tokio::time::timeout(TIMEOUT, fut).await.map_err(|_| anyhow!("{addr}: timed out"))?

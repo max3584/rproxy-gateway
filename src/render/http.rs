@@ -35,6 +35,8 @@ pub struct Ctx<'a> {
 	pub grpc: bool,
 	/// The BackendTLSPolicies (TLS to backends).
 	pub backend_tls: Option<&'a crate::render::backend_tls::Index>,
+	/// (certificate directory, the Gateway's files): the only files RproxyMiddlewares may name.
+	pub files: Option<(&'a str, &'a std::collections::BTreeSet<String>)>,
 }
 
 /// One rproxy route before priorities are given.
@@ -423,7 +425,15 @@ fn filter(ctx: &Ctx, ns: &str, f: &HttpRouteFilter, m: &HttpRouteMatch, base: &s
 				return Err(format!("ExtensionRef {}/{} is not supported (RproxyMiddleware only)", r.group, r.kind));
 			}
 			match ctx.world.middlewares.get(&(ns.to_string(), r.name.clone())) {
-				Some(mw) => vec![Value::Object(mw.spec.0.0.clone())],
+				Some(mw) => {
+					let v = Value::Object(mw.spec.0.0.clone());
+					if let Some((dir, names)) = ctx.files {
+						if let Some(path) = crate::render::foreign_file(&v, dir, names) {
+							return Err(format!("RproxyMiddleware {}: {path}: only this Gateway's certificate files may be named", r.name));
+						}
+					}
+					vec![v]
+				}
 				None => return Ok(Filtered::Missing),
 			}
 		}
@@ -767,7 +777,16 @@ mod tests {
 	fn redirects() {
 		let world = World::default();
 		let features = crate::render::Features::default();
-		let ctx = Ctx { world: &world, scheme: "http", port: 80, features: &features, kind: "HTTPRoute", grpc: false, backend_tls: None };
+		let ctx = Ctx {
+			world: &world,
+			scheme: "http",
+			port: 80,
+			features: &features,
+			kind: "HTTPRoute",
+			grpc: false,
+			backend_tls: None,
+			files: None,
+		};
 		let r = RequestRedirect { scheme: Some("https".into()), status_code: Some(301), ..Default::default() };
 		let v = redirect(&ctx, &r, &m(None)).unwrap();
 		assert_eq!(v[0]["redirect_regex"]["replacement"], "https://${1}${2}${3}");
@@ -777,8 +796,16 @@ mod tests {
 			path: Some(PathModifier { kind: "ReplacePrefixMatch".into(), replace_prefix_match: Some("/".into()), replace_full_path: None }),
 			..Default::default()
 		};
-		let ctx8080 =
-			Ctx { world: &world, scheme: "http", port: 8080, features: &features, kind: "HTTPRoute", grpc: false, backend_tls: None };
+		let ctx8080 = Ctx {
+			world: &world,
+			scheme: "http",
+			port: 8080,
+			features: &features,
+			kind: "HTTPRoute",
+			grpc: false,
+			backend_tls: None,
+			files: None,
+		};
 		let v = redirect(&ctx8080, &r, &m(Some(("PathPrefix", "/old/")))).unwrap();
 		assert_eq!(v.len(), 2);
 		assert_eq!(v[0]["redirect_regex"]["regex"], "^[a-z]+://([^/?]*?)(?::[0-9]+)?/old(/[^?]*)(\\?.*)?$");
@@ -789,7 +816,8 @@ mod tests {
 		assert_eq!(v[0]["redirect_regex"]["permanent"], false);
 		// an older rproxy: 301 and 302 only
 		let old = crate::render::Features { redirect_status: false, ..Default::default() };
-		let ctx_old = Ctx { world: &world, scheme: "http", port: 80, features: &old, kind: "HTTPRoute", grpc: false, backend_tls: None };
+		let ctx_old =
+			Ctx { world: &world, scheme: "http", port: 80, features: &old, kind: "HTTPRoute", grpc: false, backend_tls: None, files: None };
 		let e = redirect(&ctx_old, &RequestRedirect { status_code: Some(303), ..Default::default() }, &m(None)).unwrap_err();
 		assert!(e.contains("redirect_status"), "{e}");
 		let v = redirect(&ctx_old, &RequestRedirect { status_code: Some(301), ..Default::default() }, &m(None)).unwrap();
@@ -808,13 +836,23 @@ mod tests {
 		};
 		let world = World::default();
 		let features = crate::render::Features::default();
-		let ctx = Ctx { world: &world, scheme: "http", port: 80, features: &features, kind: "HTTPRoute", grpc: false, backend_tls: None };
+		let ctx = Ctx {
+			world: &world,
+			scheme: "http",
+			port: 80,
+			features: &features,
+			kind: "HTTPRoute",
+			grpc: false,
+			backend_tls: None,
+			files: None,
+		};
 		let v = rewrite(&ctx, &f, &m(Some(("PathPrefix", "/old")))).unwrap();
 		assert_eq!(v, vec![json!({"replace_path_regex": {"regex": "^/old(/.*)?$", "replacement": "/new${1}"}})]);
 		let host = crate::k8s::gateway::UrlRewrite { hostname: Some("one.example.org".into()), path: None };
 		assert_eq!(rewrite(&ctx, &host, &m(None)).unwrap(), vec![json!({"replace_host": {"host": "one.example.org"}})]);
 		let old = crate::render::Features { replace_host: false, ..Default::default() };
-		let ctx_old = Ctx { world: &world, scheme: "http", port: 80, features: &old, kind: "HTTPRoute", grpc: false, backend_tls: None };
+		let ctx_old =
+			Ctx { world: &world, scheme: "http", port: 80, features: &old, kind: "HTTPRoute", grpc: false, backend_tls: None, files: None };
 		assert!(rewrite(&ctx_old, &host, &m(None)).is_err());
 		assert_eq!(regex_escape("/a.b$"), "/a\\.b\\$");
 	}

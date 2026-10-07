@@ -15,7 +15,9 @@ mkdir -p "$work"
 
 # the experimental channel: some claimed features are experimental fields (HTTPRouteRule.retry);
 # with the standard CRDs the API server drops them
-SETUP_ONLY=1 GATEWAY_API_CHANNEL=${GATEWAY_API_CHANNEL:-experimental} scripts/e2e.sh
+# GatewayStaticAddresses: the usable address's range is allowed (static addresses are off by default)
+SETUP_ONLY=1 GATEWAY_API_CHANNEL=${GATEWAY_API_CHANNEL:-experimental} \
+  HELM_ARGS="--set managed.addressCIDRs={${ADDRESS_CIDR:-192.0.2.0/24}}" scripts/e2e.sh
 
 if [ ! -d "$work/gateway-api" ]; then
   git clone -q --depth 1 --branch "$GATEWAY_API_VERSION" https://github.com/kubernetes-sigs/gateway-api.git "$work/gateway-api"

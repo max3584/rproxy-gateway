@@ -50,12 +50,15 @@ svc_cidr=$(kubectl get svc kubernetes -o jsonpath='{.spec.clusterIP}' | awk -F. 
 sudo ip route replace "$svc_cidr" via "$node_ip"
 
 echo "== install"
+# HELM_ARGS: more helm flags, split on spaces
+# shellcheck disable=SC2086
 helm upgrade --install rproxy-gateway charts/rproxy-gateway -n $NS --create-namespace --wait \
   --set controller.image.repository=rproxy-gateway --set controller.image.tag=e2e --set controller.image.pullPolicy=Never \
   --set rproxy.image.repository=rproxy --set rproxy.image.tag=e2e --set rproxy.image.pullPolicy=Never \
   --set managed.serviceType=ClusterIP --set controller.logFormat=text --set controller.resyncSeconds=10 \
   ${MIGRATE:+--set migration.migrateTo=$MIGRATE} \
-  ${CONTROLLER_ARGS:+--set "controller.extraArgs={$CONTROLLER_ARGS}"}
+  ${CONTROLLER_ARGS:+--set "controller.extraArgs={$CONTROLLER_ARGS}"} \
+  ${HELM_ARGS:-}
 kubectl wait --for=condition=Accepted gatewayclass/rproxy --timeout=120s
 # installed after the controller: it finds them without a restart (discovery every 30 s)
 kubectl apply --server-side -f "$TRAEFIK_CRDS" > /dev/null
@@ -117,9 +120,42 @@ if [ -n "${MIGRATE:-}" ]; then
   echo "== migration (Ingress, IngressRoute)"
   retry 60 sh -c "curl -sf -H 'Host: ingress.example.com' http://$addr/i | jq -e '.path == \"/i\"' > /dev/null"
   retry 90 sh -c "curl -sf -H 'Host: traefik.example.com' http://$addr/traefik/t | jq -e '.path == \"/t\"' > /dev/null"
+  echo "== migration: no reference to another namespace without a ReferenceGrant (H2)"
+  sleep 5
+  test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: cross.example.com' "http://$addr/")" = 404
   echo "== migration: Ingress status"
   retry 60 sh -c "test \"\$(kubectl -n e2e get ingress -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}')\" = $addr"
 fi
+
+echo "== security: static addresses off, tenant files, certsync, NetworkPolicy (H3, H4, L20)"
+dns_ip=$(kubectl -n kube-system get svc kube-dns -o jsonpath='{.spec.clusterIP}')
+cat <<YAML | kubectl apply -f - > /dev/null
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {name: steal-dns, namespace: e2e}
+spec:
+  gatewayClassName: rproxy
+  addresses: [{type: IPAddress, value: "$dns_ip"}]
+  listeners: [{name: dns, port: 53, protocol: UDP}]
+---
+apiVersion: rproxy.max3584.net/v1alpha1
+kind: RproxyRule
+metadata: {name: steal-key, namespace: e2e}
+spec:
+  parentRef: {name: e2e}
+  rule:
+    protocol: tcp
+    listen_addr: 0.0.0.0
+    listen_port: 9443
+    targets: [{addr: 127.0.0.1, port: 1}]
+    tls: {mode: terminate, certificates: [{cert_file: /var/run/rproxy-gateway/certs/0000000000000000.crt, key_file: /var/run/rproxy-gateway/certs/0000000000000000.key}]}
+YAML
+retry 60 sh -c "test \"\$(kubectl -n e2e get gateway steal-dns -o jsonpath='{.status.conditions[?(@.type==\"Programmed\")].reason}')\" = AddressNotUsable"
+test -z "$(kubectl -n e2e get svc -l gateway.networking.k8s.io/gateway-name=steal-dns -o jsonpath='{.items[*].spec.externalIPs}')"
+retry 60 sh -c "test \"\$(kubectl -n e2e get rproxyrule steal-key -o jsonpath='{.status.conditions[?(@.type==\"Accepted\")].reason}')\" = Invalid"
+kubectl -n e2e delete gateway steal-dns > /dev/null
+kubectl -n e2e delete rproxyrule steal-key > /dev/null
+test "$(kubectl -n e2e get networkpolicy -l gateway.networking.k8s.io/gateway-name=e2e -o name | wc -l)" = 1
 
 echo "== rproxy restart: the controller applies the rule set again"
 kubectl -n e2e delete pod -l app.kubernetes.io/name=rproxy --wait=true > /dev/null
