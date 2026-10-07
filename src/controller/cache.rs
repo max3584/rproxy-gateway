@@ -265,7 +265,7 @@ async fn discover(client: &kube::Client) -> anyhow::Result<Vec<(String, String, 
 					out.push((g.to_string(), ar.kind.clone(), ar));
 				}
 			}
-			Err(e) => info!(group = g, error = %e, "API group not served"),
+			Err(e) => tracing::debug!(group = g, error = %e, "API group not served"),
 		}
 	}
 	Ok(out)

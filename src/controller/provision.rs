@@ -83,13 +83,15 @@ pub struct Fleet {
 	pub addresses: Vec<String>,
 }
 
-/// A short, DNS-safe id of a Gateway: `<namespace>-<name>` (cut) and a hash.
-pub fn gateway_id(ns: &str, name: &str) -> String {
+/// A short, DNS-safe id of a Gateway: `<namespace>-<name>` (cut) and a hash of
+/// them and the Gateway's uid (a Gateway created again under the same name gets
+/// new objects, not the old ones its predecessor's deletion is removing).
+pub fn gateway_id(ns: &str, name: &str, uid: &str) -> String {
 	let mut base: String =
 		format!("{ns}-{name}").chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' }).collect();
 	base.truncate(40);
 	let base = base.trim_matches('-').to_string();
-	format!("{base}-{}", &crate::pem::short_hash(format!("{ns}/{name}").as_bytes())[..6])
+	format!("{base}-{}", &crate::pem::short_hash(format!("{ns}/{name}/{uid}").as_bytes())[..6])
 }
 
 /// The labels selecting a Gateway's rproxy pods.
@@ -133,7 +135,7 @@ impl<'a> Target<'a> {
 	pub fn new(plan: &'a GatewayPlan) -> Target<'a> {
 		Target {
 			plan,
-			id: gateway_id(&plan.namespace, &plan.name),
+			id: gateway_id(&plan.namespace, &plan.name, &plan.uid),
 			owner: None,
 			labels: BTreeMap::new(),
 			annotations: BTreeMap::new(),
@@ -636,11 +638,12 @@ mod tests {
 
 	#[test]
 	fn ids_are_short_and_stable() {
-		let id = gateway_id("default", "web");
+		let id = gateway_id("default", "web", "u1");
 		assert!(id.starts_with("default-web-"), "{id}");
-		assert_eq!(id, gateway_id("default", "web"));
-		assert_ne!(id, gateway_id("default-web", ""));
-		assert!(gateway_id(&"n".repeat(63), &"g".repeat(253)).len() <= 47);
+		assert_eq!(id, gateway_id("default", "web", "u1"));
+		assert_ne!(id, gateway_id("default-web", "", "u1"));
+		assert_ne!(id, gateway_id("default", "web", "u2"), "created again: new objects");
+		assert!(gateway_id(&"n".repeat(63), &"g".repeat(253), "u").len() <= 47);
 	}
 
 	#[test]

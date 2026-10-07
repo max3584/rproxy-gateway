@@ -294,7 +294,7 @@ async fn reconcile_all(
 		let (ns, name) = (gw.metadata.namespace.clone().unwrap_or_default(), gw.metadata.name.clone().unwrap_or_default());
 		let eps = match &cfg.mode {
 			Mode::Managed(_) => {
-				let id = provision::gateway_id(&ns, &name);
+				let id = provision::gateway_id(&ns, &name, gw.metadata.uid.as_deref().unwrap_or_default());
 				provision::pods(&pods_now, &ns, &[(provision::LABEL_GATEWAY.to_string(), id)].into())
 			}
 			Mode::Fleet(f) => provision::pods(&pods_now, &cfg.namespace, &provision::parse_selector(&f.selector)),
@@ -351,7 +351,7 @@ async fn reconcile_all(
 				}
 			}
 		}
-		let id = provision::gateway_id(&plan.namespace, &plan.name);
+		let id = provision::gateway_id(&plan.namespace, &plan.name, &plan.uid);
 		let absent_key = format!("{}/{}", plan.namespace, provision::certs_secret_name(&id));
 		let applied: Applied =
 			state.applied.iter().filter(|((_, set), _)| *set == plan.ruleset).map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -364,7 +364,7 @@ async fn reconcile_all(
 		state.applied.retain(|(_, set), _| *set != out.plan.ruleset);
 		state.applied.extend(out.sub.applied);
 		state.caps.extend(out.sub.caps);
-		let id = provision::gateway_id(&out.plan.namespace, &out.plan.name);
+		let id = provision::gateway_id(&out.plan.namespace, &out.plan.name, &out.plan.uid);
 		state.absent.insert(format!("{}/{}", out.plan.namespace, provision::certs_secret_name(&id)), out.sub.absent);
 		if cfg.migration.as_ref().is_some_and(|m| m.gateway == (out.plan.namespace.clone(), out.plan.name.clone())) {
 			migration_addresses = Some(out.addresses.clone());
@@ -527,7 +527,7 @@ struct GatewayOut {
 async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan: GatewayPlan, mut sub: Sub) -> GatewayOut {
 	let mut soon = false;
 	let mut keep_id = None;
-	let id = provision::gateway_id(&plan.namespace, &plan.name);
+	let id = provision::gateway_id(&plan.namespace, &plan.name, &plan.uid);
 	let infra = gw.spec.infrastructure.clone().unwrap_or_default();
 	let (addresses, endpoints) = match &p.cfg.mode {
 		// not accepted (an unsupported address type, parametersRef): nothing is deployed

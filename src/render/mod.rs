@@ -203,6 +203,8 @@ pub struct ListenerSetPlan {
 pub struct GatewayPlan {
 	pub namespace: String,
 	pub name: String,
+	/// The Gateway's uid.
+	pub uid: String,
 	pub generation: i64,
 	/// `k8s/<namespace>/<name>`
 	pub ruleset: String,
@@ -824,6 +826,7 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 	let mut plan = GatewayPlan {
 		namespace: gw_ns.clone(),
 		name: gw_name.clone(),
+		uid: gw.metadata.uid.clone().unwrap_or_default(),
 		generation: gw.metadata.generation.unwrap_or(0),
 		ruleset: ruleset_name(&gw_ns, &gw_name),
 		..Default::default()
