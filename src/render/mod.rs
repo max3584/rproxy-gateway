@@ -235,6 +235,8 @@ pub struct GatewayPlan {
 	pub address_error: Option<String>,
 	/// The ListenerSets naming this Gateway (attached or not).
 	pub listener_sets: Vec<ListenerSetPlan>,
+	/// Why traffic does not reach rproxy yet though it is applied (`Programmed: False`, `Pending`).
+	pub serving_pending: Option<String>,
 	/// `status.attachedListenerSets`.
 	pub attached_listener_sets: i32,
 	/// BackendTLSPolicy status for this Gateway (the policies of the backends its routes send to).

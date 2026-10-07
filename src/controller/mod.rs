@@ -115,6 +115,8 @@ pub struct State {
 	pub applied: Applied,
 	/// rproxy's capabilities by pod uid.
 	pub caps: HashMap<String, Capabilities>,
+	/// Gateway id → since when its Service has had ready endpoints.
+	pub ready_since: HashMap<String, std::time::Instant>,
 	/// Certificate Secret → files no rule needs any more, since when (`provision::with_linger`).
 	pub absent: HashMap<String, BTreeMap<String, std::time::Instant>>,
 }
@@ -356,7 +358,12 @@ async fn reconcile_all(
 		let absent_key = format!("{}/{}", plan.namespace, provision::certs_secret_name(&id));
 		let applied: Applied =
 			state.applied.iter().filter(|((_, set), _)| *set == plan.ruleset).map(|(k, v)| (k.clone(), v.clone())).collect();
-		let sub = Sub { applied, caps: state.caps.clone(), absent: state.absent.remove(&absent_key).unwrap_or_default() };
+		let sub = Sub {
+			applied,
+			caps: state.caps.clone(),
+			absent: state.absent.remove(&absent_key).unwrap_or_default(),
+			ready_since: state.ready_since.get(&id).copied(),
+		};
 		jobs.push(gateway_pass(&pass, gw, plan, sub));
 	}
 	let outs: Vec<GatewayOut> = futures::stream::iter(jobs).buffer_unordered(PARALLEL).collect().await;
@@ -367,6 +374,10 @@ async fn reconcile_all(
 		state.caps.extend(out.sub.caps);
 		let id = provision::gateway_id(&out.plan.namespace, &out.plan.name, &out.plan.uid);
 		state.absent.insert(format!("{}/{}", out.plan.namespace, provision::certs_secret_name(&id)), out.sub.absent);
+		match out.sub.ready_since {
+			Some(t) => state.ready_since.insert(id.clone(), t),
+			None => state.ready_since.remove(&id),
+		};
 		if cfg.migration.as_ref().is_some_and(|m| m.gateway == (out.plan.namespace.clone(), out.plan.name.clone())) {
 			migration_addresses = Some(out.addresses.clone());
 		}
@@ -512,9 +523,15 @@ struct Sub {
 	applied: Applied,
 	caps: HashMap<String, Capabilities>,
 	absent: BTreeMap<String, std::time::Instant>,
+	/// Since when the Gateway's Service has had ready endpoints.
+	ready_since: Option<std::time::Instant>,
 }
 
-/// What one Gateway's pass gives back.
+/// How long a Gateway's Service must have had ready endpoints before the Gateway is
+/// `Programmed`: kube-proxy (or what stands in for it) programs a new Service's
+/// endpoints a little after they appear, and a client connecting before that can
+/// get stuck (its first SYN leaves a conntrack entry without the Service's NAT).
+const SERVICE_SETTLE: Duration = Duration::from_secs(3);
 struct GatewayOut {
 	plan: GatewayPlan,
 	results: Vec<PodSync>,
@@ -566,6 +583,20 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 					None
 				}
 			};
+			// traffic reaches the pods once the Service's endpoints are programmed on the nodes
+			let svc_key = (plan.namespace.clone(), provision::object_name(&id));
+			let ready = p
+				.world
+				.slices
+				.get(&svc_key)
+				.into_iter()
+				.flatten()
+				.any(|s| s.endpoints.iter().flatten().any(|e| e.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true)));
+			sub.ready_since = if ready { Some(sub.ready_since.unwrap_or_else(std::time::Instant::now)) } else { None };
+			if svc.is_some() && sub.ready_since.is_none_or(|t| t.elapsed() < SERVICE_SETTLE) {
+				plan.serving_pending = Some("waiting for the rproxy Service's endpoints to be ready on the nodes".into());
+				soon = true;
+			}
 			let addresses = match svc.as_ref() {
 				// the addresses asked for, once the Service has them
 				Some(_) if !plan.addresses.is_empty() && plan.address_error.is_none() => {
