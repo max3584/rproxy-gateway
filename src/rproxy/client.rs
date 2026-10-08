@@ -96,6 +96,20 @@ impl Client {
 		c
 	}
 
+	/// The client for one token and certificate name (the UI's token, to see if a pod takes it).
+	pub fn with_token(&self, token: &str, server_name: &str) -> Client {
+		let mut c = self.clone();
+		c.token = token.into();
+		c.server_name = server_name.into();
+		c
+	}
+
+	/// `GET /rules`: whether the token may read (`false` on 401 / 403).
+	pub async fn can_read(&self, addr: SocketAddr) -> anyhow::Result<bool> {
+		let (status, _, _) = self.send(addr, Method::GET, "/rules", &[], None).await?;
+		Ok(status.is_success())
+	}
+
 	async fn send(
 		&self,
 		addr: SocketAddr,

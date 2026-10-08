@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
 use crate::render::{self, GatewayPlan, RouteKind};
-use crate::rproxy::client::{ApiError, Client};
+use crate::rproxy::client::{ApiError, Client, server_name_for};
 use crate::rproxy::model::{Capabilities, RuleView};
 use provision::{Endpoint, Mode};
 use status::PodSync;
@@ -346,6 +346,9 @@ async fn reconcile_all(
 	}
 
 	let pods_now = cache.pods.state();
+	if cfg.ui.is_some() {
+		ui::forget(&pods_now.iter().filter_map(|p| p.metadata.uid.clone()).collect());
+	}
 	// rproxy restarted since its readiness gate was set: out of the endpoints until its sets are back
 	for pod in &pods_now {
 		if provision::gate_change(pod, None) == Some(false) {
@@ -517,9 +520,12 @@ async fn reconcile_all(
 			soon = true;
 		}
 		if shown {
-			// fleet pods read the token file at start: after the UI's token is added they need a rollout restart
-			// (docs/SECURITY.md); the ones not Ready or being deleted are not listed
+			// fleet pods take the UI's token once they read the token file again (rproxy v0.4.2; older rproxy
+			// at start only: a rollout restart, docs/SECURITY.md); the ones not Ready, being deleted or not
+			// taking it yet are not listed
 			let eps = provision::ui_pods(&pods_now, &cfg.namespace, &provision::parse_selector(&f.selector), None);
+			let eps =
+				ui::accepting(rp, &eps, &bootstrap::derive_ui_token(&boot.token, "fleet"), crate::rproxy::client::API_SERVER_NAME).await;
 			ui_groups.extend(ui::fleet_group(&boot.token, &eps));
 		}
 	}
@@ -772,6 +778,8 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 			t.service_annotations = p.cfg.service_annotations.clone();
 			t.params = plan.parameters.clone().unwrap_or_default();
 			t.graceful = graceful(p.rp, &t.rproxy_image(m), &eps, &mut sub.caps).await;
+			// rproxy v0.4.2 reads a changed token file again: the UI's token does not roll the pods
+			t.tokens_reload = image_feature(p.rp, &t.rproxy_image(m), "tokens_reload", &eps, &mut sub.caps).await;
 			// the UI reads it (its token in the token file, its pods through the NetworkPolicy)
 			t.ui = p.cfg.ui.clone().filter(|_| ui::visible(&plan));
 			t.owner = match (&p.gateway_api_version, &gw.metadata.uid) {
@@ -786,15 +794,12 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 			let svc = match applied {
 				Ok(a) => {
 					provision::touch_pods(p.client, &eps, &a.certs).await;
-					// the UI reads the pods that already have its token (the current control API Secret)
+					// the UI reads the pods that already have its token (the current control API Secret, and
+					// seen to take it)
 					if t.ui.is_some() {
-						ui_group = ui::managed_group(
-							&plan.namespace,
-							&plan.name,
-							&id,
-							&p.boot.token,
-							&provision::ui_pods(p.pods_now, &plan.namespace, &selector, Some(&a.api)),
-						);
+						let pods = provision::ui_pods(p.pods_now, &plan.namespace, &selector, Some(&a.api));
+						let pods = ui::accepting(p.rp, &pods, &bootstrap::derive_ui_token(&p.boot.token, &id), &server_name_for(&id)).await;
+						ui_group = ui::managed_group(&plan.namespace, &plan.name, &id, &p.boot.token, &pods);
 					}
 					keep_pdb = a.pdb;
 					a.service
@@ -802,13 +807,9 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 				Err(e) => {
 					// the Secrets were not written this pass: the UI keeps the pods that are Ready
 					if t.ui.is_some() {
-						ui_group = ui::managed_group(
-							&plan.namespace,
-							&plan.name,
-							&id,
-							&p.boot.token,
-							&provision::ui_pods(p.pods_now, &plan.namespace, &selector, None),
-						);
+						let pods = provision::ui_pods(p.pods_now, &plan.namespace, &selector, None);
+						let pods = ui::accepting(p.rp, &pods, &bootstrap::derive_ui_token(&p.boot.token, &id), &server_name_for(&id)).await;
+						ui_group = ui::managed_group(&plan.namespace, &plan.name, &id, &p.boot.token, &pods);
 					}
 					if plan.address_error.is_none() && !plan.addresses.is_empty() && format!("{e:#}").contains("externalIPs") {
 						// the cluster refuses the address (validation, an admission policy)
@@ -1132,28 +1133,40 @@ pub async fn sync_pod(
 	}
 }
 
-/// Images whose rproxy said it has a graceful shutdown (kept while the process runs: a Gateway whose
+/// (feature, image) whose rproxy said it has the feature (kept while the process runs: a Gateway whose
 /// pods all restart at once keeps its shape).
-static GRACEFUL_IMAGES: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
+static FEATURE_IMAGES: std::sync::Mutex<BTreeSet<(String, String)>> = std::sync::Mutex::new(BTreeSet::new());
 
-/// Whether `image` has a graceful shutdown (`features.graceful_shutdown`, rproxy v0.4.1): the image
-/// this controller ships, or one a pod running it said so of. Unknown (another image before its pods
-/// answer): no, the pods keep the preStop; they roll again once it is known.
-async fn graceful(rp: &Client, image: &str, eps: &[Endpoint], caps: &mut HashMap<String, Capabilities>) -> bool {
-	if image == provision::RPROXY_IMAGE || GRACEFUL_IMAGES.lock().unwrap().contains(image) {
+/// Features of the image this controller ships (`--rproxy-image`'s default, rproxy v0.4.2).
+const SHIPPED_FEATURES: &[&str] = &["graceful_shutdown", "tokens_reload"];
+
+/// Whether `image` has `feature` (rproxy's `features`): the image this controller ships, or one a pod
+/// running it said so of. Unknown (another image before its pods answer): no; the pods roll again
+/// once it is known.
+async fn image_feature(rp: &Client, image: &str, feature: &str, eps: &[Endpoint], caps: &mut HashMap<String, Capabilities>) -> bool {
+	if image == provision::RPROXY_IMAGE && SHIPPED_FEATURES.contains(&feature) {
+		return true;
+	}
+	let key = (feature.to_string(), image.to_string());
+	if FEATURE_IMAGES.lock().unwrap().contains(&key) {
 		return true;
 	}
 	let mine: Vec<Endpoint> = eps.iter().filter(|ep| ep.rproxy_image.as_deref() == Some(image)).cloned().collect();
 	pod_features(rp, &mine, caps).await;
-	let known = mine.iter().any(|ep| caps.get(&ep.uid).is_some_and(|c| c.feature("graceful_shutdown")));
+	let known = mine.iter().any(|ep| caps.get(&ep.uid).is_some_and(|c| c.feature(feature)));
 	if known {
-		info!(image, "rproxy has a graceful shutdown: RPROXY_SHUTDOWN_* instead of the preStop");
-		GRACEFUL_IMAGES.lock().unwrap().insert(image.to_string());
+		info!(image, feature, "rproxy has the feature");
+		FEATURE_IMAGES.lock().unwrap().insert(key);
 	}
 	known
 }
 
-/// The rproxy settings every pod in `eps` takes (asks the pods not asked yet).
+/// Whether `image` has a graceful shutdown (`features.graceful_shutdown`, rproxy v0.4.1): if not
+/// known, the pods keep the preStop.
+async fn graceful(rp: &Client, image: &str, eps: &[Endpoint], caps: &mut HashMap<String, Capabilities>) -> bool {
+	image_feature(rp, image, "graceful_shutdown", eps, caps).await
+}
+
 async fn pod_features(rp: &Client, eps: &[Endpoint], caps: &mut HashMap<String, Capabilities>) -> render::Features {
 	let mut out = render::Features::default();
 	for ep in eps {

@@ -24,6 +24,10 @@ struct Fake {
 	failing: BTreeSet<String>,
 	/// `features.graceful_shutdown` (rproxy v0.4.1)
 	graceful: bool,
+	/// `features.tokens_reload` (rproxy v0.4.2)
+	tokens_reload: bool,
+	/// Tokens that may read (`GET /rules`): the UI's
+	readers: BTreeSet<String>,
 }
 
 fn etag(generation: i64, rules: &[Value]) -> String {
@@ -49,6 +53,10 @@ async fn handle(fake: Arc<Mutex<Fake>>, req: Request<hyper::body::Incoming>) -> 
 	let auth = req.headers().get("authorization").and_then(|v| v.to_str().ok()).map(str::to_string);
 	let body = req.into_body().collect().await.unwrap().to_bytes();
 	let reply = |status: u16, v: Value| Response::builder().status(status).body(Full::new(Bytes::from(v.to_string()))).unwrap();
+	let reader = auth.as_deref().and_then(|a| a.strip_prefix("Bearer ")).is_some_and(|t| fake.lock().unwrap().readers.contains(t));
+	if method == hyper::Method::GET && path == "/rules" && reader {
+		return reply(200, json!({"rules": []}));
+	}
 	if path != "/readyz" && path != "/files" && auth.as_deref() != Some("Bearer secret") {
 		return reply(401, json!({"error": "unauthorized", "code": "unauthorized"}));
 	}
@@ -60,10 +68,10 @@ async fn handle(fake: Arc<Mutex<Fake>>, req: Request<hyper::body::Incoming>) -> 
 			reply(200, json!(asked.into_iter().filter(|n| f.files.contains(n)).collect::<Vec<_>>()))
 		}
 		("GET", "/capabilities") => {
-			let graceful = f.graceful;
+			let (graceful, reload) = (f.graceful, f.tokens_reload);
 			reply(
 				200,
-				json!({"version": "0.4.0", "features": {"rulesets": true, "labels": true, "conditions": true, "readyz": true, "graceful_shutdown": graceful}}),
+				json!({"version": "0.4.0", "features": {"rulesets": true, "labels": true, "conditions": true, "readyz": true, "graceful_shutdown": graceful, "tokens_reload": reload}}),
 			)
 		}
 		("GET", p) if p.starts_with("/rulesets/") => {
@@ -299,6 +307,54 @@ async fn graceful_shutdown_is_known_from_the_image_or_the_pods() {
 	assert!(!graceful(&rp, "example/rproxy:other", &pods, &mut caps).await, "only pods running the image count");
 	// remembered: every pod of the Gateway restarting at once does not roll it back to the preStop
 	assert!(graceful(&rp, "example/rproxy:custom", &[], &mut HashMap::new()).await);
+}
+
+#[tokio::test]
+async fn tokens_reload_is_known_from_the_image_or_the_pods() {
+	let fake = Arc::new(Mutex::new(Fake::default()));
+	let port = start(fake.clone()).await;
+	let rp = Client::new(None, "secret").unwrap();
+	let ep = |uid: &str| Endpoint {
+		pod: format!("rproxy-{uid}"),
+		uid: uid.into(),
+		ip: "127.0.0.1".into(),
+		api_port: port,
+		rproxy_image: Some("example/rproxy:reload".into()),
+		..Default::default()
+	};
+	let mut caps = HashMap::new();
+	assert!(image_feature(&rp, provision::RPROXY_IMAGE, "tokens_reload", &[], &mut caps).await, "the shipped image (v0.4.2)");
+	assert!(!image_feature(&rp, provision::RPROXY_IMAGE, "another", &[], &mut caps).await);
+	assert!(!image_feature(&rp, "example/rproxy:reload", "tokens_reload", &[ep("r1")], &mut caps).await, "rproxy before v0.4.2");
+	fake.lock().unwrap().tokens_reload = true;
+	assert!(image_feature(&rp, "example/rproxy:reload", "tokens_reload", &[ep("r1"), ep("r2")], &mut caps).await);
+	assert!(image_feature(&rp, "example/rproxy:reload", "tokens_reload", &[], &mut HashMap::new()).await, "remembered");
+	assert!(!graceful(&rp, "example/rproxy:reload", &[], &mut HashMap::new()).await, "per feature");
+}
+
+#[tokio::test]
+async fn the_ui_gets_pods_that_take_its_token() {
+	let fake = Arc::new(Mutex::new(Fake::default()));
+	let port = start(fake.clone()).await;
+	let rp = Client::new(None, "secret").unwrap();
+	let ep = |uid: &str| Endpoint {
+		pod: format!("rproxy-{uid}"),
+		uid: uid.into(),
+		ip: "127.0.0.1".into(),
+		api_port: port,
+		..Default::default()
+	};
+	// the token file was not read again yet: 401, not listed, not asked again before ASK_EVERY
+	assert!(ui::accepting(&rp, &[ep("ui-1")], "ui-token", "x").await.is_empty());
+	fake.lock().unwrap().readers.insert("ui-token".into());
+	assert!(ui::accepting(&rp, &[ep("ui-1")], "ui-token", "x").await.is_empty(), "asked a moment ago");
+	// another pod that already took it; then remembered without asking
+	assert_eq!(ui::accepting(&rp, &[ep("ui-1"), ep("ui-2")], "ui-token", "x").await.len(), 1);
+	fake.lock().unwrap().readers.clear();
+	assert_eq!(ui::accepting(&rp, &[ep("ui-2")], "ui-token", "x").await.len(), 1);
+	// a pod gone is forgotten
+	ui::forget(&["ui-1".to_string()].into());
+	assert!(ui::accepting(&rp, &[ep("ui-2")], "ui-token", "x").await.is_empty(), "asked again: 401");
 }
 
 #[tokio::test]

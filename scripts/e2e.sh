@@ -257,18 +257,17 @@ echo "== the UI (docs/DESIGN-v0.4.x.md 4.): nothing without ui.namespace"
 kubectl create namespace rproxy-ui --dry-run=client -o yaml | kubectl apply -f - > /dev/null
 sleep 12
 test -z "$(kubectl -n rproxy-ui get secret rproxy-ui-discovery -o name --ignore-not-found)"
-echo "== the UI: ui.namespace set, the Gateway shown (its pods, a read-only token; one rollout: rproxy reads its token file at start)"
+echo "== the UI: ui.namespace set, the Gateway shown (its pods, a read-only token; no rollout: rproxy reads a changed token file again, features.tokens_reload)"
 generation=$(kubectl -n e2e get deploy "$deploy" -o jsonpath='{.metadata.generation}')
 helm upgrade rproxy-gateway charts/rproxy-gateway -n $NS --reuse-values --wait --set ui.namespace=rproxy-ui > /dev/null
-retry 120 sh -c "test \"\$(kubectl -n e2e get deploy $deploy -o jsonpath='{.metadata.generation}')\" = $((generation + 1))"
-kubectl -n e2e rollout status deploy "$deploy" --timeout=240s > /dev/null
 # the Secret lists the pods that run now (the old ones go once they are gone)
 pod_ips() {
   test "$(kubectl -n rproxy-ui get secret rproxy-ui-discovery -o jsonpath='{.data.nodes\.yaml}' | base64 -d | sed -n 's/^    url: "https:\/\/\(.*\):9443"$/\1/p' | sort | xargs)" \
     = "$(kubectl -n e2e get pods -l "rproxy.max3584.net/gateway=$1" -o json | jq -r '[.items[] | .status.podIP | select(. != null)] | sort | join(" ")')"
 }
 id=$(kubectl -n e2e get deploy "$deploy" -o jsonpath='{.metadata.labels.rproxy\.max3584\.net/gateway}')
-retry 120 pod_ips "$id"
+# listed once the pods take the UI's token (the kubelet updates the mounted Secret, rproxy reads it within 10 s)
+retry 240 pod_ips "$id"
 retry 60 sh -c "test \"\$(kubectl -n rproxy-ui get secret rproxy-ui-discovery -o jsonpath='{.data.nodes\.yaml}' | base64 -d | grep -c 'url: \"https://')\" = 2"
 disc=$(kubectl -n rproxy-ui get secret rproxy-ui-discovery -o json)
 nodes=$(jq -r '.data["nodes.yaml"] | @base64d' <<< "$disc")
@@ -277,7 +276,7 @@ jq -e '.data as $d | ($d | keys | length == 3) and ($d["ca.crt"] | @base64d | te
   and ([$d[] | @base64d] | all(test("PRIVATE KEY") | not))' <<< "$disc" > /dev/null
 kubectl -n e2e get secret "rproxy-$id-api" -o jsonpath='{.data.tokens\.yaml}' | base64 -d | grep -q 'scopes: \[rules:read, metrics:read\]'
 retry 60 sh -c "kubectl -n e2e get networkpolicy rproxy-$id -o json | jq -e '[.spec.ingress[] | select(.from[0].namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"] == \"rproxy-ui\") | .ports[].port] == [9443]' > /dev/null"
-test "$(kubectl -n e2e get deploy "$deploy" -o jsonpath='{.metadata.generation}')" = $((generation + 1))
+test "$(kubectl -n e2e get deploy "$deploy" -o jsonpath='{.metadata.generation}')" = "$generation"
 # from a pod like the UI's: the token reads rules and cannot write
 ip=$(sed -n 's/^    url: "https:\/\/\(.*\):9443"$/\1/p' <<< "$nodes" | head -1)
 sn="$id.rproxy-api.rproxy-gateway.internal"
@@ -300,7 +299,7 @@ codes=$(kubectl -n rproxy-ui logs ui-probe)
 echo "UI token: GET /rules, PUT /rulesets: $codes"
 test "$codes" = "200 403"
 kubectl -n rproxy-ui delete pod ui-probe --wait=false > /dev/null
-echo "== the UI: the Gateway hidden (parameters ui.visible: false): the Secret goes, the token goes (one rollout)"
+echo "== the UI: the Gateway hidden (parameters ui.visible: false): the Secret goes, the token goes (no rollout)"
 cat <<YAML | kubectl --as=system:serviceaccount:e2e:tenant apply -f - > /dev/null
 apiVersion: rproxy.max3584.net/v1alpha1
 kind: RproxyGatewayParameters
@@ -311,8 +310,8 @@ spec:
 YAML
 retry 60 sh -c "test -z \"\$(kubectl -n rproxy-ui get secret rproxy-ui-discovery -o name --ignore-not-found)\""
 retry 60 sh -c "! kubectl -n e2e get secret rproxy-$id-api -o jsonpath='{.data.tokens\.yaml}' | base64 -d | grep -q rproxy-ui"
-retry 60 sh -c "test \"\$(kubectl -n e2e get deploy $deploy -o jsonpath='{.metadata.generation}')\" = $((generation + 2))"
-kubectl -n e2e rollout status deploy "$deploy" --timeout=240s > /dev/null
+sleep 5
+test "$(kubectl -n e2e get deploy "$deploy" -o jsonpath='{.metadata.generation}')" = "$generation"
 curl -sf -H 'Host: e2e.example.com' "http://$addr/after-ui" > /dev/null
 
 echo "== Gateway deleted: its rproxy goes"
