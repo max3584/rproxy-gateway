@@ -20,7 +20,7 @@ on:
         required: false
         default: "0.4.0"
       topology:
-        description: "how traffic reaches rproxy (scripts/acceptance.sh)"
+        description: "how traffic reaches rproxy (scripts/acceptance.sh; bgp uses externalTrafficPolicy Cluster unless helm_args sets it)"
         required: false
         default: l2-local
         type: choice

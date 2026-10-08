@@ -445,7 +445,9 @@ pub fn deployment(t: &Target, m: &Managed, api_hash: &str) -> Deployment {
 		// the kubelet mounts Secrets as root (0440, group fsGroup): rproxy may use root's files there
 		env("RPROXY_FILES_TRUSTED_DIRS", &format!("{CERT_DIR},{API_DIR}")),
 	];
-	// the parameters' logLevel, performance and extraEnv (names the controller sets are refused there)
+	// the parameters' logLevel, performance and extraEnv (names the controller sets are refused there).
+	// TODO(#35): rproxy.shutdown -> RPROXY_SHUTDOWN_DELAY / _DRAIN and the grace period, once an rproxy
+	// release has them (validated only until then)
 	rproxy_env.extend(crate::render::params::rproxy_env(&t.params));
 	let rproxy = Container {
 		name: "rproxy".into(),

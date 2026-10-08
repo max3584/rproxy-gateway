@@ -10,7 +10,11 @@
 #   l2-local    MetalLB L2, externalTrafficPolicy Local (the chart's default): one node announces
 #   l2-cluster  MetalLB L2, externalTrafficPolicy Cluster: one node announces, any node forwards
 #   bgp         MetalLB BGP (FRR mode, BFD) to an FRR router container with ECMP: every node with a
-#               ready rproxy pod announces, the router splits connections across them
+#               ready rproxy pod announces, the router splits connections across them. externalTrafficPolicy
+#               Cluster (the recommended BGP setup, README "Availability") unless HELM_ARGS sets
+#               managed.externalTrafficPolicy; with Local, a pod deletion's gap is MetalLB withdrawing the
+#               node's route once the pod is gone (3-4 s with FRR), reported as "PASS (known floor)" up to
+#               BGP_LOCAL_FLOOR seconds
 #   nodeport-lb NodePort Services (externalTrafficPolicy Local; Cluster through HELM_ARGS) behind an HAProxy container that
 #               health-checks every node and sends to all healthy ones (a user's own L4 balancer)
 # Outages are measured and reported. With MANAGED_REPLICAS >= 2, a pod deletion, a node drain and a
@@ -34,6 +38,8 @@ MANAGED_REPLICAS=${MANAGED_REPLICAS:-2}
 HELM_ARGS=${HELM_ARGS:-}
 # seconds without a 200 a pod deletion, drain or rollout may cause (MANAGED_REPLICAS >= 2)
 GAP_LIMIT=${GAP_LIMIT:-3}
+# bgp with externalTrafficPolicy Local: the gap a pod deletion may leave (MetalLB's FRR route withdrawal)
+BGP_LOCAL_FLOOR=${BGP_LOCAL_FLOOR:-5}
 FRR_IMAGE=${FRR_IMAGE:-quay.io/frrouting/frr:9.1.0}
 HAPROXY_IMAGE=${HAPROXY_IMAGE:-haproxy:3.0-alpine}
 case "$TOPOLOGY" in l2-local | l2-cluster | bgp | nodeport-lb) ;; *) echo "TOPOLOGY: l2-local, l2-cluster, bgp or nodeport-lb"; exit 1 ;; esac
@@ -229,7 +235,12 @@ spec: {ipAddressPools: [kind]}" || { cat "$work/apply.log"; exit 1; }
 esac
 case "$TOPOLOGY" in
   l2-cluster) HELM_ARGS="--set managed.externalTrafficPolicy=Cluster $HELM_ARGS" ;;
+  # the recommended BGP setup (Local is still measured when HELM_ARGS asks for it)
+  bgp) [[ $HELM_ARGS == *managed.externalTrafficPolicy=* ]] || HELM_ARGS="--set managed.externalTrafficPolicy=Cluster $HELM_ARGS" ;;
 esac
+# the externalTrafficPolicy in use (the last one HELM_ARGS sets; else the chart's default for the Service type)
+ETP=$(grep -o 'managed.externalTrafficPolicy=[A-Za-z]*' <<< "$HELM_ARGS" | tail -1 | cut -d= -f2 || true)
+if [ -z "$ETP" ]; then [ "$TOPOLOGY" = nodeport-lb ] && ETP=Cluster || ETP=Local; fi
 
 log "== cert-manager $CERT_MANAGER_VERSION"
 kubectl apply -f "https://github.com/cert-manager/cert-manager/releases/download/$CERT_MANAGER_VERSION/cert-manager.yaml" > /dev/null
@@ -606,7 +617,12 @@ record() {
   local result=$5 notes=$6 key=${1%%.*}
   if [ "$result" = PASS ] && [ $((h + s + t)) -gt 0 ]; then result="PASS (outage)"; fi
   if [ -n "${7:-}" ] && [ "$MANAGED_REPLICAS" -ge 2 ] && [ "$gap" -gt $((GAP_LIMIT * 1000)) ]; then
-    result=FAIL notes="longest gap over ${GAP_LIMIT}s; $notes"
+    if [ "$TOPOLOGY" = bgp ] && [ "$ETP" = Local ] && [ "$key" = b1 ] && [ "$gap" -le $((BGP_LOCAL_FLOOR * 1000)) ]; then
+      # documented (README "Availability"): MetalLB withdraws the node's route only once its last pod is gone
+      result="PASS (known floor)" notes="longest gap over ${GAP_LIMIT}s: BGP with externalTrafficPolicy Local waits for MetalLB (FRR) to withdraw the node's route after the pod is gone (3-4 s; use Cluster for planned changes); $notes"
+    else
+      result=FAIL notes="longest gap over ${GAP_LIMIT}s; $notes"
+    fi
   fi
   [ "$result" = FAIL ] && failed=1
   timeline "$key" "$2" "$3"
@@ -932,8 +948,8 @@ stop_probes
   case "$TOPOLOGY" in
     l2-local) echo "MetalLB $METALLB_VERSION L2, externalTrafficPolicy Local." ;;
     l2-cluster) echo "MetalLB $METALLB_VERSION L2, externalTrafficPolicy Cluster." ;;
-    bgp) echo "MetalLB $METALLB_VERSION BGP (FRR mode, BFD 300 ms x 3) to an FRR router ($FRR_IMAGE) with ECMP over the announcing nodes (externalTrafficPolicy Local unless the helm flags say otherwise)." ;;
-    nodeport-lb) echo "NodePort Services (externalTrafficPolicy Local unless the helm flags say otherwise) behind HAProxy ($HAPROXY_IMAGE, TCP, checks every 500 ms, a failed connection marks the node down and goes to another)." ;;
+    bgp) echo "MetalLB $METALLB_VERSION BGP (FRR mode, BFD 300 ms x 3) to an FRR router ($FRR_IMAGE) with ECMP over the announcing nodes (externalTrafficPolicy $ETP)." ;;
+    nodeport-lb) echo "NodePort Services (externalTrafficPolicy $ETP) behind HAProxy ($HAPROXY_IMAGE, TCP, checks every 500 ms, a failed connection marks the node down and goes to another)." ;;
   esac
   echo "kind 1 control plane + 3 workers, cert-manager $CERT_MANAGER_VERSION, Gateway API $GATEWAY_API_VERSION experimental."
   echo "Controller replicas 2, managed.replicas $MANAGED_REPLICAS. Extra helm flags: \`${HELM_ARGS:-none}\`. Probes: HTTP, HTTPS, TCP through the Gateway's address every 100 ms, a new connection each."
@@ -946,7 +962,7 @@ stop_probes
   echo "|---|---|---|---|---|---|"
   awk -F'\t' '{ printf "| %s | %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5, $6 }' "$results"
   echo
-  echo "PASS (outage): requests failed but everything recovered (recorded, not a failure). SKIP: the placement or topology did not allow the scenario. FAIL: routes never recovered, the certificate never rotated or the state was not restored (timeouts: recovery ${RECOVERY_TIMEOUT}s, leader ${LEADER_TIMEOUT}s, route change ${APPLY_TIMEOUT}s, rotation ${ROTATE_TIMEOUT}s)$([ "$MANAGED_REPLICAS" -ge 2 ] && echo ", or a pod deletion, drain or rollout restart left a gap over ${GAP_LIMIT}s")."
+  echo "PASS (outage): requests failed but everything recovered (recorded, not a failure). PASS (known floor): over the gap limit by a documented limit of the topology (bgp with externalTrafficPolicy Local, a pod deletion: up to ${BGP_LOCAL_FLOOR}s). SKIP: the placement or topology did not allow the scenario. FAIL: routes never recovered, the certificate never rotated or the state was not restored (timeouts: recovery ${RECOVERY_TIMEOUT}s, leader ${LEADER_TIMEOUT}s, route change ${APPLY_TIMEOUT}s, rotation ${ROTATE_TIMEOUT}s)$([ "$MANAGED_REPLICAS" -ge 2 ] && echo ", or a pod deletion, drain or rollout restart left a gap over ${GAP_LIMIT}s")."
   echo
   echo "Nodes: $(tr '\n' ' ' < "$work/nodes.txt")"
   for f in "$work"/timeline-*.txt; do
