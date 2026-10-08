@@ -253,7 +253,7 @@ mod linux {
 		tokio::spawn(async move {
 			use kube::runtime::WatchStreamExt;
 			let cfg = watcher::Config::default().fields(&format!("metadata.name={name}"));
-			let mut s = watcher::watcher(api, cfg).default_backoff().boxed();
+			let mut s = watcher::watcher(api, cfg).backoff(Again).boxed();
 			let (mut errored, mut epoch, mut listed) = (false, 0u64, false);
 			while let Some(ev) = s.next().await {
 				match ev {
@@ -283,6 +283,21 @@ mod linux {
 			}
 		});
 		rx
+	}
+
+	/// A watch that failed starts again after a second (not kube's backoff of up to 30 s: a VIP
+	/// waits on its Lease's changes, and the API server may be back after an outage).
+	struct Again;
+
+	impl Iterator for Again {
+		type Item = Duration;
+		fn next(&mut self) -> Option<Duration> {
+			Some(Duration::from_secs(1))
+		}
+	}
+
+	impl kube::runtime::utils::Backoff for Again {
+		fn reset(&mut self) {}
 	}
 
 	/// Whether rproxy answers `/readyz`, every `every`.
@@ -687,6 +702,16 @@ mod linux {
 									let epoch = self.lease_rx.borrow().1;
 									self.adopt(&mut st, l, epoch);
 									fresh = st.seen == before;
+									// the API server failed since the Lease was last seen to change: it was not
+									// seen unchanged for a whole duration (the holder may not have reached the
+									// API server either); watch it again from now
+									let failed = *self.shared.api_failed.lock().unwrap();
+									if fresh && st.view.as_ref().is_some_and(|v| failed.is_some_and(|f| f > v.since)) {
+										if let Some(v) = st.view.as_mut() {
+											v.since = Instant::now();
+										}
+										fresh = false;
+									}
 								}
 								Ok(None) => fresh = false,
 								Err(e) => {
