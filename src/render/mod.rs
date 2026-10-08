@@ -14,6 +14,7 @@ pub mod hostname;
 pub mod http;
 pub mod l4;
 pub mod migrate;
+pub mod params;
 pub mod policy;
 pub mod status;
 pub mod traefik_mw;
@@ -49,6 +50,8 @@ pub struct Options {
 	/// Whether certificateRefs may name Secrets of other namespaces (with a ReferenceGrant).
 	/// In managed mode their keys are copied into the Gateway's namespace.
 	pub cross_namespace_secrets: bool,
+	/// How GatewayClasses' and Gateways' RproxyGatewayParameters are found and checked.
+	pub params: params::ParamsOptions,
 }
 
 /// An IP range (`10.0.0.0/24`).
@@ -99,6 +102,7 @@ impl Default for Options {
 			address_cidrs: vec![],
 			raw_rules: true,
 			cross_namespace_secrets: true,
+			params: params::ParamsOptions::default(),
 		}
 	}
 }
@@ -289,6 +293,13 @@ pub struct GatewayPlan {
 	pub attached_listener_sets: i32,
 	/// BackendTLSPolicy status for this Gateway (the policies of the backends its routes send to).
 	pub backend_tls: Vec<policy::PolicyStatus>,
+	/// The GatewayClass's and the Gateway's RproxyGatewayParameters, merged (`None`: neither).
+	pub parameters: Option<crate::k8s::params::RproxyGatewayParametersSpec>,
+	/// Why the parameters cannot be used (`Accepted: False`, `InvalidParameters`).
+	pub parameters_error: Option<String>,
+	/// A Gateway whose parameters became invalid keeps its last good rproxy: why
+	/// (`Programmed` stays `True`, the Deployment and Service are left alone).
+	pub kept: Option<String>,
 }
 
 impl GatewayPlan {
@@ -1326,10 +1337,12 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 	let any = own.iter().any(|l| l.accepted);
 	let all = own.iter().all(|l| l.accepted);
 	let addresses = gateway_addresses(gw);
-	let params = gw.spec.infrastructure.as_ref().and_then(|i| i.parameters_ref.as_ref());
-	plan.conds.push(if let Some(p) = params {
-		// no parameters kind is supported
-		Cond::new("Accepted", false, "InvalidParameters", format!("parametersRef {}/{} {}: not supported", p.group, p.kind, p.name))
+	match params::gateway_parameters(world, gw, &opts.params) {
+		Ok(p) => plan.parameters = p,
+		Err(e) => plan.parameters_error = Some(e),
+	}
+	plan.conds.push(if let Some(e) = &plan.parameters_error {
+		Cond::new("Accepted", false, "InvalidParameters", e.clone())
 	} else if let Err(e) = &addresses {
 		Cond::new("Accepted", false, "UnsupportedAddress", e.clone())
 	} else if own.is_empty() || all {

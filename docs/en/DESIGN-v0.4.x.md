@@ -365,6 +365,8 @@ fleet:
 | `strict` | `false` | fails if E's checks see any failed request | E |
 | `mode` | `managed` | `fleet-vip` runs 7.8's scenarios j-o | F |
 
+The gap limit (`GAP_LIMIT`) fails a run only for what rproxy-gateway controls: pod deletions, drains, rollouts and parameters changes measured in l2-local, l2-cluster and nodeport-lb. `bgp` gaps (route withdrawal, BFD) and lost nodes are the CNI's, the load balancer's or the network's time, so they are recorded only (`info (network-dependent)`).
+
 Scenarios added (A), run after today's a-g; SKIP when the `RproxyGatewayParameters` CRD is not installed (an older published chart).
 
 - h. Change a Gateway's parameters: with a namespace admin's permissions, write an `RproxyGatewayParameters` and name it in the Gateway's `infrastructure.parametersRef` (one more replica, resources). The pods are replaced under traffic, `Accepted` stays True, the longest gap stays within `GAP_LIMIT`.

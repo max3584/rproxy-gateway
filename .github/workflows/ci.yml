@@ -56,7 +56,7 @@ jobs:
           helm lint charts/rproxy-gateway --set fleet.enabled=true --set migration.migrateTo=default/gw --set migration.createIngressClass=true
       - name: helm template
         run: |
-          for args in "" "--set fleet.enabled=true" "--set migration.migrateTo=default/gw"; do
+          for args in "" "--set fleet.enabled=true" "--set migration.migrateTo=default/gw" "--set managed.parameters.replicas=2 --set rbac.aggregateToAdmin=false"; do
             # shellcheck disable=SC2086
             helm template t charts/rproxy-gateway -n rproxy-gateway-system $args > /dev/null
           done
