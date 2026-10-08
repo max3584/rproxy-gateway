@@ -1041,7 +1041,7 @@ discovery_lists() {  # the Secret names every running rproxy pod of the Gateway
   local name ip ready
   while read -r name ip ready; do
     [ -n "$name" ] || continue
-    grep -q "name: k8s:$APP/acc/$name\$" <<< "$y" || return 1
+    grep -Eq "name: \"?k8s:$APP/acc/$name\"?\$" <<< "$y" || return 1
   done < <(rproxy_pods)
 }
 ui_lists() {  # the UI shows the Gateway's pods read-only
