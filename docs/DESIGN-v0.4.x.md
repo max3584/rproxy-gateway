@@ -97,7 +97,7 @@ spec:
 | 項目 | 写す先 | 既定 | 検証 |
 |---|---|---|---|
 | `replicas` | Deployment の `replicas` | `--replicas`（chart の `managed.replicas`、1） | 1〜`policy.maxReplicas`（既定 10）。0 は使わない（Gateway を止めるなら消す） |
-| `podDisruptionBudget` | PDB `rproxy-<id>`（`minAvailable` か `maxUnavailable` の片方） | replicas が 2 以上なら `maxUnavailable: 1`、1 なら作らない（v0.4.1 と同じ） | 片方だけ（CRD の CEL）。`minAvailable` が数で replicas 以上なら誤り（drain が止まるため） |
+| `podDisruptionBudget` | PDB `rproxy-<id>`（`minAvailable` か `maxUnavailable` の片方） | replicas が 2 以上なら `maxUnavailable: 1`、1 なら作らない（v0.4.1 と同じ） | 片方だけ（CRD の CEL）。`minAvailable` が replicas 以上（`100%`）、`maxUnavailable` が 0（`0%`）なら誤り（drain が止まるため） |
 | `pod.labels`・`pod.annotations` | Pod のテンプレート | なし | コントローラの接頭辞（`rproxy.max3584.net/`・`app.kubernetes.io/`・`gateway.networking.k8s.io/`）のキーは誤り |
 | `pod.resources.rproxy`・`.certsync` | 各コンテナ | なし（v0.4.1 と同じ） | Kubernetes の ResourceRequirements |
 | `pod.topologySpreadConstraints` | Pod | replicas が 2 以上なら `kubernetes.io/hostname`・`ScheduleAnyway`（v0.4.1 と同じ） | 書けば既定と置き換え。`labelSelector` を省けばその Gateway の Pod の selector を入れる |

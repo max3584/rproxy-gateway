@@ -97,7 +97,7 @@ The default column applies when neither reference sets the field; each is the v0
 | Field | Goes to | Default | Validation |
 |---|---|---|---|
 | `replicas` | the Deployment's `replicas` | `--replicas` (the chart's `managed.replicas`, 1) | 1 to `policy.maxReplicas` (10 by default). Not 0 (delete the Gateway to stop it) |
-| `podDisruptionBudget` | the PDB `rproxy-<id>` (one of `minAvailable`, `maxUnavailable`) | `maxUnavailable: 1` with 2 or more replicas, none with 1 (as in v0.4.1) | one of them (CEL in the CRD). A number `minAvailable` of replicas or more is refused (a drain would block) |
+| `podDisruptionBudget` | the PDB `rproxy-<id>` (one of `minAvailable`, `maxUnavailable`) | `maxUnavailable: 1` with 2 or more replicas, none with 1 (as in v0.4.1) | one of them (CEL in the CRD). `minAvailable` of replicas or more (`100%`) or `maxUnavailable` 0 (`0%`) is refused (a drain would block) |
 | `pod.labels`, `pod.annotations` | the pod template | none | keys with the controller's prefixes (`rproxy.max3584.net/`, `app.kubernetes.io/`, `gateway.networking.k8s.io/`) are refused |
 | `pod.resources.rproxy`, `.certsync` | each container | none (as in v0.4.1) | Kubernetes ResourceRequirements |
 | `pod.topologySpreadConstraints` | the pod | with 2 or more replicas, `kubernetes.io/hostname`, `ScheduleAnyway` (as in v0.4.1) | replaces the default when set. Without `labelSelector`, the Gateway's pod selector is filled in |
