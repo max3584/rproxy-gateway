@@ -41,7 +41,7 @@ controller:
 rproxy:
   image:
     repository: ghcr.io/max3584/rproxy-gateway/rproxy
-    tag: "0.4.0"
+    tag: "0.4.1"
     digest: ""
     pullPolicy: IfNotPresent
   # addresses rules listen on (the first is listen_addr, the rest extra_listen_addrs); add "::" for IPv6
@@ -69,13 +69,22 @@ managed:
   externalTrafficPolicy: ""
   # LoadBalancer Services get node ports (false for load balancers that do not use them, e.g. MetalLB)
   allocateLoadBalancerNodePorts: true
-  # seconds a stopping rproxy pod keeps serving (preStop) while it leaves the Service's endpoints and
-  # load balancers move away; terminationGracePeriodSeconds is 15 more. 0: none
-  preStopSeconds: 15
-  # rproxy's probes (/healthz). Readiness: how soon a hung rproxy leaves the endpoints; liveness:
-  # when the kubelet restarts it (kept slow). A pod takes traffic only once the controller has applied
-  # its rule set (the readiness gate rproxy.max3584.net/ruleset-applied)
-  readinessProbe: {periodSeconds: 2, timeoutSeconds: 1, failureThreshold: 2, successThreshold: 1, initialDelaySeconds: 0}
+  # how rproxy stops on SIGTERM (rproxy 0.4.1, features.graceful_shutdown; docs/DESIGN.md, "rproxy
+  # availability"): it keeps accepting for `delay` while GET /readyz says "draining" (the readiness
+  # probe takes the pod out of the Service and load balancers move away), then closes its listeners and
+  # lets connections end for up to `drain`. terminationGracePeriodSeconds is both and 5 s more. Per
+  # Gateway: the parameters' rproxy.shutdown
+  shutdown: {delay: 15s, drain: 25s}
+  # seconds a stopping rproxy pod keeps serving in a preStop before SIGTERM. Unset (0.4.2 and later):
+  # none with an rproxy that has a graceful shutdown (the delay above does it), 15 for older rproxy
+  # images (which stop at once on SIGTERM; terminationGracePeriodSeconds is 15 more). Set: this preStop
+  # for every pod, before the delay and drain. 0: none
+  preStopSeconds: null
+  # rproxy's probes. Readiness: how soon a hung rproxy leaves the endpoints, and its path: /readyz (also
+  # not ready while starting and stopping) or /healthz (older rproxy images: always /healthz); liveness
+  # (/healthz): when the kubelet restarts it (kept slow). A pod takes traffic only once the controller
+  # has applied its rule set (the readiness gate rproxy.max3584.net/ruleset-applied)
+  readinessProbe: {path: /readyz, periodSeconds: 2, timeoutSeconds: 1, failureThreshold: 2, successThreshold: 1, initialDelaySeconds: 0}
   livenessProbe: {periodSeconds: 5, timeoutSeconds: 1, failureThreshold: 3, initialDelaySeconds: 0}
   # the spec of an RproxyGatewayParameters the GatewayClass names (rproxy-default in the release
   # namespace): every managed Gateway's defaults and, in `policy`, what Gateways' own parameters
@@ -96,6 +105,12 @@ fleet:
   nodeSelector: {}
   tolerations: []
   resources: {}
+  # how rproxy stops on SIGTERM (a rolling update, a drained node): it keeps accepting for `delay`
+  # with GET /readyz (https://<node>:9443/readyz) saying "draining", then closes its listeners and lets
+  # connections end for `drain` (RPROXY_SHUTDOWN_DELAY / _DRAIN; terminationGracePeriodSeconds is both
+  # and 5 s more). Make `delay` as long as your load balancer or VIP takes to move away from a node
+  # (its health check on /readyz: interval x failures)
+  shutdown: {delay: 5s, drain: 25s}
   # RproxyRules (off: the fleet's pods are shared by every Gateway; fleet is for one trust domain)
   rproxyRules: false
 

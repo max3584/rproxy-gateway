@@ -709,6 +709,7 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 			t.annotations = infra.annotations.clone();
 			t.service_annotations = p.cfg.service_annotations.clone();
 			t.params = plan.parameters.clone().unwrap_or_default();
+			t.graceful = graceful(p.rp, &t.rproxy_image(m), &eps, &mut sub.caps).await;
 			t.owner = match (&p.gateway_api_version, &gw.metadata.uid) {
 				(Some(v), Some(uid)) => Some(provision::owner(v, &plan.name, uid)),
 				_ => None,
@@ -1033,6 +1034,27 @@ pub async fn sync_pod(
 		Ok(None) => (PodSync::Pending(format!("pod {}: the rule set disappeared", ep.pod)), true),
 		Err(e) => (PodSync::NotReady(format!("pod {}: {e:#}", ep.pod)), true),
 	}
+}
+
+/// Images whose rproxy said it has a graceful shutdown (kept while the process runs: a Gateway whose
+/// pods all restart at once keeps its shape).
+static GRACEFUL_IMAGES: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
+
+/// Whether `image` has a graceful shutdown (`features.graceful_shutdown`, rproxy v0.4.1): the image
+/// this controller ships, or one a pod running it said so of. Unknown (another image before its pods
+/// answer): no, the pods keep the preStop; they roll again once it is known.
+async fn graceful(rp: &Client, image: &str, eps: &[Endpoint], caps: &mut HashMap<String, Capabilities>) -> bool {
+	if image == provision::RPROXY_IMAGE || GRACEFUL_IMAGES.lock().unwrap().contains(image) {
+		return true;
+	}
+	let mine: Vec<Endpoint> = eps.iter().filter(|ep| ep.rproxy_image.as_deref() == Some(image)).cloned().collect();
+	pod_features(rp, &mine, caps).await;
+	let known = mine.iter().any(|ep| caps.get(&ep.uid).is_some_and(|c| c.feature("graceful_shutdown")));
+	if known {
+		info!(image, "rproxy has a graceful shutdown: RPROXY_SHUTDOWN_* instead of the preStop");
+		GRACEFUL_IMAGES.lock().unwrap().insert(image.to_string());
+	}
+	known
 }
 
 /// The rproxy settings every pod in `eps` takes (asks the pods not asked yet).

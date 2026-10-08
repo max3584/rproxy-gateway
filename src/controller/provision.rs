@@ -22,7 +22,7 @@
 //! and a token derived from the controller's master token (`bootstrap`).
 
 use std::collections::BTreeMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use k8s_openapi::ByteString;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy, RollingUpdateDeployment};
@@ -66,11 +66,19 @@ pub const CERT_DIR: &str = "/var/run/rproxy-gateway/certs";
 /// The readiness gate of rproxy pods: `True` once the controller has applied the pod's rule
 /// set(s) since rproxy (the container) last started; the pod takes traffic only then.
 pub const CONDITION_RULESET: &str = "rproxy.max3584.net/ruleset-applied";
-/// Seconds rproxy has after its preStop sleep before the kubelet kills it.
-pub const STOP_GRACE: i64 = 15;
+/// Seconds rproxy has, after its shutdown delay and drain, before the kubelet kills it.
+pub const STOP_GRACE: i64 = 5;
+/// Seconds an rproxy without a graceful shutdown has after its preStop (it stops at once on SIGTERM).
+pub const OLD_STOP_GRACE: i64 = 15;
+/// The preStop of an rproxy without a graceful shutdown when `--pre-stop-secs` is unset.
+pub const PRE_STOP_SECS: u32 = 15;
+/// The rproxy image this controller deploys by default (`--rproxy-image`): it has a graceful shutdown.
+pub const RPROXY_IMAGE: &str = "ghcr.io/max3584/rproxy-gateway/rproxy:0.4.1";
 const API_DIR: &str = "/etc/rproxy-gateway/api";
 
 /// How rproxy is deployed.
+// one value, made at start
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum Mode {
 	Managed(Managed),
@@ -93,12 +101,20 @@ pub struct Managed {
 	/// LoadBalancer Services get node ports (`allocateLoadBalancerNodePorts`; MetalLB does not need them).
 	pub allocate_node_ports: bool,
 	/// Seconds a stopping rproxy pod keeps serving (preStop) while load balancers and
-	/// kube-proxy take it out (0: none).
-	pub pre_stop_secs: u32,
+	/// kube-proxy take it out (0: none). `None`: none with a graceful shutdown (`Target::graceful`; the
+	/// shutdown delay does it), `PRE_STOP_SECS` without.
+	pub pre_stop_secs: Option<u32>,
 	/// The preStop is the kubelet's `sleep` action (Kubernetes 1.30 and later), else `exec sleep`.
 	pub native_sleep: bool,
-	/// rproxy's readiness probe (`/healthz`): how soon a hung rproxy leaves the Service's endpoints.
+	/// How rproxy stops on SIGTERM (`RPROXY_SHUTDOWN_DELAY`, `RPROXY_SHUTDOWN_DRAIN`, rproxy v0.4.1):
+	/// the default of the parameters' `rproxy.shutdown`.
+	pub shutdown_delay: Duration,
+	pub shutdown_drain: Duration,
+	/// rproxy's readiness probe: how soon a hung rproxy leaves the Service's endpoints.
 	pub readiness: ProbeTiming,
+	/// Its path with a graceful shutdown: `/readyz` (also not ready while starting and draining) or
+	/// `/healthz` (up). Older images: `/healthz`.
+	pub readiness_path: String,
 	/// rproxy's liveness probe (`/healthz`): when the kubelet restarts it (kept slow).
 	pub liveness: ProbeTiming,
 }
@@ -154,9 +170,12 @@ impl Default for Managed {
 			network_policy: None,
 			external_traffic_policy: None,
 			allocate_node_ports: true,
-			pre_stop_secs: 15,
+			pre_stop_secs: None,
 			native_sleep: true,
+			shutdown_delay: Duration::from_secs(15),
+			shutdown_drain: Duration::from_secs(25),
 			readiness: ProbeTiming::READINESS,
+			readiness_path: "/readyz".into(),
 			liveness: ProbeTiming::LIVENESS,
 		}
 	}
@@ -220,6 +239,9 @@ pub struct Target<'a> {
 	pub service_annotations: Vec<String>,
 	/// The GatewayClass's and the Gateway's RproxyGatewayParameters, merged (checked by `render::params`).
 	pub params: Params,
+	/// The rproxy image has a graceful shutdown (`features.graceful_shutdown`, rproxy v0.4.1):
+	/// `RPROXY_SHUTDOWN_*` and the readiness path instead of the preStop (`graceful`).
+	pub graceful: bool,
 }
 
 pub use crate::render::params::{SERVICE_ANNOTATION_DENY, service_annotation_allowed};
@@ -235,7 +257,13 @@ impl<'a> Target<'a> {
 			addresses: vec![],
 			service_annotations: vec![],
 			params: Params::default(),
+			graceful: false,
 		}
+	}
+
+	/// The rproxy image: the parameters', else `--rproxy-image`.
+	pub fn rproxy_image(&self, m: &Managed) -> String {
+		self.params.rproxy.as_ref().and_then(|r| r.image.clone()).unwrap_or_else(|| m.rproxy_image.clone())
 	}
 
 	/// rproxy pods: the parameters' `replicas`, else `--replicas`.
@@ -445,23 +473,31 @@ pub fn deployment(t: &Target, m: &Managed, api_hash: &str) -> Deployment {
 		// the kubelet mounts Secrets as root (0440, group fsGroup): rproxy may use root's files there
 		env("RPROXY_FILES_TRUSTED_DIRS", &format!("{CERT_DIR},{API_DIR}")),
 	];
-	// the parameters' logLevel, performance and extraEnv (names the controller sets are refused there).
-	// TODO(#35): rproxy.shutdown -> RPROXY_SHUTDOWN_DELAY / _DRAIN and the grace period, once an rproxy
-	// release has them (validated only until then)
+	// SIGTERM: keep accepting for delay (GET /readyz: draining), then let connections end for drain
+	// (rproxy v0.4.1). Else the preStop keeps an older rproxy serving, which stops at once on SIGTERM
+	let (delay, drain) = if t.graceful { shutdown(t, m) } else { (Duration::ZERO, Duration::ZERO) };
+	if t.graceful {
+		rproxy_env.push(env("RPROXY_SHUTDOWN_DELAY", &duration_env(delay)));
+		rproxy_env.push(env("RPROXY_SHUTDOWN_DRAIN", &duration_env(drain)));
+	}
+	let pre_stop_secs = m.pre_stop_secs.unwrap_or(if t.graceful { 0 } else { PRE_STOP_SECS });
+	// the parameters' logLevel, performance and extraEnv (names the controller sets are refused there)
 	rproxy_env.extend(crate::render::params::rproxy_env(&t.params));
 	let rproxy = Container {
 		name: "rproxy".into(),
-		image: Some(t.params.rproxy.as_ref().and_then(|r| r.image.clone()).unwrap_or_else(|| m.rproxy_image.clone())),
+		image: Some(t.rproxy_image(m)),
 		image_pull_policy: Some(m.pull_policy.clone()),
 		env: Some(rproxy_env),
 		resources: object(resources.rproxy.as_ref()),
 		ports: Some(vec![ContainerPort { name: Some("api".into()), container_port: API_PORT.into(), ..Default::default() }]),
 		// liveness needs successThreshold 1
 		liveness_probe: Some(probe("/healthz", &ProbeTiming { success: 1, ..m.liveness })),
-		readiness_probe: Some(probe("/healthz", &m.readiness)),
+		// /readyz goes draining at SIGTERM: the endpoint stops serving while rproxy still accepts
+		// (older images: /healthz)
+		readiness_probe: Some(probe(if t.graceful { &m.readiness_path } else { "/healthz" }, &m.readiness)),
 		volume_mounts: Some(vec![mount("api", API_DIR), mount("certs", CERT_DIR)]),
 		security_context: Some(restricted.clone()),
-		lifecycle: pre_stop(m),
+		lifecycle: pre_stop(m, pre_stop_secs),
 		..Default::default()
 	};
 	let certsync = Container {
@@ -543,7 +579,7 @@ pub fn deployment(t: &Target, m: &Managed, api_hash: &str) -> Deployment {
 					}),
 					containers: vec![rproxy, certsync],
 					readiness_gates: Some(vec![PodReadinessGate { condition_type: CONDITION_RULESET.into() }]),
-					termination_grace_period_seconds: (m.pre_stop_secs > 0).then(|| i64::from(m.pre_stop_secs) + STOP_GRACE),
+					termination_grace_period_seconds: grace_period(pre_stop_secs, delay, drain, t.graceful),
 					topology_spread_constraints: spread,
 					node_selector: pp.node_selector.clone(),
 					tolerations: objects(pp.tolerations.as_ref()),
@@ -562,20 +598,39 @@ pub fn deployment(t: &Target, m: &Managed, api_hash: &str) -> Deployment {
 	}
 }
 
+/// The parameters' `rproxy.shutdown` (each value), else the controller's.
+pub fn shutdown(t: &Target, m: &Managed) -> (Duration, Duration) {
+	let sd = t.params.rproxy.as_ref().and_then(|r| r.shutdown.as_ref());
+	// validated with the parameters
+	let get = |v: Option<&String>, default: Duration| v.and_then(|v| crate::render::params::duration(v)).unwrap_or(default);
+	(get(sd.and_then(|s| s.delay.as_ref()), m.shutdown_delay), get(sd.and_then(|s| s.drain.as_ref()), m.shutdown_drain))
+}
+
+/// A duration as rproxy reads it (`25s`, `500ms`).
+pub fn duration_env(d: Duration) -> String {
+	if d.subsec_millis() == 0 { format!("{}s", d.as_secs()) } else { format!("{}ms", d.as_millis()) }
+}
+
+/// `terminationGracePeriodSeconds`: the preStop, rproxy's delay and drain (rounded up), and
+/// `STOP_GRACE` for it to stop (`OLD_STOP_GRACE` after an older rproxy's preStop, as before).
+/// `None` (the kubelet's 30 s) when it stops at once.
+pub fn grace_period(pre_stop_secs: u32, delay: Duration, drain: Duration, graceful: bool) -> Option<i64> {
+	let secs = |d: Duration| i64::try_from(d.as_millis().div_ceil(1000)).unwrap_or(i64::MAX);
+	let total = i64::from(pre_stop_secs) + secs(delay) + secs(drain);
+	(total > 0).then_some(total + if graceful { STOP_GRACE } else { OLD_STOP_GRACE })
+}
+
 /// rproxy's preStop: it keeps serving for `pre_stop_secs` after the pod is marked for deletion,
 /// while the Service's endpoints, kube-proxy and load balancers (MetalLB moving its announcement)
 /// take it out. rproxy stops at once on SIGTERM, which comes after.
-fn pre_stop(m: &Managed) -> Option<Lifecycle> {
-	if m.pre_stop_secs == 0 {
+fn pre_stop(m: &Managed, secs: u32) -> Option<Lifecycle> {
+	if secs == 0 {
 		return None;
 	}
 	let handler = if m.native_sleep {
-		LifecycleHandler { sleep: Some(SleepAction { seconds: m.pre_stop_secs.into() }), ..Default::default() }
+		LifecycleHandler { sleep: Some(SleepAction { seconds: secs.into() }), ..Default::default() }
 	} else {
-		LifecycleHandler {
-			exec: Some(ExecAction { command: Some(vec!["sleep".into(), m.pre_stop_secs.to_string()]) }),
-			..Default::default()
-		}
+		LifecycleHandler { exec: Some(ExecAction { command: Some(vec!["sleep".into(), secs.to_string()]) }), ..Default::default() }
 	};
 	Some(Lifecycle { pre_stop: Some(handler), ..Default::default() })
 }
@@ -1001,6 +1056,8 @@ pub struct Endpoint {
 	pub certs: Option<String>,
 	/// A managed Gateway's id (its own credentials); `None` for fleet pods.
 	pub target: Option<String>,
+	/// The image of the pod's `rproxy` container.
+	pub rproxy_image: Option<String>,
 }
 
 /// Running pods in `ns` matching `labels` (`key=value,...`).
@@ -1045,6 +1102,7 @@ pub fn pods(store: &[std::sync::Arc<Pod>], ns: &str, selector: &BTreeMap<String,
 				certsync_port: CERTSYNC_PORT,
 				certs: p.metadata.annotations.as_ref().and_then(|a| a.get(ANNOTATION_CERTS)).cloned(),
 				target: if managed { labels.get(LABEL_GATEWAY).cloned() } else { None },
+				rproxy_image: p.spec.as_ref().and_then(|s| s.containers.iter().find(|c| c.name == "rproxy")).and_then(|c| c.image.clone()),
 			})
 		})
 		.collect();
@@ -1156,6 +1214,62 @@ mod tests {
 	}
 
 	#[test]
+	fn graceful_shutdown() {
+		let p = plan();
+		let mut t = Target::new(&p);
+		let env = |pod: &PodSpec, n: &str| pod.containers[0].env.iter().flatten().find(|e| e.name == n).and_then(|e| e.value.clone());
+		let path = |probe: &Option<Probe>| probe.as_ref().unwrap().http_get.as_ref().unwrap().path.clone().unwrap();
+		// an rproxy not known to have a graceful shutdown: the preStop and /healthz as before, no RPROXY_SHUTDOWN_*
+		let pod = deployment(&t, &Managed::default(), "h").spec.unwrap().template.spec.unwrap();
+		assert_eq!(env(&pod, "RPROXY_SHUTDOWN_DELAY"), None);
+		assert_eq!(path(&pod.containers[0].readiness_probe), "/healthz");
+		assert!(pod.containers[0].lifecycle.is_some());
+		// with one (the defaults): delay 15 s replaces the preStop, /readyz, delay + drain + 5 s
+		t.graceful = true;
+		let pod = deployment(&t, &Managed::default(), "h").spec.unwrap().template.spec.unwrap();
+		assert_eq!(env(&pod, "RPROXY_SHUTDOWN_DELAY").as_deref(), Some("15s"));
+		assert_eq!(env(&pod, "RPROXY_SHUTDOWN_DRAIN").as_deref(), Some("25s"));
+		assert!(pod.containers[0].lifecycle.is_none(), "no preStop");
+		assert_eq!(pod.termination_grace_period_seconds, Some(45), "15 s + 25 s + 5 s");
+		assert_eq!(path(&pod.containers[0].readiness_probe), "/readyz");
+		assert_eq!(path(&pod.containers[0].liveness_probe), "/healthz", "draining is not dead");
+		// the flags
+		let m = Managed {
+			shutdown_delay: Duration::from_secs(10),
+			shutdown_drain: Duration::from_millis(1500),
+			readiness_path: "/healthz".into(),
+			..Default::default()
+		};
+		let pod = deployment(&t, &m, "h").spec.unwrap().template.spec.unwrap();
+		assert_eq!(env(&pod, "RPROXY_SHUTDOWN_DELAY").as_deref(), Some("10s"));
+		assert_eq!(env(&pod, "RPROXY_SHUTDOWN_DRAIN").as_deref(), Some("1500ms"));
+		assert_eq!(pod.termination_grace_period_seconds, Some(17), "10 s + 2 s (rounded up) + 5 s");
+		assert_eq!(path(&pod.containers[0].readiness_probe), "/healthz");
+		// the parameters' rproxy.shutdown, each value over the flags'
+		t.params.rproxy = Some(crate::k8s::params::RproxyParams {
+			shutdown: Some(crate::k8s::params::Shutdown { delay: Some("5s".into()), drain: None }),
+			..Default::default()
+		});
+		let pod = deployment(&t, &Managed::default(), "h").spec.unwrap().template.spec.unwrap();
+		assert_eq!(env(&pod, "RPROXY_SHUTDOWN_DELAY").as_deref(), Some("5s"));
+		assert_eq!(env(&pod, "RPROXY_SHUTDOWN_DRAIN").as_deref(), Some("25s"));
+		assert_eq!(pod.termination_grace_period_seconds, Some(35));
+		// stopping at once: the kubelet's default
+		t.params.rproxy = Some(crate::k8s::params::RproxyParams {
+			shutdown: Some(crate::k8s::params::Shutdown { delay: Some("0s".into()), drain: Some("0".into()) }),
+			..Default::default()
+		});
+		let pod = deployment(&t, &Managed::default(), "h").spec.unwrap().template.spec.unwrap();
+		assert_eq!(pod.termination_grace_period_seconds, None);
+		assert_eq!(duration_env(Duration::from_secs(60)), "60s");
+		// --pre-stop-secs set (an install that sets managed.preStopSeconds): that preStop, then the delay and drain
+		t.params.rproxy = None;
+		let pod = deployment(&t, &Managed { pre_stop_secs: Some(10), ..Default::default() }, "h").spec.unwrap().template.spec.unwrap();
+		assert_eq!(pod.containers[0].lifecycle.as_ref().unwrap().pre_stop.as_ref().unwrap().sleep.as_ref().unwrap().seconds, 10);
+		assert_eq!(pod.termination_grace_period_seconds, Some(55), "10 + 15 + 25 + 5");
+	}
+
+	#[test]
 	fn high_availability() {
 		let p = plan();
 		let t = Target::new(&p);
@@ -1165,7 +1279,7 @@ mod tests {
 		assert_eq!(rolling.max_unavailable, Some(IntOrString::Int(0)), "a new pod is ready before an old one stops");
 		let pod = pod.template.spec.unwrap();
 		assert_eq!(pod.readiness_gates.unwrap()[0].condition_type, CONDITION_RULESET);
-		assert_eq!(pod.termination_grace_period_seconds, Some(30), "preStop 15 s + 15 s");
+		assert_eq!(pod.termination_grace_period_seconds, Some(30), "an rproxy without a graceful shutdown: preStop 15 s + 15 s");
 		let rproxy = &pod.containers[0];
 		assert_eq!(rproxy.lifecycle.as_ref().unwrap().pre_stop.as_ref().unwrap().sleep.as_ref().unwrap().seconds, 15);
 		let r = rproxy.readiness_probe.as_ref().unwrap();
@@ -1178,13 +1292,13 @@ mod tests {
 		assert_eq!(spread[0].when_unsatisfiable, "ScheduleAnyway");
 		assert_eq!(spread[0].label_selector.as_ref().unwrap().match_labels, Some(labels(&t.id)));
 		// an older cluster: exec; no preStop at 0; one replica: no spreading
-		let old = Managed { native_sleep: false, pre_stop_secs: 5, ..Default::default() };
+		let old = Managed { native_sleep: false, pre_stop_secs: Some(5), ..Default::default() };
 		let pod = deployment(&t, &old, "h").spec.unwrap().template.spec.unwrap();
 		let exec = pod.containers[0].lifecycle.clone().unwrap().pre_stop.unwrap().exec.unwrap();
 		assert_eq!(exec.command, Some(vec!["sleep".to_string(), "5".to_string()]));
 		assert_eq!(pod.termination_grace_period_seconds, Some(20));
 		assert!(pod.topology_spread_constraints.is_none());
-		let none = Managed { pre_stop_secs: 0, ..Default::default() };
+		let none = Managed { pre_stop_secs: Some(0), ..Default::default() };
 		let pod = deployment(&t, &none, "h").spec.unwrap().template.spec.unwrap();
 		assert!(pod.containers[0].lifecycle.is_none());
 		assert_eq!(pod.termination_grace_period_seconds, None);

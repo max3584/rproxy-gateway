@@ -31,6 +31,8 @@ spec:
       readinessGates:
         - conditionType: rproxy.max3584.net/ruleset-applied
       hostNetwork: {{ .Values.fleet.hostNetwork }}
+      # rproxy's shutdown delay and drain, and 5 s to stop
+      terminationGracePeriodSeconds: {{ add (include "rproxy-gateway.seconds" .Values.fleet.shutdown.delay) (include "rproxy-gateway.seconds" .Values.fleet.shutdown.drain) 5 }}
       dnsPolicy: {{ if .Values.fleet.hostNetwork }}ClusterFirstWithHostNet{{ else }}ClusterFirst{{ end }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets: {{- toYaml . | nindent 8 }}
@@ -49,6 +51,9 @@ spec:
             - {name: RPROXY_TLS_KEY, value: /etc/rproxy-gateway/api-tls/tls.key}
             # the kubelet mounts Secrets as root: rproxy may use root's files in these directories
             - {name: RPROXY_FILES_TRUSTED_DIRS, value: "/var/run/rproxy-gateway/certs,/etc/rproxy-gateway/api-tls,/etc/rproxy-gateway/token"}
+            # SIGTERM: keep accepting (GET /readyz: draining), then let connections end (rproxy v0.4.1)
+            - {name: RPROXY_SHUTDOWN_DELAY, value: {{ .Values.fleet.shutdown.delay | toString | quote }}}
+            - {name: RPROXY_SHUTDOWN_DRAIN, value: {{ .Values.fleet.shutdown.drain | toString | quote }}}
           ports:
             - {name: api, containerPort: 9443}
           livenessProbe:

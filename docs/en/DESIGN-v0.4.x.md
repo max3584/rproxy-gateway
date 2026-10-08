@@ -23,7 +23,7 @@ The current decisions: [DESIGN.md](DESIGN.md); the tenant boundaries: [SECURITY.
 | A. managed rproxy per Gateway | the `RproxyGatewayParameters` CRD, merging, status, RBAC | v0.4.2 |
 | B. Install with Kustomize | the chart's controller settings in a ConfigMap, `config/`, `install.yaml` on releases, CI | v0.4.2 |
 | C. The UI on Kubernetes | read-only tokens for the UI and a discovery Secret (the UI's chart is in the UI's repository) | a later patch |
-| E. Stopping on SIGTERM | passing rproxy's `RPROXY_SHUTDOWN_*`, the grace period | after the rproxy-api release |
+| E. Stopping on SIGTERM | passing rproxy's `RPROXY_SHUTDOWN_*`, the grace period | v0.4.2 (rproxy v0.4.1) |
 | F. VIPs held by pods | the fleet's `vip` sidecar, Leases, status | a later patch |
 
 ### Done in v0.4.1
@@ -33,9 +33,9 @@ v0.4.1 (#32) brought the availability of managed pods and Services. A and E buil
 | In v0.4.1 | In A and E |
 |---|---|
 | The readiness gate `rproxy.max3584.net/ruleset-applied` | kept |
-| preStop (`--pre-stop-secs`, 15 s by default), `terminationGracePeriodSeconds` = preStop + 15 | kept; becomes 6.'s shape once E lands |
+| preStop (`--pre-stop-secs`, 15 s by default), `terminationGracePeriodSeconds` = preStop + 15 | only for rproxy without `features.graceful_shutdown`; with it, 6.'s shape (no preStop, delay + drain + 5) |
 | With 2 or more replicas, a PDB (`maxUnavailable: 1`) and a `kubernetes.io/hostname` topology spread | the default stays; A's `podDisruptionBudget` and `pod.topologySpreadConstraints` change it |
-| Probe timing (`--readiness-probe`, `--liveness-probe`) | kept; readiness stays on `/healthz` (6.) |
+| Probe timing (`--readiness-probe`, `--liveness-probe`) | kept; the readiness path is `/readyz` for rproxy with `features.graceful_shutdown` (6.3) |
 | `externalTrafficPolicy` (`Local` for `LoadBalancer`, `Cluster` for `NodePort`) | the default stays (making NodePort `Local` is not taken: in the v0.4.1 acceptance test, NodePort behind one's own L4 balancer had shorter outages with `Cluster`); A's `service.externalTrafficPolicy` changes it |
 
 ## 2. A. managed rproxy per Gateway
@@ -77,7 +77,7 @@ spec:
     image: ""                           # the class only
     logLevel: info
     performance: {workers: 4, udpShards: auto, cpuAffinity: none, busyPollUsecs: 0, splice: {enabled: true}}
-    shutdown: {delay: 5s, drain: 25s}   # E; a shape only until the rproxy release (6.)
+    shutdown: {delay: 15s, drain: 25s}  # E (6.)
     extraEnv: []                        # the class only; names the controller sets are refused
   ui: {visible: true}                   # C: shown to the UI (a Gateway can only turn the class's default to false)
   policy:                               # only in the class's reference (InvalidParameters from a Gateway)
@@ -111,7 +111,7 @@ The default column applies when neither reference sets the field; each is the v0
 | `rproxy.image` | the rproxy container | `--rproxy-image` | an image reference (`repo:tag` or `repo@sha256:...`) |
 | `rproxy.logLevel` | `RPROXY_LOG_LEVEL` | none | `error`, `warn`, `info`, `debug`, `trace` |
 | `rproxy.performance` | `RPROXY_WORKERS`, `RPROXY_UDP_SHARDS`, `RPROXY_CPU_AFFINITY`, `RPROXY_BUSY_POLL_USECS`, `RPROXY_SPLICE`, `RPROXY_SPLICE_AFTER`, `RPROXY_SPLICE_FULL_READS`, `RPROXY_SPLICE_PIPE_SIZE` | none | the ranges of rproxy's `global.performance` (managed rproxy has no settings file, so environment variables) |
-| `rproxy.shutdown.delay`, `.drain` | once E lands, `RPROXY_SHUTDOWN_DELAY`, `RPROXY_SHUTDOWN_DRAIN` and the grace period (6.) | — | `0s` to `10m`. **Until the rproxy release, validated only, not put on the pods** |
+| `rproxy.shutdown.delay`, `.drain` | `RPROXY_SHUTDOWN_DELAY`, `RPROXY_SHUTDOWN_DRAIN` and the grace period (6.) | `--shutdown-delay` (15 s), `--shutdown-drain` (25 s) | `0s` to `10m`. Not put on rproxy without `features.graceful_shutdown` (it keeps the preStop) |
 | `rproxy.extraEnv` | the rproxy container | none | `RPROXY_*` only. Names the controller sets (`RPROXY_API_*`, `RPROXY_TOKEN_FILE`, `RPROXY_TLS_*`, `RPROXY_FILES_*`, `RPROXY_CONFIG`, `RPROXY_DATABASE_URL`, `RPROXY_UPDATE*`, `RPROXY_HANDOFF*`, `RPROXY_STATIC_RULES`, `RPROXY_SHUTDOWN_*`, and those of the fields above) are refused |
 | `ui.visible` | whether C's discovery Secret lists the Gateway | the class's value, else `true` | a Gateway cannot make it `true` when the class says `false`. Goes nowhere until C |
 
@@ -252,28 +252,47 @@ rproxy-api adds `--shutdown-delay` / `RPROXY_SHUTDOWN_DELAY` (after SIGTERM, `/r
 
 ### 6.1 When to wire them
 
-- **Only once an rproxy-api release has them** (until then A's `rproxy.shutdown` is validated only). The chart's rproxy image (`rproxy.image.tag`, the default of `--rproxy-image`) moves to that release in the same change.
-- With an older rproxy image through `rproxy.image`, `RPROXY_SHUTDOWN_*` do nothing (unknown environment variables are ignored). So the preStop goes only once the pod's rproxy is known to have `features.graceful_shutdown` (the controller asks pods for `/capabilities`; while unknown, the preStop stays).
+- rproxy-api v0.4.1 has them. The chart's rproxy image (`rproxy.image.tag`, the default of `--rproxy-image`, `RPROXY_VERSION` in release.yml) moved to 0.4.1.
+- An older rproxy image through `rproxy.image` ignores `RPROXY_SHUTDOWN_*` and stops at once on SIGTERM. So the new shape (no preStop, `/readyz`) is used only once the pod's rproxy is known to have `features.graceful_shutdown`: the image the controller ships (`--rproxy-image`'s default) at once, another image once a pod running it answers in `/capabilities` (its pods roll once more; the controller remembers such images while it runs). While unknown, v0.4.1's shape (preStop, `/healthz`, no `RPROXY_SHUTDOWN_*`).
 
-### 6.2 Shape (once wired)
+### 6.2 Shape
 
-- managed: `RPROXY_SHUTDOWN_DELAY` and `RPROXY_SHUTDOWN_DRAIN` from A's `rproxy.shutdown` (`5s` and `25s` by default). The preStop `sleep` gives way to E's `delay` (no shell needed in the image, the same shape on Kubernetes 1.29, `/readyz` can say `draining`), and `terminationGracePeriodSeconds` becomes `delay` + `drain` + 5 (35 by default). The switch is decided after an acceptance run against v0.4.1 (preStop 15 s); if keeping the preStop gives shorter outages, the grace period is preStop + `delay` + `drain` + 5.
-- fleet: the chart's `fleet.shutdown` (same defaults). It is hostNetwork, so the documentation says to choose `delay` by how the outside load balancer or VIP lets go.
-- The controller does not PUT to stopping pods (`deletionTimestamp` set), as today.
+- managed (rproxy with `features.graceful_shutdown`): `RPROXY_SHUTDOWN_DELAY` and `RPROXY_SHUTDOWN_DRAIN` from A's `rproxy.shutdown`, else the controller's `--shutdown-delay` (15 s by default) and `--shutdown-drain` (25 s by default) (the chart's `managed.shutdown`). No preStop; `terminationGracePeriodSeconds` is delay + drain + 5 (45 by default). Readiness on `/readyz` (6.3).
+- `managed.preStopSeconds` / `--pre-stop-secs` is unset by default now (no preStop for a new rproxy, 15 s for an older one). An install that sets it (a value written for 0.4.1) keeps it, as a preStop on every pod (the grace period is preStop + delay + drain + 5).
+- fleet: the chart's `fleet.shutdown` (delay 5 s and drain 25 s by default; the grace period is delay + drain + 5). It is hostNetwork without Service endpoints, so point the outside load balancer's or VIP's health check at `https://<node>:9443/readyz` and make the delay longer than it takes to let go (interval x failures) (README and values say so).
+- The controller does not PUT to pods being deleted (`deletionTimestamp`; as before. rproxy also refuses changes with `503 shutting_down` during the delay and drain).
+
+#### Acceptance comparison
+
+rproxy v0.4.1, 2 replicas, l2-local (MetalLB L2 + `Local`) and l2-cluster (MetalLB L2 + `Cluster`), six combinations, one run each. Values are the scenarios' longest time without a 200 (seconds): b1/b2 a pod deleted (not on / on the announcing node), c a drain, d a rollout restart, h a parameters change, f the controllers and rproxy restarted together (no limit). Failed: the failed requests of b1 to h together.
+
+| shape | l2-local b1/b2/c/d/h | failed | f | l2-cluster b1/b2/c/d/h | failed |
+|---|---|---|---|---|---|
+| A. preStop 15, delay 0, drain 0, `/healthz` (v0.4.1) | 0.3/1.2/1.2/0.1/1.2 | 9 | 1.3 | 0.1/0.1/0.1/0.2/0.2 | 0 |
+| B. preStop 15, delay 0, drain 25, `/healthz` | 0.2/**4.7**/0.2/0.2/0.2 | 122 | 6.1 | 0.2/0.2/0.2/0.2/0.2 | 0 |
+| C. preStop 0, delay 15, drain 25, `/healthz` | 0.1/**6.1**/1.2/0.2/1.2 | 140 | 5.8 | 0.2/0.2/0.3/1.2/0.2 | 1 |
+| **D. preStop 0, delay 15, drain 25, `/readyz` (chosen)** | 1.2/0.2/1.2/1.2/1.2 | 12 | 0.2 | 0.1/0.2/0.2/0.2/0.2 | 0 |
+| E. preStop 15, delay 0, drain 25, `/readyz` | 0.2/**4.0**/0.2/1.2/0.2 | 104 | 2.6 | 0.2/0.2/0.2/0.2/0.2 | 0 |
+| F. preStop 10, delay 5, drain 25, `/healthz` | 0.1/**6.0**/1.2/1.2/0.2 | 139 | 4.6 | 0.1/0.1/0.2/0.1/1.2 | 1 |
+
+- The shapes that add a drain without taking the endpoint out before the listeners close (B, C, E, F) lost 4–6 s in l2-local's b2 (deleting the pod on the announcing node), over `GAP_LIMIT` (3 s). From the moment the listeners close until the pod is gone (the few seconds connections take to end), the endpoint stays `serving`, and MetalLB does not move until the pod is gone. E uses `/readyz` but with no delay, the listeners close before readiness fails (up to 4 s).
+- With D, `/readyz` says `draining` on SIGTERM, and during the delay (rproxy still accepting) the endpoint goes and MetalLB moves. Gaps are like v0.4.1's (A) (one request, 1.2 s at most in l2-local), and open connections get to finish in the drain. In l2-cluster no shape differs.
+- A 5 s delay (the design's first idea) was not measured. Readiness takes up to 4 s to fail (2 s x 2), so the default is 15 s, like v0.4.1's preStop.
 
 ### 6.3 Readiness on `/readyz`? (10. Q4)
 
-The design proposed moving the readiness probe from `/healthz` to `/readyz` (out at once while `draining`). Together with the v0.4.1 results, **it stays on `/healthz` for now**:
+**`/readyz` for rproxy with `features.graceful_shutdown`** (`managed.readinessProbe.path` / `--readiness-path` can set `/healthz`). Older rproxy stays on `/healthz`.
 
-- A stopping pod is `ready: false` in its EndpointSlice as soon as its deletion starts (whatever the probe says). kube-proxy and cloud load balancers take new connections away on that. `/readyz` does not make this sooner.
-- `/readyz` saying `draining` fails the readiness probe, and the endpoint's `serving` turns `false` too. That is the design v0.4.1 did not choose (turning the stopping pod's gate `False` first): with MetalLB L2 and `externalTrafficPolicy: Local`, kube-proxy drops what still reaches that node until the announcement moves, and the outage got longer ([DESIGN.md](DESIGN.md), "rproxy availability").
-- At start, the readiness gate (the rule set applied) is a stronger condition than `/readyz` (rproxy ready), so `/readyz` makes start neither sooner nor safer.
-- The PR wiring E runs the acceptance test (l2-local, bgp, nodeport-lb) with both `/healthz` and `/readyz` and makes the one with shorter outages the default (`managed.readinessProbe` gets a `path` to choose).
+- At design time, `/readyz` `draining` dropping the endpoint's `serving` first looked like v0.4.1's rejected shape (a stopping pod's gate set to `False` first), which made MetalLB L2 + `Local` gaps longer. Measured, rproxy keeps accepting during the delay, so D (`/readyz`) was like A and shorter than the shapes adding a drain on `/healthz` (B, C) (6.2's table).
+- Liveness stays on `/healthz` (a `draining` rproxy is not restarted).
+- At start the readiness gate (rule set applied) is a stronger condition than `/readyz`, so start-up is no faster or slower.
+- bgp and nodeport-lb were not compared (bgp is recorded only). If needed, `managed.readinessProbe.path` sets `/healthz` back.
 
 ### 6.4 Tests
 
-- Unit: the environment variables and the grace period; the preStop stays for pods without `features.graceful_shutdown`.
-- Acceptance: the summary shows the failed requests of scenarios b, c, d (failures alone do not fail the run, as today; an input `strict: true` fails it unless 0).
+- Unit: the environment variables and the grace period (flags, parameters, rounding); without `features.graceful_shutdown` the preStop and `/healthz` stay and no `RPROXY_SHUTDOWN_*` is passed; how an image becomes known (the shipped image, pods' `/capabilities`, remembered).
+- e2e: `rproxy:e2e` (rproxy-api's master) is not the shipped image, so its pods roll to the new shape (no preStop, `/readyz`, `RPROXY_SHUTDOWN_*`, a 45 s grace period) once they answer `graceful_shutdown`.
+- Acceptance: failed requests have been in the summary already. Input `strict` (false by default): the scenarios `GAP_LIMIT` applies to (b, c, d, h, i) fail on any failed request (bgp stays record-only). With `source=checkout`, if the chart's rproxy image is not published yet, it is built from rproxy-api's release binary of the same version.
 
 ## 7. F. VIPs held by rproxy pods
 
@@ -377,7 +396,7 @@ Scenarios added (A), run after today's a-g; SKIP when the `RproxyGatewayParamete
 1. This document (a docs PR).
 2. A: `RproxyGatewayParameters` (v0.4.2).
 3. B: the chart's ConfigMap, `config/`, `install.yaml` on releases (v0.4.2). A and B both change the chart; whichever goes in second renders `config/` again with `scripts/render-config.sh`.
-4. E: after the rproxy-api release, wire `RPROXY_SHUTDOWN_*` (6.).
+4. E: wire rproxy-api v0.4.1's `RPROXY_SHUTDOWN_*` (6.).
 5. C: after the UI's chart, the discovery Secret and the UI token.
 6. F: the fleet VIP; large, so a patch of its own.
 7. Acceptance (8.) is run by hand on each PR's branch to check nothing regresses from v0.4.1.
@@ -388,8 +407,8 @@ Scenarios added (A), run after today's a-g; SKIP when the `RproxyGatewayParamete
 |---|---|---|
 | Q1 | One CRD for A, or a separate cluster-scoped kind for classes | **One** (namespaced; the class's reference only in the controller's namespace; `policy` only from the class's reference) |
 | Q2 | What happens to a Gateway that ran when its reference becomes invalid | **It keeps its last good shape** (`Accepted: False`, `Programmed: True`). A Gateway's rproxy with a Deployment is never deleted because of an invalid reference |
-| Q3 | The default `drain` of the rproxy binary | decided in rproxy-api's design (0 in the binary). The managed default is `5s` and `25s` (6.) |
-| Q4 | Defaults that change: the PDB with 2+ replicas, `externalTrafficPolicy: Local` for NodePort, readiness on `/readyz`, the grace period | the PDB was done in v0.4.1. NodePort stays `Cluster` (v0.4.1's measurements). `/readyz` is decided with the acceptance test when E lands (6.3). The grace period takes 6.2's shape with E |
+| Q3 | The default `drain` of the rproxy binary | decided in rproxy-api's design (0 in the binary). The managed default is delay `15s` and drain `25s` (decided with the acceptance test; 6.) |
+| Q4 | Defaults that change: the PDB with 2+ replicas, `externalTrafficPolicy: Local` for NodePort, readiness on `/readyz`, the grace period | the PDB was done in v0.4.1. NodePort stays `Cluster` (v0.4.1's measurements). readiness is on `/readyz` (decided with E's acceptance test; 6.3). The grace period is delay + drain + 5 (6.2) |
 | Q5 | What tenants may set by default | the table of 2.5. `service.type`, `loadBalancerClass`, nodeSelector, tolerations, affinity, priorityClass open through the class's `policy`. `image` and `extraEnv` never open to tenants |
 | Q6 | Move the chart's controller settings from args to a ConfigMap (`envFrom`) | **Yes** (chart values unchanged) |
 | Q7 | The UI's chart as a subchart of rproxy-gateway's | **No** (separate chart and versions). rproxy-gateway's chart only gets values such as `ui.namespace` |

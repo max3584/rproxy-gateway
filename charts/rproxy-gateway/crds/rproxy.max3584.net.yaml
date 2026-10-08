@@ -424,8 +424,10 @@ spec:
                     type: object
                   shutdown:
                     description: |-
-                      How rproxy stops on SIGTERM (RPROXY_SHUTDOWN_DELAY, RPROXY_SHUTDOWN_DRAIN): validated only
-                      until an rproxy release has them (docs/DESIGN-v0.4.x.md, E).
+                      How rproxy stops on SIGTERM (RPROXY_SHUTDOWN_DELAY, RPROXY_SHUTDOWN_DRAIN; terminationGracePeriodSeconds
+                      is both and 5 s more): keep accepting for `delay` while /readyz says draining, then let
+                      connections end for up to `drain`. Default: the controller's (15s, 25s). Only for rproxy with
+                      features.graceful_shutdown (v0.4.1); older rproxy keeps a preStop (docs/DESIGN-v0.4.x.md, E).
                     nullable: true
                     properties:
                       delay:

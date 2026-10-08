@@ -182,10 +182,12 @@ spec:
       readinessGates:
         - conditionType: rproxy.max3584.net/ruleset-applied
       hostNetwork: true
+      # rproxy's shutdown delay and drain, and 5 s to stop
+      terminationGracePeriodSeconds: 35
       dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: rproxy
-          image: ghcr.io/max3584/rproxy-gateway/rproxy:0.4.0
+          image: ghcr.io/max3584/rproxy-gateway/rproxy:0.4.1
           imagePullPolicy: IfNotPresent
           env:
             # the pod's IP (with hostNetwork, the node's): not every interface
@@ -197,6 +199,9 @@ spec:
             - {name: RPROXY_TLS_KEY, value: /etc/rproxy-gateway/api-tls/tls.key}
             # the kubelet mounts Secrets as root: rproxy may use root's files in these directories
             - {name: RPROXY_FILES_TRUSTED_DIRS, value: "/var/run/rproxy-gateway/certs,/etc/rproxy-gateway/api-tls,/etc/rproxy-gateway/token"}
+            # SIGTERM: keep accepting (GET /readyz: draining), then let connections end (rproxy v0.4.1)
+            - {name: RPROXY_SHUTDOWN_DELAY, value: "5s"}
+            - {name: RPROXY_SHUTDOWN_DRAIN, value: "25s"}
           ports:
             - {name: api, containerPort: 9443}
           livenessProbe:
