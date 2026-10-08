@@ -135,8 +135,8 @@ metallb() {
   kubectl -n metallb-system rollout status deploy/controller --timeout=300s
   kubectl -n metallb-system rollout status ds/speaker --timeout=300s
 }
-apply_pool() {  # apply_pool <range> <extra YAML>
-  cat << YAML | kubectl apply -f -
+apply_pool() {  # apply_pool <range> <extra YAML> (errors in $work/apply.log)
+  cat << YAML | kubectl apply -f - > "$work/apply.log" 2>&1
 apiVersion: metallb.io/v1beta1
 kind: IPAddressPool
 metadata: {name: kind, namespace: metallb-system}
@@ -153,7 +153,7 @@ case "$TOPOLOGY" in
     wait_for 180 apply_pool "$pool" 'apiVersion: metallb.io/v1beta1
 kind: L2Advertisement
 metadata: {name: kind, namespace: metallb-system}
-spec: {ipAddressPools: [kind]}'
+spec: {ipAddressPools: [kind]}' || { cat "$work/apply.log"; exit 1; }
     ;;
   bgp)
     # an FRR router on the kind network: eBGP with every node's MetalLB speaker (BFD), ECMP over
@@ -216,7 +216,7 @@ spec: {myASN: 64513, peerASN: 64512, peerAddress: $FRR_IP, bfdProfile: fast}
 apiVersion: metallb.io/v1beta1
 kind: BGPAdvertisement
 metadata: {name: kind, namespace: metallb-system}
-spec: {ipAddressPools: [kind]}"
+spec: {ipAddressPools: [kind]}" || { cat "$work/apply.log"; exit 1; }
     ;;
   nodeport-lb)
     HELM_ARGS="--set managed.serviceType=NodePort --set managed.externalTrafficPolicy=Local $HELM_ARGS"
