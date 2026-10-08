@@ -1,0 +1,16 @@
+# Pins the images to digests (replace the zeros). The controller's image is also the one managed rproxy
+# pods run certsync from (RPROXY_GATEWAY_IMAGE); rproxy's image is RPROXY_GATEWAY_RPROXY_IMAGE.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../default
+images:
+  - name: ghcr.io/max3584/rproxy-gateway
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+configMapGenerator:
+  - name: rproxy-gateway-config
+    namespace: rproxy-gateway-system
+    behavior: merge
+    literals:
+      - RPROXY_GATEWAY_IMAGE=ghcr.io/max3584/rproxy-gateway@sha256:0000000000000000000000000000000000000000000000000000000000000000
+      - RPROXY_GATEWAY_RPROXY_IMAGE=ghcr.io/max3584/rproxy-gateway/rproxy@sha256:0000000000000000000000000000000000000000000000000000000000000000

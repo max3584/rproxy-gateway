@@ -5,6 +5,7 @@ name: Release
 # - the rproxy image ghcr.io/max3584/rproxy-gateway/rproxy:<RPROXY_VERSION> from rproxy-api's
 #   release binaries (static musl)
 # - the Helm chart as an OCI artifact (oci://ghcr.io/max3584/charts/rproxy-gateway) and on the release
+# - install.yaml, install-fleet.yaml (kubectl apply; the Kustomize bases of config/) and crds.yaml on the release
 # Binaries are built in Alpine containers (static musl; aarch64 with cargo-zigbuild).
 # The first release (v0.4.0) ships together with rproxy v0.4.0.
 on:
@@ -129,6 +130,16 @@ jobs:
             echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
             helm push "dist/chart/rproxy-gateway-$VERSION.tgz" oci://ghcr.io/max3584/charts
           fi
+      # kubectl apply / Kustomize: the bases rendered from this chart (config/, scripts/render-config.sh)
+      - name: install manifests
+        run: |
+          grep -q "image: ghcr.io/max3584/rproxy-gateway:$VERSION$" config/default/rproxy-gateway.yaml \
+            || { echo "::error::config/ is not rendered for $VERSION: run scripts/render-config.sh"; exit 1; }
+          mkdir -p dist/install
+          kubectl kustomize config/default > dist/install/install.yaml
+          kubectl kustomize config/fleet > dist/install/install-fleet.yaml
+          cp charts/rproxy-gateway/crds/rproxy.max3584.net.yaml dist/install/crds.yaml
+          ls -l dist/install
       - name: release
         if: env.PUSH == 'true'
         uses: softprops/action-gh-release@v2
@@ -136,3 +147,6 @@ jobs:
           files: |
             dist/chart/rproxy-gateway-${{ env.VERSION }}.tgz
             charts/rproxy-gateway/crds/rproxy.max3584.net.yaml
+            dist/install/install.yaml
+            dist/install/install-fleet.yaml
+            dist/install/crds.yaml

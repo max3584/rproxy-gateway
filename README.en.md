@@ -62,7 +62,32 @@ spec:
 - By default (managed), the controller creates one rproxy Deployment and `LoadBalancer` Service per Gateway in the Gateway's namespace (`managed.serviceType`, `managed.replicas`), with the Gateway's `spec.infrastructure` labels and annotations and its `spec.addresses` (the Service's `externalIPs`).
 - The controller runs 2 replicas by default; they elect a leader with a Lease and only it applies rule sets (docs/en/DESIGN.md, "High availability").
 - With `fleet.enabled=true`, the chart's DaemonSet (`hostNetwork: true`) runs rproxy, which serves every Gateway.
-- Chart values: [charts/rproxy-gateway/values.yaml](charts/rproxy-gateway/values.yaml).
+- Chart values: [charts/rproxy-gateway/values.yaml](charts/rproxy-gateway/values.yaml). The controller's settings are passed in a ConfigMap `rproxy-gateway-config` (`RPROXY_GATEWAY_*` environment variables); `controller.extraArgs` stay arguments and win over it.
+
+### Installing without Helm (kubectl, Kustomize)
+
+Releases carry manifests rendered from the chart: `install.yaml` (managed), `install-fleet.yaml` (fleet) and `crds.yaml` (rproxy's CRDs only, for GitOps that applies CRDs first). None includes Gateway API's CRDs.
+
+```bash
+kubectl apply --server-side -f https://github.com/max3584/rproxy-gateway/releases/download/v<version>/install.yaml
+```
+
+With Kustomize, use [config/default](config/default) (fleet: [config/fleet](config/fleet)) as the base. The controller's settings are the `RPROXY_GATEWAY_*` of `rproxy-gateway controller --help`, changed with a `configMapGenerator` and `behavior: merge` (the ConfigMap's name gets a hash, so a change rolls the controller). Examples: [config/samples](config/samples) (image digests, managed replicas, one controller replica).
+
+```yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - github.com/max3584/rproxy-gateway//config/default?ref=v<version>
+configMapGenerator:
+  - name: rproxy-gateway-config
+    namespace: rproxy-gateway-system
+    behavior: merge
+    literals: [RPROXY_GATEWAY_REPLICAS=2]
+```
+
+- `config/` is the chart's defaults rendered by `scripts/render-config.sh` (not edited by hand; CI finds drift from the chart).
+- Values that change the shape of RBAC (`controller.watchNamespaces`: a Role per namespace) or make the chart add objects (`migration.createIngressClass`) need Helm.
 
 ## Availability (`managed.replicas` 2 or more)
 
