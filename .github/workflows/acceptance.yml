@@ -20,7 +20,7 @@ on:
         required: false
         default: "0.4.0"
       topology:
-        description: "how traffic reaches rproxy (scripts/acceptance.sh; bgp uses externalTrafficPolicy Cluster unless helm_args sets it)"
+        description: "how traffic reaches rproxy (scripts/acceptance.sh; bgp is record-only: its gaps are the network's)"
         required: false
         default: l2-local
         type: choice
@@ -34,7 +34,7 @@ on:
         required: false
         default: ""
       gap_limit:
-        description: "seconds without a 200 a pod deletion, drain or rollout may cause (replicas >= 2)"
+        description: "seconds without a 200 a pod deletion, drain, rollout or parameters change may cause (replicas >= 2; l2-local, l2-cluster, nodeport-lb; bgp and a lost node are recorded only)"
         required: false
         default: "3"
 

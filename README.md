@@ -96,7 +96,7 @@ rproxy の Pod は、コントローラがルールセットを反映してか�
 
 - **既定（LoadBalancer、`externalTrafficPolicy: Local`）を勧める**。クライアントの IP が rproxy に届き、Pod の入れ替え（削除・drain・rollout）の途切れは 1 秒ほどまで。MetalLB L2 は告知するノードを移すときに、その瞬間の接続を 1 つ落とすことがある（drain の 1.2 秒）。ノードが止まったときは、ロードバランサがノードの死を見つけるまで（MetalLB L2 の memberlist で 5〜8 秒）。
 - **`Cluster`** は Pod の入れ替えではほぼ途切れない（どのノードも ready な Pod に送る）が、クライアントの IP は届かず、ノードが止まると、そのノードの Pod が endpoint から外れるまで（ノードが NotReady になるまで、40〜50 秒）一部の接続が落ち続ける。
-- **BGP + ECMP**：`Local` では、MetalLB が終了中の Pod のあるノードの経路を Pod が消えてから取り下げる（FRR モードで 3〜4 秒かかる）ので、その間の分が落ちる（3〜4 秒）。計画した入れ替えでほぼ 0 にしたいなら `Cluster`（ノードが止まったときの尾は上と同じ）。BFD でノードの死は 1 秒ほどで経路から外れる。
+- **BGP + ECMP**：`Local` では、MetalLB が終了中の Pod のあるノードの経路を Pod が消えてから取り下げる（FRR モードで 3〜4 秒かかる）ので、その間の分が落ちる（3〜4 秒）。計画した入れ替えでほぼ 0 にしたいなら `Cluster`（ノードが止まったときの尾は上と同じ）。BFD でノードの死は 1 秒ほどで経路から外れる。BGP の収束はネットワークの側の設定（BFD、タイマー）で決まるので、受け入れテストの `bgp` は測って記録するだけ（途切れで失敗にしない）。
 - **NodePort と自前の L4 のロードバランサ**：`Local` では、ロードバランサは rproxy が止まってからでないとノードを外せない（NodePort には `healthCheckNodePort` がない）ので、止まる瞬間の接続が落ちる（2 秒ほど）。ロードバランサが Service の `healthCheckNodePort` を見られるなら `LoadBalancer` 型にするとよい（終了中の Pod だけのノードは失敗を返すので、preStop の間に外れる）。
 - ノードが止まったとき、そのノードの **backend** の Pod も、ノードが NotReady になるまで EndpointSlice に残る（どの形でも、表の値の後ろに 40〜60 秒の一部の失敗が続くことがある）。backend には RproxyPolicy の `outlierDetection` を使う。backend 自身も preStop で止まるようにする（受け入れテストの backend は 5 秒。ないと drain ごとに 1〜3 秒落ちる）。
 

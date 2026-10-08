@@ -10,15 +10,15 @@
 #   l2-local    MetalLB L2, externalTrafficPolicy Local (the chart's default): one node announces
 #   l2-cluster  MetalLB L2, externalTrafficPolicy Cluster: one node announces, any node forwards
 #   bgp         MetalLB BGP (FRR mode, BFD) to an FRR router container with ECMP: every node with a
-#               ready rproxy pod announces, the router splits connections across them. externalTrafficPolicy
-#               Cluster (the recommended BGP setup, README "Availability") unless HELM_ARGS sets
-#               managed.externalTrafficPolicy; with Local, a pod deletion's gap is MetalLB withdrawing the
-#               node's route once the pod is gone (3-4 s with FRR), reported as "PASS (known floor)" up to
-#               BGP_LOCAL_FLOOR seconds
+#               ready rproxy pod announces, the router splits connections across them. Record-only: its
+#               gaps are the network's (route withdrawal, BFD), so they never fail the run ("info
+#               (network-dependent)")
 #   nodeport-lb NodePort Services (externalTrafficPolicy Local; Cluster through HELM_ARGS) behind an HAProxy container that
 #               health-checks every node and sends to all healthy ones (a user's own L4 balancer)
-# Outages are measured and reported. With MANAGED_REPLICAS >= 2, a pod deletion, a node drain and a
-# rollout restart fail the run when the longest gap without a 200 exceeds GAP_LIMIT seconds; otherwise
+# Outages are measured and reported. With MANAGED_REPLICAS >= 2, a pod deletion, a node drain, a
+# rollout restart and a parameters change fail the run when the longest gap without a 200 exceeds
+# GAP_LIMIT seconds (l2-local, l2-cluster, nodeport-lb: what rproxy-gateway controls; bgp and a lost
+# node are recorded only: their gaps come from the network and the cluster's failure detection); otherwise
 # the script fails only on functional breakage (routes never recover, the certificate never rotates,
 # state not restored). Each scenario's timeline (EndpointSlices, pods, the load balancer's view,
 # probe failures) is in $work/timeline-*.txt. Results: $work/summary.md (and $GITHUB_STEP_SUMMARY).
@@ -38,8 +38,6 @@ MANAGED_REPLICAS=${MANAGED_REPLICAS:-2}
 HELM_ARGS=${HELM_ARGS:-}
 # seconds without a 200 a pod deletion, drain or rollout may cause (MANAGED_REPLICAS >= 2)
 GAP_LIMIT=${GAP_LIMIT:-3}
-# bgp with externalTrafficPolicy Local: the gap a pod deletion may leave (MetalLB's FRR route withdrawal)
-BGP_LOCAL_FLOOR=${BGP_LOCAL_FLOOR:-5}
 FRR_IMAGE=${FRR_IMAGE:-quay.io/frrouting/frr:9.1.0}
 HAPROXY_IMAGE=${HAPROXY_IMAGE:-haproxy:3.0-alpine}
 case "$TOPOLOGY" in l2-local | l2-cluster | bgp | nodeport-lb) ;; *) echo "TOPOLOGY: l2-local, l2-cluster, bgp or nodeport-lb"; exit 1 ;; esac
@@ -235,8 +233,6 @@ spec: {ipAddressPools: [kind]}" || { cat "$work/apply.log"; exit 1; }
 esac
 case "$TOPOLOGY" in
   l2-cluster) HELM_ARGS="--set managed.externalTrafficPolicy=Cluster $HELM_ARGS" ;;
-  # the recommended BGP setup (Local is still measured when HELM_ARGS asks for it)
-  bgp) [[ $HELM_ARGS == *managed.externalTrafficPolicy=* ]] || HELM_ARGS="--set managed.externalTrafficPolicy=Cluster $HELM_ARGS" ;;
 esac
 # the externalTrafficPolicy in use (the last one HELM_ARGS sets; else the chart's default for the Service type)
 ETP=$(grep -o 'managed.externalTrafficPolicy=[A-Za-z]*' <<< "$HELM_ARGS" | tail -1 | cut -d= -f2 || true)
@@ -617,9 +613,10 @@ record() {
   local result=$5 notes=$6 key=${1%%.*}
   if [ "$result" = PASS ] && [ $((h + s + t)) -gt 0 ]; then result="PASS (outage)"; fi
   if [ -n "${7:-}" ] && [ "$MANAGED_REPLICAS" -ge 2 ] && [ "$gap" -gt $((GAP_LIMIT * 1000)) ]; then
-    if [ "$TOPOLOGY" = bgp ] && [ "$ETP" = Local ] && [ "$key" = b1 ] && [ "$gap" -le $((BGP_LOCAL_FLOOR * 1000)) ]; then
-      # documented (README "Availability"): MetalLB withdraws the node's route only once its last pod is gone
-      result="PASS (known floor)" notes="longest gap over ${GAP_LIMIT}s: BGP with externalTrafficPolicy Local waits for MetalLB (FRR) to withdraw the node's route after the pod is gone (3-4 s; use Cluster for planned changes); $notes"
+    if [ "$TOPOLOGY" = bgp ]; then
+      # BGP's convergence (route withdrawal, BFD) is the network's, not rproxy-gateway's: recorded only
+      [ "$result" = FAIL ] || result="info (network-dependent)"
+      notes="longest gap over ${GAP_LIMIT}s (BGP convergence: network-side, tune with BFD); $notes"
     else
       result=FAIL notes="longest gap over ${GAP_LIMIT}s; $notes"
     fi
@@ -962,7 +959,7 @@ stop_probes
   echo "|---|---|---|---|---|---|"
   awk -F'\t' '{ printf "| %s | %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5, $6 }' "$results"
   echo
-  echo "PASS (outage): requests failed but everything recovered (recorded, not a failure). PASS (known floor): over the gap limit by a documented limit of the topology (bgp with externalTrafficPolicy Local, a pod deletion: up to ${BGP_LOCAL_FLOOR}s). SKIP: the placement or topology did not allow the scenario. FAIL: routes never recovered, the certificate never rotated or the state was not restored (timeouts: recovery ${RECOVERY_TIMEOUT}s, leader ${LEADER_TIMEOUT}s, route change ${APPLY_TIMEOUT}s, rotation ${ROTATE_TIMEOUT}s)$([ "$MANAGED_REPLICAS" -ge 2 ] && echo ", or a pod deletion, drain or rollout restart left a gap over ${GAP_LIMIT}s")."
+  echo "PASS (outage): requests failed but everything recovered (recorded, not a failure). info (network-dependent): over the gap limit in the bgp topology, whose gaps are the network's convergence (recorded, not a failure); a lost node (g) is recorded only in every topology. SKIP: the placement or topology did not allow the scenario. FAIL: routes never recovered, the certificate never rotated or the state was not restored (timeouts: recovery ${RECOVERY_TIMEOUT}s, leader ${LEADER_TIMEOUT}s, route change ${APPLY_TIMEOUT}s, rotation ${ROTATE_TIMEOUT}s)$([ "$MANAGED_REPLICAS" -ge 2 ] && [ "$TOPOLOGY" != bgp ] && echo ", or a pod deletion, drain, rollout restart or parameters change left a gap over ${GAP_LIMIT}s")."
   echo
   echo "Nodes: $(tr '\n' ' ' < "$work/nodes.txt")"
   for f in "$work"/timeline-*.txt; do
