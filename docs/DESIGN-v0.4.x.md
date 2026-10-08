@@ -24,7 +24,7 @@ v0.4.0・v0.4.1 の受け入れテストで分かった、Kubernetes で運用�
 | B. Kustomize で入れる | chart のコントローラの設定を ConfigMap に、`config/`、リリースの `install.yaml`・CI | v0.4.2 |
 | C. UI を Kubernetes で | UI 用の読むだけのトークンと発見の Secret（UI の chart は UI のリポジトリ） | v0.4.3 |
 | E. SIGTERM での終わり方 | rproxy の `RPROXY_SHUTDOWN_*` を渡す、猶予の秒数 | v0.4.2（rproxy v0.4.1） |
-| F. Pod が直接持つ VIP | fleet の `vip` サイドカー・Lease・状態 | 後のパッチ |
+| F. Pod が直接持つ VIP | fleet の `vip` サイドカー・Lease・状態 | v0.4.4 |
 
 ### v0.4.1 で済んだもの
 
@@ -384,6 +384,42 @@ fleet:
 
 - 単体：Lease の取り方（期限、持っている数の待ち、手放し）、条件（`/readyz`・反映の知らせ）、`hold` と他の MAC を見て手放すこと、VIP の確かめ（`addressCIDRs`・重なり）、ARP・NA のパケットの形。
 - 受け入れ：入力 `mode: managed | fleet-vip`。`fleet-vip` では kind の docker のネットワークから VIP を選び、ランナーから VIP へ HTTP・TCP・UDP を流し続けて測る。シナリオ j. 持ち主の Pod を消す、k. `kubectl rollout restart ds/rproxy`、l. 持ち主のノードを drain、m. `docker stop <持ち主のノード>`、n. `docker pause <持ち主のノード>`（戻ったときに二重にならないこと）、o. control-plane のコンテナを `docker pause`（`hold` で通信が続くこと）。要約に MetalLB L2 との比較を出す。
+
+### 7.9 v0.4.4 で入れた形
+
+7.2〜7.8 のとおり。設計から変えたところと細かいところ：
+
+- 値：`fleet.vip.addresses` の 1 つは、アドレス（正規の形。`2001:0db8::10` ではなく `2001:db8::10`）か `{address, interface, nodeSelector}`。`interface` が空なら `fleet.vip.interface`、それも空なら VIP を含むサブネットのアドレスを持つインタフェース。`nodeSelector` はその VIP を持てるノードのラベル。`fleet.vip.garp`・`onApiUnreachable`・`metricsPort`（既定 9445）・`resources`。chart は `fleet.enabled`・`hostNetwork`・`managed.addressCIDRs`（空なら VIP は使えない）、IPv6 の VIP に `::` の待ち受けがなければ誤りにする。コントローラには `RPROXY_GATEWAY_FLEET_VIPS` と `RPROXY_GATEWAY_ADDRESS_CIDR` を渡す（VIP を使うときだけ。使わない fleet は今までと同じ）。
+- 持つ条件の「反映の知らせ」は、新しい口を作らず readiness gate `rproxy.max3584.net/ruleset-applied` を使う：今の rproxy の再起動の回数で `True` なら反映済み（コントローラが rproxy の再起動で `False` に戻すのと同じ判断）。`vip` は自分の Pod を watch する。
+- 手放す順：VIP を外してから Lease の holder を空ける（設計の逆。二重に持つ時間をなくす。差は数ミリ秒）。
+- drain：`kubectl drain` は DaemonSet の Pod を追い出さないので、ノードが cordon されたら VIP を手放す（理由 `cordoned`）。cordon のノードの Pod は、ほかの Pod が取らないまま Lease の期限の 2 倍が過ぎたときだけ取り、取ったものは cordon では手放さない（すべてのノードが cordon でも VIP がなくならない）。`vip` は自分のノードを watch する（ラベル・cordon）。
+- 期限の数え方：Lease の `renewTime`（持ち主の時計）ではなく、自分が Lease の変化を最後に見てからの時間で数える（client-go の leader election と同じ。ノードの時計を比べない）。
+- API サーバが戻った直後：持ち主でない Pod は、API サーバに届かなかったときから期限の分は期限切れの Lease を取らない（持ち主が先に更新できる）。watch のやり直しは kube の既定（最大 30 秒）ではなく 1 秒おき。
+- ほかの MAC：ARP（送り主のアドレスが VIP）と NS（送り元が VIP）・NA（対象が VIP）を聞く。持ち主が期限内に Lease を更新できていればほかの MAC は古いので告げ直し、できていなければ（`hold` で API サーバに届かない）手放して期限の分は取らない。ほかのノードが unicast で答える ARP・NA は聞こえない（broadcast・multicast だけ）。
+- 権限：ServiceAccount のトークンの投影は Pod の ServiceAccount のものしか作れないので、VIP を使うときは fleet の Pod の ServiceAccount を `rproxy-gateway-vip` にし（`automountServiceAccountToken: false` のまま）、`projected` のトークンを `vip` のコンテナにだけつなぐ。Role：`leases` の get・list・watch・update（`resourceNames` で VIP の Lease だけ。list・watch は `metadata.name` の field selector）、`pods` の get・list・watch（自分の readiness gate）。ClusterRole：`nodes` の get・list・watch。Lease は chart が作り、`vip` に create は与えない。
+- `vip` は rproxy の `/readyz` を Pod の IP の 9443 で 0.5 秒（`retryInterval`）おきに読む（`rproxy-gateway-api-tls` の `ca.crt` だけをマウントして検証）。
+- 状態：VIP を使う fleet の Gateway の `status.addresses` は VIP（`spec.addresses` で選んだもの、なければ使える VIP すべて）。持ち主のいない時間が 10 秒を超えた VIP を選んだ Gateway は `Programmed: False`（`AddressNotUsable`）。選んでいない Gateway は、使える VIP のどれも持たれていないときだけ。
+- Kustomize：`config/samples/fleet-vip`（例の VIP 192.0.2.10。Lease の名前と Role の `resourceNames` がアドレスのハッシュなので、ほかの VIP は chart を描いて使う）。
+- 受け入れ：`mode=fleet-vip`。HTTP・HTTPS・TCP を 0.1 秒おきに流し続け、UDP（`UDPRoute`、agnhost の netexec）は VIP から答えが返ることを最初と各シナリオの後に確かめる（流し続けはしない）。m は設計の `docker stop` ではなく `docker kill`（下の値）。シナリオは j・k・l・o・n・m の順（`docker kill` したノードは別のアドレスで戻ることがあるので最後）。j・k・l・o は `GAP_LIMIT` で落とし、m・n は記録だけ（n は戻ったときに VIP が 1 つのノードだけになることを確かめる）。MetalLB L2 との比較は managed の受け入れ（l2-local・l2-cluster、6.2）の値と並べる。
+
+#### 受け入れテストでの値
+
+`mode=fleet-vip`、kind（ワーカー 3 台）、VIP 1 つ、既定の値（期限 3 秒・更新 1 秒・やり直し 0.5 秒、`hold`）で回した（run 37805425584）。「最長の途切れ」はどれかのプローブが 200 を返さなかった最長の時間、「Lease」は Lease の持ち主が変わった時刻（シナリオの始まりから）。
+
+| シナリオ | 失敗（HTTP/HTTPS/TCP） | 最長の途切れ | Lease | 結果 |
+|---|---|---|---|---|
+| j. 持ち主の Pod の削除 | 1/0/0（883 のうち） | 0.2 秒 | +0.09 秒 | PASS |
+| k. `rollout restart ds/rproxy` | 0/0/0（1090） | 0.1 秒 | +7.35 秒（持ち主の Pod の番が来たとき） | PASS |
+| l. 持ち主のノードの drain（cordon） | 0/1/0（345） | 1.2 秒 | +0.47 秒 | PASS |
+| o. control plane の `docker pause` 20 秒（`hold`） | 0/0/0（971） | 0.2 秒 | 移らない | PASS |
+| n. 持ち主のノードの `docker pause`（記録だけ） | 26/27/26（316） | 6.4 秒 | +2.36 秒 | 戻して 1.2 秒で VIP は 1 つのノードだけ |
+| m. 持ち主のノードの `docker kill`（記録だけ） | 27/27/14（416） | 5.7 秒 | +3.15 秒 | — |
+
+- 予定の移動（j・k・l）は Lease が 0.1〜0.5 秒で移り、途切れは 1 リクエストまで（MetalLB L2 + `Local` の managed（6.2 の D）の b2・c・d は 0.2〜1.2 秒）。
+- n・m は Lease の期限（3 秒）で移った。失敗の多くは、止めたノードにあるバックエンド（echo）の Pod に rproxy が送ったもの（ノードが NotReady になって EndpointSlice から外れるまで。VIP とは関係なく、managed の g と同じ）。
+- 最初の回（run 37803895238）では m を `docker stop` にした：kind のノードが止まるときに Pod が SIGTERM で止まるので、VIP は drain と同じく +0.06 秒で移り、失敗は 0。ノードの喪失を測るため `docker kill` にした。
+- UDP は最初と各シナリオの後に VIP から答えが返った（`IP_PKTINFO` で VIP から返す）。
+- 要約の `vip` の行が空になるところは、ランナーから `docker exec` でノードを読めなかったとき（プローブは成功している）。
 
 ## 8. 受け入れテスト（`acceptance.yml`）の変更
 

@@ -71,6 +71,16 @@ English: [en/SECURITY.md](en/SECURITY.md)
 - 切るとき：`ui.namespace` を空に戻す（`helm upgrade`）。トークンファイルから UI のトークンが外れ、rproxy はすぐに断る。前の namespace の `rproxy-ui-discovery` はコントローラがもう見ないので手で消す（`kubectl -n <UI の namespace> delete secret rproxy-ui-discovery`）。
 - 入れ替え：UI 用のトークンはマスタートークンから導くので、マスタートークンを入れ替えると（下の「制御 API の資格と入れ替え」）一緒に変わり、コントローラが rproxy のトークンファイルと `rproxy-ui-discovery` を書き直す（rproxy の Pod は入れ替わる。UI は Secret のボリュームが更新されると読み直すので、kubelet の更新まで 1〜2 分は古いトークンで断られる）。
 
+## fleet の VIP（`fleet.vip`）
+
+fleet の Pod が VIP を直接持つとき（[DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) の 7.）：
+
+- `vip` のコンテナだけが root で `NET_ADMIN`・`NET_RAW`（ほかは drop、`readOnlyRootFilesystem`、`allowPrivilegeEscalation: false`）。ノードのネットワーク（hostNetwork）でアドレスを足し外しし、ARP・NDP を送って聞く。fleet はもう hostNetwork なので、namespace の PodSecurity は今と同じ `privileged`（`baseline` は hostNetwork を許さない）。
+- Kubernetes の API の資格は `vip` のコンテナだけ：Pod は `automountServiceAccountToken: false` のまま、ServiceAccount `rproxy-gateway-vip` のトークンを `projected` で `vip` にだけつなぐ（rproxy・certsync は今どおり API を使わない）。権限は、VIP の Lease（`resourceNames` で名指し）の get・list・watch・update、コントローラの namespace の Pod の読み取り（自分の readiness gate）、ノードの読み取り（ラベル・cordon）。Lease は chart が作り、`vip` は作れない。乗っ取られた `vip` ができるのは、VIP をどのノードに置くかを変えることと、その namespace の Pod とノードを読むこと。
+- VIP は管理者が chart で決めるものだけで、`managed.addressCIDRs` の内にあり、ほかの Service やノードのアドレスと重ならないものだけを使う（コントローラが確かめる。`vip` も範囲の外の VIP は持たない）。Gateway は VIP を選べるが作れない。
+- fleet のルールは `0.0.0.0` で待ち受けるので、どの VIP に来てもポートが合えばその Gateway に届く（fleet は 1 つの信頼の範囲）。
+- `/metrics`（9445）はノードの IP で認証なしに答える（VIP を持っているかと移った回数だけ）。ノードへの外からの通信はファイアウォールで絞る（上の「ネットワーク」）。
+
 ## rproxy のルールセットの持ち主
 
 rproxy はルールセットを、作ったトークンの名前のものにする（ほかの admin でないトークンは変えられない）。コントローラのトークンは値が変わっても名前はいつも `rproxy-gateway` なので、トークンを入れ替えても（rproxy の再起動のあとの PUT し直しも）同じ持ち主のまま。トークンの `allow_rulesets` は、fleet のものが `k8s/`、managed の Gateway ごとのものがその Gateway のルールセット（`k8s/<namespace>/<name>`）だけ。

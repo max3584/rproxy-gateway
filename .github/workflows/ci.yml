@@ -54,9 +54,11 @@ jobs:
         run: |
           helm lint charts/rproxy-gateway
           helm lint charts/rproxy-gateway --set fleet.enabled=true --set migration.migrateTo=default/gw --set migration.createIngressClass=true
+          helm lint charts/rproxy-gateway --set fleet.enabled=true --set fleet.vip.enabled=true --set 'fleet.vip.addresses={192.0.2.10}' --set 'managed.addressCIDRs={192.0.2.0/24}'
       - name: helm template
         run: |
-          for args in "" "--set fleet.enabled=true" "--set migration.migrateTo=default/gw" "--set managed.parameters.replicas=2 --set rbac.aggregateToAdmin=false"; do
+          for args in "" "--set fleet.enabled=true" "--set migration.migrateTo=default/gw" "--set managed.parameters.replicas=2 --set rbac.aggregateToAdmin=false" \
+            "--set fleet.enabled=true --set fleet.vip.enabled=true --set fleet.vip.addresses={192.0.2.10,2001:db8::10} --set managed.addressCIDRs={192.0.2.0/24,2001:db8::/64} --set rproxy.listenAddresses={0.0.0.0,::}"; do
             # shellcheck disable=SC2086
             helm template t charts/rproxy-gateway -n rproxy-gateway-system $args > /dev/null
           done

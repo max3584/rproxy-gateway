@@ -82,3 +82,44 @@ YAML
 
 base default
 base fleet --set fleet.enabled=true
+
+# samples/fleet-vip: fleet with VIPs held by the fleet's pods (the chart's fleet.vip; docs/DESIGN-v0.4.x.md
+# 7.) for the example VIP 192.0.2.10 in 192.0.2.0/24, over config/fleet. The VIPs' Leases and the Role
+# name them by a hash of the address: for other VIPs, render the chart with yours the same way
+vip=192.0.2.10 cidr=192.0.2.0/24 dir=config/samples/fleet-vip
+mkdir -p "$dir"
+"$HELM" template rproxy-gateway "$CHART" -n "$NS" --set rendered=true --set fleet.enabled=true --set fleet.vip.enabled=true \
+  --set "fleet.vip.addresses={$vip}" --set "managed.addressCIDRs={$cidr}" |
+  awk -v vip="$dir/vip.yaml" -v ds="$dir/daemonset.yaml" -v gen="$GENERATED" '
+    function flush() {
+      if (doc ~ /# Source: [^\n]*\/templates\/vip\.yaml/) printf "---\n%s", doc > vip
+      else if (doc ~ /# Source: [^\n]*\/templates\/fleet\.yaml/) printf "%s", doc > ds
+      doc = ""
+    }
+    BEGIN { print gen > vip; print gen > ds }
+    /^---/ { flush(); next }
+    { doc = doc $0 "\n" }
+    END { flush() }
+  '
+sed -i '/^# Source: /d' "$dir/vip.yaml" "$dir/daemonset.yaml"
+cat > "$dir/kustomization.yaml" << YAML
+$GENERATED
+# fleet with VIPs held by the fleet's pods (the chart's fleet.vip): the example VIP $vip in $cidr. The
+# vip sidecar's ServiceAccount, RBAC and the VIP's Lease (vip.yaml), the DaemonSet with the sidecar
+# (daemonset.yaml, a patch), and the controller's settings. The Lease's name and the Role's resourceNames
+# are a hash of the address: for your VIPs, render the chart (helm template --set fleet.vip.enabled=true ...)
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../fleet
+  - vip.yaml
+patches:
+  - path: daemonset.yaml
+configMapGenerator:
+  - name: rproxy-gateway-config
+    namespace: $NS
+    behavior: merge
+    literals:
+      - RPROXY_GATEWAY_FLEET_VIPS=$vip
+      - RPROXY_GATEWAY_ADDRESS_CIDR=$cidr
+YAML

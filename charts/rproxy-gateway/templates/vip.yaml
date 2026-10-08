@@ -1,0 +1,91 @@
+{{- if .Values.fleet.vip.enabled }}
+{{- if not .Values.fleet.enabled }}{{ fail "fleet.vip needs fleet.enabled: true" }}{{ end }}
+{{- if not .Values.fleet.hostNetwork }}{{ fail "fleet.vip needs fleet.hostNetwork: true (the VIPs go on the nodes' interfaces)" }}{{ end }}
+{{- if not .Values.fleet.vip.addresses }}{{ fail "fleet.vip.enabled: list the VIPs in fleet.vip.addresses" }}{{ end }}
+{{- if not .Values.managed.addressCIDRs }}{{ fail "fleet.vip: the VIPs must be inside managed.addressCIDRs (empty: static addresses are off)" }}{{ end }}
+{{- if and (contains ":" (include "rproxy-gateway.vips" .)) (not (has "::" .Values.rproxy.listenAddresses)) }}{{ fail "fleet.vip: an IPv6 VIP needs \"::\" in rproxy.listenAddresses" }}{{ end }}
+{{- $leases := list }}
+{{- range splitList "," (include "rproxy-gateway.vips" .) }}
+{{- $leases = append $leases (include "rproxy-gateway.vipLease" .) }}
+{{- end }}
+# fleet.vip (docs/DESIGN-v0.4.x.md 7.): the identity of the fleet's pods when they hold VIPs. Only the
+# `vip` container gets its token (the pod does not mount one; rproxy and certsync do not use the API)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rproxy-gateway-vip
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "rproxy-gateway.labels" . | nindent 4 }}
+automountServiceAccountToken: false
+---
+# the VIPs' Leases (their holders), the pods' readiness gates (the controller has applied the rule sets)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rproxy-gateway-vip
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "rproxy-gateway.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    resourceNames: {{ toJson $leases }}
+    verbs: [get, list, watch, update]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rproxy-gateway-vip
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "rproxy-gateway.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: rproxy-gateway-vip
+subjects:
+  - kind: ServiceAccount
+    name: rproxy-gateway-vip
+    namespace: {{ .Release.Namespace }}
+---
+# the pod's node: its labels (a VIP's nodeSelector) and whether it is cordoned (VIPs move away)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: rproxy-gateway-vip
+  labels: {{- include "rproxy-gateway.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: rproxy-gateway-vip
+  labels: {{- include "rproxy-gateway.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: rproxy-gateway-vip
+subjects:
+  - kind: ServiceAccount
+    name: rproxy-gateway-vip
+    namespace: {{ .Release.Namespace }}
+{{- range splitList "," (include "rproxy-gateway.vips" .) }}
+---
+# who holds the VIP {{ . }} (written by the vip sidecars; the chart only makes it)
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: {{ include "rproxy-gateway.vipLease" . }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "rproxy-gateway.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: vip
+  annotations:
+    rproxy.max3584.net/vip: {{ . | quote }}
+spec: {}
+{{- end }}
+{{- end }}
