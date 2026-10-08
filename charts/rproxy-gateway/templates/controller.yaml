@@ -20,9 +20,12 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: rproxy-gateway
-      {{- with .Values.controller.podAnnotations }}
-      annotations: {{- toYaml . | nindent 8 }}
-      {{- end }}
+      annotations:
+        # a changed configuration rolls the controller
+        rproxy.max3584.net/config: {{ include "rproxy-gateway.config" . | sha256sum | trunc 16 }}
+        {{- with .Values.controller.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
       serviceAccountName: rproxy-gateway
       {{- with .Values.imagePullSecrets }}
@@ -37,70 +40,22 @@ spec:
         - name: controller
           image: {{ include "rproxy-gateway.controllerImage" . }}
           imagePullPolicy: {{ .Values.controller.image.pullPolicy }}
+          # the settings are in the ConfigMap rproxy-gateway-config (RPROXY_GATEWAY_* environment
+          # variables, so Kustomize can change them); extraArgs win over them (arguments beat the environment)
           args:
             - controller
-            - --controller-name={{ .Values.controller.controllerName }}
-            - --resync-secs={{ .Values.controller.resyncSeconds }}
-            - --listen-addr={{ join "," .Values.rproxy.listenAddresses }}
-            - --leader-elect={{ .Values.controller.leaderElection }}
-            - --cross-namespace-secrets={{ .Values.controller.crossNamespaceSecrets }}
-            {{- if .Values.controller.allowExternalNameServices }}
-            - --allow-external-name-services
-            {{- end }}
-            {{- with .Values.controller.watchNamespaces }}
-            - --watch-namespaces={{ join "," . }}
-            {{- end }}
-            {{- if .Values.fleet.enabled }}
-            - --mode=fleet
-            - --fleet-selector=app.kubernetes.io/name=rproxy,app.kubernetes.io/component=fleet
-            {{- if .Values.fleet.rproxyRules }}
-            - --fleet-rproxy-rules
-            {{- end }}
-            {{- with .Values.fleet.addresses }}
-            - --fleet-address={{ join "," . }}
-            {{- end }}
-            {{- else }}
-            - --mode=managed
-            - --rproxy-image={{ include "rproxy-gateway.rproxyImage" . }}
-            - --controller-image={{ include "rproxy-gateway.controllerImage" . }}
-            - --image-pull-policy={{ .Values.rproxy.image.pullPolicy }}
-            - --replicas={{ .Values.managed.replicas }}
-            - --service-type={{ .Values.managed.serviceType }}
-            - --network-policy={{ .Values.managed.networkPolicy }}
-            {{- with .Values.managed.externalTrafficPolicy }}
-            - --external-traffic-policy={{ . }}
-            {{- end }}
-            - --allocate-load-balancer-node-ports={{ .Values.managed.allocateLoadBalancerNodePorts }}
-            - --pre-stop-secs={{ int .Values.managed.preStopSeconds }}
-            - --readiness-probe={{ include "rproxy-gateway.probe" .Values.managed.readinessProbe }}
-            - --liveness-probe={{ include "rproxy-gateway.probe" .Values.managed.livenessProbe }}
-            {{- with .Values.managed.addressCIDRs }}
-            - --address-cidr={{ join "," . }}
-            {{- end }}
-            {{- with .Values.managed.serviceAnnotationPrefixes }}
-            - --service-annotation-prefix={{ join "," . }}
-            {{- end }}
-            {{- end }}
-            {{- if .Values.migration.migrateTo }}
-            - --migrate-to={{ .Values.migration.migrateTo }}
-            - --ingress-class={{ .Values.migration.ingressClass }}
-            - --traefik-entrypoint={{ join "," .Values.migration.traefikEntryPoints }}
-            {{- if .Values.migration.allowCrossNamespace }}
-            - --migration-allow-cross-namespace
-            {{- end }}
-            {{- end }}
             {{- range .Values.controller.extraArgs }}
             {{- if . }}
             - {{ . | quote }}
             {{- end }}
             {{- end }}
+          envFrom:
+            - configMapRef: {name: rproxy-gateway-config}
           env:
             - name: POD_NAMESPACE
               valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
             - name: POD_NAME
               valueFrom: {fieldRef: {fieldPath: metadata.name}}
-            - name: RPROXY_GATEWAY_LOG_FORMAT
-              value: {{ .Values.controller.logFormat | quote }}
           ports:
             - {name: health, containerPort: 8081}
           livenessProbe:

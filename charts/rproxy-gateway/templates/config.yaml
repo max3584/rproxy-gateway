@@ -1,0 +1,10 @@
+# the controller's settings as RPROXY_GATEWAY_* environment variables (`rproxy-gateway controller --help`);
+# with Kustomize, change them with a configMapGenerator (behavior: merge) on config/default
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rproxy-gateway-config
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "rproxy-gateway.labels" . | nindent 4 }}
+data:
+  {{- include "rproxy-gateway.config" . | nindent 2 }}

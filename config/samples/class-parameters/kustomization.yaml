@@ -1,0 +1,21 @@
+# The GatewayClass's default parameters for every managed Gateway's rproxy (the chart's
+# managed.parameters, docs/DESIGN-v0.4.x.md A and 3.4): an RproxyGatewayParameters "rproxy-default" in
+# the controller's namespace (the only namespace a GatewayClass's parametersRef may point to), and the
+# GatewayClass pointing at it. Its policy says what Gateways' own parameters
+# (spec.infrastructure.parametersRef) may set besides the defaults (replicas up to maxReplicas, resources, ...).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../default
+  - parameters.yaml
+patches:
+  - patch: |-
+      apiVersion: gateway.networking.k8s.io/v1
+      kind: GatewayClass
+      metadata: {name: rproxy}
+      spec:
+        parametersRef:
+          group: rproxy.max3584.net
+          kind: RproxyGatewayParameters
+          name: rproxy-default
+          namespace: rproxy-gateway-system

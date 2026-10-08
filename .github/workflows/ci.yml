@@ -60,3 +60,34 @@ jobs:
             # shellcheck disable=SC2086
             helm template t charts/rproxy-gateway -n rproxy-gateway-system $args > /dev/null
           done
+
+  config:
+    name: config (kustomize)
+    runs-on: ubuntu-latest
+    container: alpine:3.24
+    steps:
+      - name: packages
+        run: apk add --no-cache bash git curl tar helm kustomize
+      - uses: actions/checkout@v4
+      - name: kubeconform
+        run: curl -sfL https://github.com/yannh/kubeconform/releases/download/v0.7.0/kubeconform-linux-amd64.tar.gz | tar xz -C /usr/local/bin kubeconform
+      # config/ is rendered from the chart (scripts/render-config.sh), never edited by hand
+      - name: config/ matches the chart
+        shell: bash
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          scripts/render-config.sh
+          if [ -n "$(git status --porcelain config/)" ]; then
+            git status --porcelain config/
+            git diff config/
+            echo "::error::config/ differs from the chart: run scripts/render-config.sh and commit config/"
+            exit 1
+          fi
+      - name: kustomize build + kubeconform
+        shell: bash
+        run: |
+          for d in config/default config/fleet config/samples/*/; do
+            echo "== $d"
+            kustomize build "$d" | kubeconform -strict -summary -ignore-missing-schemas -schema-location default \
+              -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+          done

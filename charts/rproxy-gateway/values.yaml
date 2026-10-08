@@ -25,7 +25,8 @@ controller:
   tolerations: []
   affinity: {}
   podAnnotations: {}
-  # extra arguments of `rproxy-gateway controller`
+  # extra arguments of `rproxy-gateway controller` (the other settings are in the ConfigMap
+  # rproxy-gateway-config as RPROXY_GATEWAY_* variables; arguments win over them)
   extraArgs: []
   # watch only these namespaces (and the release namespace): the controller then gets Roles there
   # instead of a ClusterRole for namespaced objects. Empty: every namespace (docs/SECURITY.md)
@@ -121,3 +122,6 @@ rbac:
   aggregateToAdmin: true
 
 imagePullSecrets: []
+
+# for scripts/render-config.sh (config/, the releases' install.yaml): no Helm labels on what is rendered
+rendered: false

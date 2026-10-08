@@ -1,0 +1,14 @@
+# Every managed Gateway gets 2 rproxy pods (spread over nodes, a PodDisruptionBudget each) behind a
+# LoadBalancer Service with externalTrafficPolicy Cluster: the chart's managed.replicas and
+# managed.externalTrafficPolicy. Any RPROXY_GATEWAY_* of `rproxy-gateway controller --help` works the same way.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../default
+configMapGenerator:
+  - name: rproxy-gateway-config
+    namespace: rproxy-gateway-system
+    behavior: merge
+    literals:
+      - RPROXY_GATEWAY_REPLICAS=2
+      - RPROXY_GATEWAY_EXTERNAL_TRAFFIC_POLICY=Cluster

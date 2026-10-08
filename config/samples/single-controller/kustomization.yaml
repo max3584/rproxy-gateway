@@ -1,0 +1,29 @@
+# One controller replica without leader election, with its own resources (the chart's
+# controller.replicas, controller.leaderElection, controller.resources).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../default
+patches:
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata: {name: rproxy-gateway, namespace: rproxy-gateway-system}
+      spec:
+        replicas: 1
+        template:
+          spec:
+            containers:
+              - name: controller
+                resources: {requests: {cpu: 50m, memory: 128Mi}, limits: {memory: 512Mi}}
+  - patch: |-
+      $patch: delete
+      apiVersion: policy/v1
+      kind: PodDisruptionBudget
+      metadata: {name: rproxy-gateway, namespace: rproxy-gateway-system}
+configMapGenerator:
+  - name: rproxy-gateway-config
+    namespace: rproxy-gateway-system
+    behavior: merge
+    literals:
+      - RPROXY_GATEWAY_LEADER_ELECT=false

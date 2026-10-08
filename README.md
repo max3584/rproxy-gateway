@@ -76,7 +76,32 @@ spec:
 ```
 - コントローラは既定で 2 レプリカ。Lease でリーダーを選び、1 つだけが反映する（docs/DESIGN.md の「冗長化」）。
 - `fleet.enabled=true` では、chart の DaemonSet（`hostNetwork: true`）の rproxy がすべての Gateway を受け持つ。
-- chart の値は [charts/rproxy-gateway/values.yaml](charts/rproxy-gateway/values.yaml)。
+- chart の値は [charts/rproxy-gateway/values.yaml](charts/rproxy-gateway/values.yaml)。コントローラの設定は ConfigMap `rproxy-gateway-config`（`RPROXY_GATEWAY_*` の環境変数）にして渡す（`controller.extraArgs` は引数のままで、ConfigMap より強い）。
+
+### Helm を使わずに入れる（kubectl・Kustomize）
+
+リリースに、chart から描いたマニフェストを付けている：`install.yaml`（managed）、`install-fleet.yaml`（fleet）、`crds.yaml`（rproxy の CRD だけ。GitOps で CRD を先に当てるとき）。どれも Gateway API の CRD は含まない。
+
+```bash
+kubectl apply --server-side -f https://github.com/max3584/rproxy-gateway/releases/download/v<版>/install.yaml
+```
+
+Kustomize では [config/default](config/default)（fleet は [config/fleet](config/fleet)）を base にする。コントローラの設定は `rproxy-gateway controller --help` の `RPROXY_GATEWAY_*` で、`configMapGenerator` の `behavior: merge` で変える（ConfigMap の名前にハッシュが付くので、変えるとコントローラが入れ替わる）。例は [config/samples](config/samples)（イメージのダイジェスト固定、managed の replicas、コントローラ 1 台、クラスの既定の `RproxyGatewayParameters`（chart の `managed.parameters`））。
+
+```yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - github.com/max3584/rproxy-gateway//config/default?ref=v<版>
+configMapGenerator:
+  - name: rproxy-gateway-config
+    namespace: rproxy-gateway-system
+    behavior: merge
+    literals: [RPROXY_GATEWAY_REPLICAS=2]
+```
+
+- `config/` は chart の既定の値を `scripts/render-config.sh` で描いたもの（手で直さない。CI が chart との食い違いを見つける）。
+- RBAC の形が変わる値（`controller.watchNamespaces` の namespace ごとの Role）や、chart がほかの物を足す値（`migration.createIngressClass`）は Helm で入れる。
 
 ## 可用性（`managed.replicas` が 2 以上）
 

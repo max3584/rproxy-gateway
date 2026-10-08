@@ -12,6 +12,7 @@ cargo fmt --check             # rustfmt.toml（タブ、幅 140）
 RPROXY_BIN=.../rproxy-api cargo test --test rproxy   # 本物の rproxy（v0.4、ルールセット）で。CI の e2e の real rproxy ジョブ
 cargo run -- crds > charts/rproxy-gateway/crds/rproxy.max3584.net.yaml   # CRD を変えたら（テストが食い違いを見つける）
 cargo run -- render -f manifests.yaml                # クラスタなしでルールセットを描く
+scripts/render-config.sh      # chart を変えたら・版を上げたら config/（Kustomize の base）を描き直す（CI の config (kustomize) が食い違いを見つける）
 scripts/e2e.sh                # kind での e2e（Docker が要るので CI のランナーの VM で。手元にはない）
 scripts/conformance.sh        # Gateway API の conformance（同上）
 scripts/acceptance.sh         # 受け入れテスト（同上。手動の acceptance ワークフローだけ。SOURCE=published|checkout、TOPOLOGY=l2-local|l2-cluster|bgp|nodeport-lb）
@@ -22,7 +23,7 @@ scripts/acceptance.sh         # 受け入れテスト（同上。手動の accep
 - `src/render/`：変換（純粋な関数。`World` のスナップショット → `GatewayPlan`）。`http.rs`（HTTPRoute）、`l4.rs`（TLS・TCP・UDP）、`policy.rs`（RproxyPolicy・RproxyRule）、`params.rs`（RproxyGatewayParameters の参照・検証・合わせ方。docs/DESIGN-v0.4.x.md の A）、`migrate.rs`・`traefik_mw.rs`（Ingress・Traefik、rproxy-api の `contrib/traefik2rproxy.py` と同じ変換）、`backends.rs`（EndpointSlice）、`hostname.rs`、`status.rs`
 - `src/controller/`：watch（`cache.rs`）、反映のループと `sync_pod`（`mod.rs`）、状態（`status.rs`）、rproxy の配置（`provision.rs`）、CA・トークンの Secret（`bootstrap.rs`）。`tests.rs` は制御 API の文書どおりの偽の rproxy
 - `src/rproxy/`：制御 API のクライアントと形。`src/certsync.rs`：rproxy の Pod の中で証明書をファイルにする
-- `charts/rproxy-gateway/`：Helm chart（`crds/` は `rproxy-gateway crds` の出力）。`Dockerfile`（コントローラ）、`Dockerfile.rproxy`（rproxy）は Alpine で、Alpine のジョブが作った musl のバイナリを入れる
+- `charts/rproxy-gateway/`：Helm chart（`crds/` は `rproxy-gateway crds` の出力。コントローラの設定は ConfigMap `rproxy-gateway-config` の `RPROXY_GATEWAY_*`）。`config/`：chart から描いた Kustomize の base（`default`・`fleet`・`crd`）と `samples/`（手で書く overlay の例）。`Dockerfile`（コントローラ）、`Dockerfile.rproxy`（rproxy）は Alpine で、Alpine のジョブが作った musl のバイナリを入れる
 - 決めごとは docs/DESIGN.md、移行は docs/MIGRATION.md、conformance の結果は docs/CONFORMANCE.md（どれも日本語・英語）
 
 ## 約束
