@@ -923,6 +923,10 @@ pub async fn apply_secrets(
 	if current_api.is_none_or(|c| data_of(Some(c)) != data_of(Some(&api)) || !same_meta(&c.metadata, &api.metadata)) {
 		Api::<Secret>::namespaced(client.clone(), ns).patch(&api_secret_name(&t.id), &pp(), &Patch::Apply(&api)).await?;
 	}
+	// The UI's token is part of the hash: rproxy v0.4.1 reads its token file only at start (and on SIGHUP), so
+	// adding or removing it rolls the pods once.
+	// TODO(max3584/rproxy-api#253): when rproxy reports that it reloads a changed token file (in `features`),
+	// hash the Secret without the UI's entry (`bootstrap::without_ui_entry`) for those pods and skip the roll.
 	Ok((certs, content_hash(&data_of(Some(&api)))))
 }
 

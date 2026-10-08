@@ -244,7 +244,7 @@ UI のイメージ・chart（`oci://ghcr.io/max3584/charts/rproxy-ui`）・migra
 - 見せる Gateway がなくなったら Secret を消す（UI の chart は Secret のボリュームを `optional: true` でマウントする）。`ui.namespace` を外したときは、前の namespace の Secret を手で消す。
 - 見せるのは parameters が正しい Gateway だけ（`InvalidParameters` で前の形のまま残した Gateway は載せず、UI のトークンも外す）。
 - fleet の Pod は、受け持つ Gateway がすべて見せるときだけ載せる（fleet の Pod はすべての Gateway のルールを持つため）。
-- UI のトークンはトークンファイルにあり、トークンファイルは Pod のテンプレートのハッシュ（`rproxy.max3584.net/api`）に入る。rproxy v0.4.1 はトークンファイルを起動時と SIGHUP でしか読み直さない（rproxy-api docs/API.md）ので、`ui.namespace` を決めたとき・Gateway を見せる／隠すときに、その Gateway の Pod が 1 回入れ替わる（rollout は `maxUnavailable: 0`・readiness gate・graceful shutdown）。`ui.namespace` が空なら Secret も Deployment も今までと同じ。fleet の DaemonSet は chart のものなので、UI のトークンを足した後は手で `rollout restart` する。入れ替えをなくすには rproxy がトークンファイルの変化を見て読み直す（証明書の `RPROXY_CERT_CHECK_SECS` と同じ）必要がある（rproxy-api への要望）。
+- UI のトークンはトークンファイルにあり、トークンファイルは Pod のテンプレートのハッシュ（`rproxy.max3584.net/api`）に入る。rproxy v0.4.1 はトークンファイルを起動時と SIGHUP でしか読み直さない（rproxy-api docs/API.md）ので、`ui.namespace` を決めたとき・Gateway を見せる／隠すときに、その Gateway の Pod が 1 回入れ替わる（rollout は `maxUnavailable: 0`・readiness gate・graceful shutdown）。`ui.namespace` が空なら Secret も Deployment も今までと同じ。fleet の DaemonSet は chart のものなので、UI のトークンを足した後は手で `rollout restart` する。入れ替えをなくすには rproxy がトークンファイルの変化を見て読み直す（証明書の `RPROXY_CERT_CHECK_SECS` と同じ）必要がある（max3584/rproxy-api#253。入ったら、その機能を `features` で答える rproxy では入れ替えない。コードの TODO）。replicas が 2 以上なら入れ替えの途切れは 1 秒に満たない（受け入れテストの d. rollout restart と同じ形）。
 
 ### 4.3 試験（gateway の側）
 
