@@ -365,6 +365,8 @@ fleet:
 | `strict` | `false` | E の確認で失敗のリクエストが 1 つでもあれば落とす | E |
 | `mode` | `managed` | `fleet-vip` で 7.8 のシナリオ j〜o | F |
 
+途切れの上限（`GAP_LIMIT`）で落とすのは、rproxy-gateway が決める Pod の削除・drain・rollout・parameters の変更を、l2-local・l2-cluster・nodeport-lb で測ったときだけ。`bgp` の途切れ（経路の取り下げ・BFD）とノードの喪失は CNI・ロードバランサ・ネットワークの側の時間なので記録だけ（`info (network-dependent)`）。
+
 足すシナリオ（A）。今の a〜g の後に回す。`RproxyGatewayParameters` の CRD がない（公開した古い chart）ときは SKIP。
 
 - h. Gateway の parameters を変える：namespace の admin の権限で `RproxyGatewayParameters` を書き、Gateway の `infrastructure.parametersRef` で指す（replicas を 1 つ増やす、resources）。通信を流したまま入れ替わり、`Accepted` が True のまま、途切れが `GAP_LIMIT` 以下。
