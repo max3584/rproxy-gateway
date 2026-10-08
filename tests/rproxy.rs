@@ -32,8 +32,12 @@ fn rproxy_bin() -> Option<PathBuf> {
 	}
 }
 
-fn free_port() -> u16 {
-	std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+/// `N` distinct free ports. The listeners are all held until every port is known: binding and
+/// dropping one at a time can hand out the same port twice, and two listeners of the Gateway on one
+/// port conflict (one rule fewer in the set).
+fn free_ports<const N: usize>() -> [u16; N] {
+	let held: Vec<std::net::TcpListener> = (0..N).map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap()).collect();
+	std::array::from_fn(|i| held[i].local_addr().unwrap().port())
 }
 
 struct Rproxy {
@@ -142,7 +146,7 @@ async fn rule_sets_on_a_real_rproxy() {
 
 	let backend = echo_backend().await;
 	let udp = udp_echo().await;
-	let (http_port, https_port, tcp_port, udp_port, api) = (free_port(), free_port(), free_port(), free_port(), free_port());
+	let [http_port, https_port, tcp_port, udp_port, api] = free_ports();
 	let key = rcgen::KeyPair::generate().unwrap();
 	let cert = rcgen::CertificateParams::new(vec!["secure.example.com".to_string()]).unwrap().self_signed(&key).unwrap();
 	let yaml = format!(
@@ -293,7 +297,8 @@ spec:
 		assert_eq!(v.state, "running", "{} {:?} {:?}", v.key(), v.error, v.conditions);
 		assert_eq!(v.condition("Programmed").status, "True", "{}", v.key());
 	}
-	assert_eq!(views.len(), 4);
+	let keys: Vec<String> = views.iter().map(|v| v.key()).collect();
+	assert_eq!(views.len(), 4, "rules on rproxy: {keys:?}\nthe Gateway: {:?}\nlisteners: {:?}", plan.conds, plan.listeners);
 
 	// HTTP: host and path prefix (at a / boundary), a header, 404, a redirect, a rewrite, 500
 	let (s, body) = get(http_port, "web.example.com", "/app/x").await;
