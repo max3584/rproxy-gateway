@@ -187,7 +187,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: rproxy
-          image: ghcr.io/max3584/rproxy-gateway/rproxy:0.4.1
+          image: ghcr.io/max3584/rproxy-gateway/rproxy:0.4.2
           imagePullPolicy: IfNotPresent
           env:
             # the pod's IP (with hostNetwork, the node's): not every interface
