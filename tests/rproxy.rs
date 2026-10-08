@@ -20,6 +20,8 @@ use rproxy_gateway::rproxy::client::Client;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const TOKEN: &str = "test-token-0123456789";
+/// The UI's read-only token (docs/DESIGN-v0.4.x.md 4.): in the same token file, as the controller writes it.
+const UI_TOKEN: &str = "ui-token-0123456789";
 
 fn rproxy_bin() -> Option<PathBuf> {
 	match std::env::var_os("RPROXY_BIN") {
@@ -49,11 +51,8 @@ struct Rproxy {
 impl Rproxy {
 	fn start(bin: &Path, dir: &Path, api: u16) -> Rproxy {
 		let tokens = dir.join("tokens.yaml");
-		std::fs::write(
-			&tokens,
-			rproxy_gateway::controller::bootstrap::token_file(TOKEN, rproxy_gateway::controller::bootstrap::FLEET_RULESETS),
-		)
-		.unwrap();
+		use rproxy_gateway::controller::bootstrap;
+		std::fs::write(&tokens, bootstrap::token_file(TOKEN, bootstrap::FLEET_RULESETS) + &bootstrap::ui_token_entry(UI_TOKEN)).unwrap();
 		let log = std::fs::File::create(dir.join(format!("rproxy-{api}.log"))).unwrap();
 		let child = Command::new(bin)
 			.env("RPROXY_API_ADDR", "127.0.0.1")
@@ -129,6 +128,19 @@ async fn get(port: u16, host: &str, path: &str) -> (u16, String) {
 	let text = String::from_utf8_lossy(&out).to_string();
 	let status = text.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
 	(status, text)
+}
+
+/// A control API request with a token: the status.
+async fn api_status(port: u16, method: &str, path: &str, token: &str, body: &str) -> u16 {
+	let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+	let req = format!(
+		"{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+		body.len()
+	);
+	tcp.write_all(req.as_bytes()).await.unwrap();
+	let mut out = vec![];
+	tcp.read_to_end(&mut out).await.unwrap();
+	String::from_utf8_lossy(&out).split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0)
 }
 
 fn indent(s: &str) -> String {
@@ -299,6 +311,17 @@ spec:
 	}
 	let keys: Vec<String> = views.iter().map(|v| v.key()).collect();
 	assert_eq!(views.len(), 4, "rules on rproxy: {keys:?}\nthe Gateway: {:?}\nlisteners: {:?}", plan.conds, plan.listeners);
+
+	// the UI's token reads rules and metrics, and writes nothing
+	assert_eq!(api_status(api, "GET", "/rules", UI_TOKEN, "").await, 200);
+	assert_eq!(api_status(api, "GET", "/metrics", UI_TOKEN, "").await, 200);
+	assert_eq!(api_status(api, "PUT", &format!("/rulesets/{}", plan.ruleset), UI_TOKEN, "{\"generation\": 99, \"rules\": []}").await, 403);
+	let v = &views[0];
+	assert_eq!(
+		api_status(api, "DELETE", &format!("/rules/{}/{}/{}", v.protocol.as_str(), v.listen_addr, v.listen_port), UI_TOKEN, "").await,
+		403
+	);
+	assert_eq!(api_status(api, "GET", &format!("/rulesets/{}", plan.ruleset), TOKEN, "").await, 200, "the set is still there");
 
 	// HTTP: host and path prefix (at a / boundary), a header, 404, a redirect, a rewrite, 500
 	let (s, body) = get(http_port, "web.example.com", "/app/x").await;

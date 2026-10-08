@@ -74,6 +74,7 @@ spec:
 # Gateway の spec に
 #   infrastructure: {parametersRef: {group: rproxy.max3584.net, kind: RproxyGatewayParameters, name: web}}
 ```
+- 管理 UI（[TCP-UDP-rproxy-ui](https://github.com/max3584/TCP-UDP-rproxy-ui) の chart。別に入れる）に Gateway の rproxy を読むだけで見せるには、chart の `ui.namespace` に UI の namespace を書く。コントローラがそこに Secret `rproxy-ui-discovery`（rproxy の Pod・CA の証明書・読むだけのトークン）を書く。見せない Gateway は parameters の `ui: {visible: false}`（[docs/SECURITY.md](docs/SECURITY.md) の「UI に見せる」）。
 - コントローラは既定で 2 レプリカ。Lease でリーダーを選び、1 つだけが反映する（docs/DESIGN.md の「冗長化」）。
 - `fleet.enabled=true` では、chart の DaemonSet（`hostNetwork: true`）の rproxy がすべての Gateway を受け持つ。止まるときは `fleet.shutdown.delay`（既定 5 秒）受け付けを続け、`fleet.shutdown.drain`（既定 25 秒）まで今の接続を待つ。前に置くロードバランサ・VIP のヘルスチェックを `https://<ノード>:9443/readyz`（止まり始めると 503）に向け、それがノードを外すまでの時間より delay を長くする。
 - chart の値は [charts/rproxy-gateway/values.yaml](charts/rproxy-gateway/values.yaml)。コントローラの設定は ConfigMap `rproxy-gateway-config`（`RPROXY_GATEWAY_*` の環境変数）にして渡す（`controller.extraArgs` は引数のままで、ConfigMap より強い）。

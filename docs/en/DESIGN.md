@@ -72,6 +72,8 @@ On its first start the controller creates these Secrets in its namespace (readin
 
 Each managed rproxy uses `rproxy-<id>-api` in its Gateway's namespace: a control API certificate the CA issued for `<id>.rproxy-api.rproxy-gateway.internal`, and the token file (`tokens.yaml`, only the SHA-256) of a token derived from the master token (HMAC-SHA256 keyed with the master token over the Gateway's id). The controller connects to each pod with that name and token. Reading the Secrets of one Gateway's namespace gives no way into other Gateways' rproxy or into the controller (the master token and the CA key stay in the controller's namespace).
 
+With `ui.namespace` (`--ui-namespace`), the token files of Gateways shown to the UI (their parameters' `ui.visible`) also get the UI's read-only token (`rules:read`, `metrics:read`), and the controller writes the Secret `rproxy-ui-discovery` (the pods, the CA certificate, the UI's tokens) in the UI's namespace ([SECURITY.md](SECURITY.md), "Showing Gateways to the UI"; [DESIGN-v0.4.x.md](DESIGN-v0.4.x.md), 4.). The UI's token is not part of the hash on the pod template (adding or removing it rolls no pod).
+
 rproxy also gets `RPROXY_FILES_TRUSTED_DIRS` (the Secret volumes' directories, whose files the kubelet makes root's; [SECURITY.md](SECURITY.md)).
 
 rproxy runs with `RPROXY_API_ADDR=0.0.0.0`, `RPROXY_API_PORT=9443`, `RPROXY_TOKEN_FILE` and `RPROXY_TLS_CERT` / `RPROXY_TLS_KEY` (the three rproxy requires for a control API on a non-loopback address).

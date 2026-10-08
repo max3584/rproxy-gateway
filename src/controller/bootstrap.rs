@@ -150,6 +150,27 @@ pub fn token_file(token: &str, allow_rulesets: &str) -> String {
 /// The rule sets the fleet's token may change: every Gateway's.
 pub const FLEET_RULESETS: &str = "k8s/";
 
+/// The UI's read-only token of one target (a managed Gateway's id, or `fleet`): HMAC-SHA256 of
+/// the master token, apart from the controller's token of the same target (docs/SECURITY.md).
+pub fn derive_ui_token(master: &str, target: &str) -> String {
+	let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, master.as_bytes());
+	crate::pem::hex(ring::hmac::sign(&key, format!("rproxy-gateway-ui/{target}").as_bytes()).as_ref())
+}
+
+/// The token file entry starting the UI's token (appended to a `token_file`).
+pub const UI_ENTRY_START: &str = "  - name: rproxy-ui\n";
+
+/// The token file entry of the UI's token: rules and statistics, read only (rproxy refuses
+/// any write with `403`).
+pub fn ui_token_entry(token: &str) -> String {
+	format!("{UI_ENTRY_START}    sha256: {}\n    scopes: [rules:read, metrics:read]\n", crate::pem::sha256_hex(token.as_bytes()))
+}
+
+/// A token file without the UI's entry (what the pods' hash and the fleet's check look at).
+pub fn without_ui_entry(file: &str) -> &str {
+	file.find(UI_ENTRY_START).map_or(file, |i| &file[..i])
+}
+
 /// Creates the Secrets that are missing; reads them all.
 pub async fn ensure(client: &kube::Client, ns: &str) -> anyhow::Result<Bootstrap> {
 	let api: Api<Secret> = Api::namespaced(client.clone(), ns);
@@ -190,9 +211,11 @@ pub async fn ensure(client: &kube::Client, ns: &str) -> anyhow::Result<Bootstrap
 		}
 	};
 	let token = String::from_utf8(field(&tok, "token").context("the token Secret has no token")?)?;
-	// the token file follows the controller's version (a rotated token is a new Secret)
+	// the token file follows the controller's version (a rotated token is a new Secret); the UI's
+	// entry (the UI namespace) is kept here and set by each pass
 	let file = token_file(token.trim(), FLEET_RULESETS);
-	if field(&tok, "tokens.yaml").as_deref() != Some(file.as_bytes()) {
+	let have = field(&tok, "tokens.yaml").map(|f| String::from_utf8_lossy(&f).into_owned());
+	if have.as_deref().map(without_ui_entry) != Some(file.as_str()) {
 		let mut s = tok.clone();
 		s.data.get_or_insert_default().insert("tokens.yaml".into(), ByteString(file.into_bytes()));
 		info!(secret = TOKEN_SECRET, "writing the fleet's token file again");
@@ -264,5 +287,26 @@ mod tests {
 		assert!(file.contains("rules:write"));
 		assert!(file.contains("allow_rulesets: [\"k8s/\"]"), "{file}");
 		assert!(token_file(&token, "k8s/default/web").contains("allow_rulesets: [\"k8s/default/web\"]"));
+	}
+
+	#[test]
+	fn ui_tokens_read_only() {
+		let ui = derive_ui_token("master", "default-web-abcdef");
+		assert_eq!(ui.len(), 64);
+		assert_ne!(ui, derive_token("master", "default-web-abcdef"), "not the controller's token");
+		assert_ne!(ui, derive_ui_token("master", "default-api-abcdef"));
+		assert_ne!(ui, derive_ui_token("other", "default-web-abcdef"), "rotates with the master token");
+		let entry = ui_token_entry(&ui);
+		assert!(entry.contains("name: rproxy-ui"));
+		assert!(entry.contains("scopes: [rules:read, metrics:read]\n"), "{entry}");
+		assert!(!entry.contains("write") && !entry.contains("admin"));
+		assert!(entry.contains(&crate::pem::sha256_hex(ui.as_bytes())) && !entry.contains(&ui), "only its SHA-256");
+		let base = token_file("tok", "k8s/");
+		let file = format!("{base}{entry}");
+		// the file stays valid YAML with both tokens
+		let doc: serde_json::Value = serde_saphyr::from_str(&file).unwrap();
+		assert_eq!(doc["tokens"].as_array().unwrap().len(), 2);
+		assert_eq!(without_ui_entry(&file), base);
+		assert_eq!(without_ui_entry(&base), base);
 	}
 }

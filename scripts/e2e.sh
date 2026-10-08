@@ -253,6 +253,58 @@ YAML
 retry 60 sh -c "test \"\$(kubectl -n e2e get gateway e2e -o jsonpath='{.status.conditions[?(@.type==\"Accepted\")].status}')\" = True"
 retry 60 sh -c "test \"\$(kubectl -n e2e get deploy $deploy -o jsonpath='{.spec.replicas}')\" = 2"
 
+echo "== the UI (docs/DESIGN-v0.4.x.md 4.): nothing without ui.namespace"
+kubectl create namespace rproxy-ui --dry-run=client -o yaml | kubectl apply -f - > /dev/null
+sleep 12
+test -z "$(kubectl -n rproxy-ui get secret rproxy-ui-discovery -o name --ignore-not-found)"
+echo "== the UI: ui.namespace set, the Gateway shown (its pods, a read-only token; no rollout)"
+generation=$(kubectl -n e2e get deploy "$deploy" -o jsonpath='{.metadata.generation}')
+helm upgrade rproxy-gateway charts/rproxy-gateway -n $NS --reuse-values --wait --set ui.namespace=rproxy-ui > /dev/null
+retry 120 sh -c "kubectl -n rproxy-ui get secret rproxy-ui-discovery -o jsonpath='{.data.nodes\.yaml}' | base64 -d | grep -q 'k8s:e2e/e2e'"
+retry 120 sh -c "test \"\$(kubectl -n rproxy-ui get secret rproxy-ui-discovery -o jsonpath='{.data.nodes\.yaml}' | base64 -d | grep -c 'url: \"https://')\" = 2"
+disc=$(kubectl -n rproxy-ui get secret rproxy-ui-discovery -o json)
+nodes=$(jq -r '.data["nodes.yaml"] | @base64d' <<< "$disc")
+echo "$nodes"
+jq -e '.data | keys | length == 3 and (.["ca.crt"] | @base64d | test("BEGIN CERTIFICATE")) and (map(@base64d) | all(test("PRIVATE KEY") | not))' <<< "$disc" > /dev/null
+id=$(kubectl -n e2e get deploy "$deploy" -o jsonpath='{.metadata.labels.rproxy\.max3584\.net/gateway}')
+kubectl -n e2e get secret "rproxy-$id-api" -o jsonpath='{.data.tokens\.yaml}' | base64 -d | grep -q 'scopes: \[rules:read, metrics:read\]'
+retry 60 sh -c "kubectl -n e2e get networkpolicy rproxy-$id -o json | jq -e '[.spec.ingress[] | select(.from[0].namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"] == \"rproxy-ui\") | .ports[].port] == [9443]' > /dev/null"
+test "$(kubectl -n e2e get deploy "$deploy" -o jsonpath='{.metadata.generation}')" = "$generation"
+# from a pod like the UI's: the token reads rules and cannot write
+ip=$(sed -n 's/^    url: "https:\/\/\(.*\):9443"$/\1/p' <<< "$nodes" | head -1)
+sn="$id.rproxy-api.rproxy-gateway.internal"
+probe=$(cat << 'SH'
+t=$(cat /k8s/token-ID)
+c="--cacert /k8s/ca.crt --resolve SN:9443:IP -s -o /dev/null -w %{http_code}"
+r=$(curl $c -H "Authorization: Bearer $t" https://SN:9443/rules)
+w=$(curl $c -X PUT -H "Authorization: Bearer $t" -H 'Content-Type: application/json' -d '{"generation":99,"rules":[]}' https://SN:9443/rulesets/k8s/e2e/e2e)
+echo "$r $w"
+SH
+)
+probe=${probe//ID/$id}
+probe=${probe//SN/$sn}
+probe=${probe//IP/$ip}
+kubectl -n rproxy-ui run ui-probe --image=curlimages/curl:8.11.1 --restart=Never --labels=app.kubernetes.io/name=rproxy-ui \
+  --overrides="$(jq -n --arg c "$probe" '{spec: {volumes: [{name: "k8s", secret: {secretName: "rproxy-ui-discovery"}}],
+    containers: [{name: "ui-probe", image: "curlimages/curl:8.11.1", command: ["sh", "-c", $c], volumeMounts: [{name: "k8s", mountPath: "/k8s"}]}]}}')" > /dev/null
+retry 120 sh -c "test \"\$(kubectl -n rproxy-ui get pod ui-probe -o jsonpath='{.status.phase}')\" = Succeeded"
+codes=$(kubectl -n rproxy-ui logs ui-probe)
+echo "UI token: GET /rules, PUT /rulesets: $codes"
+test "$codes" = "200 403"
+kubectl -n rproxy-ui delete pod ui-probe --wait=false > /dev/null
+echo "== the UI: the Gateway hidden (parameters ui.visible: false): the Secret goes, the token goes"
+cat <<YAML | kubectl --as=system:serviceaccount:e2e:tenant apply -f - > /dev/null
+apiVersion: rproxy.max3584.net/v1alpha1
+kind: RproxyGatewayParameters
+metadata: {name: e2e, namespace: e2e}
+spec:
+  replicas: 2
+  ui: {visible: false}
+YAML
+retry 60 sh -c "test -z \"\$(kubectl -n rproxy-ui get secret rproxy-ui-discovery -o name --ignore-not-found)\""
+retry 60 sh -c "! kubectl -n e2e get secret rproxy-$id-api -o jsonpath='{.data.tokens\.yaml}' | base64 -d | grep -q rproxy-ui"
+test "$(kubectl -n e2e get deploy "$deploy" -o jsonpath='{.metadata.generation}')" = "$generation"
+
 echo "== Gateway deleted: its rproxy goes"
 kubectl -n e2e delete gateway e2e > /dev/null
 retry 120 sh -c "test -z \"\$(kubectl -n e2e get deploy,svc,sa,secret,pdb -l rproxy.max3584.net/gateway -o name)\""

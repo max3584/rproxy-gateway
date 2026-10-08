@@ -74,6 +74,7 @@ spec:
 # in the Gateway's spec:
 #   infrastructure: {parametersRef: {group: rproxy.max3584.net, kind: RproxyGatewayParameters, name: web}}
 ```
+- To show Gateways' rproxy, read only, in the management UI ([TCP-UDP-rproxy-ui](https://github.com/max3584/TCP-UDP-rproxy-ui)'s chart, installed apart), set the chart's `ui.namespace` to the UI's namespace. The controller writes the Secret `rproxy-ui-discovery` there (rproxy pods, the CA certificate, read-only tokens). Hide a Gateway with `ui: {visible: false}` in its parameters ([docs/en/SECURITY.md](docs/en/SECURITY.md), "Showing Gateways to the UI").
 - The controller runs 2 replicas by default; they elect a leader with a Lease and only it applies rule sets (docs/en/DESIGN.md, "High availability").
 - With `fleet.enabled=true`, the chart's DaemonSet (`hostNetwork: true`) runs rproxy, which serves every Gateway. When it stops it keeps accepting for `fleet.shutdown.delay` (5 s by default) and waits for open connections up to `fleet.shutdown.drain` (25 s by default). Point the health check of the load balancer or VIP in front at `https://<node>:9443/readyz` (503 once it starts stopping), and make the delay longer than it takes to take the node out.
 - Chart values: [charts/rproxy-gateway/values.yaml](charts/rproxy-gateway/values.yaml). The controller's settings are passed in a ConfigMap `rproxy-gateway-config` (`RPROXY_GATEWAY_*` environment variables); `controller.extraArgs` stay arguments and win over it.

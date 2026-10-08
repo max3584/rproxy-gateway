@@ -14,6 +14,7 @@ pub mod provision;
 pub mod status;
 #[cfg(test)]
 mod tests;
+pub mod ui;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
@@ -108,6 +109,8 @@ pub struct Config {
 	pub watch_namespaces: Vec<String>,
 	/// Leader election (`None`: this replica always leads, for a single replica).
 	pub leader: Option<leader::Settings>,
+	/// The UI's namespace and pods (`--ui-namespace`): it gets the discovery Secret (`ui`).
+	pub ui: Option<provision::UiAccess>,
 }
 
 impl Config {
@@ -441,7 +444,9 @@ async fn reconcile_all(
 		jobs.push(gateway_pass(&pass, gw, plan, sub));
 	}
 	let outs: Vec<GatewayOut> = futures::stream::iter(jobs).buffer_unordered(PARALLEL).collect().await;
+	let mut ui_groups: Vec<ui::Group> = vec![];
 	for out in outs {
+		ui_groups.extend(out.ui_group.clone());
 		soon |= out.soon;
 		state.applied.retain(|(_, set), _| *set != out.plan.ruleset);
 		state.applied.extend(out.sub.applied);
@@ -478,6 +483,23 @@ async fn reconcile_all(
 			}
 		}
 		set_gates(client, &pods_now, &done).await;
+	}
+	// fleet: the UI reads the fleet's pods only if it may see every Gateway on them
+	if let Mode::Fleet(f) = &cfg.mode {
+		let shown = cfg.ui.is_some() && plans.iter().filter(|(p, _)| p.accepted()).all(|(p, _)| ui::visible(p));
+		if let Err(e) = ui::apply_fleet_token(client, &cfg.namespace, &boot.token, shown).await {
+			warn!(error = %e, "cannot write the fleet's token file");
+			soon = true;
+		}
+		if shown {
+			let eps = provision::pods_incl_terminating(&pods_now, &cfg.namespace, &provision::parse_selector(&f.selector));
+			ui_groups.extend(ui::fleet_group(&boot.token, &eps));
+		}
+	}
+	if let Some(u) = &cfg.ui {
+		if let Err(e) = ui::apply(client, &u.namespace, &ui_groups, &boot.ca_pem).await {
+			warn!(namespace = u.namespace, error = format!("{e:#}"), "cannot write the UI's discovery Secret");
+		}
 	}
 	if let Err(e) = provision::collect_garbage(client, &keep_ids, &keep_pdb, &cfg.scope()).await {
 		warn!(error = %e, "cannot remove rproxy of deleted Gateways");
@@ -631,6 +653,8 @@ struct GatewayOut {
 	keep_pdb: bool,
 	soon: bool,
 	sub: Sub,
+	/// The UI's group of the Gateway (shown to the UI, with pods).
+	ui_group: Option<ui::Group>,
 }
 
 /// One Gateway: deploys its rproxy (managed), applies its rule set to its pods, writes its status.
@@ -638,6 +662,7 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 	let mut soon = false;
 	let mut keep_id = None;
 	let mut keep_pdb = false;
+	let mut ui_group = None;
 	let id = provision::gateway_id(&plan.namespace, &plan.name, &plan.uid);
 	let infra = gw.spec.infrastructure.clone().unwrap_or_default();
 	let svc_key = (plan.namespace.clone(), provision::object_name(&id));
@@ -710,6 +735,17 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 			t.service_annotations = p.cfg.service_annotations.clone();
 			t.params = plan.parameters.clone().unwrap_or_default();
 			t.graceful = graceful(p.rp, &t.rproxy_image(m), &eps, &mut sub.caps).await;
+			// the UI reads it (its token in the token file, its pods through the NetworkPolicy)
+			t.ui = p.cfg.ui.clone().filter(|_| ui::visible(&plan));
+			if t.ui.is_some() {
+				ui_group = ui::managed_group(
+					&plan.namespace,
+					&plan.name,
+					&id,
+					&p.boot.token,
+					&provision::pods_incl_terminating(p.pods_now, &plan.namespace, &selector),
+				);
+			}
 			t.owner = match (&p.gateway_api_version, &gw.metadata.uid) {
 				(Some(v), Some(uid)) => Some(provision::owner(v, &plan.name, uid)),
 				_ => None,
@@ -829,7 +865,7 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 		}
 	}
 
-	GatewayOut { plan, results, pod_done, addresses, keep_id, keep_pdb, soon, sub }
+	GatewayOut { plan, results, pod_done, addresses, keep_id, keep_pdb, soon, sub, ui_group }
 }
 
 /// Whether the Gateway is not accepted only because of its parameters (it may keep its last good rproxy).

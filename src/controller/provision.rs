@@ -181,6 +181,14 @@ impl Default for Managed {
 	}
 }
 
+/// Where the UI reads rproxy (`--ui-namespace`, docs/DESIGN-v0.4.x.md 4.): the UI's namespace and the
+/// labels of its pods (let through the NetworkPolicy to the control API).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UiAccess {
+	pub namespace: String,
+	pub pod_selector: BTreeMap<String, String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Fleet {
 	/// Label selector of the rproxy pods (in the controller's namespace).
@@ -242,6 +250,9 @@ pub struct Target<'a> {
 	/// The rproxy image has a graceful shutdown (`features.graceful_shutdown`, rproxy v0.4.1):
 	/// `RPROXY_SHUTDOWN_*` and the readiness path instead of the preStop (`graceful`).
 	pub graceful: bool,
+	/// The UI reads this Gateway's rproxy (`--ui-namespace` set and the parameters' `ui.visible`
+	/// not false): its read-only token in the token file, the UI's pods let through the NetworkPolicy.
+	pub ui: Option<UiAccess>,
 }
 
 pub use crate::render::params::{SERVICE_ANNOTATION_DENY, service_annotation_allowed};
@@ -258,6 +269,7 @@ impl<'a> Target<'a> {
 			service_annotations: vec![],
 			params: Params::default(),
 			graceful: false,
+			ui: None,
 		}
 	}
 
@@ -354,6 +366,17 @@ pub fn with_linger(
 	out
 }
 
+/// The hash of a control API Secret's content on the pod template (`ANNOTATION_API`): without the
+/// UI's token entry, which rproxy reads again from its file (turning the UI on or off rolls no pod).
+pub fn api_hash(data: &BTreeMap<String, Vec<u8>>) -> String {
+	let mut d = data.clone();
+	if let Some(f) = d.get_mut("tokens.yaml") {
+		let base = bootstrap::without_ui_entry(&String::from_utf8_lossy(f)).to_string();
+		*f = base.into_bytes();
+	}
+	content_hash(&d)
+}
+
 /// A short hash of a Secret's content (the pods' annotation).
 pub fn content_hash(data: &BTreeMap<String, Vec<u8>>) -> String {
 	let mut all = vec![];
@@ -390,11 +413,15 @@ pub fn api_secret(t: &Target, current: Option<&Secret>, boot: &bootstrap::Bootst
 		(c.into_bytes(), k.into_bytes())
 	};
 	let token = bootstrap::derive_token(&boot.token, &t.id);
+	let mut tokens = bootstrap::token_file(&token, &t.plan.ruleset);
+	if t.ui.is_some() {
+		tokens.push_str(&bootstrap::ui_token_entry(&bootstrap::derive_ui_token(&boot.token, &t.id)));
+	}
 	let data: BTreeMap<String, Vec<u8>> = [
 		("tls.crt".to_string(), crt),
 		("tls.key".to_string(), key),
 		("ca.crt".to_string(), boot.ca_pem.clone()),
-		("tokens.yaml".to_string(), bootstrap::token_file(&token, &t.plan.ruleset).into_bytes()),
+		("tokens.yaml".to_string(), tokens.into_bytes()),
 	]
 	.into();
 	let mut meta = t.meta(&api_secret_name(&t.id), t.secret_labels());
@@ -719,7 +746,8 @@ pub fn service(t: &Target, m: &Managed) -> Service {
 }
 
 /// Who may reach a Gateway's rproxy pods: anyone on the listener ports; on the control
-/// API and certsync ports only the controller's pods (`controller_ns`, `app.kubernetes.io/name: rproxy-gateway`).
+/// API and certsync ports only the controller's pods (`controller_ns`, `app.kubernetes.io/name: rproxy-gateway`);
+/// on the control API also the UI's pods when the UI reads the Gateway (`Target::ui`).
 pub fn network_policy(t: &Target, controller_ns: &str) -> k8s_openapi::api::networking::v1::NetworkPolicy {
 	use k8s_openapi::api::networking::v1::{
 		NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort, NetworkPolicySpec,
@@ -744,6 +772,20 @@ pub fn network_policy(t: &Target, controller_ns: &str) -> k8s_openapi::api::netw
 		from: Some(vec![controller]),
 		ports: Some(vec![port(API_PORT, "TCP"), port(CERTSYNC_PORT, "TCP")]),
 	}];
+	if let Some(ui) = &t.ui {
+		rules.push(NetworkPolicyIngressRule {
+			from: Some(vec![NetworkPolicyPeer {
+				namespace_selector: Some(LabelSelector {
+					match_labels: Some([("kubernetes.io/metadata.name".to_string(), ui.namespace.clone())].into()),
+					..Default::default()
+				}),
+				pod_selector: Some(LabelSelector { match_labels: Some(ui.pod_selector.clone()), ..Default::default() }),
+				..Default::default()
+			}]),
+			// the control API only (not certsync)
+			ports: Some(vec![port(API_PORT, "TCP")]),
+		});
+	}
 	let listeners: Vec<NetworkPolicyPort> = t.plan.ports().into_iter().map(|(proto, p)| port(p, proto.k8s())).collect();
 	if !listeners.is_empty() {
 		rules.push(NetworkPolicyIngressRule { from: None, ports: Some(listeners) });
@@ -891,7 +933,7 @@ pub async fn apply_secrets(
 	if current_api.is_none_or(|c| data_of(Some(c)) != data_of(Some(&api)) || !same_meta(&c.metadata, &api.metadata)) {
 		Api::<Secret>::namespaced(client.clone(), ns).patch(&api_secret_name(&t.id), &pp(), &Patch::Apply(&api)).await?;
 	}
-	Ok((certs, content_hash(&data_of(Some(&api)))))
+	Ok((certs, api_hash(&data_of(Some(&api)))))
 }
 
 /// Applies a Gateway's Secrets, ServiceAccount, Deployment, PodDisruptionBudget and Service.
@@ -1062,6 +1104,15 @@ pub struct Endpoint {
 
 /// Running pods in `ns` matching `labels` (`key=value,...`).
 pub fn pods(store: &[std::sync::Arc<Pod>], ns: &str, selector: &BTreeMap<String, String>) -> Vec<Endpoint> {
+	pods_of(store, ns, selector, false)
+}
+
+/// The same, with the pods being deleted that still run (the UI reads them until they are gone).
+pub fn pods_incl_terminating(store: &[std::sync::Arc<Pod>], ns: &str, selector: &BTreeMap<String, String>) -> Vec<Endpoint> {
+	pods_of(store, ns, selector, true)
+}
+
+fn pods_of(store: &[std::sync::Arc<Pod>], ns: &str, selector: &BTreeMap<String, String>, terminating: bool) -> Vec<Endpoint> {
 	let mut out: Vec<Endpoint> = store
 		.iter()
 		.filter(|p| p.metadata.namespace.as_deref() == Some(ns))
@@ -1069,7 +1120,7 @@ pub fn pods(store: &[std::sync::Arc<Pod>], ns: &str, selector: &BTreeMap<String,
 			let l = p.metadata.labels.clone().unwrap_or_default();
 			selector.iter().all(|(k, v)| l.get(k) == Some(v))
 		})
-		.filter(|p| p.metadata.deletion_timestamp.is_none())
+		.filter(|p| terminating || p.metadata.deletion_timestamp.is_none())
 		.filter_map(|p| {
 			let st = p.status.as_ref()?;
 			if st.phase.as_deref() != Some("Running") {
@@ -1479,6 +1530,43 @@ mod tests {
 		let other = boot();
 		let renewed = api_secret(&t, Some(&first), &other).unwrap();
 		assert_ne!(data_of(Some(&renewed))["tls.crt"], d["tls.crt"]);
+	}
+
+	#[test]
+	fn the_ui_reads_with_its_own_token_and_rolls_no_pod() {
+		let b = boot();
+		let p = plan();
+		let mut t = Target::new(&p);
+		let off = api_secret(&t, None, &b).unwrap();
+		let ui = UiAccess {
+			namespace: "rproxy-ui".into(),
+			pod_selector: [("app.kubernetes.io/name".to_string(), "rproxy-ui".to_string())].into(),
+		};
+		t.ui = Some(ui.clone());
+		let on = api_secret(&t, Some(&off), &b).unwrap();
+		let (d_off, d_on) = (data_of(Some(&off)), data_of(Some(&on)));
+		let tokens = String::from_utf8_lossy(&d_on["tokens.yaml"]).into_owned();
+		let ui_token = bootstrap::derive_ui_token("master", &t.id);
+		assert!(tokens.contains(&crate::pem::sha256_hex(ui_token.as_bytes())), "{tokens}");
+		assert!(tokens.ends_with("scopes: [rules:read, metrics:read]\n"));
+		assert!(!String::from_utf8_lossy(&d_off["tokens.yaml"]).contains("rproxy-ui"), "off: as before");
+		// the pod template does not change with the UI (rproxy reads its token file again)
+		assert_eq!(api_hash(&d_on), api_hash(&d_off));
+		assert_eq!(api_hash(&d_off), content_hash(&d_off), "off: the same hash as 0.4.2");
+		// the NetworkPolicy lets the UI's pods reach the control API only
+		let rules = network_policy(&t, "rproxy-gateway-system").spec.unwrap().ingress.unwrap();
+		let r = rules
+			.iter()
+			.find(|r| {
+				r.from.as_ref().is_some_and(|f| f[0].pod_selector.as_ref().and_then(|s| s.match_labels.as_ref()) == Some(&ui.pod_selector))
+			})
+			.unwrap();
+		assert_eq!(r.ports.as_ref().unwrap().len(), 1);
+		assert_eq!(r.ports.as_ref().unwrap()[0].port, Some(IntOrString::Int(API_PORT.into())), "not certsync");
+		let from = &r.from.as_ref().unwrap()[0];
+		assert_eq!(from.namespace_selector.as_ref().unwrap().match_labels.as_ref().unwrap()["kubernetes.io/metadata.name"], "rproxy-ui");
+		t.ui = None;
+		assert_eq!(network_policy(&t, "rproxy-gateway-system").spec.unwrap().ingress.unwrap().len(), rules.len() - 1);
 	}
 
 	#[test]
