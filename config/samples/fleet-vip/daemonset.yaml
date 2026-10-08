@@ -68,7 +68,7 @@ spec:
             - {name: api-tls, mountPath: /etc/rproxy-gateway/api-tls, readOnly: true}
             - {name: certs, mountPath: /var/run/rproxy-gateway/certs, readOnly: true}
         - name: certsync
-          image: ghcr.io/max3584/rproxy-gateway:0.4.3
+          image: ghcr.io/max3584/rproxy-gateway:0.4.4
           imagePullPolicy: IfNotPresent
           # tells the controller which certificate files the kubelet has put in place
           args: [certsync, --dir=/var/run/rproxy-gateway/certs, --listen=0.0.0.0:9444]
@@ -87,7 +87,7 @@ spec:
         # holds the VIPs (fleet.vip, docs/DESIGN-v0.4.x.md 7.): a Lease per VIP; the holder adds it to the
         # node's interface and announces it, while this pod's rproxy is ready and has its rule sets
         - name: vip
-          image: ghcr.io/max3584/rproxy-gateway:0.4.3
+          image: ghcr.io/max3584/rproxy-gateway:0.4.4
           imagePullPolicy: IfNotPresent
           args: [vip]
           env:
