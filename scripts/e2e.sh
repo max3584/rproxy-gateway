@@ -265,7 +265,8 @@ retry 120 sh -c "test \"\$(kubectl -n rproxy-ui get secret rproxy-ui-discovery -
 disc=$(kubectl -n rproxy-ui get secret rproxy-ui-discovery -o json)
 nodes=$(jq -r '.data["nodes.yaml"] | @base64d' <<< "$disc")
 echo "$nodes"
-jq -e '.data | keys | length == 3 and (.["ca.crt"] | @base64d | test("BEGIN CERTIFICATE")) and (map(@base64d) | all(test("PRIVATE KEY") | not))' <<< "$disc" > /dev/null
+jq -e '.data as $d | ($d | keys | length == 3) and ($d["ca.crt"] | @base64d | test("BEGIN CERTIFICATE"))
+  and ([$d[] | @base64d] | all(test("PRIVATE KEY") | not))' <<< "$disc" > /dev/null
 id=$(kubectl -n e2e get deploy "$deploy" -o jsonpath='{.metadata.labels.rproxy\.max3584\.net/gateway}')
 kubectl -n e2e get secret "rproxy-$id-api" -o jsonpath='{.data.tokens\.yaml}' | base64 -d | grep -q 'scopes: \[rules:read, metrics:read\]'
 retry 60 sh -c "kubectl -n e2e get networkpolicy rproxy-$id -o json | jq -e '[.spec.ingress[] | select(.from[0].namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"] == \"rproxy-ui\") | .ports[].port] == [9443]' > /dev/null"
