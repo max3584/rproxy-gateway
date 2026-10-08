@@ -14,7 +14,7 @@ cargo run -- crds > charts/rproxy-gateway/crds/rproxy.max3584.net.yaml   # CRD �
 cargo run -- render -f manifests.yaml                # クラスタなしでルールセットを描く
 scripts/e2e.sh                # kind での e2e（Docker が要るので CI のランナーの VM で。手元にはない）
 scripts/conformance.sh        # Gateway API の conformance（同上）
-scripts/acceptance.sh         # 公開した chart・イメージの受け入れテスト（同上。手動の acceptance ワークフローだけ）
+scripts/acceptance.sh         # 受け入れテスト（同上。手動の acceptance ワークフローだけ。SOURCE=published|checkout、TOPOLOGY=l2-local|l2-cluster|bgp|nodeport-lb）
 ```
 
 ## 構成
@@ -36,5 +36,6 @@ scripts/acceptance.sh         # 公開した chart・イメージの受け入れ
 - コミットのメッセージと PR は日本語（rproxy-api と同じ形：`feat: ...`、`fix: ...`、`docs: ...`、`ci: ...`、`chore: ...`）。PR にはマイルストーン（いまは v0.4.0）を付ける。
 - PR のブランチに追加で push する前に、その PR がまだ開いているか（`gh pr view <n> --json state`）を確かめる。マージ後に push したコミットは main に入らない。
 - e2e・conformance は rproxy-api の master（`RPROXY_REF`、手動の実行ではタグやブランチも指定できる）から rproxy をビルドする。rproxy v0.4.0 が出たら、そのタグに固定するか考える。
+- managed の rproxy の Pod・Service の形（preStop、readiness gate、プローブ、PDB、externalTrafficPolicy）を変えたら、受け入れテストをブランチから回す（`gh workflow run acceptance.yml --ref <branch> -f source=checkout -f topology=<形>`）。replicas が 2 以上では Pod の削除・drain・rollout restart の途切れが `GAP_LIMIT`（既定 3 秒）を超えると失敗する。
 - 変換を変えたら、rproxy が受け付けるか（`tests/rproxy.rs`）と conformance の結果（docs/CONFORMANCE.md）も確かめる。`SUPPORTED_FEATURES`（`src/controller/mod.rs`）と `scripts/conformance.sh` の `FEATURES` を揃える。
 - バージョンは rproxy-api・UI と別々に進める。最初のリリース（v0.4.0）は rproxy v0.4.0 と一緒に出す。

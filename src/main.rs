@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use rproxy_gateway::controller::provision::{Fleet, Managed, Mode};
+use rproxy_gateway::controller::provision::{Fleet, Managed, Mode, ProbeTiming};
 use rproxy_gateway::{certsync, controller, k8s, render};
 
 #[derive(Parser, Debug)]
@@ -60,6 +60,25 @@ struct ControllerArgs {
 	/// managed: make a NetworkPolicy per Gateway so only the controller reaches rproxy's control API and certsync.
 	#[arg(long, env = "RPROXY_GATEWAY_NETWORK_POLICY", default_value_t = true, action = clap::ArgAction::Set)]
 	network_policy: bool,
+	/// managed: `externalTrafficPolicy` of each Gateway's Service: `Local` keeps clients' addresses
+	/// (only nodes with a ready rproxy pod take traffic), `Cluster` lets every node forward (smoother
+	/// failover, clients' addresses lost). Unset: `Local` for LoadBalancer, `Cluster` for NodePort.
+	#[arg(long, env = "RPROXY_GATEWAY_EXTERNAL_TRAFFIC_POLICY", value_parser = ["Local", "Cluster"])]
+	external_traffic_policy: Option<String>,
+	/// managed: LoadBalancer Services get node ports (`allocateLoadBalancerNodePorts`).
+	#[arg(long, env = "RPROXY_GATEWAY_ALLOCATE_LOAD_BALANCER_NODE_PORTS", default_value_t = true, action = clap::ArgAction::Set)]
+	allocate_load_balancer_node_ports: bool,
+	/// managed: seconds a stopping rproxy pod keeps serving (preStop) while it leaves the Service's
+	/// endpoints and load balancers; 0: none. terminationGracePeriodSeconds is 15 more.
+	#[arg(long, env = "RPROXY_GATEWAY_PRE_STOP_SECS", default_value_t = 15)]
+	pre_stop_secs: u32,
+	/// managed: rproxy's readiness probe, `periodSeconds=2,timeoutSeconds=1,failureThreshold=2,successThreshold=1,initialDelaySeconds=0`
+	/// (these are the defaults; any of them).
+	#[arg(long, env = "RPROXY_GATEWAY_READINESS_PROBE", default_value = "", value_parser = |s: &str| ProbeTiming::parse(s, ProbeTiming::READINESS))]
+	readiness_probe: ProbeTiming,
+	/// managed: rproxy's liveness probe (same form; defaults `periodSeconds=5,timeoutSeconds=1,failureThreshold=3`).
+	#[arg(long, env = "RPROXY_GATEWAY_LIVENESS_PROBE", default_value = "", value_parser = |s: &str| ProbeTiming::parse(s, ProbeTiming::LIVENESS))]
+	liveness_probe: ProbeTiming,
 	/// managed: imagePullPolicy of rproxy pods.
 	#[arg(long, env = "RPROXY_GATEWAY_IMAGE_PULL_POLICY", default_value = "IfNotPresent")]
 	image_pull_policy: String,
@@ -233,6 +252,13 @@ fn main() -> anyhow::Result<()> {
 					service_type: a.service_type,
 					pull_policy: a.image_pull_policy,
 					network_policy: a.network_policy.then(|| a.namespace.clone()),
+					external_traffic_policy: a.external_traffic_policy,
+					allocate_node_ports: a.allocate_load_balancer_node_ports,
+					pre_stop_secs: a.pre_stop_secs,
+					// set from the cluster's version at start
+					native_sleep: false,
+					readiness: a.readiness_probe,
+					liveness: a.liveness_probe,
 				}),
 			};
 			let cfg = controller::Config {

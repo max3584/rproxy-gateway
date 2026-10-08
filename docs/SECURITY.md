@@ -38,7 +38,7 @@ English: [en/SECURITY.md](en/SECURITY.md)
 
 ## コントローラの権限（M10）
 
-- 既定ではすべての namespace の Gateway API の型・Secret・Service・Deployment・ServiceAccount・NetworkPolicy・Pod（patch）を扱う ClusterRole を持つ（Gateway の namespace に rproxy を置き、どこの証明書でも参照できるため）。コントローラが乗っ取られると、クラスタ全体の Secret が読める。
+- 既定ではすべての namespace の Gateway API の型・Secret・Service・Deployment・ServiceAccount・NetworkPolicy・PodDisruptionBudget・Pod（patch。rproxy の Pod の readiness gate のため `pods/status` の patch も）を扱う ClusterRole を持つ（Gateway の namespace に rproxy を置き、どこの証明書でも参照できるため）。コントローラが乗っ取られると、クラスタ全体の Secret が読める。readiness gate の条件は、その gate を持つ Pod にだけ書く。
 - `controller.watchNamespaces`（`--watch-namespaces`）を決めると、そこ（とコントローラの namespace）だけを watch し、chart はその namespace ごとの Role を作る。ClusterRole に残るのは GatewayClass と namespace（allowedRoutes の selector）だけ。
 
 ## ネットワーク

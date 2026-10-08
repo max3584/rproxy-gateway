@@ -157,6 +157,14 @@ kubectl -n e2e delete gateway steal-dns > /dev/null
 kubectl -n e2e delete rproxyrule steal-key > /dev/null
 test "$(kubectl -n e2e get networkpolicy -l gateway.networking.k8s.io/gateway-name=e2e -o name | wc -l)" = 1
 
+echo "== availability: readiness gate, preStop, grace period"
+rp_json=$(kubectl -n e2e get pods -l gateway.networking.k8s.io/gateway-name=e2e,app.kubernetes.io/name=rproxy -o json)
+jq -e '.items[0].status.conditions[] | select(.type == "rproxy.max3584.net/ruleset-applied") | .status == "True"' <<< "$rp_json" > /dev/null
+jq -e '.items[0].spec.readinessGates[0].conditionType == "rproxy.max3584.net/ruleset-applied"' <<< "$rp_json" > /dev/null
+jq -e '.items[0].spec.containers[0].lifecycle.preStop.sleep.seconds == 15 and .items[0].spec.terminationGracePeriodSeconds == 30' <<< "$rp_json" > /dev/null
+jq -e '.items[0].spec.containers[0].readinessProbe.periodSeconds == 2' <<< "$rp_json" > /dev/null
+test -z "$(kubectl -n e2e get pdb -l gateway.networking.k8s.io/gateway-name=e2e -o name)"
+
 echo "== rproxy restart: the controller applies the rule set again"
 kubectl -n e2e delete pod -l app.kubernetes.io/name=rproxy --wait=true > /dev/null
 retry 120 sh -c "curl -sf -H 'Host: e2e.example.com' http://$addr/again > /dev/null"
@@ -169,7 +177,14 @@ retry 120 sh -c "h=\$(kubectl -n $NS get lease rproxy-gateway -o jsonpath='{.spe
 kubectl -n e2e delete pod -l app.kubernetes.io/name=rproxy --wait=true > /dev/null
 retry 120 sh -c "curl -sf -H 'Host: e2e.example.com' http://$addr/after-failover > /dev/null"
 
+echo "== 2 replicas: a PodDisruptionBudget, spread over nodes, both Ready only with their rule set"
+# shellcheck disable=SC2086
+helm upgrade rproxy-gateway charts/rproxy-gateway -n $NS --reuse-values --wait --set managed.replicas=2 > /dev/null
+retry 120 sh -c "test \"\$(kubectl -n e2e get pdb -l gateway.networking.k8s.io/gateway-name=e2e -o jsonpath='{.items[0].spec.maxUnavailable}')\" = 1"
+retry 180 sh -c "test \"\$(kubectl -n e2e get pods -l gateway.networking.k8s.io/gateway-name=e2e,app.kubernetes.io/name=rproxy -o json | jq '[.items[] | select(.metadata.deletionTimestamp == null) | .status.conditions[] | select(.type == \"Ready\" and .status == \"True\")] | length')\" = 2"
+retry 60 sh -c "curl -sf -H 'Host: e2e.example.com' http://$addr/two > /dev/null"
+
 echo "== Gateway deleted: its rproxy goes"
 kubectl -n e2e delete gateway e2e > /dev/null
-retry 120 sh -c "test -z \"\$(kubectl -n e2e get deploy,svc,sa,secret -l rproxy.max3584.net/gateway -o name)\""
+retry 120 sh -c "test -z \"\$(kubectl -n e2e get deploy,svc,sa,secret,pdb -l rproxy.max3584.net/gateway -o name)\""
 echo "e2e OK"

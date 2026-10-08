@@ -67,6 +67,13 @@ spec:
             - --replicas={{ .Values.managed.replicas }}
             - --service-type={{ .Values.managed.serviceType }}
             - --network-policy={{ .Values.managed.networkPolicy }}
+            {{- with .Values.managed.externalTrafficPolicy }}
+            - --external-traffic-policy={{ . }}
+            {{- end }}
+            - --allocate-load-balancer-node-ports={{ .Values.managed.allocateLoadBalancerNodePorts }}
+            - --pre-stop-secs={{ int .Values.managed.preStopSeconds }}
+            - --readiness-probe={{ include "rproxy-gateway.probe" .Values.managed.readinessProbe }}
+            - --liveness-probe={{ include "rproxy-gateway.probe" .Values.managed.livenessProbe }}
             {{- with .Values.managed.addressCIDRs }}
             - --address-cidr={{ join "," . }}
             {{- end }}

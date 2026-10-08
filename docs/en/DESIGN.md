@@ -37,6 +37,26 @@ Gateway API / CRDs ──watch──▶ rproxy-gateway ──PUT /rulesets/k8s/<
 - Managed pods run as non-root (65532) and take ports below 1024 through `net.ipv4.ip_unprivileged_port_start=0` (a namespaced, safe sysctl).
 - In fleet mode, when two Gateways use the same port, rproxy refuses the later one's rule with `409 already_exists` and that listener's `Programmed` is `False`.
 
+## rproxy availability (managed)
+
+Keeping traffic flowing while rproxy pods are replaced (deleted, `kubectl rollout restart`, a node drain, an image or certificate update).
+
+- **Readiness gate** (`rproxy.max3584.net/ruleset-applied`): an rproxy pod becomes Ready, and joins the Service's endpoints, only once the controller has applied its rule set to it (the `PUT` went through). `/healthz` alone would send traffic to an rproxy without rules. The controller writes the condition into the pod's `status.conditions` (`pods/status` patch). When the rproxy container restarts (rule sets live in memory) it is set back to `False`, and to `True` once the sets are applied again (the condition's `message` holds the restart count it was set for). A pod that is `True` stays so while a later update waits (for certificate files, say). A set rproxy refused (`Rejected`) counts as done: there is nothing to wait for. The fleet DaemonSet has the same gate (Ready once every Gateway's set is on the pod; its rolling update waits for that).
+- **Rolling update**: `maxUnavailable: 0`. An old pod stops only after a new one is Ready (gate included).
+- **preStop** (`managed.preStopSeconds` / `--pre-stop-secs`, 15 s by default): a pod marked for deletion turns `ready: false` (`serving: true`, `terminating: true`) in its EndpointSlice at once. With other ready pods, kube-proxy sends new connections there, and cloud load balancers take the node out by its `healthCheckNodePort` (failing once the node's pods are all terminating). rproxy keeps answering meanwhile (preStop), then stops on SIGTERM. MetalLB keeps announcing from a node with a `serving` endpoint and moves when the pod is gone (L2 at once, BGP in FRR mode after 3–4 s; measured by the acceptance test). On Kubernetes 1.30 and later (the kubelet's `sleep` action on by default) it is `lifecycle.preStop.sleep`, before that `sleep` in the rproxy container (the controller picks by the API server's version at start). `terminationGracePeriodSeconds` is preStop + 15 s. certsync stops at once on SIGTERM (it hands rproxy nothing; the controller does not talk to pods being deleted).
+- **Probes** (`managed.readinessProbe` / `--readiness-probe`, `managed.livenessProbe` / `--liveness-probe`): readiness every 2 s by default, out after 2 failures in a row (a hung rproxy leaves the endpoints in about 4 s); liveness every 5 s, restarted after 3 (kept slow). The form is `periodSeconds=2,timeoutSeconds=1,failureThreshold=2,successThreshold=1,initialDelaySeconds=0` (any of them).
+- **2 or more replicas** (`managed.replicas`): a PodDisruptionBudget per Gateway (`rproxy-<id>`, `maxUnavailable: 1`, `unhealthyPodEvictionPolicy: AlwaysAllow`; owned by the Gateway; deleted when replicas go back to 1) and topologySpreadConstraints on `kubernetes.io/hostname` (`ScheduleAnyway`). A drain does not stop both pods at once, and they normally run on different nodes.
+- **externalTrafficPolicy** (`managed.externalTrafficPolicy` / `--external-traffic-policy`):
+  - `Local` (the default for `LoadBalancer`): clients' IPs reach rproxy. Only nodes with a ready rproxy pod take traffic; load balancers pick nodes by the Service's `healthCheckNodePort` (answered by kube-proxy; it fails once the node's pods are all terminating). MetalLB L2 announces from one of those nodes.
+  - `Cluster`: every node forwards to any ready pod (kube-proxy SNATs: rproxy sees node IPs). Replacing pods changes nothing on the load balancer's side.
+  - Empty (default): `Local` for `LoadBalancer`, `Cluster` for `NodePort` (as in v0.4.0). With your own L4 load balancer in front of `NodePort`, use `Local` and let it pick nodes by health checks on the node ports.
+  - Kubernetes allocates `healthCheckNodePort` per Service (each Gateway's differs, so it is not a value).
+- **allocateLoadBalancerNodePorts** (`managed.allocateLoadBalancerNodePorts`, true by default): false for load balancers that do not use node ports, such as MetalLB.
+- The controller PUTs to a Gateway's pods 4 at a time.
+- Not chosen: setting a stopping pod's gate to `False` first, which also drops the endpoint's `serving`. MetalLB would move sooner, but with `externalTrafficPolicy: Local` kube-proxy drops what still reaches that node (it cannot send it to other nodes' pods), so the gap until the announcement moves gets worse.
+
+The acceptance test (`.github/workflows/acceptance.yml`, `TOPOLOGY` of `scripts/acceptance.sh`) measures the outages per load balancer topology. Results and recommendations: the [README](../../README.en.md), "Availability".
+
 ## Control API connection
 
 On its first start the controller creates these Secrets in its namespace (reading them when they exist). The fleet's rproxy uses them.

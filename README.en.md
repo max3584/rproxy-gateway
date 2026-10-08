@@ -64,6 +64,28 @@ spec:
 - With `fleet.enabled=true`, the chart's DaemonSet (`hostNetwork: true`) runs rproxy, which serves every Gateway.
 - Chart values: [charts/rproxy-gateway/values.yaml](charts/rproxy-gateway/values.yaml).
 
+## Availability (`managed.replicas` 2 or more)
+
+rproxy pods become Ready only once the controller has applied their rule set (a readiness gate), and keep answering for a preStop (15 s by default) when they stop. Each Gateway gets a PodDisruptionBudget and its pods spread over nodes (docs/en/DESIGN.md, "rproxy availability").
+
+The acceptance test (kind 1+3 nodes, `managed.replicas=2`, HTTP, HTTPS and TCP every 100 ms on new connections), longest time without an answer (s):
+
+| Topology (`TOPOLOGY`) | pod deleted | pod on the announcing node deleted | drain | rollout restart | node lost |
+|---|---|---|---|---|---|
+| v0.4.0 (MetalLB L2, Local) | 1.2 | 10.2–14.9 | 2.0 (drain 32.9 s) | 10.8–13.5 | 5.6 |
+| MetalLB L2, `Local` (default) | 0.2 | 0.3 | 1.2 (drain 16.5 s) | 0.2 | 7.8 |
+| MetalLB L2, `Cluster` | 0.2 | 0.2 | 0.2 | 0.2 | 9.0 (some fail until ~59 s) |
+| MetalLB BGP + ECMP (BFD), `Local` | 3.5 | — | 2.3 | 2.3 | 3.3 |
+| MetalLB BGP + ECMP (BFD), `Cluster` | 0.2 | — | 0.2 | 0.1 | 13.3 (some fail until ~60 s) |
+| NodePort + own L4 (HAProxy), `Local` | 0.2 | — | 2.2 | 2.2 | 6.4 |
+| NodePort + own L4 (HAProxy), `Cluster` | 0.1 | — | 0.1 | 0.2 | 20.2 (some fail until ~63 s) |
+
+- **The default (LoadBalancer, `externalTrafficPolicy: Local`) is recommended.** Clients' IPs reach rproxy, and replacing pods (deletion, drain, rollout) costs about a second at most. MetalLB L2 may drop a connection in flight when it moves the announcement (the drain's 1.2 s). When a node is lost, it takes as long as the load balancer needs to notice (MetalLB L2's memberlist: 5–8 s).
+- **`Cluster`** hardly drops anything when pods are replaced (every node sends to ready pods), but clients' IPs are lost, and when a node is lost some connections keep failing until its pods leave the endpoints (when the node turns NotReady: 40–50 s).
+- **BGP + ECMP**: with `Local`, MetalLB withdraws the route of a node with a terminating pod only once the pod is gone (3–4 s in FRR mode), so that much is lost (3–4 s). For close to 0 on planned replacements use `Cluster` (with the same tail when a node is lost). BFD takes a lost node out of the routes in about a second.
+- **NodePort behind your own L4 load balancer**: with `Local`, the load balancer can take a node out only once rproxy has stopped (NodePort has no `healthCheckNodePort`), so the connections of that moment fail (about 2 s). If your load balancer can check the Service's `healthCheckNodePort`, use type `LoadBalancer` (a node whose pods are all terminating fails it, so it is taken out during the preStop).
+- When a node is lost, its **backend** pods also stay in their EndpointSlices until the node turns NotReady (in every topology, some failures may follow the table's values for 40–60 s). Use RproxyPolicy's `outlierDetection` for backends, and let backends stop with a preStop too (5 s in the acceptance test; without it, each drain loses 1–3 s).
+
 ## Commands
 
 | Command | What it does |

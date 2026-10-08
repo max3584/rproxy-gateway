@@ -19,3 +19,12 @@ helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
 {{ .Values.rproxy.image.repository }}:{{ .Values.rproxy.image.tag }}
 {{- end }}
 {{- end }}
+
+{{/* a probe's timing as `key=value,...` (--readiness-probe, --liveness-probe) */}}
+{{- define "rproxy-gateway.probe" -}}
+{{- $out := list -}}
+{{- range $k, $v := . -}}
+{{- $out = append $out (printf "%s=%d" $k (int $v)) -}}
+{{- end -}}
+{{- join "," $out -}}
+{{- end -}}

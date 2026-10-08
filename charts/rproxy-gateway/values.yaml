@@ -48,6 +48,7 @@ rproxy:
 
 # managed mode (default): one rproxy Deployment, Service and ServiceAccount per Gateway, in the Gateway's namespace
 managed:
+  # 2 or more: the pods spread over nodes, and each Gateway gets a PodDisruptionBudget (maxUnavailable 1)
   replicas: 1
   # type of each Gateway's Service: LoadBalancer, NodePort or ClusterIP
   serviceType: LoadBalancer
@@ -59,6 +60,22 @@ managed:
   serviceAnnotationPrefixes: []
   # a NetworkPolicy per Gateway: only the controller reaches rproxy's control API and certsync
   networkPolicy: true
+  # externalTrafficPolicy of the Service (LoadBalancer, NodePort). Local: clients' source addresses
+  # are kept and only nodes with a ready rproxy pod take traffic (load balancers check the Service's
+  # healthCheckNodePort); Cluster: every node forwards to any rproxy pod (smoother failover when a
+  # node or the announcing node goes; clients' addresses are lost). Empty: Local for LoadBalancer,
+  # Cluster for NodePort (docs/DESIGN.md, "Availability")
+  externalTrafficPolicy: ""
+  # LoadBalancer Services get node ports (false for load balancers that do not use them, e.g. MetalLB)
+  allocateLoadBalancerNodePorts: true
+  # seconds a stopping rproxy pod keeps serving (preStop) while it leaves the Service's endpoints and
+  # load balancers move away; terminationGracePeriodSeconds is 15 more. 0: none
+  preStopSeconds: 15
+  # rproxy's probes (/healthz). Readiness: how soon a hung rproxy leaves the endpoints; liveness:
+  # when the kubelet restarts it (kept slow). A pod takes traffic only once the controller has applied
+  # its rule set (the readiness gate rproxy.max3584.net/ruleset-applied)
+  readinessProbe: {periodSeconds: 2, timeoutSeconds: 1, failureThreshold: 2, successThreshold: 1, initialDelaySeconds: 0}
+  livenessProbe: {periodSeconds: 5, timeoutSeconds: 1, failureThreshold: 3, initialDelaySeconds: 0}
 
 # fleet mode: rproxy pods deployed by this chart serve every Gateway (rproxy-api docs/DESIGN-v0.4.md 3.3)
 fleet:
