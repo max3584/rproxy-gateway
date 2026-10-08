@@ -22,6 +22,8 @@ struct Fake {
 	files: BTreeSet<String>,
 	/// rule keys rproxy fails (e.g. a port in use)
 	failing: BTreeSet<String>,
+	/// `features.graceful_shutdown` (rproxy v0.4.1)
+	graceful: bool,
 }
 
 fn etag(generation: i64, rules: &[Value]) -> String {
@@ -58,7 +60,11 @@ async fn handle(fake: Arc<Mutex<Fake>>, req: Request<hyper::body::Incoming>) -> 
 			reply(200, json!(asked.into_iter().filter(|n| f.files.contains(n)).collect::<Vec<_>>()))
 		}
 		("GET", "/capabilities") => {
-			reply(200, json!({"version": "0.4.0", "features": {"rulesets": true, "labels": true, "conditions": true, "readyz": true}}))
+			let graceful = f.graceful;
+			reply(
+				200,
+				json!({"version": "0.4.0", "features": {"rulesets": true, "labels": true, "conditions": true, "readyz": true, "graceful_shutdown": graceful}}),
+			)
 		}
 		("GET", p) if p.starts_with("/rulesets/") => {
 			let name = &p["/rulesets/".len()..];
@@ -264,6 +270,35 @@ async fn a_wrong_token_is_reported() {
 	};
 	let (r, _) = sync_pod(&rp, &ep, &plan(80, &[]), &mut Applied::new(), &mut HashMap::new()).await;
 	assert!(matches!(&r, PodSync::NotReady(m) if m.contains("401")), "{r:?}");
+}
+
+#[tokio::test]
+async fn graceful_shutdown_is_known_from_the_image_or_the_pods() {
+	let fake = Arc::new(Mutex::new(Fake::default()));
+	let port = start(fake.clone()).await;
+	let rp = Client::new(None, "secret").unwrap();
+	let ep = |uid: &str, image: &str| Endpoint {
+		pod: format!("rproxy-{uid}"),
+		uid: uid.into(),
+		ip: "127.0.0.1".into(),
+		api_port: port,
+		certsync_port: port,
+		rproxy_image: Some(image.into()),
+		..Default::default()
+	};
+	let mut caps = HashMap::new();
+	// the image this controller ships: known without asking
+	assert!(graceful(&rp, provision::RPROXY_IMAGE, &[], &mut caps).await);
+	assert!(caps.is_empty());
+	// another image: not before a pod running it says so
+	assert!(!graceful(&rp, "example/rproxy:custom", &[], &mut caps).await, "no pods yet: the preStop stays");
+	assert!(!graceful(&rp, "example/rproxy:custom", &[ep("u1", "example/rproxy:custom")], &mut caps).await, "an older rproxy");
+	fake.lock().unwrap().graceful = true;
+	let pods = [ep("u1", "example/rproxy:custom"), ep("u2", "example/rproxy:custom")];
+	assert!(graceful(&rp, "example/rproxy:custom", &pods, &mut caps).await, "u2 answers graceful_shutdown");
+	assert!(!graceful(&rp, "example/rproxy:other", &pods, &mut caps).await, "only pods running the image count");
+	// remembered: every pod of the Gateway restarting at once does not roll it back to the preStop
+	assert!(graceful(&rp, "example/rproxy:custom", &[], &mut HashMap::new()).await);
 }
 
 #[tokio::test]

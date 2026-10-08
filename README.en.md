@@ -75,7 +75,7 @@ spec:
 #   infrastructure: {parametersRef: {group: rproxy.max3584.net, kind: RproxyGatewayParameters, name: web}}
 ```
 - The controller runs 2 replicas by default; they elect a leader with a Lease and only it applies rule sets (docs/en/DESIGN.md, "High availability").
-- With `fleet.enabled=true`, the chart's DaemonSet (`hostNetwork: true`) runs rproxy, which serves every Gateway.
+- With `fleet.enabled=true`, the chart's DaemonSet (`hostNetwork: true`) runs rproxy, which serves every Gateway. When it stops it keeps accepting for `fleet.shutdown.delay` (5 s by default) and waits for open connections up to `fleet.shutdown.drain` (25 s by default). Point the health check of the load balancer or VIP in front at `https://<node>:9443/readyz` (503 once it starts stopping), and make the delay longer than it takes to take the node out.
 - Chart values: [charts/rproxy-gateway/values.yaml](charts/rproxy-gateway/values.yaml). The controller's settings are passed in a ConfigMap `rproxy-gateway-config` (`RPROXY_GATEWAY_*` environment variables); `controller.extraArgs` stay arguments and win over it.
 
 ### Installing without Helm (kubectl, Kustomize)
@@ -105,7 +105,7 @@ configMapGenerator:
 
 ## Availability (`managed.replicas` 2 or more)
 
-rproxy pods become Ready only once the controller has applied their rule set (a readiness gate), and keep answering for a preStop (15 s by default) when they stop. Each Gateway gets a PodDisruptionBudget and its pods spread over nodes (docs/en/DESIGN.md, "rproxy availability").
+rproxy pods become Ready only once the controller has applied their rule set (a readiness gate), and when they stop they keep accepting for 15 s after SIGTERM (`managed.shutdown.delay`) while `/readyz` takes them out of the Service, then close their listeners and let open connections end for up to 25 s (`managed.shutdown.drain`) (rproxy v0.4.1; older rproxy images: a 15 s preStop). `managed.preStopSeconds` is unset by default from 0.4.2; if you set it for 0.4.1, that preStop stays on every pod and the delay and drain follow it (remove the value if you do not need it). Each Gateway gets a PodDisruptionBudget and its pods spread over nodes (docs/en/DESIGN.md, "rproxy availability").
 
 The acceptance test (kind 1+3 nodes, `managed.replicas=2`, HTTP, HTTPS and TCP every 100 ms on new connections), longest time without an answer (s):
 
@@ -122,7 +122,7 @@ The acceptance test (kind 1+3 nodes, `managed.replicas=2`, HTTP, HTTPS and TCP e
 - **The default (LoadBalancer, `externalTrafficPolicy: Local`) is recommended.** Clients' IPs reach rproxy, and replacing pods (deletion, drain, rollout) costs about a second at most. MetalLB L2 may drop a connection in flight when it moves the announcement (the drain's 1.2 s). When a node is lost, it takes as long as the load balancer needs to notice (MetalLB L2's memberlist: 5–8 s).
 - **`Cluster`** hardly drops anything when pods are replaced (every node sends to ready pods), but clients' IPs are lost, and when a node is lost some connections keep failing until its pods leave the endpoints (when the node turns NotReady: 40–50 s).
 - **BGP + ECMP**: with `Local`, MetalLB withdraws the route of a node with a terminating pod only once the pod is gone (3–4 s in FRR mode), so that much is lost (3–4 s). For close to 0 on planned replacements use `Cluster` (with the same tail when a node is lost). BFD takes a lost node out of the routes in about a second. BGP convergence is network-side tuning (BFD, timers), so the acceptance test's `bgp` topology is measured and recorded only (gaps do not fail it).
-- **NodePort behind your own L4 load balancer**: with `Local`, the load balancer can take a node out only once rproxy has stopped (NodePort has no `healthCheckNodePort`), so the connections of that moment fail (about 2 s). If your load balancer can check the Service's `healthCheckNodePort`, use type `LoadBalancer` (a node whose pods are all terminating fails it, so it is taken out during the preStop).
+- **NodePort behind your own L4 load balancer**: with `Local`, the load balancer can take a node out only once rproxy has stopped (NodePort has no `healthCheckNodePort`), so the connections of that moment fail (about 2 s). If your load balancer can check the Service's `healthCheckNodePort`, use type `LoadBalancer` (a node whose pods are all terminating fails it, so it is taken out while rproxy still accepts).
 - When a node is lost, its **backend** pods also stay in their EndpointSlices until the node turns NotReady (in every topology, some failures may follow the table's values for 40–60 s). Use RproxyPolicy's `outlierDetection` for backends, and let backends stop with a preStop too (5 s in the acceptance test; without it, each drain loses 1–3 s).
 
 ## Commands

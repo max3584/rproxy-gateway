@@ -23,7 +23,7 @@ v0.4.0・v0.4.1 の受け入れテストで分かった、Kubernetes で運用�
 | A. Gateway ごとの managed の rproxy | CRD `RproxyGatewayParameters`・合わせ方・状態・RBAC | v0.4.2 |
 | B. Kustomize で入れる | chart のコントローラの設定を ConfigMap に、`config/`、リリースの `install.yaml`・CI | v0.4.2 |
 | C. UI を Kubernetes で | UI 用の読むだけのトークンと発見の Secret（UI の chart は UI のリポジトリ） | 後のパッチ |
-| E. SIGTERM での終わり方 | rproxy の `RPROXY_SHUTDOWN_*` を渡す、猶予の秒数 | rproxy-api のリリースの後 |
+| E. SIGTERM での終わり方 | rproxy の `RPROXY_SHUTDOWN_*` を渡す、猶予の秒数 | v0.4.2（rproxy v0.4.1） |
 | F. Pod が直接持つ VIP | fleet の `vip` サイドカー・Lease・状態 | 後のパッチ |
 
 ### v0.4.1 で済んだもの
@@ -33,9 +33,9 @@ v0.4.1（#32）で managed の Pod・Service の可用性を入れた。A・E �
 | v0.4.1 にあるもの | A・E での扱い |
 |---|---|
 | readiness gate `rproxy.max3584.net/ruleset-applied` | そのまま |
-| preStop（`--pre-stop-secs`、既定 15 秒）、`terminationGracePeriodSeconds` = preStop + 15 | そのまま。E が入ったら 6. の形にする |
+| preStop（`--pre-stop-secs`、既定 15 秒）、`terminationGracePeriodSeconds` = preStop + 15 | `features.graceful_shutdown` のない rproxy だけ。ある rproxy は 6. の形（preStop なし、delay + drain + 5） |
 | replicas が 2 以上で PDB（`maxUnavailable: 1`）と `kubernetes.io/hostname` の topologySpread | 既定のまま。A の `podDisruptionBudget`・`pod.topologySpreadConstraints` で変えられる |
-| プローブの秒数（`--readiness-probe`・`--liveness-probe`） | そのまま。readiness は `/healthz` のまま（6.） |
+| プローブの秒数（`--readiness-probe`・`--liveness-probe`） | そのまま。readiness のパスは `features.graceful_shutdown` のある rproxy では `/readyz`（6.3） |
 | `externalTrafficPolicy`（`LoadBalancer` は `Local`、`NodePort` は `Cluster`） | 既定のまま（NodePort を `Local` にする案は採らない。v0.4.1 の受け入れテストで NodePort + 自前の L4 は `Cluster` のほうが途切れが短い）。A の `service.externalTrafficPolicy` で変えられる |
 
 ## 2. A. managed の rproxy を Gateway ごとに変える
@@ -77,7 +77,7 @@ spec:
     image: ""                           # クラスだけ
     logLevel: info
     performance: {workers: 4, udpShards: auto, cpuAffinity: none, busyPollUsecs: 0, splice: {enabled: true}}
-    shutdown: {delay: 5s, drain: 25s}   # E。rproxy のリリースまでは形だけ（6.）
+    shutdown: {delay: 15s, drain: 25s}  # E（6.）
     extraEnv: []                        # クラスだけ。コントローラが決める名前は書けない
   ui: {visible: true}                   # C。UI に見せるか（Gateway はクラスの既定を false にだけできる）
   policy:                               # クラスの参照でだけ使える（Gateway から指すと InvalidParameters）
@@ -111,7 +111,7 @@ spec:
 | `rproxy.image` | rproxy のコンテナ | `--rproxy-image` | 参照の形（`repo:tag` か `repo@sha256:…`） |
 | `rproxy.logLevel` | `RPROXY_LOG_LEVEL` | なし | `error`・`warn`・`info`・`debug`・`trace` |
 | `rproxy.performance` | `RPROXY_WORKERS`・`RPROXY_UDP_SHARDS`・`RPROXY_CPU_AFFINITY`・`RPROXY_BUSY_POLL_USECS`・`RPROXY_SPLICE`・`RPROXY_SPLICE_AFTER`・`RPROXY_SPLICE_FULL_READS`・`RPROXY_SPLICE_PIPE_SIZE` | なし | rproxy の `global.performance` と同じ範囲（managed の rproxy は設定ファイルを使わないので環境変数で渡す） |
-| `rproxy.shutdown.delay`・`.drain` | E が入ったら `RPROXY_SHUTDOWN_DELAY`・`RPROXY_SHUTDOWN_DRAIN` と猶予（6.） | — | `0s`〜`10m`。**rproxy のリリースまでは確かめるだけで Pod には写さない** |
+| `rproxy.shutdown.delay`・`.drain` | `RPROXY_SHUTDOWN_DELAY`・`RPROXY_SHUTDOWN_DRAIN` と猶予（6.） | `--shutdown-delay`（15 秒）・`--shutdown-drain`（25 秒） | `0s`〜`10m`。`features.graceful_shutdown` のない rproxy には写さない（preStop のまま） |
 | `rproxy.extraEnv` | rproxy のコンテナ | なし | `RPROXY_*` だけ。コントローラが決める名前（`RPROXY_API_*`・`RPROXY_TOKEN_FILE`・`RPROXY_TLS_*`・`RPROXY_FILES_*`・`RPROXY_CONFIG`・`RPROXY_DATABASE_URL`・`RPROXY_UPDATE*`・`RPROXY_HANDOFF*`・`RPROXY_STATIC_RULES`・`RPROXY_SHUTDOWN_*`、上の項目で渡す名前）は誤り |
 | `ui.visible` | C の発見の Secret に載せるか | クラスの値、なければ `true` | Gateway はクラスが `false` のとき `true` にできない。C が入るまでは写す先がない |
 
@@ -252,28 +252,47 @@ rproxy-api が `--shutdown-delay` / `RPROXY_SHUTDOWN_DELAY`（SIGTERM の後、`
 
 ### 6.1 つなぐ時期
 
-- **rproxy-api のリリースにこの 2 つが入ってから**つなぐ（それまでは A の `rproxy.shutdown` は確かめるだけ）。つなぐときに chart の rproxy のイメージ（`rproxy.image.tag`、`--rproxy-image` の既定）もそのリリースに上げる。
-- 古い rproxy のイメージを `rproxy.image` で使うと `RPROXY_SHUTDOWN_*` は効かない（知らない環境変数は無視される）。そのため preStop を外すのは、Pod の rproxy が `features.graceful_shutdown` を持つと分かってからにする（コントローラは Pod の `/capabilities` を聞いている。分からない間は preStop を残す）。
+- rproxy-api v0.4.1 で入った。chart の rproxy のイメージ（`rproxy.image.tag`、`--rproxy-image` の既定、release.yml の `RPROXY_VERSION`）を 0.4.1 に上げた。
+- 古い rproxy のイメージを `rproxy.image` で使うと `RPROXY_SHUTDOWN_*` は効かず、SIGTERM ですぐ止まる。そのため新しい形（preStop なし、`/readyz`）にするのは、Pod の rproxy が `features.graceful_shutdown` を持つと分かってから：コントローラが出荷するイメージ（`--rproxy-image` の既定）はそのまま、ほかのイメージはそれを動かす Pod の `/capabilities` が答えてから（Pod がもう一度入れ替わる。分かったイメージはコントローラが動いている間覚える）。分からない間は v0.4.1 の形（preStop、`/healthz`、`RPROXY_SHUTDOWN_*` なし）。
 
-### 6.2 形（つないだ後）
+### 6.2 形
 
-- managed：`RPROXY_SHUTDOWN_DELAY`・`RPROXY_SHUTDOWN_DRAIN` を A の `rproxy.shutdown`（既定 `5s`・`25s`）から渡す。preStop の `sleep` は E の `delay` に置き換え（イメージにシェルが要らない、Kubernetes 1.29 でも同じ形、`/readyz` が `draining` を返せる）、`terminationGracePeriodSeconds` を `delay` + `drain` + 5（既定 35）にする。置き換えは受け入れテストで v0.4.1（preStop 15 秒）と比べてから決め、preStop を残すほうが途切れが短ければ preStop + `delay` + `drain` + 5 にする。
-- fleet：chart の `fleet.shutdown`（同じ既定）。hostNetwork なので外の LB・VIP の外れ方に合わせて `delay` を決めることを文書に書く。
-- コントローラは終わりかけ（`deletionTimestamp` あり）の Pod に PUT しない（今と同じ）。
+- managed（`features.graceful_shutdown` のある rproxy）：`RPROXY_SHUTDOWN_DELAY`・`RPROXY_SHUTDOWN_DRAIN` を A の `rproxy.shutdown`、なければコントローラの `--shutdown-delay`（既定 15 秒）・`--shutdown-drain`（既定 25 秒）（chart の `managed.shutdown`）から渡す。preStop は付けず、`terminationGracePeriodSeconds` は delay + drain + 5（既定 45）。readiness は `/readyz`（6.3）。
+- `managed.preStopSeconds` / `--pre-stop-secs` は既定を未設定にした（新しい rproxy には preStop なし、古い rproxy には 15 秒）。設定してある入れ方（0.4.1 で値を書いたもの）は値を守り、どの Pod にもその preStop を付ける（猶予は preStop + delay + drain + 5）。
+- fleet：chart の `fleet.shutdown`（既定 delay 5 秒・drain 25 秒、猶予は delay + drain + 5）。hostNetwork で Service の endpoint がないので、外の LB・VIP のヘルスチェックを `https://<ノード>:9443/readyz` に向け、それが外すまでの時間（間隔 × 回数）より delay を長くする（README と values に書いた）。
+- コントローラは終わりかけ（`deletionTimestamp` あり）の Pod に PUT しない（今と同じ。rproxy も delay・drain の間は変更を `503 shutting_down` で断る）。
+
+#### 受け入れテストでの比較
+
+rproxy v0.4.1、replicas 2、l2-local（MetalLB L2 + `Local`）と l2-cluster（MetalLB L2 + `Cluster`）で 6 通りを 1 回ずつ回した。値はシナリオの「200 のない最長の時間」（秒）。b1・b2 は Pod の削除（告知していないノード・しているノード）、c は drain、d は rollout restart、h は parameters の変更、f はコントローラと rproxy を一緒に再起動（上限なし）。失敗は b1〜h の失敗したリクエストの合計。
+
+| 形 | l2-local b1/b2/c/d/h | 失敗 | f | l2-cluster b1/b2/c/d/h | 失敗 |
+|---|---|---|---|---|---|
+| A. preStop 15・delay 0・drain 0・`/healthz`（v0.4.1） | 0.3/1.2/1.2/0.1/1.2 | 9 | 1.3 | 0.1/0.1/0.1/0.2/0.2 | 0 |
+| B. preStop 15・delay 0・drain 25・`/healthz` | 0.2/**4.7**/0.2/0.2/0.2 | 122 | 6.1 | 0.2/0.2/0.2/0.2/0.2 | 0 |
+| C. preStop 0・delay 15・drain 25・`/healthz` | 0.1/**6.1**/1.2/0.2/1.2 | 140 | 5.8 | 0.2/0.2/0.3/1.2/0.2 | 1 |
+| **D. preStop 0・delay 15・drain 25・`/readyz`（採った形）** | 1.2/0.2/1.2/1.2/1.2 | 12 | 0.2 | 0.1/0.2/0.2/0.2/0.2 | 0 |
+| E. preStop 15・delay 0・drain 25・`/readyz` | 0.2/**4.0**/0.2/1.2/0.2 | 104 | 2.6 | 0.2/0.2/0.2/0.2/0.2 | 0 |
+| F. preStop 10・delay 5・drain 25・`/healthz` | 0.1/**6.0**/1.2/1.2/0.2 | 139 | 4.6 | 0.1/0.1/0.2/0.1/1.2 | 1 |
+
+- drain を足し、待ち受けを閉じる前に endpoint を外さない形（B・C・E・F）は、l2-local の b2（告知しているノードの Pod の削除）で 4〜6 秒途切れて `GAP_LIMIT`（3 秒）を超えた。待ち受けを閉じてから Pod が消えるまで（接続の終わりを待つ数秒）endpoint が `serving` のまま残り、MetalLB は Pod が消えるまで告知を移さない。E は `/readyz` でも delay 0 なので、readiness が落ちる（最大 4 秒）前に待ち受けが閉じる。
+- D は SIGTERM で `/readyz` が `draining` になり、delay の間（rproxy はまだ受け付ける）に endpoint が外れて MetalLB が告知を移す。途切れは v0.4.1（A）と同じ程度（l2-local で 1 リクエストの 1.2 秒まで）で、そのうえ今の接続は drain で終われる。l2-cluster ではどの形も差がない。
+- delay を 5 秒（設計の案）にするのは測っていない。readiness が落ちるまで最大 4 秒（2 秒 × 2 回）かかるので、既定は v0.4.1 の preStop と同じ 15 秒にした。
 
 ### 6.3 readiness を `/readyz` にするか（10. Q4）
 
-設計の案は readiness の probe を `/healthz` から `/readyz` に変える（`draining` ですぐに外れる）ものだった。v0.4.1 の結果と合わせると、**今は `/healthz` のままにする**：
+**`features.graceful_shutdown` のある rproxy では `/readyz`**（`managed.readinessProbe.path` / `--readiness-path` で `/healthz` にもできる）。古い rproxy は `/healthz` のまま。
 
-- 終わる Pod は、削除が決まったときに EndpointSlice で `ready: false` になる（readiness の結果によらない）。kube-proxy・クラウドの LB はこれで新しい接続を外す。`/readyz` を見ても、ここは早くならない。
-- `/readyz` が `draining` を返すと、readiness が落ちて endpoint の `serving` も `false` になる。これは v0.4.1 で選ばなかった形（止まる Pod の gate を先に `False` にする）と同じ動きで、MetalLB L2 + `externalTrafficPolicy: Local` では告知が移るまでそのノードに来た通信を kube-proxy が落とし、途切れが長くなった（[DESIGN.md](DESIGN.md) の「rproxy の可用性」）。
-- 起動のときは readiness gate（ルールセットを反映したか）が `/readyz`（rproxy の準備）より強い条件なので、`/readyz` にしても早くも安全にもならない。
-- E をつなぐ PR で、受け入れテストの l2-local・bgp・nodeport-lb を `/healthz` と `/readyz` の両方で回し、途切れの短いほうを既定にする（`managed.readinessProbe` に `path` を足して選べるようにする）。
+- 設計の時点では、`/readyz` の `draining` で endpoint の `serving` が先に落ちるのは v0.4.1 で選ばなかった形（止まる Pod の gate を先に `False` にする）と同じで、MetalLB L2 + `Local` で途切れが長くなると考えていた。測ると、delay の間 rproxy が受け付け続けるので、D（`/readyz`）が A と同じ程度で、`/healthz` で drain を足した形（B・C）より短かった（6.2 の表）。
+- liveness は `/healthz` のまま（`draining` の rproxy を再起動させない）。
+- 起動のときは readiness gate（ルールセットを反映したか）が `/readyz` より強い条件なので、起動の早さは変わらない。
+- bgp・nodeport-lb は比べていない（bgp は記録だけ）。必要になれば `managed.readinessProbe.path` で `/healthz` に戻せる。
 
 ### 6.4 試験
 
-- 単体：環境変数と猶予の秒数、`features.graceful_shutdown` のない Pod では preStop が残ること。
-- 受け入れ：シナリオ b・c・d の「失敗したリクエスト」を要約に出す（今の決まりどおり、失敗だけでは落とさない。入力 `strict: true` で 0 でなければ落とす）。
+- 単体：環境変数と猶予の秒数（フラグ・parameters・丸め）、`features.graceful_shutdown` のない rproxy では preStop と `/healthz` が残り `RPROXY_SHUTDOWN_*` を渡さないこと、イメージの分かり方（出荷するイメージ、Pod の `/capabilities`、覚えていること）。
+- e2e：`rproxy:e2e`（rproxy-api の master）は出荷するイメージではないので、Pod が `graceful_shutdown` を答えた後に新しい形（preStop なし、`/readyz`、`RPROXY_SHUTDOWN_*`、猶予 45 秒）に入れ替わること。
+- 受け入れ：失敗したリクエストは前から要約に出ている。入力 `strict`（既定 false）で、`GAP_LIMIT` を当てるシナリオ（b・c・d・h・i）に失敗したリクエストが 1 つでもあれば落とす（bgp は記録だけのまま）。`source=checkout` で chart の rproxy のイメージがまだ出ていなければ、rproxy-api の同じ版のリリースのバイナリから作る。
 
 ## 7. F. rproxy の Pod が直接持つ VIP
 
@@ -377,7 +396,7 @@ fleet:
 1. この文書（docs の PR）。
 2. A：`RproxyGatewayParameters`（v0.4.2）。
 3. B：chart の ConfigMap、`config/`、リリースの `install.yaml`（v0.4.2）。A と B は chart を両方変えるので、後から入るほうが `scripts/render-config.sh` で `config/` を描き直す。
-4. E：rproxy-api のリリースの後、`RPROXY_SHUTDOWN_*` をつなぐ（6.）。
+4. E：rproxy-api v0.4.1 の `RPROXY_SHUTDOWN_*` をつなぐ（6.）。
 5. C：UI の chart の後、発見の Secret と UI のトークン。
 6. F：fleet の VIP。大きいので、ほかと別のパッチにする。
 7. 受け入れ（8.）は各 PR のブランチで手で回し、v0.4.1 から下がっていないことを確かめる。
@@ -388,8 +407,8 @@ fleet:
 |---|---|---|
 | Q1 | A の CRD を 1 つにするか、クラス用の cluster-scoped の種類を分けるか | **1 つ**（namespaced、クラスの参照はコントローラの namespace だけ、`policy` はクラスの参照だけ） |
 | Q2 | 参照が誤りになったとき、前に動いていた Gateway をどうするか | **前の形のまま残す**（`Accepted: False`・`Programmed: True`）。Deployment のある Gateway の rproxy を、誤った参照のために消さない |
-| Q3 | rproxy のバイナリの既定の `drain` | rproxy-api の設計で決める（バイナリの既定は 0）。managed の既定は `5s`・`25s`（6.） |
-| Q4 | 既定を変えるもの：replicas 2 以上の PDB、NodePort の `externalTrafficPolicy: Local`、readiness の `/readyz`、猶予 | PDB は v0.4.1 で済んだ。NodePort は `Cluster` のまま（v0.4.1 の測定）。`/readyz` は E のときに受け入れテストで決める（6.3）。猶予は E のときに 6.2 の形 |
+| Q3 | rproxy のバイナリの既定の `drain` | rproxy-api の設計で決める（バイナリの既定は 0）。managed の既定は delay `15s`・drain `25s`（受け入れテストで決めた。6.） |
+| Q4 | 既定を変えるもの：replicas 2 以上の PDB、NodePort の `externalTrafficPolicy: Local`、readiness の `/readyz`、猶予 | PDB は v0.4.1 で済んだ。NodePort は `Cluster` のまま（v0.4.1 の測定）。readiness は `/readyz`（E の受け入れテストで決めた。6.3）。猶予は delay + drain + 5（6.2） |
 | Q5 | テナントが既定で決められる項目 | 2.5 の表のとおり。`service.type`・`loadBalancerClass`・nodeSelector・tolerations・affinity・priorityClass はクラスの `policy` で開ける。`image`・`extraEnv` はテナントには開けない |
 | Q6 | chart のコントローラの設定を args から ConfigMap（`envFrom`）に移すか | **移す**（chart の値は変わらない） |
 | Q7 | UI の chart を gateway の chart の subchart にするか | **しない**（別の chart、版も別）。gateway の chart には `ui.namespace` などの値だけ |

@@ -77,6 +77,19 @@ kubectl -n e2e wait --for=condition=Programmed gateway/e2e --timeout=240s
 addr=$(kubectl -n e2e get gateway e2e -o jsonpath='{.status.addresses[0].value}')
 echo "Gateway address: $addr"
 
+echo "== graceful shutdown (rproxy v0.4.1)"
+# rproxy:e2e is not the image the controller ships: its pods start with the preStop and roll to the
+# graceful shutdown (RPROXY_SHUTDOWN_*, /readyz, no preStop) once they report features.graceful_shutdown
+graceful() {
+  kubectl -n e2e get deploy -l gateway.networking.k8s.io/gateway-name=e2e -o json | jq -e '.items[0].spec.template.spec
+    | .containers[0].lifecycle == null and .terminationGracePeriodSeconds == 45
+      and .containers[0].readinessProbe.httpGet.path == "/readyz" and .containers[0].livenessProbe.httpGet.path == "/healthz"
+      and ([.containers[0].env[] | select(.name | startswith("RPROXY_SHUTDOWN_")) | "\(.name)=\(.value)"]
+        == ["RPROXY_SHUTDOWN_DELAY=15s", "RPROXY_SHUTDOWN_DRAIN=25s"])' > /dev/null
+}
+retry 120 graceful
+kubectl -n e2e rollout status deploy -l gateway.networking.k8s.io/gateway-name=e2e --timeout=180s > /dev/null
+
 echo "== HTTP"
 retry 60 sh -c "curl -sf -H 'Host: e2e.example.com' http://$addr/hello > $work/http.json"
 jq -e '.path == "/hello" and (.headers["X-E2e"] == ["rproxy"])' "$work/http.json" > /dev/null || { cat "$work/http.json"; exit 1; }
@@ -157,11 +170,10 @@ kubectl -n e2e delete gateway steal-dns > /dev/null
 kubectl -n e2e delete rproxyrule steal-key > /dev/null
 test "$(kubectl -n e2e get networkpolicy -l gateway.networking.k8s.io/gateway-name=e2e -o name | wc -l)" = 1
 
-echo "== availability: readiness gate, preStop, grace period"
+echo "== availability: readiness gate, graceful shutdown, grace period"
 rp_json=$(kubectl -n e2e get pods -l gateway.networking.k8s.io/gateway-name=e2e,app.kubernetes.io/name=rproxy -o json)
 jq -e '.items[0].status.conditions[] | select(.type == "rproxy.max3584.net/ruleset-applied") | .status == "True"' <<< "$rp_json" > /dev/null
 jq -e '.items[0].spec.readinessGates[0].conditionType == "rproxy.max3584.net/ruleset-applied"' <<< "$rp_json" > /dev/null
-jq -e '.items[0].spec.containers[0].lifecycle.preStop.sleep.seconds == 15 and .items[0].spec.terminationGracePeriodSeconds == 30' <<< "$rp_json" > /dev/null
 jq -e '.items[0].spec.containers[0].readinessProbe.periodSeconds == 2' <<< "$rp_json" > /dev/null
 test -z "$(kubectl -n e2e get pdb -l gateway.networking.k8s.io/gateway-name=e2e -o name)"
 

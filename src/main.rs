@@ -46,7 +46,7 @@ struct ControllerArgs {
 	#[arg(long, env = "RPROXY_GATEWAY_MODE", default_value = "managed", value_parser = ["managed", "fleet"])]
 	mode: String,
 	/// managed: the rproxy image.
-	#[arg(long, env = "RPROXY_GATEWAY_RPROXY_IMAGE", default_value = "ghcr.io/max3584/rproxy-gateway/rproxy:0.4.0")]
+	#[arg(long, env = "RPROXY_GATEWAY_RPROXY_IMAGE", default_value = rproxy_gateway::controller::provision::RPROXY_IMAGE)]
 	rproxy_image: String,
 	/// managed: this controller's image (runs certsync next to rproxy).
 	#[arg(long, env = "RPROXY_GATEWAY_IMAGE", default_value = concat!("ghcr.io/max3584/rproxy-gateway:", env!("CARGO_PKG_VERSION")))]
@@ -68,10 +68,28 @@ struct ControllerArgs {
 	/// managed: LoadBalancer Services get node ports (`allocateLoadBalancerNodePorts`).
 	#[arg(long, env = "RPROXY_GATEWAY_ALLOCATE_LOAD_BALANCER_NODE_PORTS", default_value_t = true, action = clap::ArgAction::Set)]
 	allocate_load_balancer_node_ports: bool,
-	/// managed: seconds a stopping rproxy pod keeps serving (preStop) while it leaves the Service's
-	/// endpoints and load balancers; 0: none. terminationGracePeriodSeconds is 15 more.
-	#[arg(long, env = "RPROXY_GATEWAY_PRE_STOP_SECS", default_value_t = 15)]
-	pre_stop_secs: u32,
+	/// managed: seconds a stopping rproxy pod keeps serving (preStop) before SIGTERM while it leaves the
+	/// Service's endpoints and load balancers; 0: none. Unset: none for rproxy with a graceful shutdown
+	/// (the shutdown delay does it), 15 for older rproxy images (terminationGracePeriodSeconds 15 more).
+	/// Set: this preStop for every pod, before the shutdown delay and drain.
+	#[arg(long, env = "RPROXY_GATEWAY_PRE_STOP_SECS")]
+	pre_stop_secs: Option<u32>,
+	/// managed, rproxy with a graceful shutdown (`features.graceful_shutdown`, v0.4.1): after SIGTERM,
+	/// rproxy keeps accepting this long while `/readyz` says `draining` and load balancers move away
+	/// (RPROXY_SHUTDOWN_DELAY; it replaces the preStop). The default of the parameters'
+	/// `rproxy.shutdown.delay`. `15s`, `250ms`, `1m`; at most 10m.
+	#[arg(long, env = "RPROXY_GATEWAY_SHUTDOWN_DELAY", default_value = "15s", value_parser = shutdown_duration)]
+	shutdown_delay: Duration,
+	/// managed: then rproxy closes its listeners and lets connections end for up to this long
+	/// (RPROXY_SHUTDOWN_DRAIN). The default of the parameters' `rproxy.shutdown.drain`.
+	/// terminationGracePeriodSeconds is the delay, the drain and 5 more.
+	#[arg(long, env = "RPROXY_GATEWAY_SHUTDOWN_DRAIN", default_value = "25s", value_parser = shutdown_duration)]
+	shutdown_drain: Duration,
+	/// managed, rproxy with a graceful shutdown: the path of its readiness probe: `/readyz` (also not
+	/// ready while restoring at start and while shutting down: the endpoint stops serving during the
+	/// delay) or `/healthz` (the process answers). Older images: `/healthz`.
+	#[arg(long, env = "RPROXY_GATEWAY_READINESS_PATH", default_value = "/readyz", value_parser = ["/healthz", "/readyz"])]
+	readiness_path: String,
 	/// managed: rproxy's readiness probe, `periodSeconds=2,timeoutSeconds=1,failureThreshold=2,successThreshold=1,initialDelaySeconds=0`
 	/// (these are the defaults; any of them).
 	#[arg(long, env = "RPROXY_GATEWAY_READINESS_PROBE", default_value = "", value_parser = |s: &str| ProbeTiming::parse(s, ProbeTiming::READINESS))]
@@ -180,6 +198,15 @@ struct RenderArgs {
 	migration: MigrationArgs,
 }
 
+/// `--shutdown-delay`, `--shutdown-drain`: like the parameters' `rproxy.shutdown` (0s to 10m).
+fn shutdown_duration(s: &str) -> Result<Duration, String> {
+	let d = render::params::duration(s).ok_or_else(|| format!("{s:?} is not a duration (5s, 250ms, 1m)"))?;
+	if d > Duration::from_secs(600) {
+		return Err("at most 10m".into());
+	}
+	Ok(d)
+}
+
 fn init_logging(format: &str) {
 	let filter = tracing_subscriber::EnvFilter::try_from_env("RPROXY_GATEWAY_LOG").unwrap_or_else(|_| "info".into());
 	let b = tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr);
@@ -257,7 +284,10 @@ fn main() -> anyhow::Result<()> {
 					pre_stop_secs: a.pre_stop_secs,
 					// set from the cluster's version at start
 					native_sleep: false,
+					shutdown_delay: a.shutdown_delay,
+					shutdown_drain: a.shutdown_drain,
 					readiness: a.readiness_probe,
+					readiness_path: a.readiness_path,
 					liveness: a.liveness_probe,
 				}),
 			};

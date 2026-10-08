@@ -37,6 +37,11 @@ on:
         description: "seconds without a 200 a pod deletion, drain, rollout or parameters change may cause (replicas >= 2; l2-local, l2-cluster, nodeport-lb; bgp and a lost node are recorded only)"
         required: false
         default: "3"
+      strict:
+        description: "those scenarios also fail on any failed request (not only on a gap over gap_limit)"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -89,6 +94,7 @@ jobs:
           MANAGED_REPLICAS: ${{ inputs.managed_replicas || '2' }}
           HELM_ARGS: ${{ inputs.helm_args }}
           GAP_LIMIT: ${{ inputs.gap_limit || '3' }}
+          STRICT: ${{ inputs.strict && 'true' || 'false' }}
         run: scripts/acceptance.sh
       - uses: actions/upload-artifact@v4
         if: always()

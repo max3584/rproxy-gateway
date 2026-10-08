@@ -18,10 +18,10 @@
 # Outages are measured and reported. With MANAGED_REPLICAS >= 2, a pod deletion, a node drain, a
 # rollout restart and a parameters change fail the run when the longest gap without a 200 exceeds
 # GAP_LIMIT seconds (l2-local, l2-cluster, nodeport-lb: what rproxy-gateway controls; bgp and a lost
-# node are recorded only: their gaps come from the network and the cluster's failure detection); otherwise
-# the script fails only on functional breakage (routes never recover, the certificate never rotates,
-# state not restored). Each scenario's timeline (EndpointSlices, pods, the load balancer's view,
-# probe failures) is in $work/timeline-*.txt. Results: $work/summary.md (and $GITHUB_STEP_SUMMARY).
+# node are recorded only: their gaps come from the network and the cluster's failure detection), and with
+# STRICT=true on any failed request; otherwise the script fails only on functional breakage (routes never
+# recover, the certificate never rotates, state not restored). Each scenario's timeline (EndpointSlices,
+# pods, the load balancer's view, probe failures) is in $work/timeline-*.txt. Results: $work/summary.md (and $GITHUB_STEP_SUMMARY).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -38,6 +38,9 @@ MANAGED_REPLICAS=${MANAGED_REPLICAS:-2}
 HELM_ARGS=${HELM_ARGS:-}
 # seconds without a 200 a pod deletion, drain or rollout may cause (MANAGED_REPLICAS >= 2)
 GAP_LIMIT=${GAP_LIMIT:-3}
+# true: a pod deletion, drain, rollout or parameters change also fails on any failed request (not only
+# on a gap over GAP_LIMIT)
+STRICT=${STRICT:-false}
 FRR_IMAGE=${FRR_IMAGE:-quay.io/frrouting/frr:9.1.0}
 HAPROXY_IMAGE=${HAPROXY_IMAGE:-haproxy:3.0-alpine}
 case "$TOPOLOGY" in l2-local | l2-cluster | bgp | nodeport-lb) ;; *) echo "TOPOLOGY: l2-local, l2-cluster, bgp or nodeport-lb"; exit 1 ;; esac
@@ -253,6 +256,22 @@ if [ "$SOURCE" = checkout ]; then
   docker build -q -t rproxy-gateway:acc --build-arg TARGETARCH=amd64 -f Dockerfile .
   kind load docker-image --name "$CLUSTER" rproxy-gateway:acc
   image_args=(--set controller.image.repository=rproxy-gateway --set controller.image.tag=acc)
+  # the chart's rproxy image before its first release (made by release.yml): built from rproxy-api's
+  # release binary of the same version (Dockerfile.rproxy)
+  rproxy_repo=$(sed -n '/^rproxy:/,/^[a-z]/s/^    repository: *//p' "$CHART/values.yaml")
+  rproxy_tag=$(sed -n '/^rproxy:/,/^[a-z]/s/^    tag: *"\(.*\)"/\1/p' "$CHART/values.yaml")
+  if ! docker pull -q "$rproxy_repo:$rproxy_tag" > /dev/null 2>&1; then
+    log "== rproxy image $rproxy_repo:$rproxy_tag not published: built from rproxy-api v$rproxy_tag"
+    rel=https://github.com/max3584/rproxy-api/releases/download/v$rproxy_tag
+    bin=rproxy-api-v$rproxy_tag-x86_64-unknown-linux-musl
+    curl -fsSLo "$work/$bin" "$rel/$bin"
+    curl -fsSLo "$work/SHA256SUMS" "$rel/SHA256SUMS"
+    (cd "$work" && grep " \*\?$bin\$" SHA256SUMS | sha256sum -c -)
+    mkdir -p dist/amd64
+    install -m 755 "$work/$bin" dist/amd64/rproxy-api
+    docker build -q -t "$rproxy_repo:$rproxy_tag" --build-arg TARGETARCH=amd64 -f Dockerfile.rproxy .
+  fi
+  kind load docker-image --name "$CLUSTER" "$rproxy_repo:$rproxy_tag"
 else
   image_args=(--version "$CHART_VERSION")
 fi
@@ -621,6 +640,11 @@ record() {
       result=FAIL notes="longest gap over ${GAP_LIMIT}s; $notes"
     fi
   fi
+  # STRICT: any failed request in these scenarios fails the run (not in bgp: recorded only)
+  if [ "$STRICT" = true ] && [ -n "${7:-}" ] && [ "$MANAGED_REPLICAS" -ge 2 ] && [ "$TOPOLOGY" != bgp ] &&
+    [ $((h + s + t)) -gt 0 ] && [ "$result" != FAIL ]; then
+    result=FAIL notes="failed requests (STRICT); $notes"
+  fi
   [ "$result" = FAIL ] && failed=1
   timeline "$key" "$2" "$3"
   notes+="; timeline: $TIMELINE"
@@ -959,7 +983,7 @@ stop_probes
   echo "|---|---|---|---|---|---|"
   awk -F'\t' '{ printf "| %s | %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5, $6 }' "$results"
   echo
-  echo "PASS (outage): requests failed but everything recovered (recorded, not a failure). info (network-dependent): over the gap limit in the bgp topology, whose gaps are the network's convergence (recorded, not a failure); a lost node (g) is recorded only in every topology. SKIP: the placement or topology did not allow the scenario. FAIL: routes never recovered, the certificate never rotated or the state was not restored (timeouts: recovery ${RECOVERY_TIMEOUT}s, leader ${LEADER_TIMEOUT}s, route change ${APPLY_TIMEOUT}s, rotation ${ROTATE_TIMEOUT}s)$([ "$MANAGED_REPLICAS" -ge 2 ] && [ "$TOPOLOGY" != bgp ] && echo ", or a pod deletion, drain, rollout restart or parameters change left a gap over ${GAP_LIMIT}s")."
+  echo "PASS (outage): requests failed but everything recovered (recorded, not a failure). info (network-dependent): over the gap limit in the bgp topology, whose gaps are the network's convergence (recorded, not a failure); a lost node (g) is recorded only in every topology. SKIP: the placement or topology did not allow the scenario. FAIL: routes never recovered, the certificate never rotated or the state was not restored (timeouts: recovery ${RECOVERY_TIMEOUT}s, leader ${LEADER_TIMEOUT}s, route change ${APPLY_TIMEOUT}s, rotation ${ROTATE_TIMEOUT}s)$([ "$MANAGED_REPLICAS" -ge 2 ] && [ "$TOPOLOGY" != bgp ] && echo ", or a pod deletion, drain, rollout restart or parameters change left a gap over ${GAP_LIMIT}s$([ "$STRICT" = true ] && echo " or any failed request (STRICT)")")."
   echo
   echo "Nodes: $(tr '\n' ' ' < "$work/nodes.txt")"
   for f in "$work"/timeline-*.txt; do

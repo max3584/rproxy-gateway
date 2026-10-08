@@ -228,8 +228,10 @@ pub struct RproxyParams {
 	/// rproxy's global.performance, passed as environment variables.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub performance: Option<Performance>,
-	/// How rproxy stops on SIGTERM (RPROXY_SHUTDOWN_DELAY, RPROXY_SHUTDOWN_DRAIN): validated only
-	/// until an rproxy release has them (docs/DESIGN-v0.4.x.md, E).
+	/// How rproxy stops on SIGTERM (RPROXY_SHUTDOWN_DELAY, RPROXY_SHUTDOWN_DRAIN; terminationGracePeriodSeconds
+	/// is both and 5 s more): keep accepting for `delay` while /readyz says draining, then let
+	/// connections end for up to `drain`. Default: the controller's (15s, 25s). Only for rproxy with
+	/// features.graceful_shutdown (v0.4.1); older rproxy keeps a preStop (docs/DESIGN-v0.4.x.md, E).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub shutdown: Option<Shutdown>,
 	/// More RPROXY_* environment variables of the rproxy container (Kubernetes EnvVars): only in

@@ -22,6 +22,20 @@ helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
 {{- end }}
 {{- end }}
 
+{{/* a duration (5s, 250ms, 1m; a bare number is seconds) in whole seconds, rounded up */}}
+{{- define "rproxy-gateway.seconds" -}}
+{{- $v := toString . | trim -}}
+{{- $digits := regexFind "^[0-9]+" $v -}}
+{{- $n := $digits | default "0" | int -}}
+{{- $unit := trimPrefix $digits $v -}}
+{{- if not $digits -}}{{ fail (printf "%q is not a duration (5s, 250ms, 1m)" $v) }}
+{{- else if eq $unit "ms" -}}{{ div (add $n 999) 1000 }}
+{{- else if eq $unit "m" -}}{{ mul $n 60 }}
+{{- else if or (eq $unit "s") (eq $unit "") -}}{{ $n }}
+{{- else -}}{{ fail (printf "%q is not a duration (5s, 250ms, 1m)" $v) }}
+{{- end -}}
+{{- end -}}
+
 {{/* a probe's timing as `key=value,...` (--readiness-probe, --liveness-probe) */}}
 {{- define "rproxy-gateway.probe" -}}
 {{- $out := list -}}
@@ -67,8 +81,13 @@ RPROXY_GATEWAY_NETWORK_POLICY: {{ .Values.managed.networkPolicy | quote }}
 RPROXY_GATEWAY_EXTERNAL_TRAFFIC_POLICY: {{ . | quote }}
 {{- end }}
 RPROXY_GATEWAY_ALLOCATE_LOAD_BALANCER_NODE_PORTS: {{ .Values.managed.allocateLoadBalancerNodePorts | quote }}
+{{- if not (kindIs "invalid" .Values.managed.preStopSeconds) }}
 RPROXY_GATEWAY_PRE_STOP_SECS: {{ int .Values.managed.preStopSeconds | quote }}
-RPROXY_GATEWAY_READINESS_PROBE: {{ include "rproxy-gateway.probe" .Values.managed.readinessProbe | quote }}
+{{- end }}
+RPROXY_GATEWAY_SHUTDOWN_DELAY: {{ .Values.managed.shutdown.delay | toString | quote }}
+RPROXY_GATEWAY_SHUTDOWN_DRAIN: {{ .Values.managed.shutdown.drain | toString | quote }}
+RPROXY_GATEWAY_READINESS_PATH: {{ .Values.managed.readinessProbe.path | default "/readyz" | quote }}
+RPROXY_GATEWAY_READINESS_PROBE: {{ include "rproxy-gateway.probe" (omit .Values.managed.readinessProbe "path") | quote }}
 RPROXY_GATEWAY_LIVENESS_PROBE: {{ include "rproxy-gateway.probe" .Values.managed.livenessProbe | quote }}
 {{- with .Values.managed.addressCIDRs }}
 RPROXY_GATEWAY_ADDRESS_CIDR: {{ join "," . | quote }}
