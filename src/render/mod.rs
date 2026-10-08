@@ -353,22 +353,35 @@ fn address_policy(world: &World, gw: &Gateway, ips: &[String], opts: &Options) -
 				format!("{a}: outside the ranges the controller allows (--address-cidr)")
 			});
 		}
-		for ((ns, name), svc) in &world.services {
-			let ours = *ns == gw_ns
-				&& svc.metadata.labels.as_ref().and_then(|l| l.get("gateway.networking.k8s.io/gateway-name")) == Some(&gw_name);
-			if ours {
-				continue;
-			}
-			let spec = svc.spec.clone().unwrap_or_default();
-			let mut taken: Vec<String> = spec.cluster_ips.unwrap_or_default();
-			taken.extend(spec.cluster_ip);
-			taken.extend(spec.external_ips.unwrap_or_default());
-			for i in svc.status.as_ref().and_then(|s| s.load_balancer.as_ref()).and_then(|l| l.ingress.as_ref()).into_iter().flatten() {
-				taken.extend(i.ip.clone());
-			}
-			if taken.iter().any(|t| t.parse::<std::net::IpAddr>().ok() == Some(ip)) {
-				return Some(format!("{a}: Service {ns}/{name} has that address"));
-			}
+		let ours = |ns: &str, svc: &k8s_openapi::api::core::v1::Service| {
+			ns == gw_ns && svc.metadata.labels.as_ref().and_then(|l| l.get("gateway.networking.k8s.io/gateway-name")) == Some(&gw_name)
+		};
+		if let Some((ns, name)) = service_with(world, ip, ours) {
+			return Some(format!("{a}: Service {ns}/{name} has that address"));
+		}
+	}
+	None
+}
+
+/// A Service (not `skip`) with `ip` as its cluster, external or load balancer address.
+pub fn service_with(
+	world: &World,
+	ip: std::net::IpAddr,
+	skip: impl Fn(&str, &k8s_openapi::api::core::v1::Service) -> bool,
+) -> Option<(String, String)> {
+	for ((ns, name), svc) in &world.services {
+		if skip(ns, svc) {
+			continue;
+		}
+		let spec = svc.spec.clone().unwrap_or_default();
+		let mut taken: Vec<String> = spec.cluster_ips.unwrap_or_default();
+		taken.extend(spec.cluster_ip);
+		taken.extend(spec.external_ips.unwrap_or_default());
+		for i in svc.status.as_ref().and_then(|s| s.load_balancer.as_ref()).and_then(|l| l.ingress.as_ref()).into_iter().flatten() {
+			taken.extend(i.ip.clone());
+		}
+		if taken.iter().any(|t| t.parse::<std::net::IpAddr>().ok() == Some(ip)) {
+			return Some((ns.clone(), name.clone()));
 		}
 	}
 	None

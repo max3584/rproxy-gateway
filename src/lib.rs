@@ -10,3 +10,4 @@ pub mod manifests;
 pub mod pem;
 pub mod render;
 pub mod rproxy;
+pub mod vip;

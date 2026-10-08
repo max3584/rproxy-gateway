@@ -1592,6 +1592,7 @@ dependencies = [
  "jiff",
  "k8s-openapi",
  "kube",
+ "libc",
  "rcgen",
  "ring",
  "rustls",
