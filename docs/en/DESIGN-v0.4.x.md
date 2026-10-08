@@ -399,9 +399,26 @@ As in 7.2-7.8. What changed from the design, and details:
 - `vip` reads rproxy's `/readyz` on the pod's IP, port 9443, every 0.5 s (`retryInterval`), verified with `ca.crt` of `rproxy-gateway-api-tls` (only that key is mounted).
 - Status: with VIPs, a fleet Gateway's `status.addresses` are the VIPs (those picked in `spec.addresses`, else every usable VIP). A Gateway that picked a VIP nobody has held for over 10 s is `Programmed: False` (`AddressNotUsable`); one that picked none, only when none of the usable VIPs is held.
 - Kustomize: `config/samples/fleet-vip` (the example VIP 192.0.2.10; the Lease's name and the Role's `resourceNames` are a hash of the address, so render the chart for other VIPs).
-- Acceptance: `mode=fleet-vip`. HTTP, HTTPS and TCP every 0.1 s throughout; UDP (a `UDPRoute` to agnhost's netexec) is checked to answer from the VIP at the start and after each scenario (not continuously). Scenarios run in the order j, k, l, o, n, m (a node after `docker stop` may come back with another address, so last). j, k, l and o fail over `GAP_LIMIT`; m and n are recorded only (n checks the VIP is on one node again once it comes back). MetalLB L2 is compared with the managed acceptance runs (l2-local, l2-cluster, 6.2).
+- Acceptance: `mode=fleet-vip`. HTTP, HTTPS and TCP every 0.1 s throughout; UDP (a `UDPRoute` to agnhost's netexec) is checked to answer from the VIP at the start and after each scenario (not continuously). m is `docker kill` rather than the design's `docker stop` (see the numbers below). Scenarios run in the order j, k, l, o, n, m (a node after `docker kill` may come back with another address, so last). j, k, l and o fail over `GAP_LIMIT`; m and n are recorded only (n checks the VIP is on one node again once it comes back). MetalLB L2 is compared with the managed acceptance runs (l2-local, l2-cluster, 6.2).
 
-MEASUREMENTS_EN
+#### Acceptance test numbers
+
+`mode=fleet-vip`, kind (3 workers), one VIP, default values (duration 3 s, renew 1 s, retry 0.5 s, `hold`), run 37805425584. "Longest gap" is the longest time some probe got no 200; "Lease" is when the Lease's holder changed (from the start of the scenario).
+
+| Scenario | Failed (HTTP/HTTPS/TCP) | Longest gap | Lease | Result |
+|---|---|---|---|---|
+| j. the holder's pod deleted | 1/0/0 (of 883) | 0.2 s | +0.09 s | PASS |
+| k. `rollout restart ds/rproxy` | 0/0/0 (1090) | 0.1 s | +7.35 s (when the holder's pod's turn came) | PASS |
+| l. the holder's node drained (cordon) | 0/1/0 (345) | 1.2 s | +0.47 s | PASS |
+| o. the control plane `docker pause`d for 20 s (`hold`) | 0/0/0 (971) | 0.2 s | does not move | PASS |
+| n. the holder's node `docker pause`d (record only) | 26/27/26 (316) | 6.4 s | +2.36 s | once unpaused, the VIP is on one node 1.2 s later |
+| m. the holder's node `docker kill`ed (record only) | 27/27/14 (416) | 5.7 s | +3.15 s | — |
+
+- Planned moves (j, k, l): the Lease moves in 0.1-0.5 s and at most one request fails (managed behind MetalLB L2 + `Local`, 6.2's D: b2, c, d 0.2-1.2 s).
+- n and m moved at the Lease's expiry (3 s). Most failures are requests rproxy sent to the backend (echo) pod on the stopped node (until the node is NotReady and leaves the EndpointSlice: not the VIP's, as in managed's g).
+- The first run (run 37803895238) had m as `docker stop`: a stopping kind node stops its pods with SIGTERM, so the VIP moved at +0.06 s like a drain, with no failures. m became `docker kill` to measure a lost node.
+- UDP answered from the VIP at the start and after each scenario (rproxy answers from it with `IP_PKTINFO`).
+- Empty `vip` lines in the summary's timelines are the runner failing to read a node with `docker exec` (the probes succeed meanwhile).
 
 ## 8. Changes to the acceptance test (`acceptance.yml`)
 

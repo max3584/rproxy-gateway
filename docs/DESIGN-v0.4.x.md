@@ -399,9 +399,26 @@ fleet:
 - `vip` は rproxy の `/readyz` を Pod の IP の 9443 で 0.5 秒（`retryInterval`）おきに読む（`rproxy-gateway-api-tls` の `ca.crt` だけをマウントして検証）。
 - 状態：VIP を使う fleet の Gateway の `status.addresses` は VIP（`spec.addresses` で選んだもの、なければ使える VIP すべて）。持ち主のいない時間が 10 秒を超えた VIP を選んだ Gateway は `Programmed: False`（`AddressNotUsable`）。選んでいない Gateway は、使える VIP のどれも持たれていないときだけ。
 - Kustomize：`config/samples/fleet-vip`（例の VIP 192.0.2.10。Lease の名前と Role の `resourceNames` がアドレスのハッシュなので、ほかの VIP は chart を描いて使う）。
-- 受け入れ：`mode=fleet-vip`。HTTP・HTTPS・TCP を 0.1 秒おきに流し続け、UDP（`UDPRoute`、agnhost の netexec）は VIP から答えが返ることを最初と各シナリオの後に確かめる（流し続けはしない）。シナリオは j・k・l・o・n・m の順（`docker stop` したノードは別のアドレスで戻ることがあるので最後）。j・k・l・o は `GAP_LIMIT` で落とし、m・n は記録だけ（n は戻ったときに VIP が 1 つのノードだけになることを確かめる）。MetalLB L2 との比較は managed の受け入れ（l2-local・l2-cluster、6.2）の値と並べる。
+- 受け入れ：`mode=fleet-vip`。HTTP・HTTPS・TCP を 0.1 秒おきに流し続け、UDP（`UDPRoute`、agnhost の netexec）は VIP から答えが返ることを最初と各シナリオの後に確かめる（流し続けはしない）。m は設計の `docker stop` ではなく `docker kill`（下の値）。シナリオは j・k・l・o・n・m の順（`docker kill` したノードは別のアドレスで戻ることがあるので最後）。j・k・l・o は `GAP_LIMIT` で落とし、m・n は記録だけ（n は戻ったときに VIP が 1 つのノードだけになることを確かめる）。MetalLB L2 との比較は managed の受け入れ（l2-local・l2-cluster、6.2）の値と並べる。
 
-MEASUREMENTS_JA
+#### 受け入れテストでの値
+
+`mode=fleet-vip`、kind（ワーカー 3 台）、VIP 1 つ、既定の値（期限 3 秒・更新 1 秒・やり直し 0.5 秒、`hold`）で回した（run 37805425584）。「最長の途切れ」はどれかのプローブが 200 を返さなかった最長の時間、「Lease」は Lease の持ち主が変わった時刻（シナリオの始まりから）。
+
+| シナリオ | 失敗（HTTP/HTTPS/TCP） | 最長の途切れ | Lease | 結果 |
+|---|---|---|---|---|
+| j. 持ち主の Pod の削除 | 1/0/0（883 のうち） | 0.2 秒 | +0.09 秒 | PASS |
+| k. `rollout restart ds/rproxy` | 0/0/0（1090） | 0.1 秒 | +7.35 秒（持ち主の Pod の番が来たとき） | PASS |
+| l. 持ち主のノードの drain（cordon） | 0/1/0（345） | 1.2 秒 | +0.47 秒 | PASS |
+| o. control plane の `docker pause` 20 秒（`hold`） | 0/0/0（971） | 0.2 秒 | 移らない | PASS |
+| n. 持ち主のノードの `docker pause`（記録だけ） | 26/27/26（316） | 6.4 秒 | +2.36 秒 | 戻して 1.2 秒で VIP は 1 つのノードだけ |
+| m. 持ち主のノードの `docker kill`（記録だけ） | 27/27/14（416） | 5.7 秒 | +3.15 秒 | — |
+
+- 予定の移動（j・k・l）は Lease が 0.1〜0.5 秒で移り、途切れは 1 リクエストまで（MetalLB L2 + `Local` の managed（6.2 の D）の b2・c・d は 0.2〜1.2 秒）。
+- n・m は Lease の期限（3 秒）で移った。失敗の多くは、止めたノードにあるバックエンド（echo）の Pod に rproxy が送ったもの（ノードが NotReady になって EndpointSlice から外れるまで。VIP とは関係なく、managed の g と同じ）。
+- 最初の回（run 37803895238）では m を `docker stop` にした：kind のノードが止まるときに Pod が SIGTERM で止まるので、VIP は drain と同じく +0.06 秒で移り、失敗は 0。ノードの喪失を測るため `docker kill` にした。
+- UDP は最初と各シナリオの後に VIP から答えが返った（`IP_PKTINFO` で VIP から返す）。
+- 要約の `vip` の行が空になるところは、ランナーから `docker exec` でノードを読めなかったとき（プローブは成功している）。
 
 ## 8. 受け入れテスト（`acceptance.yml`）の変更
 
