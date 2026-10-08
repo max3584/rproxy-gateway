@@ -64,6 +64,28 @@ spec:
 - `fleet.enabled=true` では、chart の DaemonSet（`hostNetwork: true`）の rproxy がすべての Gateway を受け持つ。
 - chart の値は [charts/rproxy-gateway/values.yaml](charts/rproxy-gateway/values.yaml)。
 
+## 可用性（`managed.replicas` が 2 以上）
+
+rproxy の Pod は、コントローラがルールセットを反映してから Ready になり（readiness gate）、止まるときは preStop（既定 15 秒）の間答え続ける。Gateway ごとに PodDisruptionBudget と、ノードへの分散が付く（docs/DESIGN.md の「rproxy の可用性」）。
+
+受け入れテスト（kind 1+3 ノード、`managed.replicas=2`、HTTP・HTTPS・TCP を 100 ms ごとに新しい接続で）の、通らなかった最も長い間（秒）：
+
+| 形（`TOPOLOGY`） | Pod の削除 | 告知するノードの Pod の削除 | drain | rollout restart | ノードが止まる |
+|---|---|---|---|---|---|
+| v0.4.0（MetalLB L2、Local） | 1.2 | 10.2〜14.9 | 2.0（drain 32.9 秒） | 10.8〜13.5 | 5.6 |
+| MetalLB L2、`Local`（既定） | 0.2 | 0.3 | 1.2（drain 16.5 秒） | 0.2 | 7.8 |
+| MetalLB L2、`Cluster` | 0.2 | 0.2 | 0.2 | 0.2 | 9.0（約 59 秒まで一部が落ちる） |
+| MetalLB BGP + ECMP（BFD）、`Local` | 3.5 | — | 2.3 | 2.3 | 3.3 |
+| MetalLB BGP + ECMP（BFD）、`Cluster` | 0.2 | — | 0.2 | 0.1 | 13.3（約 60 秒まで一部が落ちる） |
+| NodePort + 自前の L4（HAProxy）、`Local` | 0.2 | — | 2.2 | 2.2 | 6.4 |
+| NodePort + 自前の L4（HAProxy）、`Cluster` | 0.1 | — | 0.1 | 0.2 | 20.2（約 63 秒まで一部が落ちる） |
+
+- **既定（LoadBalancer、`externalTrafficPolicy: Local`）を勧める**。クライアントの IP が rproxy に届き、Pod の入れ替え（削除・drain・rollout）の途切れは 1 秒ほどまで。MetalLB L2 は告知するノードを移すときに、その瞬間の接続を 1 つ落とすことがある（drain の 1.2 秒）。ノードが止まったときは、ロードバランサがノードの死を見つけるまで（MetalLB L2 の memberlist で 5〜8 秒）。
+- **`Cluster`** は Pod の入れ替えではほぼ途切れない（どのノードも ready な Pod に送る）が、クライアントの IP は届かず、ノードが止まると、そのノードの Pod が endpoint から外れるまで（ノードが NotReady になるまで、40〜50 秒）一部の接続が落ち続ける。
+- **BGP + ECMP**：`Local` では、MetalLB が終了中の Pod のあるノードの経路を Pod が消えてから取り下げる（FRR モードで 3〜4 秒かかる）ので、その間の分が落ちる（3〜4 秒）。計画した入れ替えでほぼ 0 にしたいなら `Cluster`（ノードが止まったときの尾は上と同じ）。BFD でノードの死は 1 秒ほどで経路から外れる。
+- **NodePort と自前の L4 のロードバランサ**：`Local` では、ロードバランサは rproxy が止まってからでないとノードを外せない（NodePort には `healthCheckNodePort` がない）ので、止まる瞬間の接続が落ちる（2 秒ほど）。ロードバランサが Service の `healthCheckNodePort` を見られるなら `LoadBalancer` 型にするとよい（終了中の Pod だけのノードは失敗を返すので、preStop の間に外れる）。
+- ノードが止まったとき、そのノードの **backend** の Pod も、ノードが NotReady になるまで EndpointSlice に残る（どの形でも、表の値の後ろに 40〜60 秒の一部の失敗が続くことがある）。backend には RproxyPolicy の `outlierDetection` を使う。backend 自身も preStop で止まるようにする（受け入れテストの backend は 5 秒。ないと drain ごとに 1〜3 秒落ちる）。
+
 ## コマンド
 
 | コマンド | 内容 |

@@ -43,7 +43,7 @@ rproxy の Pod が入れ替わる（削除、`kubectl rollout restart`、ノー�
 
 - **readiness gate**（`rproxy.max3584.net/ruleset-applied`）：rproxy の Pod は、コントローラがその Pod にルールセットを反映して（`PUT` が通って）からはじめて Ready になり、Service の endpoint に入る。`/healthz` だけでは、ルールのない rproxy に通信が来る。コントローラは Pod の `status.conditions` にこの条件を書く（`pods/status` の patch）。rproxy のコンテナが再起動したら（ルールセットはメモリにある）`False` に戻し、反映し直したら `True` にする（書いたときの再起動の回数を条件の `message` に持つ）。一度 `True` になった Pod は、その後の更新を待つ間（証明書のファイルが揃うまでなど）も `True` のまま。rproxy が断ったセット（`Rejected`）も「待つものがない」として `True`。fleet の DaemonSet にも同じ gate を付ける（すべての Gateway のセットが載ってから Ready。DaemonSet の rolling update はそれを待つ）。
 - **rolling update**：`maxUnavailable: 0`。新しい Pod が（gate を含めて）Ready になってから古い Pod を止める。
-- **preStop**（`managed.preStopSeconds` / `--pre-stop-secs`、既定 15 秒）：削除が決まった Pod は、すぐに EndpointSlice で `ready: false`（`serving: true`、`terminating: true`）になり、kube-proxy・MetalLB・クラウドのロードバランサが外していく。その間も rproxy は preStop で答え続け、そのあと SIGTERM で止まる。Kubernetes 1.30 以降（kubelet の `sleep` アクションが既定で使える）は `lifecycle.preStop.sleep`、それより前は rproxy のコンテナで `sleep`（コントローラが起動時に API サーバの版を見て選ぶ）。`terminationGracePeriodSeconds` は preStop + 15 秒。certsync は SIGTERM ですぐ止まる（rproxy には何も渡していない。コントローラは削除中の Pod に話しかけない）。
+- **preStop**（`managed.preStopSeconds` / `--pre-stop-secs`、既定 15 秒）：削除が決まった Pod は、すぐに EndpointSlice で `ready: false`（`serving: true`、`terminating: true`）になる。ほかに ready な Pod があれば kube-proxy は新しい接続をそちらへ送り、クラウドのロードバランサは `healthCheckNodePort`（そのノードの Pod が終了中だけになると失敗）を見てノードを外す。その間も rproxy は preStop で答え続け、そのあと SIGTERM で止まる。MetalLB は `serving` の endpoint のあるノードから告知し続け、Pod が消えたときに移す（L2 はすぐ、BGP の FRR モードは 3〜4 秒。受け入れテストで測った）。Kubernetes 1.30 以降（kubelet の `sleep` アクションが既定で使える）は `lifecycle.preStop.sleep`、それより前は rproxy のコンテナで `sleep`（コントローラが起動時に API サーバの版を見て選ぶ）。`terminationGracePeriodSeconds` は preStop + 15 秒。certsync は SIGTERM ですぐ止まる（rproxy には何も渡していない。コントローラは削除中の Pod に話しかけない）。
 - **プローブ**（`managed.readinessProbe` / `--readiness-probe`、`managed.livenessProbe` / `--liveness-probe`）：readiness は既定で 2 秒ごと、2 回続けて失敗で外す（固まった rproxy が 4 秒ほどで endpoint から外れる）。liveness は 5 秒ごと・3 回で再起動（ゆっくりのまま）。形は `periodSeconds=2,timeoutSeconds=1,failureThreshold=2,successThreshold=1,initialDelaySeconds=0`（どれかだけでもよい）。
 - **replicas が 2 以上**（`managed.replicas`）：Gateway ごとに PodDisruptionBudget（`rproxy-<id>`、`maxUnavailable: 1`、`unhealthyPodEvictionPolicy: AlwaysAllow`。Gateway が持ち主。replicas を 1 に戻すと消す）と、`kubernetes.io/hostname` の topologySpreadConstraints（`ScheduleAnyway`）。drain で 2 つの Pod が同時に止まらず、ふだんは別のノードに置く。
 - **externalTrafficPolicy**（`managed.externalTrafficPolicy` / `--external-traffic-policy`）：
@@ -53,6 +53,7 @@ rproxy の Pod が入れ替わる（削除、`kubectl rollout restart`、ノー�
   - `healthCheckNodePort` は Service ごとに Kubernetes が割り当てる（Gateway ごとに違うので、値にはしない）。
 - **allocateLoadBalancerNodePorts**（`managed.allocateLoadBalancerNodePorts`、既定 true）：MetalLB のようにノードのポートを使わないロードバランサなら false にできる。
 - コントローラは 1 つの Gateway の Pod へ、4 つずつ並べて PUT する。
+- 選ばなかった形：止まる Pod の gate を先に `False` にして endpoint の `serving` も落とす。MetalLB は早く告知を移すが、`externalTrafficPolicy: Local` の kube-proxy はそのノードに来た通信を（ほかのノードの Pod に送れないので）落とすので、告知が移るまでの間がかえって途切れる。
 
 受け入れテスト（`.github/workflows/acceptance.yml`、`scripts/acceptance.sh` の `TOPOLOGY`）で、ロードバランサの形ごとに途切れを測る。結果と勧めは [README](../README.md) の「可用性」。
 
