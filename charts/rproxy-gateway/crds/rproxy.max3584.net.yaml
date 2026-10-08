@@ -200,3 +200,301 @@ spec:
     storage: true
     subresources:
       status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: rproxygatewayparameters.rproxy.max3584.net
+spec:
+  group: rproxy.max3584.net
+  names:
+    kind: RproxyGatewayParameters
+    plural: rproxygatewayparameters
+    shortNames:
+    - rpgwp
+    singular: rproxygatewayparameters
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.replicas
+      name: Replicas
+      type: integer
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: >-
+          How a managed Gateway's rproxy Deployment, Service and pods are made; named by
+          a GatewayClass's parametersRef (in the controller's namespace) or a Gateway's
+          spec.infrastructure.parametersRef
+        properties:
+          spec:
+            description: |-
+              How a managed Gateway's rproxy is made: replicas, the PodDisruptionBudget, the pods, the
+              Service and rproxy's settings. Every field may be left out (the controller's flags then).
+            properties:
+              pod:
+                nullable: true
+                properties:
+                  affinity:
+                    description: A Kubernetes Affinity.
+                    nullable: true
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                  annotations:
+                    additionalProperties:
+                      type: string
+                    nullable: true
+                    type: object
+                  labels:
+                    additionalProperties:
+                      type: string
+                    nullable: true
+                    type: object
+                  nodeSelector:
+                    additionalProperties:
+                      type: string
+                    nullable: true
+                    type: object
+                  priorityClassName:
+                    nullable: true
+                    type: string
+                  resources:
+                    description: Kubernetes ResourceRequirements of each container.
+                    nullable: true
+                    properties:
+                      certsync:
+                        nullable: true
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                      rproxy:
+                        nullable: true
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                    type: object
+                  tolerations:
+                    description: Kubernetes Tolerations.
+                    items:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    nullable: true
+                    type: array
+                  topologySpreadConstraints:
+                    description: >-
+                      Kubernetes TopologySpreadConstraints; without a labelSelector, the Gateway's
+                      pods are selected.
+                    items:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    nullable: true
+                    type: array
+                type: object
+              podDisruptionBudget:
+                description: "The Gateway's PodDisruptionBudget (default: maxUnavailable 1 with 2 or more replicas, none with 1)."
+                nullable: true
+                properties:
+                  maxUnavailable:
+                    nullable: true
+                    x-kubernetes-int-or-string: true
+                  minAvailable:
+                    nullable: true
+                    x-kubernetes-int-or-string: true
+                type: object
+                x-kubernetes-validations:
+                - message: one of minAvailable and maxUnavailable
+                  rule: "!(has(self.minAvailable) && has(self.maxUnavailable))"
+              policy:
+                description: "What Gateways' own parameters may set: only in the GatewayClass's parameters."
+                nullable: true
+                properties:
+                  allowedLoadBalancerClasses:
+                    description: >-
+                      loadBalancerClass values a Gateway's parameters may use (with
+                      service.loadBalancerClass allowed).
+                    items:
+                      type: string
+                    nullable: true
+                    type: array
+                  allowedPriorityClasses:
+                    description: >-
+                      priorityClassName values a Gateway's parameters may use (with
+                      pod.priorityClassName allowed).
+                    items:
+                      type: string
+                    nullable: true
+                    type: array
+                  gatewayOverrides:
+                    description: |-
+                      The fields a Gateway's parameters may set (default: replicas, podDisruptionBudget,
+                      pod.labels, pod.annotations, pod.resources, pod.topologySpreadConstraints,
+                      service.externalTrafficPolicy, service.loadBalancerSourceRanges, service.ipFamilyPolicy,
+                      service.labels, service.annotations, rproxy.logLevel, rproxy.performance, rproxy.shutdown, ui).
+                      rproxy.image, rproxy.extraEnv and policy cannot be listed.
+                    items:
+                      type: string
+                    nullable: true
+                    type: array
+                  maxReplicas:
+                    description: The most replicas a Gateway's parameters may ask for (10 by default).
+                    format: int32
+                    minimum: 1.0
+                    nullable: true
+                    type: integer
+                type: object
+              replicas:
+                description: rproxy pods per Gateway (1 to policy.maxReplicas, 10 by default).
+                format: int32
+                minimum: 1.0
+                nullable: true
+                type: integer
+              rproxy:
+                nullable: true
+                properties:
+                  extraEnv:
+                    description: |-
+                      More RPROXY_* environment variables of the rproxy container (Kubernetes EnvVars): only in
+                      the GatewayClass's parameters; names the controller sets are refused.
+                    items:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    nullable: true
+                    type: array
+                  image:
+                    description: "The rproxy image (`repo:tag` or `repo@sha256:...`): only in the GatewayClass's parameters."
+                    nullable: true
+                    type: string
+                  logLevel:
+                    enum:
+                    - error
+                    - warn
+                    - info
+                    - debug
+                    - trace
+                    - null
+                    nullable: true
+                    type: string
+                  performance:
+                    description: rproxy's global.performance, passed as environment variables.
+                    nullable: true
+                    properties:
+                      busyPollUsecs:
+                        description: "RPROXY_BUSY_POLL_USECS: 0 (off) to 1000."
+                        format: uint32
+                        maximum: 1000.0
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      cpuAffinity:
+                        description: "RPROXY_CPU_AFFINITY: none, auto or a CPU list (0-3,6)."
+                        nullable: true
+                        type: string
+                      splice:
+                        description: splice(2) for plain L4 TCP (RPROXY_SPLICE*).
+                        nullable: true
+                        properties:
+                          after:
+                            description: Bytes relayed in user space first (a number or "64KiB").
+                            nullable: true
+                            x-kubernetes-int-or-string: true
+                          enabled:
+                            nullable: true
+                            type: boolean
+                          fullReads:
+                            description: 0 to 64.
+                            format: uint32
+                            maximum: 64.0
+                            minimum: 0.0
+                            nullable: true
+                            type: integer
+                          pipeSize:
+                            description: 0 (the kernel's) or 4KiB to 16MiB.
+                            nullable: true
+                            x-kubernetes-int-or-string: true
+                        type: object
+                      udpShards:
+                        description: "RPROXY_UDP_SHARDS: 1 to 64, or auto."
+                        nullable: true
+                        x-kubernetes-int-or-string: true
+                      workers:
+                        description: "RPROXY_WORKERS: tokio worker threads."
+                        format: uint32
+                        maximum: 1024.0
+                        minimum: 1.0
+                        nullable: true
+                        type: integer
+                    type: object
+                  shutdown:
+                    description: |-
+                      How rproxy stops on SIGTERM (RPROXY_SHUTDOWN_DELAY, RPROXY_SHUTDOWN_DRAIN): validated only
+                      until an rproxy release has them (docs/DESIGN-v0.4.x.md, E).
+                    nullable: true
+                    properties:
+                      delay:
+                        nullable: true
+                        type: string
+                      drain:
+                        nullable: true
+                        type: string
+                    type: object
+                type: object
+              service:
+                nullable: true
+                properties:
+                  annotations:
+                    additionalProperties:
+                      type: string
+                    nullable: true
+                    type: object
+                  externalTrafficPolicy:
+                    enum:
+                    - Local
+                    - Cluster
+                    - null
+                    nullable: true
+                    type: string
+                  ipFamilyPolicy:
+                    enum:
+                    - SingleStack
+                    - PreferDualStack
+                    - RequireDualStack
+                    - null
+                    nullable: true
+                    type: string
+                  labels:
+                    additionalProperties:
+                      type: string
+                    nullable: true
+                    type: object
+                  loadBalancerClass:
+                    description: Cannot change once the Service exists (create the Gateway again).
+                    nullable: true
+                    type: string
+                  loadBalancerSourceRanges:
+                    items:
+                      type: string
+                    nullable: true
+                    type: array
+                  type:
+                    enum:
+                    - LoadBalancer
+                    - NodePort
+                    - ClusterIP
+                    - null
+                    nullable: true
+                    type: string
+                type: object
+              ui:
+                description: What the UI is shown (docs/DESIGN-v0.4.x.md, C).
+                nullable: true
+                properties:
+                  visible:
+                    description: Listed for the UI (a Gateway can only turn the class's true into false).
+                    nullable: true
+                    type: boolean
+                type: object
+            type: object
+        required:
+        - spec
+        title: RproxyGatewayParameters
+        type: object
+    served: true
+    storage: true

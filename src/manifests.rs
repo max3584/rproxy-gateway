@@ -65,6 +65,10 @@ impl World {
 			}
 			(crate::k8s::crd::GROUP, "RproxyPolicy") => self.policies.push(serde_json::from_value(obj).map_err(err)?),
 			(crate::k8s::crd::GROUP, "RproxyRule") => self.raw_rules.push(serde_json::from_value(obj).map_err(err)?),
+			(crate::k8s::crd::GROUP, "RproxyGatewayParameters") => {
+				let p: crate::k8s::params::RproxyGatewayParameters = serde_json::from_value(obj).map_err(err)?;
+				self.gateway_parameters.insert(crate::render::world::key(&p.metadata), p);
+			}
 			("networking.k8s.io", "Ingress") => self.migration.ingresses.push(serde_json::from_value(obj).map_err(err)?),
 			(g, "IngressRoute") if crate::k8s::traefik::GROUPS.contains(&g) => {
 				self.migration.ingress_routes.push(serde_json::from_value(obj).map_err(err)?)

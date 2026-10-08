@@ -98,7 +98,7 @@ pub fn gateway_status(plan: &GatewayPlan, addresses: &[(String, String)], pods: 
 	let generation = plan.generation;
 	let prev = |path: &str| previous.and_then(|p| p.pointer(path));
 	let mut conds = plan.conds.clone();
-	let programmed = if !plan.accepted() {
+	let programmed = if !plan.accepted() && plan.kept.is_none() {
 		Cond::new("Programmed", false, "Invalid", "the Gateway is not accepted")
 	} else if let Some(e) = &plan.address_error {
 		Cond::new("Programmed", false, "AddressNotUsable", e.clone())
@@ -109,6 +109,8 @@ pub fn gateway_status(plan: &GatewayPlan, addresses: &[(String, String)], pods: 
 	} else if synced(pods) == 0 {
 		let (rejected, m) = waiting(pods);
 		Cond::new("Programmed", false, if rejected { "Invalid" } else { "Pending" }, m)
+	} else if let Some(why) = &plan.kept {
+		Cond::new("Programmed", true, "Programmed", format!("the previous parameters are kept ({why})"))
 	} else {
 		Cond::ok("Programmed", "Programmed")
 	};
@@ -258,8 +260,13 @@ pub fn policy_ancestors(previous: Option<&Value>, ours: Vec<Value>, controller: 
 }
 
 /// GatewayClass `status`.
-pub fn class_status(generation: i64, features: &[&str], previous: Option<&Value>, now: &str) -> Value {
-	let conds = [Cond::ok("Accepted", "Accepted"), Cond::ok("SupportedVersion", "SupportedVersion")];
+/// A GatewayClass's `status`; `invalid`: why its parametersRef cannot be used (`InvalidParameters`).
+pub fn class_status(generation: i64, features: &[&str], invalid: Option<&str>, previous: Option<&Value>, now: &str) -> Value {
+	let accepted = match invalid {
+		Some(e) => Cond::new("Accepted", false, "InvalidParameters", e),
+		None => Cond::ok("Accepted", "Accepted"),
+	};
+	let conds = [accepted, Cond::ok("SupportedVersion", "SupportedVersion")];
 	let mut features: Vec<&str> = features.to_vec();
 	features.sort();
 	json!({
@@ -316,6 +323,24 @@ mod tests {
 	}
 
 	#[test]
+	fn invalid_parameters_keep_the_last_good_rproxy() {
+		let mut p = plan();
+		p.conds = vec![Cond::new("Accepted", false, "InvalidParameters", "spec.pod.tolerations: not allowed")];
+		let addrs = vec![("IPAddress".to_string(), "10.96.0.10".to_string())];
+		let synced = [PodSync::Synced(vec![view(80, "True")])];
+		let s = gateway_status(&p, &addrs, &synced, None, "T");
+		assert_eq!(s["conditions"][1]["status"], "False", "a new Gateway with invalid parameters is not deployed");
+		p.kept = Some("spec.pod.tolerations: not allowed".into());
+		let s = gateway_status(&p, &addrs, &synced, None, "T");
+		assert_eq!(
+			(s["conditions"][0]["status"].as_str(), s["conditions"][0]["reason"].as_str()),
+			(Some("False"), Some("InvalidParameters"))
+		);
+		assert_eq!(s["conditions"][1]["status"], "True", "its rproxy runs on as it was");
+		assert!(s["conditions"][1]["message"].as_str().unwrap().contains("previous parameters are kept"));
+	}
+
+	#[test]
 	fn route_parents_keep_other_controllers() {
 		let prev = json!({"parents": [
 			{"parentRef": {"name": "other"}, "controllerName": "example.com/other", "conditions": []},
@@ -335,7 +360,12 @@ mod tests {
 		let parents = route_parents(Some(&prev), vec![e], "me");
 		assert_eq!(parents.len(), 2);
 		assert_eq!(parents[0]["controllerName"], "example.com/other");
-		let c = class_status(1, &["HTTPRoute", "Gateway"], None, "T");
+		let c = class_status(1, &["HTTPRoute", "Gateway"], None, None, "T");
 		assert_eq!(c["supportedFeatures"][0]["name"], "Gateway");
+		let c = class_status(1, &["Gateway"], Some("not found"), None, "T");
+		assert_eq!(
+			(c["conditions"][0]["status"].as_str(), c["conditions"][0]["reason"].as_str()),
+			(Some("False"), Some("InvalidParameters"))
+		);
 	}
 }

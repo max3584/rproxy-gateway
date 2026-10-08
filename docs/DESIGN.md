@@ -32,7 +32,7 @@ Gateway API / CRD ──watch──▶ rproxy-gateway ──PUT /rulesets/k8s/<n
 | `fleet`（1 つの信頼の範囲のため。[SECURITY.md](SECURITY.md)） | 先に置いた rproxy の Pod（chart の `hostNetwork: true` の DaemonSet など、`--fleet-selector`）がすべての Gateway を受け持つ。コントローラはすべての Pod に同じセットを PUT する | `--fleet-address`、なければ Pod のノードの IP |
 
 - `<id>` は `<namespace>-<name>`（40 文字まで）とハッシュ 6 桁。
-- managed で作るものには、Gateway の `spec.infrastructure` の `labels`・`annotations`（Pod にも）と、`gateway.networking.k8s.io/gateway-name` のラベルを付ける（コントローラのラベルが優先。Pod を選ぶのに使う）。`spec.infrastructure.parametersRef` はどの種類も扱わないので、付けた Gateway は `Accepted: False`（`InvalidParameters`）。
+- managed で作るものには、Gateway の `spec.infrastructure` の `labels`・`annotations`（Pod にも）と、`gateway.networking.k8s.io/gateway-name` のラベルを付ける（コントローラのラベルが優先。Pod を選ぶのに使う）。Deployment・Service・PDB・Pod の形は、GatewayClass の `parametersRef` と Gateway の `spec.infrastructure.parametersRef` が指す `RproxyGatewayParameters`（下の表）で Gateway ごとに変えられる（どちらもなければフラグのまま。決めごとは [DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) の 2.）。ほかの種類を指す・見つからない・許されていない項目を書いた Gateway は `Accepted: False`（`InvalidParameters`）。ただし rproxy の Deployment がもうある Gateway は、参照が誤りになっても最後に正しかった形のまま動かし続ける（Deployment・Service を変えず、ルールセットの反映は続ける。`Programmed: True`）。
 - `spec.addresses`：`IPAddress` だけ（ほかの型は `Accepted: False`、`UnsupportedAddress`）。managed では Service の `externalIPs` にする（既定では使えない：`--address-cidr` の範囲だけで、ほかの Service の IP は取れない。[SECURITY.md](SECURITY.md)）（kube-proxy がその IP への通信を rproxy に送る）。値のない項目は Service のアドレスのまま。unspecified・loopback・link-local・multicast の IP や、クラスタが Service に付けられない IP は `Programmed: False`（`AddressNotUsable`）。fleet では fleet のアドレス（`--fleet-address` かノードの IP）のどれかでなければ `AddressNotUsable`。
 - managed の Pod は非 root（65532）で、1024 未満のポートは `net.ipv4.ip_unprivileged_port_start=0`（namespace ごとの安全な sysctl）で受ける。
 - fleet で同じポートを 2 つの Gateway が使うと、後から来たほうのルールは rproxy が `409 already_exists` で断り、リスナーの `Programmed` が `False` になる。
@@ -142,6 +142,7 @@ rproxy は `RPROXY_API_ADDR=0.0.0.0`、`RPROXY_API_PORT=9443`、`RPROXY_TOKEN_FI
 |---|---|
 | `RproxyMiddleware` | `spec` は rproxy の `http.middlewares.<名前>` の形（例 `{rate_limit: {average: 10}}`）。HTTPRoute の `ExtensionRef` フィルタで使う。見つからなければそのルールは 500 で、`ResolvedRefs: False` |
 | `RproxyPolicy` | `spec.targetRefs`（同じ namespace の Gateway、`sectionName` でそのリスナー、Service）に、ルールの `limits`・`bandwidth`・`geoip`・`outlierDetection`・`allowFrom`・`crowdsec` を足す（GEP-713）。Service を指すと、その Service に送る L4 のルール（`outlierDetection` は `http` のサービスにも）。同じ項目を複数のポリシーが決めたら古いほうが勝つ。状態は `status.ancestors[]`（見つからないリスナーは `Accepted: False`、`TargetNotFound`） |
+| `RproxyGatewayParameters` | managed の Gateway の rproxy の形（replicas、PDB、Pod のラベル・注釈・resources・topologySpread・nodeSelector・tolerations・affinity・priorityClass、Service の型・externalTrafficPolicy・loadBalancerClass・sourceRanges・ipFamilyPolicy・ラベル・注釈、rproxy のイメージ・logLevel・performance・追加の環境変数）。GatewayClass の `parametersRef`（コントローラの namespace、`policy` で Gateway に許す項目を決める）と Gateway の `infrastructure.parametersRef`（同じ namespace）から。合わせ方・検証・誰が何を決められるかは [DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) の 2. |
 | `RproxyRule` | `spec.rule` はルールそのもの（`POST /rules` の本文）。`spec.parentRef` の Gateway のルールセットに足す。ほかの namespace の Gateway には、その namespace の ReferenceGrant（from `rproxy.max3584.net/RproxyRule`、to `Gateway`）が要る。同じキーのルールが既にあれば `Accepted: False`（`Conflicted`）。状態は rproxy のルールの `conditions` を写す |
 
 できないもの（ルートは `Accepted: False`、理由 `UnsupportedValue`）：backendRef の `RequestMirror`・`CORS`・`RequestRedirect` フィルタ、`ExternalAuth`。
@@ -158,7 +159,7 @@ rproxy は `RPROXY_API_ADDR=0.0.0.0`、`RPROXY_API_PORT=9443`、`RPROXY_TOKEN_FI
 
 | 書くところ | 中身 |
 |---|---|
-| GatewayClass | `Accepted`、`SupportedVersion`、`supportedFeatures` |
+| GatewayClass | `Accepted`（`parametersRef` が誤りなら `InvalidParameters`）、`SupportedVersion`、`supportedFeatures` |
 | Gateway | `addresses`、`Accepted`（`UnsupportedAddress`、`InvalidParameters`、`ListenersNotValid`）、`Programmed`（アドレスがあり、1 つ以上の Pod に反映できた。`AddressNotUsable`）、`ResolvedRefs`（`tls.backend` があるとき）、`InsecureFrontendValidationMode`、`attachedListenerSets`。`observedGeneration` は Gateway の generation |
 | ListenerSet | `Accepted`、`Programmed`、`listeners`（Gateway のリスナーと同じ） |
 | BackendTLSPolicy・RproxyPolicy | `status.ancestors[]`（Gateway ごと、ほかのコントローラの項目は残す） |

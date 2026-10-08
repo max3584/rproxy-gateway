@@ -10,11 +10,15 @@
 #   l2-local    MetalLB L2, externalTrafficPolicy Local (the chart's default): one node announces
 #   l2-cluster  MetalLB L2, externalTrafficPolicy Cluster: one node announces, any node forwards
 #   bgp         MetalLB BGP (FRR mode, BFD) to an FRR router container with ECMP: every node with a
-#               ready rproxy pod announces, the router splits connections across them
+#               ready rproxy pod announces, the router splits connections across them. Record-only: its
+#               gaps are the network's (route withdrawal, BFD), so they never fail the run ("info
+#               (network-dependent)")
 #   nodeport-lb NodePort Services (externalTrafficPolicy Local; Cluster through HELM_ARGS) behind an HAProxy container that
 #               health-checks every node and sends to all healthy ones (a user's own L4 balancer)
-# Outages are measured and reported. With MANAGED_REPLICAS >= 2, a pod deletion, a node drain and a
-# rollout restart fail the run when the longest gap without a 200 exceeds GAP_LIMIT seconds; otherwise
+# Outages are measured and reported. With MANAGED_REPLICAS >= 2, a pod deletion, a node drain, a
+# rollout restart and a parameters change fail the run when the longest gap without a 200 exceeds
+# GAP_LIMIT seconds (l2-local, l2-cluster, nodeport-lb: what rproxy-gateway controls; bgp and a lost
+# node are recorded only: their gaps come from the network and the cluster's failure detection); otherwise
 # the script fails only on functional breakage (routes never recover, the certificate never rotates,
 # state not restored). Each scenario's timeline (EndpointSlices, pods, the load balancer's view,
 # probe failures) is in $work/timeline-*.txt. Results: $work/summary.md (and $GITHUB_STEP_SUMMARY).
@@ -230,6 +234,9 @@ esac
 case "$TOPOLOGY" in
   l2-cluster) HELM_ARGS="--set managed.externalTrafficPolicy=Cluster $HELM_ARGS" ;;
 esac
+# the externalTrafficPolicy in use (the last one HELM_ARGS sets; else the chart's default for the Service type)
+ETP=$(grep -o 'managed.externalTrafficPolicy=[A-Za-z]*' <<< "$HELM_ARGS" | tail -1 | cut -d= -f2 || true)
+if [ -z "$ETP" ]; then [ "$TOPOLOGY" = nodeport-lb ] && ETP=Cluster || ETP=Local; fi
 
 log "== cert-manager $CERT_MANAGER_VERSION"
 kubectl apply -f "https://github.com/cert-manager/cert-manager/releases/download/$CERT_MANAGER_VERSION/cert-manager.yaml" > /dev/null
@@ -606,7 +613,13 @@ record() {
   local result=$5 notes=$6 key=${1%%.*}
   if [ "$result" = PASS ] && [ $((h + s + t)) -gt 0 ]; then result="PASS (outage)"; fi
   if [ -n "${7:-}" ] && [ "$MANAGED_REPLICAS" -ge 2 ] && [ "$gap" -gt $((GAP_LIMIT * 1000)) ]; then
-    result=FAIL notes="longest gap over ${GAP_LIMIT}s; $notes"
+    if [ "$TOPOLOGY" = bgp ]; then
+      # BGP's convergence (route withdrawal, BFD) is the network's, not rproxy-gateway's: recorded only
+      [ "$result" = FAIL ] || result="info (network-dependent)"
+      notes="longest gap over ${GAP_LIMIT}s (BGP convergence: network-side, tune with BFD); $notes"
+    else
+      result=FAIL notes="longest gap over ${GAP_LIMIT}s; $notes"
+    fi
   fi
   [ "$result" = FAIL ] && failed=1
   timeline "$key" "$2" "$3"
@@ -844,7 +857,75 @@ scenario_g() {
     "paused $node (announcing node: $ann; controller leader there: $([ "$node" = "$ld_node" ] && echo yes || echo no)); steady again (5 s without a failure) by $(secs $((t_ok - t0)))s; announcing node → $(announcer)"
 }
 
-for s in a b1 b2 c d e f g; do
+# ---------------------------------------------------------------- h, i. RproxyGatewayParameters
+# a namespace admin (the chart's ClusterRole aggregated to admin) writes the Gateway's parameters
+params_crd() { kubectl get crd rproxygatewayparameters.rproxy.max3584.net > /dev/null 2>&1; }
+as_tenant() { kubectl --as="system:serviceaccount:$APP:tenant" "$@"; }
+tenant_params() {  # tenant_params <replicas> [more pod fields]: writes RproxyGatewayParameters acc as the tenant
+  cat << YAML | as_tenant apply -f - > /dev/null
+apiVersion: rproxy.max3584.net/v1alpha1
+kind: RproxyGatewayParameters
+metadata: {name: acc, namespace: $APP}
+spec:
+  replicas: $1
+  pod:
+    resources: {rproxy: {requests: {cpu: 50m, memory: 64Mi}}}
+    ${2:-}
+YAML
+}
+gw_cond() { cond gateway/acc "{.status.conditions[?(@.type==\"$1\")].$2}"; }
+gw_reason_is() { [ "$(gw_cond Accepted reason)" = "$1" ]; }
+skip_params() {
+  printf '%s\t–\t–\t–\tSKIP\tno RproxyGatewayParameters CRD (a chart before 0.4.2)\n' "$1" >> "$results"
+}
+scenario_h() {
+  local label="h. Gateway parameters changed (replicas +1, resources)" t0 old ok=PASS want served
+  params_crd || { skip_params "$label"; return 0; }
+  kubectl -n "$APP" create serviceaccount tenant --dry-run=client -o yaml | kubectl apply -f - > /dev/null
+  kubectl -n "$APP" create rolebinding tenant-admin --clusterrole=admin --serviceaccount="$APP:tenant" --dry-run=client -o yaml | kubectl apply -f - > /dev/null
+  wait_for 60 sh -c "kubectl auth can-i create rproxygatewayparameters.rproxy.max3584.net -n $APP --as=system:serviceaccount:$APP:tenant | grep -qx yes" || return 1
+  want=$((MANAGED_REPLICAS + 1))
+  old=$(rproxy_pods | awk '{print $1}' | tr '\n' ' ')
+  log "== $label: replicas $MANAGED_REPLICAS → $want"
+  t0=$(now_ms)
+  tenant_params "$want" || ok=FAIL
+  kubectl -n "$APP" patch gateway acc --type=merge \
+    -p '{"spec":{"infrastructure":{"parametersRef":{"group":"rproxy.max3584.net","kind":"RproxyGatewayParameters","name":"acc"}}}}' > /dev/null
+  MANAGED_REPLICAS=$want
+  wait_for 60 sh -c "test \"\$(kubectl -n $APP get deploy $DEPLOY -o jsonpath='{.spec.replicas}')\" = $want" || ok=FAIL
+  kubectl -n "$APP" rollout status "deploy/$DEPLOY" --timeout="${RECOVERY_TIMEOUT}s" > /dev/null || ok=FAIL
+  new_pods_serve "$old" "$RECOVERY_TIMEOUT" || ok=FAIL
+  served=$SERVED_AT
+  [ "$served" -gt 0 ] || served=$(now_ms)
+  gw_reason_is Accepted || ok=FAIL
+  [ "$(kubectl -n "$APP" get deploy "$DEPLOY" -o jsonpath='{.spec.template.spec.containers[0].resources.requests.cpu}')" = 50m ] || ok=FAIL
+  settle || ok=FAIL
+  wait_for 60 statuses_ok || ok=FAIL
+  record "$label" "$t0" "$(now_ms)" "$(secs $((served - t0)))s" "$ok" "every pod replaced and serving after $(secs $((served - t0)))s; Accepted $(gw_cond Accepted status); ${NEW_GAPS}" limit
+}
+scenario_i() {
+  local label="i. invalid Gateway parameters (the running rproxy is kept)" t0 gen ok=PASS t_bad t_fixed notes
+  params_crd || { skip_params "$label"; return 0; }
+  gen=$(kubectl -n "$APP" get deploy "$DEPLOY" -o jsonpath='{.metadata.generation}')
+  log "== $label: tolerations (not allowed to tenants by default)"
+  t0=$(now_ms)
+  tenant_params "$MANAGED_REPLICAS" "tolerations: [{key: node-role.kubernetes.io/control-plane, operator: Exists}]" || ok=FAIL
+  if wait_for 60 gw_reason_is InvalidParameters; then t_bad=$(now_ms); else t_bad=$(now_ms) ok=FAIL; fi
+  # passes go on meanwhile: the Deployment must stay as it was, the rule set still applied
+  route changed-i
+  wait_for "$APPLY_TIMEOUT" lb_host_ok changed-i.example.com || { ok=FAIL; notes="a route change did not reach the kept rproxy; "; }
+  sleep 10
+  [ "$(gw_cond Programmed status)" = True ] || { ok=FAIL; notes+="Programmed $(gw_cond Programmed status); "; }
+  [ "$(kubectl -n "$APP" get deploy "$DEPLOY" -o jsonpath='{.metadata.generation}')" = "$gen" ] || { ok=FAIL; notes+="the Deployment changed; "; }
+  notes+="InvalidParameters after $(secs $((t_bad - t0)))s ($(gw_cond Accepted message)); Programmed $(gw_cond Programmed status); "
+  tenant_params "$MANAGED_REPLICAS" || ok=FAIL
+  if wait_for 60 gw_reason_is Accepted; then t_fixed=$(now_ms); else t_fixed=$(now_ms) ok=FAIL; fi
+  settle || ok=FAIL
+  [ "$(kubectl -n "$APP" get deploy "$DEPLOY" -o jsonpath='{.metadata.generation}')" = "$gen" ] || { ok=FAIL; notes+="fixed: the Deployment changed; "; }
+  record "$label" "$t0" "$(now_ms)" "$(secs $((t_fixed - t0)))s" "$ok" "${notes}accepted again $(secs $((t_fixed - t_bad)))s after the fix" limit
+}
+
+for s in a b1 b2 c d e f g h i; do
   if ! "scenario_$s"; then
     echo "scenario $s aborted" >&2
     printf '%s\t–\t–\t–\tFAIL\taborted\n' "$s" >> "$results"
@@ -864,8 +945,8 @@ stop_probes
   case "$TOPOLOGY" in
     l2-local) echo "MetalLB $METALLB_VERSION L2, externalTrafficPolicy Local." ;;
     l2-cluster) echo "MetalLB $METALLB_VERSION L2, externalTrafficPolicy Cluster." ;;
-    bgp) echo "MetalLB $METALLB_VERSION BGP (FRR mode, BFD 300 ms x 3) to an FRR router ($FRR_IMAGE) with ECMP over the announcing nodes (externalTrafficPolicy Local unless the helm flags say otherwise)." ;;
-    nodeport-lb) echo "NodePort Services (externalTrafficPolicy Local unless the helm flags say otherwise) behind HAProxy ($HAPROXY_IMAGE, TCP, checks every 500 ms, a failed connection marks the node down and goes to another)." ;;
+    bgp) echo "MetalLB $METALLB_VERSION BGP (FRR mode, BFD 300 ms x 3) to an FRR router ($FRR_IMAGE) with ECMP over the announcing nodes (externalTrafficPolicy $ETP)." ;;
+    nodeport-lb) echo "NodePort Services (externalTrafficPolicy $ETP) behind HAProxy ($HAPROXY_IMAGE, TCP, checks every 500 ms, a failed connection marks the node down and goes to another)." ;;
   esac
   echo "kind 1 control plane + 3 workers, cert-manager $CERT_MANAGER_VERSION, Gateway API $GATEWAY_API_VERSION experimental."
   echo "Controller replicas 2, managed.replicas $MANAGED_REPLICAS. Extra helm flags: \`${HELM_ARGS:-none}\`. Probes: HTTP, HTTPS, TCP through the Gateway's address every 100 ms, a new connection each."
@@ -878,7 +959,7 @@ stop_probes
   echo "|---|---|---|---|---|---|"
   awk -F'\t' '{ printf "| %s | %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5, $6 }' "$results"
   echo
-  echo "PASS (outage): requests failed but everything recovered (recorded, not a failure). SKIP: the placement or topology did not allow the scenario. FAIL: routes never recovered, the certificate never rotated or the state was not restored (timeouts: recovery ${RECOVERY_TIMEOUT}s, leader ${LEADER_TIMEOUT}s, route change ${APPLY_TIMEOUT}s, rotation ${ROTATE_TIMEOUT}s)$([ "$MANAGED_REPLICAS" -ge 2 ] && echo ", or a pod deletion, drain or rollout restart left a gap over ${GAP_LIMIT}s")."
+  echo "PASS (outage): requests failed but everything recovered (recorded, not a failure). info (network-dependent): over the gap limit in the bgp topology, whose gaps are the network's convergence (recorded, not a failure); a lost node (g) is recorded only in every topology. SKIP: the placement or topology did not allow the scenario. FAIL: routes never recovered, the certificate never rotated or the state was not restored (timeouts: recovery ${RECOVERY_TIMEOUT}s, leader ${LEADER_TIMEOUT}s, route change ${APPLY_TIMEOUT}s, rotation ${ROTATE_TIMEOUT}s)$([ "$MANAGED_REPLICAS" -ge 2 ] && [ "$TOPOLOGY" != bgp ] && echo ", or a pod deletion, drain, rollout restart or parameters change left a gap over ${GAP_LIMIT}s")."
   echo
   echo "Nodes: $(tr '\n' ' ' < "$work/nodes.txt")"
   for f in "$work"/timeline-*.txt; do

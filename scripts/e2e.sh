@@ -184,6 +184,63 @@ retry 120 sh -c "test \"\$(kubectl -n e2e get pdb -l gateway.networking.k8s.io/g
 retry 180 sh -c "test \"\$(kubectl -n e2e get pods -l gateway.networking.k8s.io/gateway-name=e2e,app.kubernetes.io/name=rproxy -o json | jq '[.items[] | select(.metadata.deletionTimestamp == null) | .status.conditions[] | select(.type == \"Ready\" and .status == \"True\")] | length')\" = 2"
 retry 60 sh -c "curl -sf -H 'Host: e2e.example.com' http://$addr/two > /dev/null"
 
+echo "== RproxyGatewayParameters: the Gateway's own replicas, resources, labels and topology spread"
+cat <<YAML | kubectl apply -f - > /dev/null
+apiVersion: rproxy.max3584.net/v1alpha1
+kind: RproxyGatewayParameters
+metadata: {name: e2e, namespace: e2e}
+spec:
+  replicas: 3
+  pod:
+    labels: {cost-center: e2e}
+    resources: {rproxy: {requests: {cpu: 10m, memory: 32Mi}}}
+    topologySpreadConstraints: [{maxSkew: 1, topologyKey: kubernetes.io/hostname, whenUnsatisfiable: ScheduleAnyway}]
+YAML
+kubectl -n e2e patch gateway e2e --type=merge \
+  -p '{"spec":{"infrastructure":{"parametersRef":{"group":"rproxy.max3584.net","kind":"RproxyGatewayParameters","name":"e2e"}}}}' > /dev/null
+deploy=$(kubectl -n e2e get deploy -l gateway.networking.k8s.io/gateway-name=e2e -o jsonpath='{.items[0].metadata.name}')
+retry 120 sh -c "test \"\$(kubectl -n e2e get deploy $deploy -o jsonpath='{.spec.replicas}')\" = 3"
+d_json=$(kubectl -n e2e get deploy "$deploy" -o json)
+jq -e '.spec.template.spec.containers[0].resources.requests.cpu == "10m" and .spec.template.metadata.labels["cost-center"] == "e2e"' <<< "$d_json" > /dev/null
+jq -e '.spec.template.spec.topologySpreadConstraints | length == 1 and .[0].labelSelector.matchLabels["rproxy.max3584.net/gateway"] != null' <<< "$d_json" > /dev/null
+retry 180 sh -c "test \"\$(kubectl -n e2e get pods -l gateway.networking.k8s.io/gateway-name=e2e,app.kubernetes.io/name=rproxy -o json | jq '[.items[] | select(.metadata.deletionTimestamp == null) | .status.conditions[] | select(.type == \"Ready\" and .status == \"True\")] | length')\" = 3"
+test "$(kubectl -n e2e get gateway e2e -o jsonpath='{.status.conditions[?(@.type=="Accepted")].status}')" = True
+retry 60 sh -c "curl -sf -H 'Host: e2e.example.com' http://$addr/params > /dev/null"
+
+echo "== invalid parameters from a namespace admin (aggregated ClusterRole): InvalidParameters, the running rproxy stays"
+kubectl -n e2e create serviceaccount tenant --dry-run=client -o yaml | kubectl apply -f - > /dev/null
+kubectl -n e2e create rolebinding tenant-admin --clusterrole=admin --serviceaccount=e2e:tenant --dry-run=client -o yaml | kubectl apply -f - > /dev/null
+retry 60 sh -c "kubectl auth can-i update rproxygatewayparameters.rproxy.max3584.net -n e2e --as=system:serviceaccount:e2e:tenant | grep -qx yes"
+generation=$(kubectl -n e2e get deploy "$deploy" -o jsonpath='{.metadata.generation}')
+cat <<YAML | kubectl --as=system:serviceaccount:e2e:tenant apply -f - > /dev/null
+apiVersion: rproxy.max3584.net/v1alpha1
+kind: RproxyGatewayParameters
+metadata: {name: e2e, namespace: e2e}
+spec:
+  replicas: 1
+  pod:
+    tolerations: [{key: node-role.kubernetes.io/control-plane, operator: Exists}]
+YAML
+retry 60 sh -c "test \"\$(kubectl -n e2e get gateway e2e -o jsonpath='{.status.conditions[?(@.type==\"Accepted\")].reason}')\" = InvalidParameters"
+kubectl -n e2e get gateway e2e -o jsonpath='{.status.conditions[?(@.type=="Accepted")].message}' | grep -q 'spec.pod.tolerations'
+sleep 12
+test "$(kubectl -n e2e get gateway e2e -o jsonpath='{.status.conditions[?(@.type=="Programmed")].status}')" = True
+test "$(kubectl -n e2e get deploy "$deploy" -o jsonpath='{.metadata.generation} {.spec.replicas}')" = "$generation 3"
+curl -sf -H 'Host: e2e.example.com' "http://$addr/kept" > /dev/null
+# a route change still reaches the kept rproxy
+kubectl -n e2e patch httproute echo --type=json -p '[{"op":"add","path":"/spec/hostnames/-","value":"kept.example.com"}]' > /dev/null
+retry 60 sh -c "curl -sf -H 'Host: kept.example.com' http://$addr/kept > /dev/null"
+echo "== parameters fixed: accepted, the new shape"
+cat <<YAML | kubectl --as=system:serviceaccount:e2e:tenant apply -f - > /dev/null
+apiVersion: rproxy.max3584.net/v1alpha1
+kind: RproxyGatewayParameters
+metadata: {name: e2e, namespace: e2e}
+spec:
+  replicas: 2
+YAML
+retry 60 sh -c "test \"\$(kubectl -n e2e get gateway e2e -o jsonpath='{.status.conditions[?(@.type==\"Accepted\")].status}')\" = True"
+retry 60 sh -c "test \"\$(kubectl -n e2e get deploy $deploy -o jsonpath='{.spec.replicas}')\" = 2"
+
 echo "== Gateway deleted: its rproxy goes"
 kubectl -n e2e delete gateway e2e > /dev/null
 retry 120 sh -c "test -z \"\$(kubectl -n e2e get deploy,svc,sa,secret,pdb -l rproxy.max3584.net/gateway -o name)\""

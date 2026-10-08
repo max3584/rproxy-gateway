@@ -104,6 +104,7 @@ pub const DYNAMIC_KINDS: &[(&str, &str)] = &[
 	(crate::k8s::crd::GROUP, "RproxyMiddleware"),
 	(crate::k8s::crd::GROUP, "RproxyPolicy"),
 	(crate::k8s::crd::GROUP, "RproxyRule"),
+	(crate::k8s::crd::GROUP, "RproxyGatewayParameters"),
 ];
 
 fn spawn_watch<K>(api: Api<K>, changed: Arc<Notify>, what: &'static str) -> Store<K>

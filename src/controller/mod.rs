@@ -313,6 +313,16 @@ async fn reconcile_all(
 	let now = render::status::now();
 	let mut soon = false;
 
+	let params_opts = render::params::ParamsOptions {
+		controller_namespace: cfg.namespace.clone(),
+		fleet: matches!(cfg.mode, Mode::Fleet(_)),
+		default_replicas: match &cfg.mode {
+			Mode::Managed(m) => m.replicas,
+			Mode::Fleet(_) => 1,
+		},
+		service_annotations: cfg.service_annotations.clone(),
+	};
+
 	// GatewayClasses
 	let classes: BTreeSet<String> =
 		world.classes.iter().filter(|c| c.spec.controller_name == cfg.controller_name).filter_map(|c| c.metadata.name.clone()).collect();
@@ -320,7 +330,9 @@ async fn reconcile_all(
 		for c in world.classes.iter().filter(|c| c.spec.controller_name == cfg.controller_name) {
 			let name = c.metadata.name.clone().unwrap_or_default();
 			let previous = api.get_status(&name).await.ok().and_then(|o| o.data.get("status").cloned());
-			let st = status::class_status(c.metadata.generation.unwrap_or(0), SUPPORTED_FEATURES, previous.as_ref(), &now);
+			let invalid = render::params::class_parameters(&world, c, &params_opts).err();
+			let st =
+				status::class_status(c.metadata.generation.unwrap_or(0), SUPPORTED_FEATURES, invalid.as_deref(), previous.as_ref(), &now);
 			if previous.as_ref() != Some(&st) {
 				if let Err(e) = patch_status(&api, &name, st).await {
 					warn!(class = name, error = %e, "cannot write GatewayClass status");
@@ -340,6 +352,7 @@ async fn reconcile_all(
 	let mut notes_seen = NOTES_SEEN.lock().unwrap().clone();
 	let mut plans: Vec<(GatewayPlan, Vec<PodSync>)> = vec![];
 	let mut keep_ids = vec![];
+	let mut keep_pdb = vec![];
 	let mut pod_done: Vec<(String, bool)> = vec![];
 	let opts = render::Options {
 		listen_addrs: cfg.listen_addrs.clone(),
@@ -350,6 +363,7 @@ async fn reconcile_all(
 		address_cidrs: cfg.address_cidrs.clone(),
 		raw_rules: !matches!(cfg.mode, Mode::Fleet(_)) || cfg.fleet_rproxy_rules,
 		cross_namespace_secrets: cfg.cross_namespace_secrets,
+		params: params_opts.clone(),
 	};
 	let mut rendered: Vec<(&crate::k8s::gateway::Gateway, GatewayPlan)> = vec![];
 	for gw in world.gateways.iter().filter(|g| classes.contains(&g.spec.gateway_class_name)) {
@@ -441,6 +455,9 @@ async fn reconcile_all(
 		if cfg.migration.as_ref().is_some_and(|m| m.gateway == (out.plan.namespace.clone(), out.plan.name.clone())) {
 			migration_addresses = Some(out.addresses.clone());
 		}
+		if out.keep_pdb {
+			keep_pdb.extend(out.keep_id.clone());
+		}
 		keep_ids.extend(out.keep_id);
 		pod_done.extend(out.pod_done);
 		plans.push((out.plan, out.results));
@@ -462,8 +479,7 @@ async fn reconcile_all(
 		}
 		set_gates(client, &pods_now, &done).await;
 	}
-	let keep_pdb = matches!(&cfg.mode, Mode::Managed(m) if m.replicas >= 2);
-	if let Err(e) = provision::collect_garbage(client, &keep_ids, keep_pdb, &cfg.scope()).await {
+	if let Err(e) = provision::collect_garbage(client, &keep_ids, &keep_pdb, &cfg.scope()).await {
 		warn!(error = %e, "cannot remove rproxy of deleted Gateways");
 	}
 	if let Mode::Fleet(f) = &cfg.mode {
@@ -611,6 +627,8 @@ struct GatewayOut {
 	pod_done: Vec<(String, bool)>,
 	addresses: Vec<(String, String)>,
 	keep_id: Option<String>,
+	/// Whether the Gateway's PodDisruptionBudget stays.
+	keep_pdb: bool,
 	soon: bool,
 	sub: Sub,
 }
@@ -619,10 +637,67 @@ struct GatewayOut {
 async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan: GatewayPlan, mut sub: Sub) -> GatewayOut {
 	let mut soon = false;
 	let mut keep_id = None;
+	let mut keep_pdb = false;
 	let id = provision::gateway_id(&plan.namespace, &plan.name, &plan.uid);
 	let infra = gw.spec.infrastructure.clone().unwrap_or_default();
+	let svc_key = (plan.namespace.clone(), provision::object_name(&id));
+	if let (Mode::Managed(_), Some(want), Some(have)) = (&p.cfg.mode, &plan.parameters, p.world.services.get(&svc_key)) {
+		// a Service's loadBalancerClass cannot change: the old Service stays
+		let want = want.service.as_ref().and_then(|s| s.load_balancer_class.clone());
+		let have = have.spec.as_ref().and_then(|s| s.load_balancer_class.clone());
+		if have.is_some() && want != have {
+			let e = format!(
+				"spec.service.loadBalancerClass: the Service has {} and it cannot change (create the Gateway again)",
+				have.unwrap_or_default()
+			);
+			render::status::set(&mut plan.conds, render::status::Cond::new("Accepted", false, "InvalidParameters", e.clone()));
+			plan.parameters_error = Some(e);
+		}
+	}
+	// invalid parameters: a Gateway whose rproxy runs keeps it as it is (one mistyped reference
+	// does not stop its traffic); its rule set is still applied
+	if let (Mode::Managed(_), Some(e)) = (&p.cfg.mode, plan.parameters_error.clone()) {
+		match provision::deployed(p.client, &plan.namespace, &id).await {
+			Ok(true) if plan.address_error.is_none() && status_only_params(&plan) => plan.kept = Some(e),
+			Ok(_) => {}
+			Err(err) => {
+				// unknown: keep what may run (collected later if it does not)
+				warn!(gateway = %plan.ruleset, error = %err, "cannot read the rproxy Deployment");
+				keep_id = Some(id.clone());
+				keep_pdb = true;
+				soon = true;
+			}
+		}
+	}
 	let (addresses, endpoints) = match &p.cfg.mode {
-		// not accepted (an unsupported address type, parametersRef): nothing is deployed
+		Mode::Managed(_) if plan.kept.is_some() => {
+			keep_id = Some(id.clone());
+			keep_pdb = true;
+			let selector: BTreeMap<String, String> = [(provision::LABEL_GATEWAY.to_string(), id.clone())].into();
+			let eps = provision::pods(p.pods_now, &plan.namespace, &selector);
+			let mut t = provision::Target::new(&plan);
+			t.labels = infra.labels.clone();
+			t.annotations = infra.annotations.clone();
+			t.owner = match (&p.gateway_api_version, &gw.metadata.uid) {
+				(Some(v), Some(uid)) => Some(provision::owner(v, &plan.name, uid)),
+				_ => None,
+			};
+			let current_api = p.world.secrets.get(&(plan.namespace.clone(), provision::api_secret_name(&id)));
+			match provision::apply_secrets(p.client, &t, p.boot, current_api, &mut sub.absent).await {
+				Ok((certs, _)) => provision::touch_pods(p.client, &eps, &certs).await,
+				Err(e) => {
+					warn!(gateway = %plan.ruleset, error = format!("{e:#}"), "cannot write the rproxy Secrets");
+					soon = true;
+				}
+			}
+			let addresses = match p.world.services.get(&svc_key) {
+				Some(_) if !plan.addresses.is_empty() => plan.addresses.iter().map(|a| ("IPAddress".to_string(), a.clone())).collect(),
+				Some(s) => provision::service_addresses(s),
+				None => vec![],
+			};
+			(addresses, eps)
+		}
+		// not accepted (an unsupported address type, invalid parameters): nothing is deployed
 		_ if !plan.accepted() => (vec![], vec![]),
 		Mode::Managed(m) => {
 			keep_id = Some(id.clone());
@@ -633,6 +708,7 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 			t.labels = infra.labels.clone();
 			t.annotations = infra.annotations.clone();
 			t.service_annotations = p.cfg.service_annotations.clone();
+			t.params = plan.parameters.clone().unwrap_or_default();
 			t.owner = match (&p.gateway_api_version, &gw.metadata.uid) {
 				(Some(v), Some(uid)) => Some(provision::owner(v, &plan.name, uid)),
 				_ => None,
@@ -645,6 +721,7 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 			let svc = match applied {
 				Ok(a) => {
 					provision::touch_pods(p.client, &eps, &a.certs).await;
+					keep_pdb = a.pdb;
 					a.service
 				}
 				Err(e) => {
@@ -654,12 +731,13 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 					} else {
 						warn!(gateway = %plan.ruleset, error = format!("{e:#}"), "cannot deploy rproxy");
 					}
+					// what runs stays (the PodDisruptionBudget too) until the next pass
+					keep_pdb = true;
 					soon = true;
 					None
 				}
 			};
 			// traffic reaches the pods once the Service's endpoints are programmed on the nodes
-			let svc_key = (plan.namespace.clone(), provision::object_name(&id));
 			let ready = p
 				.world
 				.slices
@@ -750,7 +828,12 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 		}
 	}
 
-	GatewayOut { plan, results, pod_done, addresses, keep_id, soon, sub }
+	GatewayOut { plan, results, pod_done, addresses, keep_id, keep_pdb, soon, sub }
+}
+
+/// Whether the Gateway is not accepted only because of its parameters (it may keep its last good rproxy).
+fn status_only_params(plan: &GatewayPlan) -> bool {
+	plan.parameters_error.is_some() && plan.conds.iter().filter(|c| c.kind == "Accepted").all(|c| c.reason == "InvalidParameters")
 }
 
 /// Sets the readiness gate of the pods in `done` (by uid) where it changes.

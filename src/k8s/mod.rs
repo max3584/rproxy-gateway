@@ -2,4 +2,5 @@
 
 pub mod crd;
 pub mod gateway;
+pub mod params;
 pub mod traefik;

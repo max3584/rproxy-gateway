@@ -28,7 +28,7 @@ enum Command {
 	Controller(Box<ControllerArgs>),
 	/// Write certificate Secrets into rproxy's certificate directory (runs next to rproxy).
 	Certsync(certsync::Args),
-	/// Print rproxy-gateway's CRDs (RproxyMiddleware, RproxyPolicy, RproxyRule) as YAML.
+	/// Print rproxy-gateway's CRDs (RproxyMiddleware, RproxyPolicy, RproxyRule, RproxyGatewayParameters) as YAML.
 	Crds,
 	/// Render manifests (YAML files) into rule sets without a cluster: what the controller would PUT.
 	Render(RenderArgs),

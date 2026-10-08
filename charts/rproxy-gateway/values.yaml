@@ -77,6 +77,14 @@ managed:
   # its rule set (the readiness gate rproxy.max3584.net/ruleset-applied)
   readinessProbe: {periodSeconds: 2, timeoutSeconds: 1, failureThreshold: 2, successThreshold: 1, initialDelaySeconds: 0}
   livenessProbe: {periodSeconds: 5, timeoutSeconds: 1, failureThreshold: 3, initialDelaySeconds: 0}
+  # the spec of an RproxyGatewayParameters the GatewayClass names (rproxy-default in the release
+  # namespace): every managed Gateway's defaults and, in `policy`, what Gateways' own parameters
+  # (spec.infrastructure.parametersRef) may set (docs/DESIGN-v0.4.x.md, A). Empty: none (the flags
+  # above). Upgrading from 0.4.1, apply the chart's CRDs first: helm upgrade does not install new ones
+  #   parameters:
+  #     pod: {resources: {rproxy: {requests: {cpu: 100m, memory: 64Mi}}}}
+  #     policy: {maxReplicas: 5, gatewayOverrides: [replicas, pod.resources, pod.tolerations]}
+  parameters: {}
 
 # fleet mode: rproxy pods deployed by this chart serve every Gateway (rproxy-api docs/DESIGN-v0.4.md 3.3)
 fleet:
@@ -107,6 +115,11 @@ migration:
   createIngressClass: false
   # references to other namespaces without a ReferenceGrant (Traefik's allowCrossNamespace)
   allowCrossNamespace: false
+
+rbac:
+  # a ClusterRole aggregated to namespace admins (not edit): they write RproxyGatewayParameters for
+  # their Gateways (bounded by the GatewayClass's parameters' policy)
+  aggregateToAdmin: true
 
 imagePullSecrets: []
 

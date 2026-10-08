@@ -28,6 +28,7 @@ What the controller trusts, and what tenants (whoever can write Gateways and rou
 | Migration (Ingress, Traefik) references to other namespaces (Services, Middlewares, TLSOptions, the errors service) | not converted without a ReferenceGrant in the target namespace (from `traefik.io` `IngressRoute*`, `Middleware`), as Traefik's `allowCrossNamespace=false` | `migration.allowCrossNamespace` / `--migration-allow-cross-namespace` |
 | Ingress paths | not converted with backticks, quotes, control characters, or not starting with `/` (they are embedded in a `match` expression) | — |
 | Ingress `defaultBackend` | only from the target Gateway's namespace | — |
+| A Gateway's `RproxyGatewayParameters` (`infrastructure.parametersRef`, same namespace only) | only replicas (up to `policy.maxReplicas`, 10 by default), PDB, resources, pod and Service labels and annotations, topology spread, externalTrafficPolicy, source ranges, ipFamilyPolicy, logLevel, performance. Annotations that pick load balancer addresses only through the allow list above (others: `InvalidParameters`). `service.type`, `loadBalancerClass`, nodeSelector, tolerations, affinity, priorityClassName are off by default. Never rproxy's image, extra environment variables or `policy`; never labels or annotations with the controller's prefixes (`rproxy.max3584.net/`, ...) | `policy` of the GatewayClass's `RproxyGatewayParameters` (the chart's `managed.parameters`): `gatewayOverrides`, `maxReplicas`, `allowedPriorityClasses`, `allowedLoadBalancerClasses`. The image and environment variables cannot be opened ([DESIGN-v0.4.x.md](DESIGN-v0.4.x.md), 2.5) |
 
 ## Keys from other namespaces (M7)
 
@@ -39,6 +40,7 @@ When `certificateRefs` (or `spec.tls.backend.clientCertificateRef`) names a Secr
 ## The controller's permissions (M10)
 
 - By default the controller has a ClusterRole over Gateway API kinds, Secrets, Services, Deployments, ServiceAccounts, NetworkPolicies, PodDisruptionBudgets and Pods (patch; `pods/status` patch for rproxy pods' readiness gate) in every namespace (it deploys rproxy into Gateways' namespaces and certificates may be referenced from anywhere). It sets the readiness gate condition only on pods that declare it. A compromised controller can read every Secret in the cluster.
+- The chart aggregates a ClusterRole `rproxy-gateway-parameters-edit` (read and write `rproxygatewayparameters`) to namespace admins (`rbac.authorization.k8s.io/aggregate-to-admin`; not to edit; `rbac.aggregateToAdmin: false` turns it off). The class's `policy` bounds what they can set. A GatewayClass's `parametersRef` is used only in the controller's namespace, so tenants cannot change the class's defaults.
 - With `controller.watchNamespaces` (`--watch-namespaces`) it watches only those namespaces (and its own), and the chart makes a Role in each. The ClusterRole keeps only GatewayClasses and namespaces (allowedRoutes selectors).
 
 ## Network
