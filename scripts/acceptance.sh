@@ -11,7 +11,7 @@
 #   l2-cluster  MetalLB L2, externalTrafficPolicy Cluster: one node announces, any node forwards
 #   bgp         MetalLB BGP (FRR mode, BFD) to an FRR router container with ECMP: every node with a
 #               ready rproxy pod announces, the router splits connections across them
-#   nodeport-lb NodePort Services (externalTrafficPolicy Local) behind an HAProxy container that
+#   nodeport-lb NodePort Services (externalTrafficPolicy Local; Cluster through HELM_ARGS) behind an HAProxy container that
 #               health-checks every node and sends to all healthy ones (a user's own L4 balancer)
 # Outages are measured and reported. With MANAGED_REPLICAS >= 2, a pod deletion, a node drain and a
 # rollout restart fail the run when the longest gap without a 200 exceeds GAP_LIMIT seconds; otherwise
@@ -309,9 +309,14 @@ spec:
     spec:
       topologySpreadConstraints:
         - {maxSkew: 1, topologyKey: kubernetes.io/hostname, whenUnsatisfiable: ScheduleAnyway, labelSelector: {matchLabels: {app: echo}}}
+      # backends stop gracefully too (as they should behind any proxy): a drain then measures
+      # rproxy's own failover, not requests sent to an evicted backend before the controller
+      # has PUT the rule set without it (without this, about 1-3 s of failures per drain)
+      terminationGracePeriodSeconds: 15
       containers:
         - name: echo
           image: registry.k8s.io/gateway-api/echo-basic:v1.5.1
+          lifecycle: {preStop: {sleep: {seconds: 5}}}
           env:
             - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
             - {name: NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}
@@ -859,8 +864,8 @@ stop_probes
   case "$TOPOLOGY" in
     l2-local) echo "MetalLB $METALLB_VERSION L2, externalTrafficPolicy Local." ;;
     l2-cluster) echo "MetalLB $METALLB_VERSION L2, externalTrafficPolicy Cluster." ;;
-    bgp) echo "MetalLB $METALLB_VERSION BGP (FRR mode, BFD 300 ms x 3) to an FRR router ($FRR_IMAGE) with ECMP over the announcing nodes, externalTrafficPolicy Local." ;;
-    nodeport-lb) echo "NodePort Services (externalTrafficPolicy Local) behind HAProxy ($HAPROXY_IMAGE, TCP, checks every 500 ms, a failed connection marks the node down and goes to another)." ;;
+    bgp) echo "MetalLB $METALLB_VERSION BGP (FRR mode, BFD 300 ms x 3) to an FRR router ($FRR_IMAGE) with ECMP over the announcing nodes (externalTrafficPolicy Local unless the helm flags say otherwise)." ;;
+    nodeport-lb) echo "NodePort Services (externalTrafficPolicy Local unless the helm flags say otherwise) behind HAProxy ($HAPROXY_IMAGE, TCP, checks every 500 ms, a failed connection marks the node down and goes to another)." ;;
   esac
   echo "kind 1 control plane + 3 workers, cert-manager $CERT_MANAGER_VERSION, Gateway API $GATEWAY_API_VERSION experimental."
   echo "Controller replicas 2, managed.replicas $MANAGED_REPLICAS. Extra helm flags: \`${HELM_ARGS:-none}\`. Probes: HTTP, HTTPS, TCP through the Gateway's address every 100 ms, a new connection each."
