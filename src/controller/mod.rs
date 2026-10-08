@@ -492,7 +492,9 @@ async fn reconcile_all(
 			soon = true;
 		}
 		if shown {
-			let eps = provision::pods_incl_terminating(&pods_now, &cfg.namespace, &provision::parse_selector(&f.selector));
+			// fleet pods read the token file at start: after the UI's token is added they need a rollout restart
+			// (docs/SECURITY.md); the ones not Ready or being deleted are not listed
+			let eps = provision::ui_pods(&pods_now, &cfg.namespace, &provision::parse_selector(&f.selector), None);
 			ui_groups.extend(ui::fleet_group(&boot.token, &eps));
 		}
 	}
@@ -737,15 +739,6 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 			t.graceful = graceful(p.rp, &t.rproxy_image(m), &eps, &mut sub.caps).await;
 			// the UI reads it (its token in the token file, its pods through the NetworkPolicy)
 			t.ui = p.cfg.ui.clone().filter(|_| ui::visible(&plan));
-			if t.ui.is_some() {
-				ui_group = ui::managed_group(
-					&plan.namespace,
-					&plan.name,
-					&id,
-					&p.boot.token,
-					&provision::pods_incl_terminating(p.pods_now, &plan.namespace, &selector),
-				);
-			}
 			t.owner = match (&p.gateway_api_version, &gw.metadata.uid) {
 				(Some(v), Some(uid)) => Some(provision::owner(v, &plan.name, uid)),
 				_ => None,
@@ -758,10 +751,30 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 			let svc = match applied {
 				Ok(a) => {
 					provision::touch_pods(p.client, &eps, &a.certs).await;
+					// the UI reads the pods that already have its token (the current control API Secret)
+					if t.ui.is_some() {
+						ui_group = ui::managed_group(
+							&plan.namespace,
+							&plan.name,
+							&id,
+							&p.boot.token,
+							&provision::ui_pods(p.pods_now, &plan.namespace, &selector, Some(&a.api)),
+						);
+					}
 					keep_pdb = a.pdb;
 					a.service
 				}
 				Err(e) => {
+					// the Secrets were not written this pass: the UI keeps the pods that are Ready
+					if t.ui.is_some() {
+						ui_group = ui::managed_group(
+							&plan.namespace,
+							&plan.name,
+							&id,
+							&p.boot.token,
+							&provision::ui_pods(p.pods_now, &plan.namespace, &selector, None),
+						);
+					}
 					if plan.address_error.is_none() && !plan.addresses.is_empty() && format!("{e:#}").contains("externalIPs") {
 						// the cluster refuses the address (validation, an admission policy)
 						plan.address_error = Some(format!("the Service cannot take the address: {e:#}"));

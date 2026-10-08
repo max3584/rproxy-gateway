@@ -904,6 +904,8 @@ pub struct Applied {
 	pub certs: String,
 	/// Whether the Gateway has a PodDisruptionBudget (else `collect_garbage` deletes it).
 	pub pdb: bool,
+	/// The hash of the control API Secret's content (the pod template's `ANNOTATION_API`).
+	pub api: String,
 }
 
 /// Writes a Gateway's certificate and control API Secrets; returns the hashes of their content.
@@ -963,10 +965,10 @@ pub async fn apply_managed(
 	if t.plan.ports().is_empty() {
 		// a Service needs a port; none until a listener is valid
 		let _ = svc_api.delete(&name, &DeleteParams::default()).await;
-		return Ok(Applied { service: None, certs, pdb: pdb.is_some() });
+		return Ok(Applied { service: None, certs, pdb: pdb.is_some(), api: api_hash });
 	}
 	let service = svc_api.patch(&name, &pp(), &Patch::Apply(&service(t, m))).await?;
-	Ok(Applied { service: Some(service), certs, pdb: pdb.is_some() })
+	Ok(Applied { service: Some(service), certs, pdb: pdb.is_some(), api: api_hash })
 }
 
 /// Whether a Gateway's rproxy Deployment exists (a Gateway kept in its last good shape when its
@@ -1101,11 +1103,6 @@ pub fn pods(store: &[std::sync::Arc<Pod>], ns: &str, selector: &BTreeMap<String,
 	pods_of(store, ns, selector, false)
 }
 
-/// The same, with the pods being deleted that still run (the UI reads them until they are gone).
-pub fn pods_incl_terminating(store: &[std::sync::Arc<Pod>], ns: &str, selector: &BTreeMap<String, String>) -> Vec<Endpoint> {
-	pods_of(store, ns, selector, true)
-}
-
 fn pods_of(store: &[std::sync::Arc<Pod>], ns: &str, selector: &BTreeMap<String, String>, terminating: bool) -> Vec<Endpoint> {
 	let mut out: Vec<Endpoint> = store
 		.iter()
@@ -1153,6 +1150,35 @@ fn pods_of(store: &[std::sync::Arc<Pod>], ns: &str, selector: &BTreeMap<String, 
 		.collect();
 	out.sort_by(|a, b| a.pod.cmp(&b.pod));
 	out
+}
+
+/// The pods the UI may be sent to: running, not being deleted, Ready (with the readiness gate
+/// `CONDITION_RULESET` True when the pod has it) and, with `api_hash`, made from the pod template that
+/// has the current control API Secret (`ANNOTATION_API`): only those already read the token file with the
+/// UI's token (rproxy v0.4.1 reads it at start). A pod that would answer the UI's token with 401 is not
+/// listed (rproxy locks a client out after repeated failures).
+pub fn ui_pods(store: &[std::sync::Arc<Pod>], ns: &str, selector: &BTreeMap<String, String>, api_hash: Option<&str>) -> Vec<Endpoint> {
+	let accepts: std::collections::BTreeSet<String> = store
+		.iter()
+		.filter(|p| p.metadata.namespace.as_deref() == Some(ns) && p.metadata.deletion_timestamp.is_none())
+		.filter(|p| {
+			let conds = p.status.as_ref().and_then(|s| s.conditions.as_ref());
+			let is_true = |t: &str| conds.into_iter().flatten().any(|c| c.type_ == t && c.status == "True");
+			let gated = p
+				.spec
+				.as_ref()
+				.and_then(|s| s.readiness_gates.as_ref())
+				.into_iter()
+				.flatten()
+				.any(|g| g.condition_type == CONDITION_RULESET);
+			is_true("Ready") && (!gated || is_true(CONDITION_RULESET))
+		})
+		.filter(|p| {
+			api_hash.is_none_or(|h| p.metadata.annotations.as_ref().and_then(|a| a.get(ANNOTATION_API)).map(String::as_str) == Some(h))
+		})
+		.filter_map(|p| p.metadata.name.clone())
+		.collect();
+	pods_of(store, ns, selector, false).into_iter().filter(|e| accepts.contains(&e.pod)).collect()
 }
 
 /// `a=b,c=d` → labels.
@@ -1584,5 +1610,41 @@ mod tests {
 		with_linger(&f(&["a.crt"]), &f(&["a.crt"]), &mut absent, t0);
 		assert!(absent.is_empty());
 		assert_ne!(content_hash(&f(&["a.crt"])), content_hash(&f(&["b.crt"])));
+	}
+
+	#[test]
+	fn the_ui_gets_only_pods_that_take_its_token() {
+		// name, Ready, ruleset-applied, the pod template's api hash, being deleted
+		let pod = |name: &str, ready: bool, gate: bool, api: &str, deleting: bool| {
+			let mut v = serde_json::json!({
+				"metadata": {
+					"name": name, "namespace": "web", "uid": format!("uid-{name}"),
+					"labels": {LABEL_GATEWAY: "web-gw-1", "app.kubernetes.io/managed-by": MANAGER},
+					"annotations": {ANNOTATION_API: api},
+					"ownerReferences": [{"apiVersion": "apps/v1", "kind": "ReplicaSet", "name": format!("{}-abc", object_name("web-gw-1")), "uid": "rs", "controller": true}],
+				},
+				"spec": {"containers": [{"name": "rproxy"}], "readinessGates": [{"conditionType": CONDITION_RULESET}]},
+				"status": {"phase": "Running", "podIP": format!("10.0.0.{}", name.len()), "conditions": [
+					{"type": "Ready", "status": if ready { "True" } else { "False" }},
+					{"type": CONDITION_RULESET, "status": if gate { "True" } else { "False" }},
+				]},
+			});
+			if deleting {
+				v["metadata"]["deletionTimestamp"] = serde_json::json!("2026-10-08T00:00:00Z");
+			}
+			std::sync::Arc::new(serde_json::from_value::<Pod>(v).unwrap())
+		};
+		let store = vec![
+			pod("new", true, true, "h2", false),
+			pod("old-template", true, true, "h1", false),
+			pod("starting", false, false, "h2", false),
+			pod("no-rule-set-yet", true, false, "h2", false),
+			pod("stopping", true, true, "h2", true),
+		];
+		let sel: BTreeMap<String, String> = [(LABEL_GATEWAY.to_string(), "web-gw-1".to_string())].into();
+		let names = |eps: Vec<Endpoint>| eps.into_iter().map(|e| e.pod).collect::<Vec<_>>();
+		assert_eq!(names(ui_pods(&store, "web", &sel, Some("h2"))), ["new"]);
+		// without the hash (fleet; a pass that could not write the Secrets): Ready and not being deleted
+		assert_eq!(names(ui_pods(&store, "web", &sel, None)), ["new", "old-template"]);
 	}
 }

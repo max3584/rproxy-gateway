@@ -144,7 +144,7 @@ struct ControllerArgs {
 	#[arg(long, env = "RPROXY_GATEWAY_UI_NAMESPACE", default_value = "")]
 	ui_namespace: String,
 	/// The labels of the UI's pods (`k=v,k2=v2`): the Gateways' NetworkPolicy lets them reach the control API.
-	#[arg(long, env = "RPROXY_GATEWAY_UI_POD_SELECTOR", default_value = "app.kubernetes.io/name=rproxy-ui")]
+	#[arg(long, env = "RPROXY_GATEWAY_UI_POD_SELECTOR", default_value = "app.kubernetes.io/name=rproxy-ui,app.kubernetes.io/component=ui")]
 	ui_pod_selector: String,
 	/// Leader election: run several replicas, one of which acts (a Lease in the controller's namespace).
 	#[arg(long, env = "RPROXY_GATEWAY_LEADER_ELECT", default_value_t = true, action = clap::ArgAction::Set)]

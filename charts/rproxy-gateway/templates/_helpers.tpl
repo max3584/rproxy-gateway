@@ -98,7 +98,7 @@ RPROXY_GATEWAY_SERVICE_ANNOTATION_PREFIX: {{ join "," . | quote }}
 {{- end }}
 {{- with .Values.ui.namespace }}
 RPROXY_GATEWAY_UI_NAMESPACE: {{ . | quote }}
-RPROXY_GATEWAY_UI_POD_SELECTOR: {{ include "rproxy-gateway.selector" ($.Values.ui.podSelector | default (dict "app.kubernetes.io/name" "rproxy-ui")) | quote }}
+RPROXY_GATEWAY_UI_POD_SELECTOR: {{ include "rproxy-gateway.selector" ($.Values.ui.podSelector | default (dict "app.kubernetes.io/name" "rproxy-ui" "app.kubernetes.io/component" "ui")) | quote }}
 {{- end }}
 {{- if .Values.migration.migrateTo }}
 RPROXY_GATEWAY_MIGRATE_TO: {{ .Values.migration.migrateTo | quote }}

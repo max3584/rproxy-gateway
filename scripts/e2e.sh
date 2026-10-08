@@ -292,7 +292,7 @@ SH
 probe=${probe//ID/$id}
 probe=${probe//SN/$sn}
 probe=${probe//IP/$ip}
-kubectl -n rproxy-ui run ui-probe --image=curlimages/curl:8.11.1 --restart=Never --labels=app.kubernetes.io/name=rproxy-ui \
+kubectl -n rproxy-ui run ui-probe --image=curlimages/curl:8.11.1 --restart=Never --labels=app.kubernetes.io/name=rproxy-ui,app.kubernetes.io/component=ui \
   --overrides="$(jq -n --arg c "$probe" '{spec: {volumes: [{name: "k8s", secret: {secretName: "rproxy-ui-discovery"}}],
     containers: [{name: "ui-probe", image: "curlimages/curl:8.11.1", command: ["sh", "-c", $c], volumeMounts: [{name: "k8s", mountPath: "/k8s"}]}]}}')" > /dev/null
 retry 120 sh -c "test \"\$(kubectl -n rproxy-ui get pod ui-probe -o jsonpath='{.status.phase}')\" = Succeeded"

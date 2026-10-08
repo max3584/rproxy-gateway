@@ -10,8 +10,11 @@
 //! - `ca.crt`: the CA's certificate (never its key).
 //! - `token-<id>` (`token-fleet`): the UI's token of that Gateway (the fleet).
 //!
-//! Pods being deleted stay listed while they run (rproxy answers reads while it drains). The
-//! Secret is written only when its content changes, and deleted when nothing is visible.
+//! Only pods that take the UI's token are listed (`provision::ui_pods`): Ready (and their rule set
+//! applied), not being deleted, and made from the pod template with the current token file (rproxy
+//! v0.4.1 reads it at start; a pod answering 401 again and again would lock the UI out). The last
+//! interval of a stopping pod's usage is not collected (design 10. Q16). The Secret is written only
+//! when its content changes, and deleted when nothing is visible.
 
 use std::collections::BTreeMap;
 

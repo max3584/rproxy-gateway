@@ -127,9 +127,11 @@ gatewayClass:
 # The controller gets a Role there for that one Secret. Empty: off (nothing is written)
 ui:
   namespace: ""
-  # the UI pods' labels (Helm merges maps: set app.kubernetes.io/name to null to drop it)
+  # the UI pods' labels: the UI chart's UI pods only (not its migration and backup pods). Helm merges
+  # maps: set a key to null to drop it
   podSelector:
     app.kubernetes.io/name: rproxy-ui
+    app.kubernetes.io/component: ui
 
 # migration from Ingress and Traefik (docs/MIGRATION.md): off unless migrateTo is set
 migration:
