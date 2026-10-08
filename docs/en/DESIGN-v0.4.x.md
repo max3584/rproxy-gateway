@@ -244,7 +244,7 @@ As in 4.1. Details:
 - When no Gateway is shown, the Secret is deleted (the UI's chart mounts the Secret volume with `optional: true`). When `ui.namespace` is unset, delete the Secret in the former namespace by hand.
 - Only Gateways with valid parameters are shown (one kept in its last good shape with `InvalidParameters` is not listed and loses the UI's token).
 - Fleet pods are listed only when every Gateway they serve is shown (fleet pods hold every Gateway's rules).
-- The UI's token is not part of the pod template's hash (`rproxy.max3584.net/api`): setting or unsetting `ui.namespace`, and showing or hiding a Gateway, roll no pod (rproxy reads its token file again).
+- The UI's token is not part of the pod template's hash (`rproxy.max3584.net/api`): setting or unsetting `ui.namespace`, and showing or hiding a Gateway, roll no pod (rproxy reads its token file again). When a token file changes, the pods get the annotation `rproxy.max3584.net/tokens` (the file's hash), so the kubelet updates the mounted file at once (like `rproxy.max3584.net/certs` for certificates).
 
 ### 4.3 Tests (the gateway side)
 

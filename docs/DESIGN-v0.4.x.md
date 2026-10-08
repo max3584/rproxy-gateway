@@ -244,7 +244,7 @@ UI のイメージ・chart（`oci://ghcr.io/max3584/charts/rproxy-ui`）・migra
 - 見せる Gateway がなくなったら Secret を消す（UI の chart は Secret のボリュームを `optional: true` でマウントする）。`ui.namespace` を外したときは、前の namespace の Secret を手で消す。
 - 見せるのは parameters が正しい Gateway だけ（`InvalidParameters` で前の形のまま残した Gateway は載せず、UI のトークンも外す）。
 - fleet の Pod は、受け持つ Gateway がすべて見せるときだけ載せる（fleet の Pod はすべての Gateway のルールを持つため）。
-- UI のトークンは Pod のテンプレートのハッシュ（`rproxy.max3584.net/api`）に入れない。`ui.namespace` を入れる・外すとき、Gateway が見せる・隠すときに Pod は入れ替わらない（rproxy がトークンファイルを読み直す）。
+- UI のトークンは Pod のテンプレートのハッシュ（`rproxy.max3584.net/api`）に入れない。`ui.namespace` を入れる・外すとき、Gateway が見せる・隠すときに Pod は入れ替わらない（rproxy がトークンファイルを読み直す）。トークンファイルが変わったら Pod に注釈 `rproxy.max3584.net/tokens`（ファイルのハッシュ）を付け、kubelet にマウントしたファイルをすぐ更新させる（証明書の `rproxy.max3584.net/certs` と同じ）。
 
 ### 4.3 試験（gateway の側）
 

@@ -487,9 +487,13 @@ async fn reconcile_all(
 	// fleet: the UI reads the fleet's pods only if it may see every Gateway on them
 	if let Mode::Fleet(f) = &cfg.mode {
 		let shown = cfg.ui.is_some() && plans.iter().filter(|(p, _)| p.accepted()).all(|(p, _)| ui::visible(p));
-		if let Err(e) = ui::apply_fleet_token(client, &cfg.namespace, &boot.token, shown).await {
-			warn!(error = %e, "cannot write the fleet's token file");
-			soon = true;
+		match ui::apply_fleet_token(client, &cfg.namespace, &boot.token, shown).await {
+			Ok(Some(hash)) => provision::touch_tokens(client, &pods_now, &fleet_pods, &hash, shown).await,
+			Ok(None) => {}
+			Err(e) => {
+				warn!(error = %e, "cannot write the fleet's token file");
+				soon = true;
+			}
 		}
 		if shown {
 			let eps = provision::pods_incl_terminating(&pods_now, &cfg.namespace, &provision::parse_selector(&f.selector));
@@ -709,7 +713,10 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 			};
 			let current_api = p.world.secrets.get(&(plan.namespace.clone(), provision::api_secret_name(&id)));
 			match provision::apply_secrets(p.client, &t, p.boot, current_api, &mut sub.absent).await {
-				Ok((certs, _)) => provision::touch_pods(p.client, &eps, &certs).await,
+				Ok(h) => {
+					provision::touch_pods(p.client, &eps, &h.certs).await;
+					provision::touch_tokens(p.client, p.pods_now, &eps, &h.tokens, false).await;
+				}
 				Err(e) => {
 					warn!(gateway = %plan.ruleset, error = format!("{e:#}"), "cannot write the rproxy Secrets");
 					soon = true;
@@ -758,6 +765,7 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 			let svc = match applied {
 				Ok(a) => {
 					provision::touch_pods(p.client, &eps, &a.certs).await;
+					provision::touch_tokens(p.client, p.pods_now, &eps, &a.tokens, t.ui.is_some()).await;
 					keep_pdb = a.pdb;
 					a.service
 				}

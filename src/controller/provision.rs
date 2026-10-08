@@ -54,6 +54,9 @@ pub const ANNOTATION_GATEWAY: &str = "rproxy.max3584.net/gateway";
 pub const ANNOTATION_CERTS: &str = "rproxy.max3584.net/certs";
 /// On a control API Secret: the name its certificate was issued for.
 pub const ANNOTATION_SERVER_NAME: &str = "rproxy.max3584.net/server-name";
+/// On rproxy pods (not the template): the hash of the token file they should have mounted, once the
+/// UI's token is in it (the kubelet then updates the mounted file at once; rproxy reads it again).
+pub const ANNOTATION_TOKENS: &str = "rproxy.max3584.net/tokens";
 /// On rproxy pod templates: the hash of the control API Secret (rproxy reads its certificate at start).
 pub const ANNOTATION_API: &str = "rproxy.max3584.net/api";
 /// The certificate Secret of fleet pods (every Gateway's files).
@@ -848,6 +851,23 @@ pub async fn touch_pods(client: &kube::Client, pods: &[Endpoint], hash: &str) {
 	}
 }
 
+/// Sets `ANNOTATION_TOKENS` on the pods of `eps` whose mounted token file is to change (`tokens`:
+/// the file's hash, `ui`: whether it has the UI's token; pods never annotated need nothing until it has).
+pub async fn touch_tokens(client: &kube::Client, store: &[std::sync::Arc<Pod>], eps: &[Endpoint], tokens: &str, ui: bool) {
+	for ep in eps {
+		let Some(pod) = store.iter().find(|p| p.metadata.uid.as_deref() == Some(ep.uid.as_str())) else { continue };
+		let have = pod.metadata.annotations.as_ref().and_then(|a| a.get(ANNOTATION_TOKENS));
+		if have.map(String::as_str) == Some(tokens) || (have.is_none() && !ui) {
+			continue;
+		}
+		let api = Api::<Pod>::namespaced(client.clone(), &ep.namespace);
+		let patch = serde_json::json!({"metadata": {"annotations": {ANNOTATION_TOKENS: tokens}}});
+		if let Err(e) = api.patch(&ep.pod, &PatchParams::default(), &Patch::Merge(&patch)).await {
+			tracing::debug!(pod = ep.pod, error = %e, "cannot annotate the pod (its token file updates at the kubelet's next sync)");
+		}
+	}
+}
+
 /// The rproxy container's restart count.
 fn rproxy_restarts(pod: &Pod) -> i32 {
 	pod.status
@@ -912,8 +932,18 @@ pub struct Applied {
 	pub service: Option<Service>,
 	/// The hash of the certificate Secret's content.
 	pub certs: String,
+	/// The hash of the token file.
+	pub tokens: String,
 	/// Whether the Gateway has a PodDisruptionBudget (else `collect_garbage` deletes it).
 	pub pdb: bool,
+}
+
+/// What `apply_secrets` wrote: hashes of the certificate Secret, of the control API Secret (the pod
+/// template's, without the UI's token) and of the token file.
+pub struct SecretHashes {
+	pub certs: String,
+	pub api: String,
+	pub tokens: String,
 }
 
 /// Writes a Gateway's certificate and control API Secrets; returns the hashes of their content.
@@ -923,7 +953,7 @@ pub async fn apply_secrets(
 	boot: &bootstrap::Bootstrap,
 	current_api: Option<&Secret>,
 	absent: &mut BTreeMap<String, Instant>,
-) -> anyhow::Result<(String, String)> {
+) -> anyhow::Result<SecretHashes> {
 	let ns = t.ns();
 	let certs = apply_certs(client, ns, &certs_secret_name(&t.id), &t.plan.files, absent, |data| {
 		secret(t.meta(&certs_secret_name(&t.id), t.secret_labels()), data)
@@ -933,7 +963,9 @@ pub async fn apply_secrets(
 	if current_api.is_none_or(|c| data_of(Some(c)) != data_of(Some(&api)) || !same_meta(&c.metadata, &api.metadata)) {
 		Api::<Secret>::namespaced(client.clone(), ns).patch(&api_secret_name(&t.id), &pp(), &Patch::Apply(&api)).await?;
 	}
-	Ok((certs, api_hash(&data_of(Some(&api)))))
+	let data = data_of(Some(&api));
+	let tokens = crate::pem::short_hash(data.get("tokens.yaml").map(Vec::as_slice).unwrap_or_default());
+	Ok(SecretHashes { certs, api: api_hash(&data), tokens })
 }
 
 /// Applies a Gateway's Secrets, ServiceAccount, Deployment, PodDisruptionBudget and Service.
@@ -947,7 +979,7 @@ pub async fn apply_managed(
 	absent: &mut BTreeMap<String, Instant>,
 ) -> anyhow::Result<Applied> {
 	let ns = t.ns();
-	let (certs, api_hash) = apply_secrets(client, t, boot, current_api, absent).await?;
+	let SecretHashes { certs, api: api_hash, tokens } = apply_secrets(client, t, boot, current_api, absent).await?;
 	let name = object_name(&t.id);
 	if let Some(cns) = &m.network_policy {
 		let np = network_policy(t, cns);
@@ -969,10 +1001,10 @@ pub async fn apply_managed(
 	if t.plan.ports().is_empty() {
 		// a Service needs a port; none until a listener is valid
 		let _ = svc_api.delete(&name, &DeleteParams::default()).await;
-		return Ok(Applied { service: None, certs, pdb: pdb.is_some() });
+		return Ok(Applied { service: None, certs, tokens, pdb: pdb.is_some() });
 	}
 	let service = svc_api.patch(&name, &pp(), &Patch::Apply(&service(t, m))).await?;
-	Ok(Applied { service: Some(service), certs, pdb: pdb.is_some() })
+	Ok(Applied { service: Some(service), certs, tokens, pdb: pdb.is_some() })
 }
 
 /// Whether a Gateway's rproxy Deployment exists (a Gateway kept in its last good shape when its

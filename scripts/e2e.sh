@@ -277,7 +277,8 @@ sn="$id.rproxy-api.rproxy-gateway.internal"
 probe=$(cat << 'SH'
 t=$(cat /k8s/token-ID)
 c="--cacert /k8s/ca.crt --resolve SN:9443:IP -s -o /dev/null -w %{http_code}"
-r=$(curl $c -H "Authorization: Bearer $t" https://SN:9443/rules)
+# rproxy takes the token once the kubelet has updated its mounted token file (the controller annotates the pod)
+for _ in $(seq 60); do r=$(curl $c -H "Authorization: Bearer $t" https://SN:9443/rules); [ "$r" = 200 ] && break; sleep 2; done
 w=$(curl $c -X PUT -H "Authorization: Bearer $t" -H 'Content-Type: application/json' -d '{"generation":99,"rules":[]}' https://SN:9443/rulesets/k8s/e2e/e2e)
 echo "$r $w"
 SH
@@ -288,7 +289,7 @@ probe=${probe//IP/$ip}
 kubectl -n rproxy-ui run ui-probe --image=curlimages/curl:8.11.1 --restart=Never --labels=app.kubernetes.io/name=rproxy-ui \
   --overrides="$(jq -n --arg c "$probe" '{spec: {volumes: [{name: "k8s", secret: {secretName: "rproxy-ui-discovery"}}],
     containers: [{name: "ui-probe", image: "curlimages/curl:8.11.1", command: ["sh", "-c", $c], volumeMounts: [{name: "k8s", mountPath: "/k8s"}]}]}}')" > /dev/null
-retry 120 sh -c "test \"\$(kubectl -n rproxy-ui get pod ui-probe -o jsonpath='{.status.phase}')\" = Succeeded"
+retry 180 sh -c "test \"\$(kubectl -n rproxy-ui get pod ui-probe -o jsonpath='{.status.phase}')\" = Succeeded"
 codes=$(kubectl -n rproxy-ui logs ui-probe)
 echo "UI token: GET /rules, PUT /rulesets: $codes"
 test "$codes" = "200 403"
