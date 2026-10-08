@@ -27,10 +27,18 @@
 - apiGroups: [networking.k8s.io]
   resources: [networkpolicies]
   verbs: [get, list, watch, create, update, patch, delete]
+# managed mode with 2 or more replicas: a PodDisruptionBudget per Gateway
+- apiGroups: [policy]
+  resources: [poddisruptionbudgets]
+  verbs: [get, list, watch, create, update, patch, delete]
 # rproxy pods: the certificate Secret's hash as an annotation, so the kubelet updates the mounted files at once
 - apiGroups: [""]
   resources: [pods]
   verbs: [get, list, watch, patch]
+# rproxy pods' readiness gate (rproxy.max3584.net/ruleset-applied): True once their rule set is applied
+- apiGroups: [""]
+  resources: [pods/status]
+  verbs: [get, patch]
 - apiGroups: [discovery.k8s.io]
   resources: [endpointslices]
   verbs: [get, list, watch]

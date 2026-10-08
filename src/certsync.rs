@@ -67,7 +67,11 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
 	};
 	let listener = tokio::net::TcpListener::bind(listen).await.with_context(|| format!("listen on {listen}"))?;
 	info!(dir = %args.dir.display(), %listen, "certsync started");
-	serve(listener, args.dir).await;
+	// PID 1 of its container: without a handler SIGTERM is ignored and the pod waits for its grace period
+	tokio::select! {
+		_ = serve(listener, args.dir) => {}
+		_ = crate::controller::shutdown_signal() => {}
+	}
 	Ok(())
 }
 

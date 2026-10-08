@@ -132,6 +132,8 @@ static NOTES_SEEN: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BT
 
 /// How many Gateways are brought up to date at once.
 const PARALLEL: usize = 16;
+/// How many pods of one Gateway are brought up to date at once.
+const POD_PARALLEL: usize = 4;
 
 /// What was last applied to a pod: (pod uid, set) → (hash of what was sent, etag rproxy answered).
 pub type Applied = HashMap<(String, String), (String, String, Vec<RuleView>)>;
@@ -148,8 +150,11 @@ pub struct State {
 	pub absent: HashMap<String, BTreeMap<String, std::time::Instant>>,
 }
 
-pub async fn run(cfg: Config) -> anyhow::Result<()> {
+pub async fn run(mut cfg: Config) -> anyhow::Result<()> {
 	let client = kube::Client::try_default().await.context("connecting to Kubernetes")?;
+	if let Mode::Managed(m) = &mut cfg.mode {
+		m.native_sleep = native_sleep(&client).await;
+	}
 	let boot = bootstrap::ensure(&client, &cfg.namespace).await.context("the controller's Secrets")?;
 	let rp = Client::new(Some(&boot.ca_pem), &boot.token)?;
 	let cache = std::sync::Arc::new(cache::Cache::start(&client, cfg.migration.is_some(), cfg.scope()).await?);
@@ -228,8 +233,24 @@ async fn lost(leading: &mut tokio::sync::watch::Receiver<bool>) {
 	}
 }
 
+/// Whether the cluster has the kubelet's `sleep` preStop action on by default (Kubernetes 1.30 and later).
+async fn native_sleep(client: &kube::Client) -> bool {
+	match client.apiserver_version().await {
+		Ok(v) => {
+			let num = |s: &str| s.chars().take_while(char::is_ascii_digit).collect::<String>().parse::<u32>().unwrap_or(0);
+			let native = (num(&v.major), num(&v.minor)) >= (1, 30);
+			info!(version = v.git_version, native, "rproxy preStop: the sleep action (else exec sleep)");
+			native
+		}
+		Err(e) => {
+			warn!(error = %e, "cannot read the Kubernetes version; rproxy's preStop runs `sleep` in the container");
+			false
+		}
+	}
+}
+
 /// SIGTERM or Ctrl-C.
-async fn shutdown_signal() {
+pub(crate) async fn shutdown_signal() {
 	#[cfg(unix)]
 	{
 		let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
@@ -309,10 +330,17 @@ async fn reconcile_all(
 	}
 
 	let pods_now = cache.pods.state();
+	// rproxy restarted since its readiness gate was set: out of the endpoints until its sets are back
+	for pod in &pods_now {
+		if provision::gate_change(pod, None) == Some(false) {
+			provision::set_gate(client, pod, false).await;
+		}
+	}
 	let mut migration_addresses: Option<Vec<(String, String)>> = None;
 	let mut notes_seen = NOTES_SEEN.lock().unwrap().clone();
 	let mut plans: Vec<(GatewayPlan, Vec<PodSync>)> = vec![];
 	let mut keep_ids = vec![];
+	let mut pod_done: Vec<(String, bool)> = vec![];
 	let opts = render::Options {
 		listen_addrs: cfg.listen_addrs.clone(),
 		cert_dir: provision::CERT_DIR.into(),
@@ -414,6 +442,7 @@ async fn reconcile_all(
 			migration_addresses = Some(out.addresses.clone());
 		}
 		keep_ids.extend(out.keep_id);
+		pod_done.extend(out.pod_done);
 		plans.push((out.plan, out.results));
 	}
 
@@ -423,7 +452,18 @@ async fn reconcile_all(
 	state.absent.retain(|name, _| {
 		name == provision::FLEET_CERTS_SECRET || keep_ids.iter().any(|id| name.ends_with(&format!("/{}", provision::certs_secret_name(id))))
 	});
-	if let Err(e) = provision::collect_garbage(client, &keep_ids, &cfg.scope()).await {
+	// fleet: the readiness gate of each pod once every Gateway's set is on it
+	if !fleet_pods.is_empty() {
+		let mut done: HashMap<&str, bool> = fleet_pods.iter().map(|e| (e.uid.as_str(), true)).collect();
+		for (uid, ok) in &pod_done {
+			if let Some(d) = done.get_mut(uid.as_str()) {
+				*d &= ok;
+			}
+		}
+		set_gates(client, &pods_now, &done).await;
+	}
+	let keep_pdb = matches!(&cfg.mode, Mode::Managed(m) if m.replicas >= 2);
+	if let Err(e) = provision::collect_garbage(client, &keep_ids, keep_pdb, &cfg.scope()).await {
 		warn!(error = %e, "cannot remove rproxy of deleted Gateways");
 	}
 	if let Mode::Fleet(f) = &cfg.mode {
@@ -567,6 +607,8 @@ const SERVICE_SETTLE: Duration = Duration::from_secs(3);
 struct GatewayOut {
 	plan: GatewayPlan,
 	results: Vec<PodSync>,
+	/// Pod uid → whether the set is on it (`Synced`, or refused: nothing more to wait for).
+	pod_done: Vec<(String, bool)>,
 	addresses: Vec<(String, String)>,
 	keep_id: Option<String>,
 	soon: bool,
@@ -669,11 +711,32 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 		}
 	};
 	let addresses = if plan.address_error.is_some() { vec![] } else { addresses };
+	// the pods side by side (each with its own part of what was applied)
+	let jobs = endpoints.iter().map(|ep| {
+		let mut applied: Applied = sub.applied.iter().filter(|((uid, _), _)| *uid == ep.uid).map(|(k, v)| (k.clone(), v.clone())).collect();
+		let mut caps: HashMap<String, Capabilities> =
+			sub.caps.get(&ep.uid).map(|c| [(ep.uid.clone(), c.clone())].into()).unwrap_or_default();
+		let plan = &plan;
+		async move {
+			let (r, again) = sync_pod(p.rp, ep, plan, &mut applied, &mut caps).await;
+			(r, again, applied, caps)
+		}
+	});
+	let synced: Vec<_> = futures::stream::iter(jobs).buffered(POD_PARALLEL).collect().await;
 	let mut results = vec![];
-	for ep in &endpoints {
-		let (r, again) = sync_pod(p.rp, ep, &plan, &mut sub.applied, &mut sub.caps).await;
+	let mut pod_done = vec![];
+	for (ep, (r, again, applied, caps)) in endpoints.iter().zip(synced) {
 		soon |= again;
+		sub.applied.retain(|(uid, _), _| *uid != ep.uid);
+		sub.applied.extend(applied);
+		sub.caps.extend(caps);
+		pod_done.push((ep.uid.clone(), matches!(r, PodSync::Synced(_) | PodSync::Rejected(_))));
 		results.push(r);
+	}
+	// managed: each pod is this Gateway's alone
+	if matches!(p.cfg.mode, Mode::Managed(_)) {
+		let done: HashMap<&str, bool> = pod_done.iter().map(|(u, d)| (u.as_str(), *d)).collect();
+		set_gates(p.client, p.pods_now, &done).await;
 	}
 	if let Some(api) = dyn_api(p.client, p.cache, "Gateway", Some(&plan.namespace)) {
 		let st = status::gateway_status(&plan, &addresses, &results, gw.status.as_ref(), p.now);
@@ -687,7 +750,17 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 		}
 	}
 
-	GatewayOut { plan, results, addresses, keep_id, soon, sub }
+	GatewayOut { plan, results, pod_done, addresses, keep_id, soon, sub }
+}
+
+/// Sets the readiness gate of the pods in `done` (by uid) where it changes.
+async fn set_gates(client: &kube::Client, pods: &[std::sync::Arc<k8s_openapi::api::core::v1::Pod>], done: &HashMap<&str, bool>) {
+	for pod in pods {
+		let Some(d) = pod.metadata.uid.as_deref().and_then(|u| done.get(u)) else { continue };
+		if let Some(ready) = provision::gate_change(pod, Some(*d)) {
+			provision::set_gate(client, pod, ready).await;
+		}
+	}
 }
 
 /// RproxyPolicy and BackendTLSPolicy `status.ancestors`, RproxyRule `status`.

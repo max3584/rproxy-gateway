@@ -25,11 +25,13 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use k8s_openapi::ByteString;
-use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
+use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy, RollingUpdateDeployment};
 use k8s_openapi::api::core::v1::{
-	Capabilities, Container, ContainerPort, EnvVar, HTTPGetAction, KeyToPath, Pod, PodSecurityContext, PodSpec, PodTemplateSpec, Probe,
-	Secret, SecretVolumeSource, SecurityContext, Service, ServiceAccount, ServicePort, ServiceSpec, Sysctl, Volume, VolumeMount,
+	Capabilities, Container, ContainerPort, EnvVar, ExecAction, HTTPGetAction, KeyToPath, Lifecycle, LifecycleHandler, Pod,
+	PodReadinessGate, PodSecurityContext, PodSpec, PodTemplateSpec, Probe, Secret, SecretVolumeSource, SecurityContext, Service,
+	ServiceAccount, ServicePort, ServiceSpec, SleepAction, Sysctl, TopologySpreadConstraint, Volume, VolumeMount,
 };
+use k8s_openapi::api::policy::v1::{PodDisruptionBudget, PodDisruptionBudgetSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::Api;
@@ -59,6 +61,11 @@ pub const API_PORT: u16 = 9443;
 /// certsync's port (`GET /files`).
 pub const CERTSYNC_PORT: u16 = 9444;
 pub const CERT_DIR: &str = "/var/run/rproxy-gateway/certs";
+/// The readiness gate of rproxy pods: `True` once the controller has applied the pod's rule
+/// set(s) since rproxy (the container) last started; the pod takes traffic only then.
+pub const CONDITION_RULESET: &str = "rproxy.max3584.net/ruleset-applied";
+/// Seconds rproxy has after its preStop sleep before the kubelet kills it.
+pub const STOP_GRACE: i64 = 15;
 const API_DIR: &str = "/etc/rproxy-gateway/api";
 
 /// How rproxy is deployed.
@@ -78,6 +85,79 @@ pub struct Managed {
 	/// A NetworkPolicy per Gateway letting only the controller (in this namespace) reach
 	/// rproxy's control API and certsync (`None`: none made).
 	pub network_policy: Option<String>,
+	/// `externalTrafficPolicy` of the Service: `Local` (clients' addresses kept; only nodes with a
+	/// ready rproxy pod take traffic) or `Cluster`. `None`: `Local` for LoadBalancer, `Cluster` for NodePort.
+	pub external_traffic_policy: Option<String>,
+	/// LoadBalancer Services get node ports (`allocateLoadBalancerNodePorts`; MetalLB does not need them).
+	pub allocate_node_ports: bool,
+	/// Seconds a stopping rproxy pod keeps serving (preStop) while load balancers and
+	/// kube-proxy take it out (0: none).
+	pub pre_stop_secs: u32,
+	/// The preStop is the kubelet's `sleep` action (Kubernetes 1.30 and later), else `exec sleep`.
+	pub native_sleep: bool,
+	/// rproxy's readiness probe (`/healthz`): how soon a hung rproxy leaves the Service's endpoints.
+	pub readiness: ProbeTiming,
+	/// rproxy's liveness probe (`/healthz`): when the kubelet restarts it (kept slow).
+	pub liveness: ProbeTiming,
+}
+
+/// A probe's timing (the fields of a Kubernetes probe, in seconds).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProbeTiming {
+	pub period: i32,
+	pub timeout: i32,
+	pub failure: i32,
+	pub success: i32,
+	pub initial_delay: i32,
+}
+
+impl ProbeTiming {
+	/// Readiness: a hung rproxy is out of the endpoints after ~4 s.
+	pub const READINESS: ProbeTiming = ProbeTiming { period: 2, timeout: 1, failure: 2, success: 1, initial_delay: 0 };
+	/// Liveness: restarted after ~15 s without an answer.
+	pub const LIVENESS: ProbeTiming = ProbeTiming { period: 5, timeout: 1, failure: 3, success: 1, initial_delay: 0 };
+
+	/// `periodSeconds=2,timeoutSeconds=1,failureThreshold=2,successThreshold=1,initialDelaySeconds=0`
+	/// (any of them; the others from `base`).
+	pub fn parse(s: &str, base: ProbeTiming) -> Result<ProbeTiming, String> {
+		let mut t = base;
+		for kv in s.split(',').map(str::trim).filter(|kv| !kv.is_empty()) {
+			let (k, v) = kv.split_once('=').ok_or_else(|| format!("{kv}: key=value"))?;
+			let v: i32 = v.trim().parse().map_err(|_| format!("{kv}: not a number"))?;
+			let min = if k.trim() == "initialDelaySeconds" { 0 } else { 1 };
+			if v < min {
+				return Err(format!("{kv}: at least {min}"));
+			}
+			match k.trim() {
+				"periodSeconds" => t.period = v,
+				"timeoutSeconds" => t.timeout = v,
+				"failureThreshold" => t.failure = v,
+				"successThreshold" => t.success = v,
+				"initialDelaySeconds" => t.initial_delay = v,
+				other => return Err(format!("{other}: not a probe setting")),
+			}
+		}
+		Ok(t)
+	}
+}
+
+impl Default for Managed {
+	fn default() -> Self {
+		Managed {
+			rproxy_image: String::new(),
+			controller_image: String::new(),
+			replicas: 1,
+			service_type: "LoadBalancer".into(),
+			pull_policy: "IfNotPresent".into(),
+			network_policy: None,
+			external_traffic_policy: None,
+			allocate_node_ports: true,
+			pre_stop_secs: 15,
+			native_sleep: true,
+			readiness: ProbeTiming::READINESS,
+			liveness: ProbeTiming::LIVENESS,
+		}
+	}
 }
 
 #[derive(Clone, Debug)]
@@ -344,14 +424,18 @@ pub fn deployment(t: &Target, m: &Managed, api_hash: &str) -> Deployment {
 		capabilities: Some(Capabilities { drop: Some(vec!["ALL".into()]), ..Default::default() }),
 		..Default::default()
 	};
-	let probe = |path: &str| Probe {
+	let probe = |path: &str, t: &ProbeTiming| Probe {
 		http_get: Some(HTTPGetAction {
 			path: Some(path.into()),
 			port: IntOrString::Int(API_PORT.into()),
 			scheme: Some("HTTPS".into()),
 			..Default::default()
 		}),
-		period_seconds: Some(5),
+		period_seconds: Some(t.period),
+		timeout_seconds: Some(t.timeout),
+		failure_threshold: Some(t.failure),
+		success_threshold: Some(t.success),
+		initial_delay_seconds: Some(t.initial_delay),
 		..Default::default()
 	};
 	let rproxy = Container {
@@ -368,10 +452,12 @@ pub fn deployment(t: &Target, m: &Managed, api_hash: &str) -> Deployment {
 			env("RPROXY_FILES_TRUSTED_DIRS", &format!("{CERT_DIR},{API_DIR}")),
 		]),
 		ports: Some(vec![ContainerPort { name: Some("api".into()), container_port: API_PORT.into(), ..Default::default() }]),
-		liveness_probe: Some(probe("/healthz")),
-		readiness_probe: Some(probe("/healthz")),
+		// liveness needs successThreshold 1
+		liveness_probe: Some(probe("/healthz", &ProbeTiming { success: 1, ..m.liveness })),
+		readiness_probe: Some(probe("/healthz", &m.readiness)),
 		volume_mounts: Some(vec![mount("api", API_DIR), mount("certs", CERT_DIR)]),
 		security_context: Some(restricted.clone()),
+		lifecycle: pre_stop(m),
 		..Default::default()
 	};
 	let certsync = Container {
@@ -404,7 +490,11 @@ pub fn deployment(t: &Target, m: &Managed, api_hash: &str) -> Deployment {
 		spec: Some(DeploymentSpec {
 			replicas: Some(m.replicas),
 			selector: LabelSelector { match_labels: Some(labels(&t.id)), ..Default::default() },
-			strategy: Some(DeploymentStrategy { type_: Some("RollingUpdate".into()), ..Default::default() }),
+			// a new pod takes traffic (its readiness gate) before an old one stops
+			strategy: Some(DeploymentStrategy {
+				type_: Some("RollingUpdate".into()),
+				rolling_update: Some(RollingUpdateDeployment { max_unavailable: Some(IntOrString::Int(0)), ..Default::default() }),
+			}),
 			template: PodTemplateSpec {
 				metadata: Some(ObjectMeta { labels: pod_meta.labels, annotations: pod_meta.annotations, ..Default::default() }),
 				spec: Some(PodSpec {
@@ -425,6 +515,18 @@ pub fn deployment(t: &Target, m: &Managed, api_hash: &str) -> Deployment {
 						..Default::default()
 					}),
 					containers: vec![rproxy, certsync],
+					readiness_gates: Some(vec![PodReadinessGate { condition_type: CONDITION_RULESET.into() }]),
+					termination_grace_period_seconds: (m.pre_stop_secs > 0).then(|| i64::from(m.pre_stop_secs) + STOP_GRACE),
+					// replicas on different nodes when they can be
+					topology_spread_constraints: (m.replicas >= 2).then(|| {
+						vec![TopologySpreadConstraint {
+							max_skew: 1,
+							topology_key: "kubernetes.io/hostname".into(),
+							when_unsatisfiable: "ScheduleAnyway".into(),
+							label_selector: Some(LabelSelector { match_labels: Some(labels(&t.id)), ..Default::default() }),
+							..Default::default()
+						}]
+					}),
 					volumes: Some(vec![
 						secret_volume("api", &api_secret_name(&t.id), Some(vec![item("tokens.yaml"), item("tls.crt"), item("tls.key")])),
 						secret_volume("certs", &certs_secret_name(&t.id), None),
@@ -435,6 +537,48 @@ pub fn deployment(t: &Target, m: &Managed, api_hash: &str) -> Deployment {
 			..Default::default()
 		}),
 		..Default::default()
+	}
+}
+
+/// rproxy's preStop: it keeps serving for `pre_stop_secs` after the pod is marked for deletion,
+/// while the Service's endpoints, kube-proxy and load balancers (MetalLB moving its announcement)
+/// take it out. rproxy stops at once on SIGTERM, which comes after.
+fn pre_stop(m: &Managed) -> Option<Lifecycle> {
+	if m.pre_stop_secs == 0 {
+		return None;
+	}
+	let handler = if m.native_sleep {
+		LifecycleHandler { sleep: Some(SleepAction { seconds: m.pre_stop_secs.into() }), ..Default::default() }
+	} else {
+		LifecycleHandler {
+			exec: Some(ExecAction { command: Some(vec!["sleep".into(), m.pre_stop_secs.to_string()]) }),
+			..Default::default()
+		}
+	};
+	Some(Lifecycle { pre_stop: Some(handler), ..Default::default() })
+}
+
+/// A Gateway's PodDisruptionBudget (with 2 or more replicas): one pod at a time goes in a drain.
+pub fn pod_disruption_budget(t: &Target) -> PodDisruptionBudget {
+	PodDisruptionBudget {
+		metadata: t.meta(&object_name(&t.id), labels(&t.id)),
+		spec: Some(PodDisruptionBudgetSpec {
+			max_unavailable: Some(IntOrString::Int(1)),
+			selector: Some(LabelSelector { match_labels: Some(labels(&t.id)), ..Default::default() }),
+			// a pod that is not ready (its rule set never applied) does not block a drain
+			unhealthy_pod_eviction_policy: Some("AlwaysAllow".into()),
+			..Default::default()
+		}),
+		..Default::default()
+	}
+}
+
+/// The Service's `externalTrafficPolicy` (none for ClusterIP).
+fn external_traffic_policy(m: &Managed) -> Option<String> {
+	match (m.service_type.as_str(), &m.external_traffic_policy) {
+		("LoadBalancer" | "NodePort", Some(p)) => Some(p.clone()),
+		("LoadBalancer", None) => Some("Local".into()),
+		_ => None,
 	}
 }
 
@@ -463,7 +607,8 @@ pub fn service(t: &Target, m: &Managed) -> Service {
 			type_: Some(m.service_type.clone()),
 			selector: Some(labels(&t.id)),
 			ports: Some(ports),
-			external_traffic_policy: (m.service_type == "LoadBalancer").then(|| "Local".into()),
+			external_traffic_policy: external_traffic_policy(m),
+			allocate_load_balancer_node_ports: (m.service_type == "LoadBalancer").then_some(m.allocate_node_ports),
 			external_ips: (!t.addresses.is_empty()).then(|| t.addresses.clone()),
 			..Default::default()
 		}),
@@ -559,6 +704,64 @@ pub async fn touch_pods(client: &kube::Client, pods: &[Endpoint], hash: &str) {
 	}
 }
 
+/// The rproxy container's restart count.
+fn rproxy_restarts(pod: &Pod) -> i32 {
+	pod.status
+		.as_ref()
+		.and_then(|s| s.container_statuses.as_ref())
+		.and_then(|cs| cs.iter().find(|c| c.name == "rproxy"))
+		.map_or(0, |c| c.restart_count)
+}
+
+/// The message of a `True` readiness gate condition: the rproxy restart count it was set for.
+fn gate_message(restarts: i32) -> String {
+	format!("rule sets applied (rproxy restarts: {restarts})")
+}
+
+/// What the pod's readiness gate (`CONDITION_RULESET`) should become, if it must change.
+/// `done`: whether this pass brought every rule set of the pod up to date (`None`: not
+/// asked). The gate turns `True` once the sets are applied and stays so (a later update
+/// waiting for files does not take a serving pod out); it turns `False` when rproxy has
+/// restarted since (its sets live in memory) until they are applied again.
+pub fn gate_change(pod: &Pod, done: Option<bool>) -> Option<bool> {
+	let gated =
+		pod.spec.as_ref().and_then(|s| s.readiness_gates.as_ref()).is_some_and(|g| g.iter().any(|g| g.condition_type == CONDITION_RULESET));
+	if !gated || pod.metadata.deletion_timestamp.is_some() {
+		return None;
+	}
+	let cond = pod.status.as_ref().and_then(|s| s.conditions.as_ref()).and_then(|c| c.iter().find(|c| c.type_ == CONDITION_RULESET));
+	let is_true = cond.is_some_and(|c| c.status == "True");
+	let restarts = rproxy_restarts(pod);
+	let current = is_true && cond.and_then(|c| c.message.as_deref()) == Some(gate_message(restarts).as_str());
+	match done {
+		Some(true) if !current => Some(true),
+		_ if is_true && !current => Some(false),
+		_ => None,
+	}
+}
+
+/// Sets the pod's readiness gate condition.
+pub async fn set_gate(client: &kube::Client, pod: &Pod, ready: bool) {
+	let (ns, name) = (pod.metadata.namespace.clone().unwrap_or_default(), pod.metadata.name.clone().unwrap_or_default());
+	let restarts = rproxy_restarts(pod);
+	let (reason, message) = if ready {
+		("RuleSetsApplied", gate_message(restarts))
+	} else {
+		("RproxyRestarted", format!("rproxy restarted (restarts: {restarts}); waiting for its rule sets"))
+	};
+	let patch = serde_json::json!({"status": {"conditions": [{
+		"type": CONDITION_RULESET,
+		"status": if ready { "True" } else { "False" },
+		"reason": reason,
+		"message": message,
+		"lastTransitionTime": crate::render::status::now(),
+	}]}});
+	match Api::<Pod>::namespaced(client.clone(), &ns).patch_status(&name, &PatchParams::default(), &Patch::Strategic(&patch)).await {
+		Ok(_) => info!(pod = format!("{ns}/{name}"), ready, "readiness gate"),
+		Err(e) => tracing::warn!(pod = format!("{ns}/{name}"), error = %e, "cannot set the readiness gate (RBAC: pods/status patch)"),
+	}
+}
+
 /// What `apply_managed` made.
 pub struct Applied {
 	/// The Service (with its status), when there is a port to serve.
@@ -596,6 +799,13 @@ pub async fn apply_managed(
 	Api::<ServiceAccount>::namespaced(client.clone(), ns).patch(&name, &pp(), &Patch::Apply(&service_account(t))).await?;
 	let api_hash = content_hash(&data_of(Some(&api)));
 	Api::<Deployment>::namespaced(client.clone(), ns).patch(&name, &pp(), &Patch::Apply(&deployment(t, m, &api_hash))).await?;
+	// with fewer replicas, `collect_garbage` deletes it
+	if m.replicas >= 2 {
+		let pdb = Api::<PodDisruptionBudget>::namespaced(client.clone(), ns);
+		if let Err(e) = pdb.patch(&name, &pp(), &Patch::Apply(&pod_disruption_budget(t))).await {
+			tracing::warn!(gateway = %t.plan.ruleset, error = %e, "cannot write the PodDisruptionBudget");
+		}
+	}
 	let svc_api = Api::<Service>::namespaced(client.clone(), ns);
 	if t.plan.ports().is_empty() {
 		// a Service needs a port; none until a listener is valid
@@ -608,8 +818,14 @@ pub async fn apply_managed(
 
 /// Deletes managed objects of Gateways that are gone or no longer ours (`keep`:
 /// ids still in use), in every namespace. (Deleting a Gateway deletes them as
-/// well: the Gateway owns them.)
-pub async fn collect_garbage(client: &kube::Client, keep: &[String], scope: &crate::controller::cache::Scope) -> anyhow::Result<()> {
+/// well: the Gateway owns them.) PodDisruptionBudgets go as well unless `keep_pdb`
+/// (2 or more replicas).
+pub async fn collect_garbage(
+	client: &kube::Client,
+	keep: &[String],
+	keep_pdb: bool,
+	scope: &crate::controller::cache::Scope,
+) -> anyhow::Result<()> {
 	let nss: Vec<Option<String>> = match scope {
 		None => vec![None],
 		Some(n) => n.iter().cloned().map(Some).collect(),
@@ -636,6 +852,14 @@ pub async fn collect_garbage(client: &kube::Client, keep: &[String], scope: &cra
 			if gone(&np.metadata) {
 				let (ns, name) = ns_name(&np.metadata);
 				Api::<k8s_openapi::api::networking::v1::NetworkPolicy>::namespaced(client.clone(), &ns).delete(&name, &dp).await?;
+			}
+		}
+	}
+	if let Ok(list) = list_in::<PodDisruptionBudget>(client, &nss, &lp).await {
+		for pdb in list {
+			if gone(&pdb.metadata) || !keep_pdb {
+				let (ns, name) = ns_name(&pdb.metadata);
+				Api::<PodDisruptionBudget>::namespaced(client.clone(), &ns).delete(&name, &dp).await?;
 			}
 		}
 	}
@@ -804,6 +1028,7 @@ mod tests {
 			service_type: "LoadBalancer".into(),
 			pull_policy: "IfNotPresent".into(),
 			network_policy: Some("rproxy-gateway-system".into()),
+			..Default::default()
 		};
 		let np = network_policy(&Target::new(&plan()), "rproxy-gateway-system");
 		let rules = np.spec.unwrap().ingress.unwrap();
@@ -859,6 +1084,120 @@ mod tests {
 		assert_eq!(l[LABEL_CERTS_FOR], "fleet");
 		assert!(!l.contains_key(LABEL_GATEWAY), "the fleet Secret is not one Gateway's");
 		assert_eq!(parse_selector("a=b, c=d"), [("a".to_string(), "b".to_string()), ("c".to_string(), "d".to_string())].into());
+	}
+
+	#[test]
+	fn high_availability() {
+		let p = plan();
+		let t = Target::new(&p);
+		let m = Managed { replicas: 2, ..Default::default() };
+		let pod = deployment(&t, &m, "h").spec.unwrap();
+		let rolling = pod.strategy.unwrap().rolling_update.unwrap();
+		assert_eq!(rolling.max_unavailable, Some(IntOrString::Int(0)), "a new pod is ready before an old one stops");
+		let pod = pod.template.spec.unwrap();
+		assert_eq!(pod.readiness_gates.unwrap()[0].condition_type, CONDITION_RULESET);
+		assert_eq!(pod.termination_grace_period_seconds, Some(30), "preStop 15 s + 15 s");
+		let rproxy = &pod.containers[0];
+		assert_eq!(rproxy.lifecycle.as_ref().unwrap().pre_stop.as_ref().unwrap().sleep.as_ref().unwrap().seconds, 15);
+		let r = rproxy.readiness_probe.as_ref().unwrap();
+		assert_eq!((r.period_seconds, r.failure_threshold, r.timeout_seconds), (Some(2), Some(2), Some(1)));
+		let l = rproxy.liveness_probe.as_ref().unwrap();
+		assert_eq!((l.period_seconds, l.failure_threshold), (Some(5), Some(3)));
+		assert!(pod.containers[1].lifecycle.is_none(), "certsync stops at once");
+		let spread = pod.topology_spread_constraints.unwrap();
+		assert_eq!(spread[0].topology_key, "kubernetes.io/hostname");
+		assert_eq!(spread[0].when_unsatisfiable, "ScheduleAnyway");
+		assert_eq!(spread[0].label_selector.as_ref().unwrap().match_labels, Some(labels(&t.id)));
+		// an older cluster: exec; no preStop at 0; one replica: no spreading
+		let old = Managed { native_sleep: false, pre_stop_secs: 5, ..Default::default() };
+		let pod = deployment(&t, &old, "h").spec.unwrap().template.spec.unwrap();
+		let exec = pod.containers[0].lifecycle.clone().unwrap().pre_stop.unwrap().exec.unwrap();
+		assert_eq!(exec.command, Some(vec!["sleep".to_string(), "5".to_string()]));
+		assert_eq!(pod.termination_grace_period_seconds, Some(20));
+		assert!(pod.topology_spread_constraints.is_none());
+		let none = Managed { pre_stop_secs: 0, ..Default::default() };
+		let pod = deployment(&t, &none, "h").spec.unwrap().template.spec.unwrap();
+		assert!(pod.containers[0].lifecycle.is_none());
+		assert_eq!(pod.termination_grace_period_seconds, None);
+		// the PodDisruptionBudget
+		let pdb = pod_disruption_budget(&t);
+		assert_eq!(pdb.metadata.name, Some(object_name(&t.id)));
+		assert_eq!(pdb.metadata.labels.as_ref().unwrap()[LABEL_GATEWAY], t.id, "collected with the Gateway's objects");
+		let spec = pdb.spec.unwrap();
+		assert_eq!(spec.max_unavailable, Some(IntOrString::Int(1)));
+		assert_eq!(spec.selector.unwrap().match_labels, Some(labels(&t.id)));
+		assert_eq!(spec.unhealthy_pod_eviction_policy.as_deref(), Some("AlwaysAllow"));
+	}
+
+	#[test]
+	fn external_traffic_policies() {
+		let p = plan();
+		let t = Target::new(&p);
+		let etp = |service_type: &str, policy: Option<&str>| {
+			let m = Managed { service_type: service_type.into(), external_traffic_policy: policy.map(Into::into), ..Default::default() };
+			service(&t, &m).spec.unwrap().external_traffic_policy
+		};
+		assert_eq!(etp("LoadBalancer", None).as_deref(), Some("Local"), "clients' addresses kept by default");
+		assert_eq!(etp("LoadBalancer", Some("Cluster")).as_deref(), Some("Cluster"));
+		assert_eq!(etp("NodePort", None), None, "NodePort as before (Cluster)");
+		assert_eq!(etp("NodePort", Some("Local")).as_deref(), Some("Local"));
+		assert_eq!(etp("ClusterIP", Some("Local")), None);
+		let m = Managed { allocate_node_ports: false, ..Default::default() };
+		assert_eq!(service(&t, &m).spec.unwrap().allocate_load_balancer_node_ports, Some(false));
+		let m = Managed { service_type: "ClusterIP".into(), ..Default::default() };
+		assert_eq!(service(&t, &m).spec.unwrap().allocate_load_balancer_node_ports, None);
+	}
+
+	#[test]
+	fn probe_timing() {
+		let r = ProbeTiming::READINESS;
+		assert_eq!(ProbeTiming::parse("", r), Ok(r));
+		let t = ProbeTiming::parse("periodSeconds=1, failureThreshold=3,initialDelaySeconds=0", r).unwrap();
+		assert_eq!((t.period, t.failure, t.timeout, t.initial_delay), (1, 3, 1, 0));
+		assert!(ProbeTiming::parse("periodSeconds=0", r).is_err());
+		assert!(ProbeTiming::parse("period=1", r).is_err());
+		assert!(ProbeTiming::parse("periodSeconds", r).is_err());
+		let p = plan();
+		let m = Managed { liveness: ProbeTiming { success: 3, ..ProbeTiming::LIVENESS }, ..Default::default() };
+		let pod = deployment(&Target::new(&p), &m, "h").spec.unwrap().template.spec.unwrap();
+		assert_eq!(pod.containers[0].liveness_probe.as_ref().unwrap().success_threshold, Some(1), "liveness takes 1 only");
+	}
+
+	#[test]
+	fn readiness_gate() {
+		use k8s_openapi::api::core::v1::{ContainerStatus, PodCondition, PodStatus};
+		let pod = |gated: bool, cond: Option<(&str, String)>, restarts: i32| Pod {
+			spec: Some(PodSpec {
+				readiness_gates: gated.then(|| vec![PodReadinessGate { condition_type: CONDITION_RULESET.into() }]),
+				..Default::default()
+			}),
+			status: Some(PodStatus {
+				conditions: cond.map(|(status, message)| {
+					vec![PodCondition {
+						type_: CONDITION_RULESET.into(),
+						status: status.into(),
+						message: Some(message),
+						..Default::default()
+					}]
+				}),
+				container_statuses: Some(vec![ContainerStatus { name: "rproxy".into(), restart_count: restarts, ..Default::default() }]),
+				..Default::default()
+			}),
+			..Default::default()
+		};
+		assert_eq!(gate_change(&pod(false, None, 0), Some(true)), None, "no gate: not touched");
+		assert_eq!(gate_change(&pod(true, None, 0), Some(true)), Some(true), "applied: ready");
+		assert_eq!(gate_change(&pod(true, None, 0), Some(false)), None);
+		assert_eq!(gate_change(&pod(true, None, 0), None), None);
+		let set = Some(("True", gate_message(0)));
+		assert_eq!(gate_change(&pod(true, set.clone(), 0), Some(true)), None, "already");
+		assert_eq!(gate_change(&pod(true, set.clone(), 0), Some(false)), None, "a later update waiting for files: stays ready");
+		assert_eq!(gate_change(&pod(true, set.clone(), 1), None), Some(false), "rproxy restarted: out until applied");
+		assert_eq!(gate_change(&pod(true, set.clone(), 1), Some(true)), Some(true), "applied again");
+		assert_eq!(gate_change(&pod(true, Some(("False", "x".into())), 1), Some(true)), Some(true));
+		let mut gone = pod(true, set, 1);
+		gone.metadata.deletion_timestamp = Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(Default::default()));
+		assert_eq!(gate_change(&gone, None), None, "a pod being deleted is left alone");
 	}
 
 	#[test]
