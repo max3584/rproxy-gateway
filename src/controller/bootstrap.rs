@@ -166,7 +166,7 @@ pub fn ui_token_entry(token: &str) -> String {
 	format!("{UI_ENTRY_START}    sha256: {}\n    scopes: [rules:read, metrics:read]\n", crate::pem::sha256_hex(token.as_bytes()))
 }
 
-/// A token file without the UI's entry (what the pods' hash and the fleet's check look at).
+/// A token file without the UI's entry (what the fleet's check at start looks at).
 pub fn without_ui_entry(file: &str) -> &str {
 	file.find(UI_ENTRY_START).map_or(file, |i| &file[..i])
 }

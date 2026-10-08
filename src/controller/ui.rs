@@ -184,24 +184,22 @@ pub async fn apply(client: &kube::Client, ns: &str, groups: &[Group], ca_pem: &[
 	Ok(())
 }
 
-/// Fleet: the UI's token entry in the fleet's token file (`rproxy-gateway-token`), added or removed;
-/// returns the file's hash (`provision::touch_tokens`).
-pub async fn apply_fleet_token(client: &kube::Client, ns: &str, master: &str, shown: bool) -> anyhow::Result<Option<String>> {
+/// Fleet: the UI's token entry in the fleet's token file (`rproxy-gateway-token`), added or removed.
+pub async fn apply_fleet_token(client: &kube::Client, ns: &str, master: &str, shown: bool) -> anyhow::Result<()> {
 	let api: Api<Secret> = Api::namespaced(client.clone(), ns);
-	let Some(s) = api.get_opt(bootstrap::TOKEN_SECRET).await? else { return Ok(None) };
+	let Some(s) = api.get_opt(bootstrap::TOKEN_SECRET).await? else { return Ok(()) };
 	let mut want = bootstrap::token_file(master, bootstrap::FLEET_RULESETS);
 	if shown {
 		want.push_str(&bootstrap::ui_token_entry(&bootstrap::derive_ui_token(master, "fleet")));
 	}
-	let hash = Some(crate::pem::short_hash(want.as_bytes()));
 	let have = s.data.as_ref().and_then(|d| d.get("tokens.yaml")).map(|b| b.0.clone());
 	if have.as_deref() == Some(want.as_bytes()) {
-		return Ok(hash);
+		return Ok(());
 	}
 	info!(secret = bootstrap::TOKEN_SECRET, ui = shown, "writing the fleet's token file (the UI's read-only token)");
 	let patch = serde_json::json!({"data": {"tokens.yaml": base64::engine::general_purpose::STANDARD.encode(want.as_bytes())}});
 	api.patch(bootstrap::TOKEN_SECRET, &PatchParams::default(), &Patch::Merge(&patch)).await?;
-	Ok(hash)
+	Ok(())
 }
 
 #[cfg(test)]

@@ -221,7 +221,7 @@ UI のイメージ・chart（`oci://ghcr.io/max3584/charts/rproxy-ui`）・migra
 **コントローラが UI 用の読むだけの資格を作り、UI の namespace に 1 つの Secret で渡す**（両側の明示が要る）。
 
 1. 管理者が gateway の chart で `ui.namespace: rproxy-ui`（`--ui-namespace`）と `ui.podSelector`（既定 `app.kubernetes.io/name: rproxy-ui`）を決める。決めなければ何も作らない（今と同じ）。
-2. 各 Gateway の `tokens.yaml` に 2 つ目のトークン `rproxy-ui` を足す：導き方は `HMAC(master, "rproxy-gateway-ui/<id>")`（コントローラのトークンと別の値）、スコープは **`rules:read`・`metrics:read` だけ**。書き込みは rproxy が `403` で断るので、UI の作りに頼らない。rproxy はトークンファイルを読み直すので Pod の入れ替えは要らない。
+2. 各 Gateway の `tokens.yaml` に 2 つ目のトークン `rproxy-ui` を足す：導き方は `HMAC(master, "rproxy-gateway-ui/<id>")`（コントローラのトークンと別の値）、スコープは **`rules:read`・`metrics:read` だけ**。書き込みは rproxy が `403` で断るので、UI の作りに頼らない。（実装で分かったこと：rproxy v0.4.1 はトークンファイルを起動時と SIGHUP でしか読み直さないので、Pod が 1 回入れ替わる。4.2）
 3. コントローラは UI の namespace に Secret `rproxy-ui-discovery` を書く：`nodes.yaml`（Gateway ごとのグループ `k8s:<ns>/<name>` と Pod ごとのノード、`url: https://<Pod の IP>:9443`、`tls_server_name: <id>.rproxy-api.rproxy-gateway.internal`、`readonly: true`）、`ca.crt`（CA の証明書だけ。鍵は入れない）、`token-<id>`。parameters の `ui.visible: false` の Gateway は載せない。fleet ではすべての fleet の Pod（トークンは `rproxy-gateway-token` に足す）。終わりかけの Pod も消えるまで載せる（利用量を最後まで取るため）。
 4. NetworkPolicy：managed の Gateway の NetworkPolicy に、UI の namespace の `ui.podSelector` から 9443 を足す（`ui.visible` の Gateway だけ）。certsync（9444）は足さない。
 5. UI：`RPROXY_UI_K8S_DISCOVERY=/etc/rproxy-ui/k8s`（Secret のボリューム）を読み、ファイルの更新時刻で読み直す。
@@ -244,7 +244,7 @@ UI のイメージ・chart（`oci://ghcr.io/max3584/charts/rproxy-ui`）・migra
 - 見せる Gateway がなくなったら Secret を消す（UI の chart は Secret のボリュームを `optional: true` でマウントする）。`ui.namespace` を外したときは、前の namespace の Secret を手で消す。
 - 見せるのは parameters が正しい Gateway だけ（`InvalidParameters` で前の形のまま残した Gateway は載せず、UI のトークンも外す）。
 - fleet の Pod は、受け持つ Gateway がすべて見せるときだけ載せる（fleet の Pod はすべての Gateway のルールを持つため）。
-- UI のトークンは Pod のテンプレートのハッシュ（`rproxy.max3584.net/api`）に入れない。`ui.namespace` を入れる・外すとき、Gateway が見せる・隠すときに Pod は入れ替わらない（rproxy がトークンファイルを読み直す）。トークンファイルが変わったら Pod に注釈 `rproxy.max3584.net/tokens`（ファイルのハッシュ）を付け、kubelet にマウントしたファイルをすぐ更新させる（証明書の `rproxy.max3584.net/certs` と同じ）。
+- UI のトークンはトークンファイルにあり、トークンファイルは Pod のテンプレートのハッシュ（`rproxy.max3584.net/api`）に入る。rproxy v0.4.1 はトークンファイルを起動時と SIGHUP でしか読み直さない（rproxy-api docs/API.md）ので、`ui.namespace` を決めたとき・Gateway を見せる／隠すときに、その Gateway の Pod が 1 回入れ替わる（rollout は `maxUnavailable: 0`・readiness gate・graceful shutdown）。`ui.namespace` が空なら Secret も Deployment も今までと同じ。fleet の DaemonSet は chart のものなので、UI のトークンを足した後は手で `rollout restart` する。入れ替えをなくすには rproxy がトークンファイルの変化を見て読み直す（証明書の `RPROXY_CERT_CHECK_SECS` と同じ）必要がある（rproxy-api への要望）。
 
 ### 4.3 試験（gateway の側）
 

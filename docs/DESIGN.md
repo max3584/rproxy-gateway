@@ -72,7 +72,7 @@ rproxy の Pod が入れ替わる（削除、`kubectl rollout restart`、ノー�
 
 managed の rproxy は、それぞれ Gateway の namespace の `rproxy-<id>-api` を使う：CA が `<id>.rproxy-api.rproxy-gateway.internal` に出した制御 API の証明書と、マスタートークンから導いたトークン（HMAC-SHA256、鍵がマスタートークンで中身が Gateway の id）のトークンファイル（`tokens.yaml`、SHA-256 だけ）。コントローラは Pod ごとにその名前とトークンでつなぐ。ある Gateway の namespace の Secret を読めても、ほかの Gateway の rproxy にもコントローラにもつなげない（マスタートークンと CA の鍵はコントローラの namespace だけ）。
 
-`ui.namespace`（`--ui-namespace`）のときは、UI に見せる Gateway（parameters の `ui.visible`）のトークンファイルに UI 用の読むだけのトークン（`rules:read`・`metrics:read`）を足し、UI の namespace に Secret `rproxy-ui-discovery`（Pod の一覧・CA の証明書・UI 用のトークン）を書く（[SECURITY.md](SECURITY.md) の「UI に見せる」、[DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) の 4.）。UI 用のトークンは Pod のテンプレートの注釈のハッシュに入れない（入れても外しても Pod は入れ替わらない）。
+`ui.namespace`（`--ui-namespace`）のときは、UI に見せる Gateway（parameters の `ui.visible`）のトークンファイルに UI 用の読むだけのトークン（`rules:read`・`metrics:read`）を足し、UI の namespace に Secret `rproxy-ui-discovery`（Pod の一覧・CA の証明書・UI 用のトークン）を書く（[SECURITY.md](SECURITY.md) の「UI に見せる」、[DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) の 4.）。トークンファイルは Pod のテンプレートの注釈のハッシュに入るので、UI 用のトークンを入れる・外すと Pod が 1 回入れ替わる（rproxy v0.4.1 はトークンファイルを起動時と SIGHUP でしか読み直さない）。
 
 rproxy には `RPROXY_FILES_TRUSTED_DIRS`（Secret のボリュームのディレクトリ。kubelet が root のファイルにするため。[SECURITY.md](SECURITY.md)）も渡す。
 

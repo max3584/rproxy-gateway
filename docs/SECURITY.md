@@ -63,13 +63,13 @@ English: [en/SECURITY.md](en/SECURITY.md)
 管理 UI（TCP-UDP-rproxy-ui の chart。別に入れる）に Kubernetes の rproxy を読ませる仕組み（[DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) の 4.）。**既定では切ってある**（`ui.namespace: ""`。何も作らない）。両方の明示が要る：管理者が chart の `ui.namespace`（`--ui-namespace`）を決め、Gateway の `RproxyGatewayParameters` の `ui.visible` が false でない（既定 true。GatewayClass が false にしたら Gateway は true にできない）。
 
 - コントローラは UI の namespace に Secret `rproxy-ui-discovery` を書く：`nodes.yaml`（見せる Gateway の rproxy の Pod ごとの `https://<Pod の IP>:9443` と証明書の名前）、`ca.crt`（制御 API の CA の証明書だけ。**鍵は入れない**）、Gateway ごとの UI 用のトークン `token-<id>`。見せる Gateway がなくなれば Secret を消す。
-- UI 用のトークンはマスタートークンから導く（HMAC-SHA256、中身は `rproxy-gateway-ui/<id>`。コントローラのトークンと別の値）。各 Gateway の rproxy のトークンファイルに名前 `rproxy-ui`・スコープ **`rules:read`・`metrics:read` だけ**で足す。書き込み（ルール・ルールセット・ACME）は rproxy が `403` で断る（UI の作りに頼らない）。rproxy はトークンファイルを読み直すので、入れても外しても Pod は入れ替わらない。
+- UI 用のトークンはマスタートークンから導く（HMAC-SHA256、中身は `rproxy-gateway-ui/<id>`。コントローラのトークンと別の値）。各 Gateway の rproxy のトークンファイルに名前 `rproxy-ui`・スコープ **`rules:read`・`metrics:read` だけ**で足す。書き込み（ルール・ルールセット・ACME）は rproxy が `403` で断る（UI の作りに頼らない）。rproxy（v0.4.1）はトークンファイルを起動時と SIGHUP でしか読み直さないので、トークンを入れる・外すと（`ui.namespace` を決めたとき、Gateway を見せる・隠すとき）その Gateway の rproxy の Pod が 1 回入れ替わる（rollout は readiness gate・graceful shutdown で通信を止めない。`ui.namespace` が空なら今までと同じ Pod）。
 - **この Secret を読める人は、見せたすべての Gateway のルール（宛先・ラベル）と統計を読める**。書けない、鍵はない、見せていない Gateway の rproxy のトークンはない。UI の namespace の Secret を読める人を絞る（UI の chart の ServiceAccount 以外に `get secrets` を渡さない）。見せたくない Gateway は parameters で `ui: {visible: false}`、クラスの既定で隠すなら chart の `managed.parameters` に `ui: {visible: false}`。
 - NetworkPolicy：見せる Gateway の NetworkPolicy に、UI の namespace の `ui.podSelector`（既定 `app.kubernetes.io/name: rproxy-ui`）の Pod から制御 API（9443）だけを足す（certsync の 9444 は足さない）。
 - RBAC：chart は UI の namespace に Role `rproxy-gateway-ui` を作る（Secret の `create` と、`rproxy-ui-discovery` だけの `get`・`update`・`patch`・`delete`）。`controller.watchNamespaces` のときもこれで書ける。
-- fleet：fleet の Pod はすべての Gateway のルールを持つので、受け持つ Gateway が**すべて**見せるときだけ fleet の Pod を載せ、`rproxy-gateway-token` の `tokens.yaml` に UI 用のトークン（`rproxy-gateway-ui/fleet`）を足す。fleet の制御 API は NetworkPolicy で守れない（上の「ネットワーク」）。
+- fleet：fleet の Pod はすべての Gateway のルールを持つので、受け持つ Gateway が**すべて**見せるときだけ fleet の Pod を載せ、`rproxy-gateway-token` の `tokens.yaml` に UI 用のトークン（`rproxy-gateway-ui/fleet`）を足す。fleet の DaemonSet は chart のものなので、足した・外した後に `kubectl -n rproxy-gateway-system rollout restart daemonset -l app.kubernetes.io/component=fleet` で rproxy に読ませる。fleet の制御 API は NetworkPolicy で守れない（上の「ネットワーク」）。
 - 切るとき：`ui.namespace` を空に戻す（`helm upgrade`）。トークンファイルから UI のトークンが外れ、rproxy はすぐに断る。前の namespace の `rproxy-ui-discovery` はコントローラがもう見ないので手で消す（`kubectl -n <UI の namespace> delete secret rproxy-ui-discovery`）。
-- 入れ替え：UI 用のトークンはマスタートークンから導くので、マスタートークンを入れ替えると（下の「制御 API の資格と入れ替え」）一緒に変わり、コントローラが rproxy のトークンファイルと `rproxy-ui-discovery` を書き直す（UI は Secret のボリュームが更新されると読み直す。kubelet の更新まで 1〜2 分は古いトークンで断られる）。
+- 入れ替え：UI 用のトークンはマスタートークンから導くので、マスタートークンを入れ替えると（下の「制御 API の資格と入れ替え」）一緒に変わり、コントローラが rproxy のトークンファイルと `rproxy-ui-discovery` を書き直す（rproxy の Pod は入れ替わる。UI は Secret のボリュームが更新されると読み直すので、kubelet の更新まで 1〜2 分は古いトークンで断られる）。
 
 ## rproxy のルールセットの持ち主
 
