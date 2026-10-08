@@ -376,12 +376,13 @@ log "managed rproxy Deployment: $DEPLOY"
 kubectl -n "$APP" rollout status "deploy/$DEPLOY" --timeout=300s
 if [ "$TOPOLOGY" = nodeport-lb ]; then
   # HAProxy (TCP) in front of every worker's node ports: health checks every 500 ms (down after 2
-  # failures), a failed connection is tried again on another node
+  # failures); a connection that fails marks the node down at once and is tried again on another
+  # node (a node whose last rproxy pod has stopped drops connections: externalTrafficPolicy Local)
   nodeport() { kubectl -n "$APP" get svc "$DEPLOY" -o jsonpath="{.spec.ports[?(@.port==$1)].nodePort}"; }
   {
     printf 'global\n  log stdout format raw local0\ndefaults\n  mode tcp\n  log global\n  option log-health-checks\n'
-    printf '  timeout connect 1s\n  timeout client 30s\n  timeout server 30s\n  timeout check 500ms\n  retries 2\n  option redispatch 1\n'
-    printf '  default-server inter 500ms fastinter 250ms downinter 500ms fall 2 rise 2 on-marked-down shutdown-sessions\n'
+    printf '  timeout connect 200ms\n  timeout client 30s\n  timeout server 30s\n  timeout check 500ms\n  retries 3\n  option redispatch 1\n'
+    printf '  default-server inter 500ms fastinter 250ms downinter 500ms fall 2 rise 2 on-marked-down shutdown-sessions observe layer4 error-limit 1 on-error mark-down\n'
     for port in 80 443 9000; do
       np=$(nodeport $port)
       printf 'frontend f%s\n  bind :%s\n  default_backend b%s\nbackend b%s\n  balance roundrobin\n' "$port" "$port" "$port" "$port"
@@ -859,7 +860,7 @@ stop_probes
     l2-local) echo "MetalLB $METALLB_VERSION L2, externalTrafficPolicy Local." ;;
     l2-cluster) echo "MetalLB $METALLB_VERSION L2, externalTrafficPolicy Cluster." ;;
     bgp) echo "MetalLB $METALLB_VERSION BGP (FRR mode, BFD 300 ms x 3) to an FRR router ($FRR_IMAGE) with ECMP over the announcing nodes, externalTrafficPolicy Local." ;;
-    nodeport-lb) echo "NodePort Services (externalTrafficPolicy Local) behind HAProxy ($HAPROXY_IMAGE, TCP, checks every 500 ms, redispatch)." ;;
+    nodeport-lb) echo "NodePort Services (externalTrafficPolicy Local) behind HAProxy ($HAPROXY_IMAGE, TCP, checks every 500 ms, a failed connection marks the node down and goes to another)." ;;
   esac
   echo "kind 1 control plane + 3 workers, cert-manager $CERT_MANAGER_VERSION, Gateway API $GATEWAY_API_VERSION experimental."
   echo "Controller replicas 2, managed.replicas $MANAGED_REPLICAS. Extra helm flags: \`${HELM_ARGS:-none}\`. Probes: HTTP, HTTPS, TCP through the Gateway's address every 100 ms, a new connection each."
