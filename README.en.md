@@ -29,7 +29,7 @@ A Kubernetes controller for [rproxy](https://github.com/max3584/rproxy-api). It 
 | `RproxyMiddleware`, `RproxyPolicy`, `RproxyRule` (`rproxy.max3584.net/v1alpha1`) | settings Gateway API lacks (middlewares; L4 limits, bandwidth, GeoIP, passive health checks; rules verbatim) |
 | Migration (`--migrate-to`) | reads Ingress and Traefik's IngressRoute, IngressRouteTCP, IngressRouteUDP, Middleware, TLSOption ([docs/en/MIGRATION.md](docs/en/MIGRATION.md)) |
 
-Decisions and the mapping tables: [docs/en/DESIGN.md](docs/en/DESIGN.md). Gateway API conformance results: [docs/en/CONFORMANCE.md](docs/en/CONFORMANCE.md). Tenant separation, what is off by default, and permissions: [docs/en/SECURITY.md](docs/en/SECURITY.md).
+Decisions and the mapping tables: [docs/en/DESIGN.md](docs/en/DESIGN.md). Gateway API conformance results: [docs/en/CONFORMANCE.md](docs/en/CONFORMANCE.md). Tenant separation, what is off by default, and permissions: [docs/en/SECURITY.md](docs/en/SECURITY.md). The design of what the v0.4 patches add for running on Kubernetes (rproxy settings per Gateway, Kustomize, the UI, VIPs): [docs/en/DESIGN-v0.4.x.md](docs/en/DESIGN-v0.4.x.md).
 
 ## Installing
 
