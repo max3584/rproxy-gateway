@@ -38,7 +38,7 @@ When `certificateRefs` (or `spec.tls.backend.clientCertificateRef`) names a Secr
 
 ## The controller's permissions (M10)
 
-- By default the controller has a ClusterRole over Gateway API kinds, Secrets, Services, Deployments, ServiceAccounts, NetworkPolicies and Pods (patch) in every namespace (it deploys rproxy into Gateways' namespaces and certificates may be referenced from anywhere). A compromised controller can read every Secret in the cluster.
+- By default the controller has a ClusterRole over Gateway API kinds, Secrets, Services, Deployments, ServiceAccounts, NetworkPolicies, PodDisruptionBudgets and Pods (patch; `pods/status` patch for rproxy pods' readiness gate) in every namespace (it deploys rproxy into Gateways' namespaces and certificates may be referenced from anywhere). It sets the readiness gate condition only on pods that declare it. A compromised controller can read every Secret in the cluster.
 - With `controller.watchNamespaces` (`--watch-namespaces`) it watches only those namespaces (and its own), and the chart makes a Role in each. The ClusterRole keeps only GatewayClasses and namespaces (allowedRoutes selectors).
 
 ## Network

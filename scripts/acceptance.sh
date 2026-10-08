@@ -200,6 +200,11 @@ EOF2
     docker exec "$CLUSTER-frr" sysctl -qw net.ipv4.conf.eth0.send_redirects=0 || true
     FRR_IP=$(kind_ip "$CLUSTER-frr")
     metallb metallb-frr
+    # MetalLB's CRDs give ASNs a maximum beyond int32 that newer API servers refuse
+    # ("Maximum boundary value must be of type integer with format int32"): drop those maximums
+    kubectl get crd bgppeers.metallb.io -o json |
+      jq 'walk(if type == "object" and .format? == "int32" and ((.maximum? // 0) > 2147483647) then del(.maximum) else . end)' |
+      kubectl replace -f - > /dev/null
     pool=10.200.0.10-10.200.0.50
     sudo ip route replace 10.200.0.0/24 via "$FRR_IP"
     echo "FRR $FRR_IP, pool $pool (routed through FRR)"
@@ -237,6 +242,7 @@ kubectl apply --server-side -f "https://github.com/kubernetes-sigs/gateway-api/r
 image_args=()
 if [ "$SOURCE" = checkout ]; then
   log "== controller image from dist/amd64/rproxy-gateway"
+  chmod +x dist/amd64/rproxy-gateway
   docker build -q -t rproxy-gateway:acc --build-arg TARGETARCH=amd64 -f Dockerfile .
   kind load docker-image --name "$CLUSTER" rproxy-gateway:acc
   image_args=(--set controller.image.repository=rproxy-gateway --set controller.image.tag=acc)
