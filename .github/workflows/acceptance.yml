@@ -1,0 +1,46 @@
+name: acceptance
+
+# Acceptance test of the PUBLISHED chart and images (oci://ghcr.io/max3584/charts/rproxy-gateway):
+# HA, TLS and state recovery under continuous traffic on a multi-node kind cluster with MetalLB
+# and cert-manager (scripts/acceptance.sh). Heavy: run by hand only.
+on:
+  workflow_dispatch:
+    inputs:
+      chart_version:
+        description: "chart version to install"
+        required: false
+        default: "0.4.0"
+      managed_replicas:
+        description: "rproxy replicas per Gateway (managed.replicas)"
+        required: false
+        default: "2"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: acceptance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  acceptance:
+    name: acceptance (published chart)
+    # kind runs the nodes as Docker containers: on the runner VM (like e2e)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: kind
+        run: |
+          curl -sLo "$RUNNER_TEMP/kind" https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+          sudo install -m 755 "$RUNNER_TEMP/kind" /usr/local/bin/kind
+      - name: scripts/acceptance.sh
+        env:
+          CHART_VERSION: ${{ inputs.chart_version || '0.4.0' }}
+          MANAGED_REPLICAS: ${{ inputs.managed_replicas || '2' }}
+        run: scripts/acceptance.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: acceptance-logs
+          path: ${{ runner.temp }}/rproxy-gateway-acceptance

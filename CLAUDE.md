@@ -14,6 +14,7 @@ cargo run -- crds > charts/rproxy-gateway/crds/rproxy.max3584.net.yaml   # CRD �
 cargo run -- render -f manifests.yaml                # クラスタなしでルールセットを描く
 scripts/e2e.sh                # kind での e2e（Docker が要るので CI のランナーの VM で。手元にはない）
 scripts/conformance.sh        # Gateway API の conformance（同上）
+scripts/acceptance.sh         # 公開した chart・イメージの受け入れテスト（同上。手動の acceptance ワークフローだけ）
 ```
 
 ## 構成

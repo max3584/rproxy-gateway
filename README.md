@@ -84,6 +84,7 @@ cargo fmt --check
 ```
 
 - e2e（`scripts/e2e.sh`）と conformance（`scripts/conformance.sh`）は kind で動く（Docker が要る。CI の `e2e` ワークフロー）。rproxy は rproxy-api の master（手動の実行ではほかの ref も）からビルドする。
+- 受け入れテスト（`scripts/acceptance.sh`、手動の `acceptance` ワークフロー）：公開した chart とイメージを、ノード 4 つの kind・MetalLB・cert-manager に入れ、通信を流し続けながら冗長化・証明書の更新・状態の復旧を測る。
 
 ## ライセンス
 
