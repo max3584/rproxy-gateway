@@ -77,6 +77,15 @@ spec:
 - To show Gateways' rproxy, read only, in the management UI ([TCP-UDP-rproxy-ui](https://github.com/max3584/TCP-UDP-rproxy-ui)'s chart, installed apart), set the chart's `ui.namespace` to the UI's namespace. The controller writes the Secret `rproxy-ui-discovery` there (rproxy pods, the CA certificate, read-only tokens). Setting `ui.namespace`, and showing or hiding a Gateway, rolls that Gateway's rproxy pods once (rproxy v0.4.1 reads its token file only at start; with 2 or more replicas the gap is under a second). Hide a Gateway with `ui: {visible: false}` in its parameters ([docs/en/SECURITY.md](docs/en/SECURITY.md), "Showing Gateways to the UI").
 - The controller runs 2 replicas by default; they elect a leader with a Lease and only it applies rule sets (docs/en/DESIGN.md, "High availability").
 - With `fleet.enabled=true`, the chart's DaemonSet (`hostNetwork: true`) runs rproxy, which serves every Gateway. When it stops it keeps accepting for `fleet.shutdown.delay` (5 s by default) and waits for open connections up to `fleet.shutdown.drain` (25 s by default). Point the health check of the load balancer or VIP in front at `https://<node>:9443/readyz` (503 once it starts stopping), and make the delay longer than it takes to take the node out.
+- To have the fleet's pods hold VIPs directly, use `fleet.vip` (no Service or load balancer; [docs/en/DESIGN-v0.4.x.md](docs/en/DESIGN-v0.4.x.md) 7.). The `vip` sidecar (`NET_ADMIN` and `NET_RAW` in that container only) of the pod that takes a VIP's Lease adds the VIP to its node's interface and sends gratuitous ARP (unsolicited NA for IPv6). Only pods whose rproxy is ready and has its rule sets hold VIPs, and they let them go first when rproxy drains, the pod stops or the node is cordoned (a drain), so a planned move takes under a second (a lost node: the Lease's duration, 3 s by default). Keep the VIPs inside `managed.addressCIDRs`; Gateways pick VIPs with `spec.addresses` (none: all). The namespace's PodSecurity is `privileged` ([docs/en/SECURITY.md](docs/en/SECURITY.md), "fleet VIPs").
+  ```yaml
+  fleet:
+    enabled: true
+    vip:
+      enabled: true
+      addresses: ["192.0.2.10", {address: "192.0.2.11", interface: eth1, nodeSelector: {zone: a}}]
+  managed: {addressCIDRs: [192.0.2.0/24]}
+  ```
 - Chart values: [charts/rproxy-gateway/values.yaml](charts/rproxy-gateway/values.yaml). The controller's settings are passed in a ConfigMap `rproxy-gateway-config` (`RPROXY_GATEWAY_*` environment variables); `controller.extraArgs` stay arguments and win over it.
 
 ### Installing without Helm (kubectl, Kustomize)
@@ -87,7 +96,7 @@ Releases carry manifests rendered from the chart: `install.yaml` (managed), `ins
 kubectl apply --server-side -f https://github.com/max3584/rproxy-gateway/releases/download/v<version>/install.yaml
 ```
 
-With Kustomize, use [config/default](config/default) (fleet: [config/fleet](config/fleet)) as the base. The controller's settings are the `RPROXY_GATEWAY_*` of `rproxy-gateway controller --help`, changed with a `configMapGenerator` and `behavior: merge` (the ConfigMap's name gets a hash, so a change rolls the controller). Examples: [config/samples](config/samples) (image digests, managed replicas, one controller replica, the class's default `RproxyGatewayParameters` (the chart's `managed.parameters`)).
+With Kustomize, use [config/default](config/default) (fleet: [config/fleet](config/fleet)) as the base. The controller's settings are the `RPROXY_GATEWAY_*` of `rproxy-gateway controller --help`, changed with a `configMapGenerator` and `behavior: merge` (the ConfigMap's name gets a hash, so a change rolls the controller). Examples: [config/samples](config/samples) (image digests, managed replicas, one controller replica, the class's default `RproxyGatewayParameters` (the chart's `managed.parameters`), fleet VIPs (the chart's `fleet.vip`, rendered for an example VIP)).
 
 ```yaml
 apiVersion: kustomize.config.k8s.io/v1beta1

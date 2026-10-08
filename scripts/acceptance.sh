@@ -17,7 +17,7 @@
 #               health-checks every node and sends to all healthy ones (a user's own L4 balancer)
 # MODE=fleet-vip (instead of a TOPOLOGY): fleet mode with VIPs held by the fleet's pods (fleet.vip,
 # docs/DESIGN-v0.4.x.md 7.): a VIP from kind's docker network, no Service or load balancer; the runner
-# sends to the VIP. Scenarios j-o (the VIP holder's pod deleted, rollout restart, drain; its node stopped
+# sends to the VIP. Scenarios j-o (the VIP holder's pod deleted, rollout restart, drain; its node killed
 # or paused, the control plane paused); the pod deletion, rollout restart, drain and the paused control
 # plane (hold) fail over GAP_LIMIT, a lost node is recorded only.
 # Outages are measured and reported. With MANAGED_REPLICAS >= 2, a pod deletion, a node drain, a
@@ -54,7 +54,7 @@ GAP_LIMIT=${GAP_LIMIT:-3}
 # on a gap over GAP_LIMIT)
 STRICT=${STRICT:-false}
 # the scenarios to run (a b1 b2 c d e f g h i; u is added with UI=true; MODE=fleet-vip: j k l o n m, the
-# node stopped (m) last: a kind node started again may come back with another address)
+# node killed (m) last: a kind node started again may come back with another address)
 if [ "$MODE" = fleet-vip ]; then
   SCENARIOS=${SCENARIOS:-j k l o n m}
 else
@@ -495,6 +495,20 @@ fi
 log "Gateway address ($TOPOLOGY): $LB"
 
 # ---------------------------------------------------------------- checks
+# fleet-vip: the nodes with the VIP on an interface (a paused or stopped node is not listed)
+vip_nodes() {
+  local n
+  for n in $WORKERS; do
+    if docker exec "$n" ip -o addr show 2> /dev/null | grep -q " $VIP/"; then echo "$n"; fi
+  done
+}
+vip_once() { [ "$(vip_nodes | wc -l)" -eq 1 ]; }
+# vip_moved <node>: exactly one node other than <node> has the VIP
+vip_moved() { local n; n=$(vip_nodes); [ -n "$n" ] && [ "$n" != "$1" ] && [ "$(echo "$n" | wc -l)" -eq 1 ]; }
+vip_holder() { kubectl -n "$NS" get lease "$LEASE" -o jsonpath='{.spec.holderIdentity}' 2> /dev/null; }
+pod_node() { kubectl -n "$RP_NS" get pod "$1" -o jsonpath='{.spec.nodeName}' 2> /dev/null; }
+# fleet-vip: a UDP datagram to the VIP is answered (from the VIP: the client only takes answers from where it sent)
+udp_ok() { [ "$(echo 'echo vip-udp' | timeout 3 nc -u -w 1 "$LB" 9001 2> /dev/null | head -c 7)" = vip-udp ]; }
 http_code() { curl -s -o /dev/null -w '%{http_code}' --connect-timeout 1 --max-time 2 "$@" || true; }
 lb_host_ok() { [ "$(http_code -H "Host: $1" "http://$LB/")" = 200 ]; }
 # a pod's rule set: HTTP, HTTPS (verified against the CA) and TCP straight to the pod IP
@@ -521,9 +535,15 @@ all_pods_serve() {
 cond() {  # cond <kind/name> <jsonpath filter>
   kubectl -n "$APP" get "$1" -o jsonpath="$2"
 }
+# every listener Programmed (3; fleet-vip: 4 with the UDP one)
+listeners_programmed() {
+  local l
+  l=$(cond gateway/acc '{.status.listeners[*].conditions[?(@.type=="Programmed")].status}')
+  [ -n "$l" ] && ! tr ' ' '\n' <<< "$l" | grep -qvx True && [ "$(wc -w <<< "$l")" -ge 3 ]
+}
 statuses_ok() {
   [ "$(cond gateway/acc '{.status.conditions[?(@.type=="Programmed")].status}')" = True ] &&
-    [ "$(cond gateway/acc '{.status.listeners[*].conditions[?(@.type=="Programmed")].status}')" = "True True True" ] &&
+    listeners_programmed &&
     [ "$(cond httproute/echo '{.status.parents[*].conditions[?(@.type=="Accepted")].status}')" = "True True" ] &&
     [ "$(cond httproute/echo '{.status.parents[*].conditions[?(@.type=="ResolvedRefs")].status}')" = "True True" ] &&
     [ "$(cond tcproute/echo '{.status.parents[*].conditions[?(@.type=="Accepted")].status}')" = True ]
@@ -538,6 +558,45 @@ secret_serial() {
   kubectl -n "$APP" get secret secure-cert -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -serial | cut -d= -f2
 }
 secret_changed() { local s; s=$(secret_serial); [ -n "$s" ] && [ "$s" != "$1" ]; }
+
+if [ "$MODE" = fleet-vip ]; then
+  # UDP through the VIP (rproxy answers from the address the datagram came to): a UDP listener and an
+  # echo backend (agnhost netexec answers "echo <text>" with <text>)
+  cat << YAML | kubectl apply -f - > /dev/null
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: udp-echo, namespace: $APP}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: udp-echo}}
+  template:
+    metadata: {labels: {app: udp-echo}}
+    spec:
+      containers:
+        - name: echo
+          image: registry.k8s.io/e2e-test-images/agnhost:2.53
+          args: [netexec, --http-port=8080, --udp-port=8081]
+          readinessProbe: {httpGet: {path: /healthz, port: 8080}, periodSeconds: 2}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: udp-echo, namespace: $APP}
+spec:
+  selector: {app: udp-echo}
+  ports: [{name: udp, port: 8081, protocol: UDP}]
+---
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: UDPRoute
+metadata: {name: udp-echo, namespace: $APP}
+spec:
+  parentRefs: [{name: acc, sectionName: udp}]
+  rules: [{backendRefs: [{name: udp-echo, port: 8081}]}]
+YAML
+  kubectl -n "$APP" patch gateway acc --type=json -p '[{"op":"add","path":"/spec/listeners/-","value":{"name":"udp","port":9001,"protocol":"UDP"}}]' > /dev/null
+  kubectl -n "$APP" rollout status deploy/udp-echo --timeout=300s
+  wait_for 120 udp_ok || { echo "UDP through the VIP never answered"; exit 1; }
+  log "UDP through the VIP answers"
+fi
 
 log "== baseline"
 wait_for 180 all_pods_serve || { echo "the rproxy pods never served"; exit 1; }
@@ -733,21 +792,12 @@ settle() {
   wait_for "$RECOVERY_TIMEOUT" probes_ok_since "$t" || return 1
   # pods being deleted are gone (the next scenario starts from a clean placement)
   wait_for 120 none_terminating || true
-  if [ "$MODE" = fleet-vip ]; then wait_for 60 vip_once || return 1; fi
+  if [ "$MODE" = fleet-vip ]; then
+    wait_for 60 vip_once || return 1
+    wait_for 60 udp_ok || return 1
+  fi
   sleep 5
 }
-# fleet-vip: the nodes with the VIP on an interface (a paused or stopped node is not listed)
-vip_nodes() {
-  local n
-  for n in $WORKERS; do
-    if docker exec "$n" ip -o addr show 2> /dev/null | grep -q " $VIP/"; then echo "$n"; fi
-  done
-}
-vip_once() { [ "$(vip_nodes | wc -l)" -eq 1 ]; }
-# vip_moved <node>: exactly one node other than <node> has the VIP
-vip_moved() { local n; n=$(vip_nodes); [ -n "$n" ] && [ "$n" != "$1" ] && [ "$(echo "$n" | wc -l)" -eq 1 ]; }
-vip_holder() { kubectl -n "$NS" get lease "$LEASE" -o jsonpath='{.spec.holderIdentity}' 2> /dev/null; }
-pod_node() { kubectl -n "$RP_NS" get pod "$1" -o jsonpath='{.spec.nodeName}' 2> /dev/null; }
 none_terminating() {
   [ -z "$(kubectl get pods -A -l 'app.kubernetes.io/name in (rproxy, rproxy-gateway)' -o json | jq -r '.items[] | select(.metadata.deletionTimestamp != null) | .metadata.name')" ]
 }
@@ -1088,15 +1138,27 @@ scenario_l() {
   vip_where
   log "== $label: $HOLDER_NODE; placement: $(placement)"
   t0=$(now_ms)
-  kubectl drain "$HOLDER_NODE" --ignore-daemonsets --delete-emptydir-data --timeout=300s > "$work/drain.log" 2>&1 || ok=FAIL
-  t_drained=$(now_ms)
+  # the VIP moves when the node is cordoned, while the drain evicts the other pods
+  kubectl drain "$HOLDER_NODE" --ignore-daemonsets --delete-emptydir-data --timeout=300s > "$work/drain.log" 2>&1 &
+  local drain=$!
   moved "$HOLDER_NODE" || ok=FAIL
+  wait "$drain" || ok=FAIL
+  t_drained=$(now_ms)
   settle || ok=FAIL
   record "$label" "$t0" "$(now_ms)" "$(secs $((MOVED_AT - t0)))s" "$ok" \
     "VIP $HOLDER_NODE → ${MOVED_TO}after $(secs $((MOVED_AT - t0)))s; kubectl drain took $(secs $((t_drained - t0)))s (the fleet's pods stay: a DaemonSet)" limit
   kubectl uncordon "$HOLDER_NODE" > /dev/null
 }
-# node_lost <stop|pause> <label>: the VIP holder's node stopped or paused (the Lease expires: record only)
+# first_ok <from ms>: seconds from <from> to the first 200 after the first failure (any probe)
+first_ok() {
+  local p t best=""
+  for p in http https tcp; do
+    t=$(awk -v s="$1" '$1 >= s { if ($2 != "200") bad = 1; else if (bad) { print $1; exit } }' "$work/probe-$p.log")
+    if [ -n "$t" ] && { [ -z "$best" ] || [ "$t" -lt "$best" ]; }; then best=$t; fi
+  done
+  if [ -n "$best" ]; then secs $((best - $1)); else echo "–"; fi
+}
+# node_lost <kill|pause> <label>: the VIP holder's node killed or paused (the Lease expires: record only)
 node_lost() {
   local how=$1 label=$2 t0 ok=PASS t_ok t_end notes node
   vip_where
@@ -1108,7 +1170,7 @@ node_lost() {
   sleep 3
   if wait_for "$RECOVERY_TIMEOUT" probes_stable 5; then t_ok=$(($(now_ms) - 5000)); else t_ok=$(now_ms) ok=FAIL; fi
   t_end=$(now_ms)
-  notes="VIP $node → ${MOVED_TO}after $(secs $((MOVED_AT - t0)))s; steady again (5 s without a failure) by $(secs $((t_ok - t0)))s"
+  notes="VIP $node → ${MOVED_TO}after $(secs $((MOVED_AT - t0)))s; first 200 again after $(first_ok "$t0")s; steady again (5 s without a failure) by $(secs $((t_ok - t0)))s (requests rproxy sends to the echo pod on that node fail until the node is NotReady)"
   if [ "$how" = pause ]; then
     sleep 15
     docker unpause "$node" > /dev/null
@@ -1123,15 +1185,19 @@ node_lost() {
     fi
   else
     docker start "$node" > /dev/null
+    # the address the node comes back with (docker may give it another one)
+    notes+="; started again as $(kind_ip "$node")"
   fi
   wait_for 300 node_ready "$node" || ok=FAIL
   settle || ok=FAIL
   record "$label" "$t0" "$t_end" "$(secs $((t_ok - t0)))s" "$ok" "$notes"
 }
 scenario_m() {
-  local label="m. VIP holder's node lost (docker stop)"
+  # docker kill: lost at once (docker stop shuts the node down cleanly: its pods stop and the VIP is
+  # handed over like a drain)
+  local label="m. VIP holder's node lost (docker kill)"
   only_fleet "$label" || return 0
-  node_lost stop "$label"
+  node_lost kill "$label"
 }
 scenario_n() {
   local label="n. VIP holder's node paused (docker pause, then unpause)"

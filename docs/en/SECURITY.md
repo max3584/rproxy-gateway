@@ -71,6 +71,16 @@ How the management UI (TCP-UDP-rproxy-ui's chart, installed apart) reads the rpr
 - Turning it off: set `ui.namespace` back to empty (`helm upgrade`). The UI's tokens leave the token files and rproxy refuses them at once. The controller no longer looks at the old namespace: delete `rproxy-ui-discovery` there by hand (`kubectl -n <UI namespace> delete secret rproxy-ui-discovery`).
 - Rotation: the UI's tokens derive from the master token, so rotating it ("Control API credentials and rotation" below) changes them too, and the controller writes the rproxy token files and `rproxy-ui-discovery` again (the rproxy pods roll; the UI reads the Secret volume again when it changes, so until the kubelet updates it, 1 to 2 minutes, the old token is refused).
 
+## fleet VIPs (`fleet.vip`)
+
+When the fleet's pods hold VIPs directly ([DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) 7.):
+
+- Only the `vip` container runs as root with `NET_ADMIN` and `NET_RAW` (everything else dropped, `readOnlyRootFilesystem`, `allowPrivilegeEscalation: false`). It adds and removes addresses on the node's network (hostNetwork) and sends and hears ARP and NDP. The fleet uses hostNetwork already, so the namespace's PodSecurity stays `privileged` (`baseline` does not allow hostNetwork).
+- Only the `vip` container has Kubernetes API credentials: the pod keeps `automountServiceAccountToken: false`, and the token of the ServiceAccount `rproxy-gateway-vip` is mounted (`projected`) into `vip` alone (rproxy and certsync still do not use the API). Its permissions: get, list, watch and update on the VIPs' Leases (named in `resourceNames`), reading pods in the controller's namespace (its readiness gate) and nodes (labels, cordon). The chart makes the Leases; `vip` cannot create any. A compromised `vip` can change which node has a VIP and read that namespace's pods and the nodes.
+- VIPs are only those the administrator lists in the chart, inside `managed.addressCIDRs` and not another Service's or a node's address (the controller checks; `vip` does not hold a VIP outside the ranges either). Gateways can pick VIPs but not create them.
+- The fleet's rules listen on `0.0.0.0`, so traffic to any VIP reaches a Gateway whose port matches (the fleet is one trust domain).
+- `/metrics` (9445) answers on the node's IP without authentication (whether the pod holds each VIP and how often they moved). Filter traffic to the nodes from outside with a firewall ("Network" above).
+
 ## Owners of rproxy's rule sets
 
 rproxy makes a rule set belong to the name of the token that created it (other non-admin tokens cannot change it). The controller's token is always named `rproxy-gateway` whatever its value, so after a token rotation (and after re-PUTs once rproxy restarts) the owner stays the same. The tokens' `allow_rulesets` are `k8s/` for the fleet's and, for each managed Gateway's, only that Gateway's rule set (`k8s/<namespace>/<name>`).
