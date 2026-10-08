@@ -86,7 +86,7 @@ spec:
 kubectl apply --server-side -f https://github.com/max3584/rproxy-gateway/releases/download/v<版>/install.yaml
 ```
 
-Kustomize では [config/default](config/default)（fleet は [config/fleet](config/fleet)）を base にする。コントローラの設定は `rproxy-gateway controller --help` の `RPROXY_GATEWAY_*` で、`configMapGenerator` の `behavior: merge` で変える（ConfigMap の名前にハッシュが付くので、変えるとコントローラが入れ替わる）。例は [config/samples](config/samples)（イメージのダイジェスト固定、managed の replicas、コントローラ 1 台）。
+Kustomize では [config/default](config/default)（fleet は [config/fleet](config/fleet)）を base にする。コントローラの設定は `rproxy-gateway controller --help` の `RPROXY_GATEWAY_*` で、`configMapGenerator` の `behavior: merge` で変える（ConfigMap の名前にハッシュが付くので、変えるとコントローラが入れ替わる）。例は [config/samples](config/samples)（イメージのダイジェスト固定、managed の replicas、コントローラ 1 台、クラスの既定の `RproxyGatewayParameters`（chart の `managed.parameters`））。
 
 ```yaml
 apiVersion: kustomize.config.k8s.io/v1beta1

@@ -86,7 +86,7 @@ Releases carry manifests rendered from the chart: `install.yaml` (managed), `ins
 kubectl apply --server-side -f https://github.com/max3584/rproxy-gateway/releases/download/v<version>/install.yaml
 ```
 
-With Kustomize, use [config/default](config/default) (fleet: [config/fleet](config/fleet)) as the base. The controller's settings are the `RPROXY_GATEWAY_*` of `rproxy-gateway controller --help`, changed with a `configMapGenerator` and `behavior: merge` (the ConfigMap's name gets a hash, so a change rolls the controller). Examples: [config/samples](config/samples) (image digests, managed replicas, one controller replica).
+With Kustomize, use [config/default](config/default) (fleet: [config/fleet](config/fleet)) as the base. The controller's settings are the `RPROXY_GATEWAY_*` of `rproxy-gateway controller --help`, changed with a `configMapGenerator` and `behavior: merge` (the ConfigMap's name gets a hash, so a change rolls the controller). Examples: [config/samples](config/samples) (image digests, managed replicas, one controller replica, the class's default `RproxyGatewayParameters` (the chart's `managed.parameters`)).
 
 ```yaml
 apiVersion: kustomize.config.k8s.io/v1beta1

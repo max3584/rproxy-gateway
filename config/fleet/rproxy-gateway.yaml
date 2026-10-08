@@ -56,7 +56,7 @@ rules:
     resources: [gateways/status, httproutes/status, grpcroutes/status, tlsroutes/status, tcproutes/status, udproutes/status, listenersets/status, backendtlspolicies/status]
     verbs: [get, update, patch]
   - apiGroups: [rproxy.max3584.net]
-    resources: [rproxymiddlewares, rproxypolicies, rproxyrules]
+    resources: [rproxymiddlewares, rproxypolicies, rproxyrules, rproxygatewayparameters]
     verbs: [get, list, watch]
   - apiGroups: [rproxy.max3584.net]
     resources: [rproxypolicies/status, rproxyrules/status]
@@ -91,6 +91,20 @@ rules:
   - apiGroups: [discovery.k8s.io]
     resources: [endpointslices]
     verbs: [get, list, watch]
+---
+# namespace admins write their Gateways' RproxyGatewayParameters (spec.infrastructure.parametersRef);
+# what those may set is bounded by the GatewayClass's parameters (policy). Not given to "edit".
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: rproxy-gateway-parameters-edit
+  labels:
+    app.kubernetes.io/part-of: rproxy-gateway
+    rbac.authorization.k8s.io/aggregate-to-admin: "true"
+rules:
+  - apiGroups: [rproxy.max3584.net]
+    resources: [rproxygatewayparameters]
+    verbs: [get, list, watch, create, update, patch, delete, deletecollection]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

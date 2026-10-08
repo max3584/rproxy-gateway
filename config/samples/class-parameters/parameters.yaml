@@ -1,0 +1,13 @@
+apiVersion: rproxy.max3584.net/v1alpha1
+kind: RproxyGatewayParameters
+metadata:
+  name: rproxy-default
+  namespace: rproxy-gateway-system
+spec:
+  replicas: 2
+  pod:
+    resources:
+      rproxy: {requests: {cpu: 100m, memory: 64Mi}, limits: {memory: 256Mi}}
+  policy:
+    maxReplicas: 5
+    gatewayOverrides: [pod.tolerations]
