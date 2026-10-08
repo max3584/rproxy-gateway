@@ -9,6 +9,7 @@
 
 pub mod bootstrap;
 pub mod cache;
+pub mod fleet_vip;
 pub mod leader;
 pub mod provision;
 pub mod status;
@@ -411,8 +412,32 @@ async fn reconcile_all(
 		}
 		Mode::Managed(_) => vec![],
 	};
+	// fleet with VIPs: which can be used, who holds them
+	let vips = match &cfg.mode {
+		Mode::Fleet(f) if !f.vips.is_empty() => {
+			let host_ips: Vec<String> = fleet_pods.iter().filter_map(|e| e.host_ip.clone()).collect();
+			let unusable: BTreeMap<String, String> = f
+				.vips
+				.iter()
+				.filter_map(|v| fleet_vip::unusable(&world, v, &cfg.address_cidrs, &host_ips).map(|why| (v.clone(), why)))
+				.collect();
+			{
+				let mut seen = VIPS_SEEN.lock().unwrap();
+				for why in unusable.values() {
+					if seen.insert(why.clone()) {
+						warn!(reason = %why, "a VIP is not used");
+					}
+				}
+			}
+			let holders = fleet_vip::holders(client, &cfg.namespace, &f.vips).await;
+			soon |= holders.values().any(|h| matches!(h, fleet_vip::Holder::Unheld(_)));
+			Some(VipState { unusable, holders })
+		}
+		_ => None,
+	};
 	let pass = Pass {
 		client,
+		vips: vips.as_ref(),
 		cache,
 		rp,
 		cfg,
@@ -622,8 +647,18 @@ async fn write_ancestors<'a>(
 }
 
 /// What every Gateway's pass reads.
+/// fleet with VIPs: the VIPs that cannot be used (why) and who holds each.
+struct VipState {
+	unusable: BTreeMap<String, String>,
+	holders: BTreeMap<String, fleet_vip::Holder>,
+}
+
+/// Why VIPs are not used, already logged.
+static VIPS_SEEN: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
+
 struct Pass<'a> {
 	client: &'a kube::Client,
+	vips: Option<&'a VipState>,
 	cache: &'a cache::Cache,
 	rp: &'a Client,
 	cfg: &'a Config,
@@ -813,30 +848,42 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 		}
 		Mode::Fleet(f) => {
 			let eps = p.fleet_pods.to_vec();
-			let addrs = if f.addresses.is_empty() {
-				let mut a: Vec<String> = eps.iter().filter_map(|e| e.host_ip.clone()).collect();
-				a.sort();
-				a.dedup();
-				a
+			if let Some(v) = p.vips {
+				let addrs = match fleet_vip::gateway_vips(&plan.addresses, &f.vips, &v.unusable, &v.holders) {
+					Ok(a) => a,
+					Err(e) => {
+						plan.address_error.get_or_insert(e);
+						vec![]
+					}
+				};
+				let addrs = addrs.into_iter().map(|a| ("IPAddress".to_string(), a)).collect();
+				(addrs, eps)
 			} else {
-				f.addresses.clone()
-			};
-			let addrs = if plan.addresses.is_empty() {
-				addrs
-			} else {
-				// the fleet's addresses are fixed: an address asked for must be one of them
-				if let Some(a) = plan.addresses.iter().find(|a| !addrs.contains(a)) {
-					plan.address_error.get_or_insert(format!("{a} is not an address of the rproxy fleet ({})", addrs.join(", ")));
-				}
-				plan.addresses.clone()
-			};
-			(
-				addrs
-					.into_iter()
-					.map(|a| (if a.parse::<std::net::IpAddr>().is_ok() { "IPAddress" } else { "Hostname" }.to_string(), a))
-					.collect(),
-				eps,
-			)
+				let addrs = if f.addresses.is_empty() {
+					let mut a: Vec<String> = eps.iter().filter_map(|e| e.host_ip.clone()).collect();
+					a.sort();
+					a.dedup();
+					a
+				} else {
+					f.addresses.clone()
+				};
+				let addrs = if plan.addresses.is_empty() {
+					addrs
+				} else {
+					// the fleet's addresses are fixed: an address asked for must be one of them
+					if let Some(a) = plan.addresses.iter().find(|a| !addrs.contains(a)) {
+						plan.address_error.get_or_insert(format!("{a} is not an address of the rproxy fleet ({})", addrs.join(", ")));
+					}
+					plan.addresses.clone()
+				};
+				(
+					addrs
+						.into_iter()
+						.map(|a| (if a.parse::<std::net::IpAddr>().is_ok() { "IPAddress" } else { "Hostname" }.to_string(), a))
+						.collect(),
+					eps,
+				)
+			}
 		}
 	};
 	let addresses = if plan.address_error.is_some() { vec![] } else { addresses };
