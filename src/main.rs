@@ -137,6 +137,15 @@ struct ControllerArgs {
 	/// fleet: read RproxyRules (off by default: fleet pods are shared by every Gateway).
 	#[arg(long, env = "RPROXY_GATEWAY_FLEET_RPROXY_RULES")]
 	fleet_rproxy_rules: bool,
+	/// The UI's namespace (TCP-UDP-rproxy-ui's chart): the controller writes the Secret
+	/// `rproxy-ui-discovery` there with the rproxy pods of the Gateways shown to the UI (their
+	/// parameters' `ui.visible`), the control API's CA certificate and read-only tokens
+	/// (`rules:read`, `metrics:read`). Empty: off (docs/SECURITY.md).
+	#[arg(long, env = "RPROXY_GATEWAY_UI_NAMESPACE", default_value = "")]
+	ui_namespace: String,
+	/// The labels of the UI's pods (`k=v,k2=v2`): the Gateways' NetworkPolicy lets them reach the control API.
+	#[arg(long, env = "RPROXY_GATEWAY_UI_POD_SELECTOR", default_value = "app.kubernetes.io/name=rproxy-ui,app.kubernetes.io/component=ui")]
+	ui_pod_selector: String,
 	/// Leader election: run several replicas, one of which acts (a Lease in the controller's namespace).
 	#[arg(long, env = "RPROXY_GATEWAY_LEADER_ELECT", default_value_t = true, action = clap::ArgAction::Set)]
 	leader_elect: bool,
@@ -305,6 +314,10 @@ fn main() -> anyhow::Result<()> {
 				fleet_rproxy_rules: a.fleet_rproxy_rules,
 				cross_namespace_secrets: a.cross_namespace_secrets,
 				watch_namespaces: a.watch_namespaces.clone(),
+				ui: (!a.ui_namespace.trim().is_empty()).then(|| rproxy_gateway::controller::provision::UiAccess {
+					namespace: a.ui_namespace.trim().to_string(),
+					pod_selector: rproxy_gateway::controller::provision::parse_selector(&a.ui_pod_selector),
+				}),
 				leader: a.leader_elect.then(|| {
 					let identity = a
 						.leader_identity

@@ -11,6 +11,7 @@ What the controller trusts, and what tenants (whoever can write Gateways and rou
 | Cluster administrator | set the chart values and controller flags | — |
 | Gateway owner (a namespace's editor) | write Gateways, routes, RproxyRules, RproxyMiddlewares in their namespace | use Services or Secrets of other namespaces without a ReferenceGrant there; take cluster IPs; use other Gateways' keys or rproxy |
 | A managed rproxy pod | read its Gateway's certificates (a mounted Secret) | use the Kubernetes API (no token, no RBAC); use other Gateways' credentials |
+| Whoever can read Secrets in the UI's namespace (with `ui.namespace`) | read the rules (targets, labels) and statistics of the rproxy of Gateways shown to the UI | write or delete rules; read keys; reach the rproxy of Gateways not shown |
 
 ## Managed and fleet
 
@@ -55,7 +56,20 @@ When `certificateRefs` (or `spec.tls.backend.clientCertificateRef`) names a Secr
 - The controller reads at most 8 MiB of rproxy's answers and 1 MiB of certsync's. It talks only to managed pods owned by the Gateway's Deployment's ReplicaSet (`rproxy-<id>-...`).
 - Rotation:
   - CA: `kubectl -n rproxy-gateway-system delete secret rproxy-gateway-ca rproxy-gateway-api-tls`, then restart the controller: every control API certificate is issued again by the new CA and the rproxy pods roll
-  - master token: `kubectl -n rproxy-gateway-system delete secret rproxy-gateway-token`, then restart the controller: the per-Gateway tokens change and the rproxy pods roll (restart the DaemonSet in fleet mode)
+  - master token: `kubectl -n rproxy-gateway-system delete secret rproxy-gateway-token`, then restart the controller: the per-Gateway tokens change and the rproxy pods roll (restart the DaemonSet in fleet mode). The UI's tokens (`ui.namespace`) change too and `rproxy-ui-discovery` is written again
+
+## Showing Gateways to the UI (`ui.namespace`)
+
+How the management UI (TCP-UDP-rproxy-ui's chart, installed apart) reads the rproxy on Kubernetes ([DESIGN-v0.4.x.md](DESIGN-v0.4.x.md), 4.). **Off by default** (`ui.namespace: ""`: nothing is made). Both sides must opt in: the administrator sets the chart's `ui.namespace` (`--ui-namespace`), and the Gateway's `RproxyGatewayParameters` do not set `ui.visible` to false (default true; when the GatewayClass sets false, a Gateway cannot set true).
+
+- The controller writes the Secret `rproxy-ui-discovery` in the UI's namespace: `nodes.yaml` (each shown Gateway's rproxy pods, `https://<pod IP>:9443`, and their certificate's name), `ca.crt` (the control API CA's certificate only: **no key**), and per Gateway the UI's token `token-<id>`. It deletes the Secret when no Gateway is shown.
+- The UI's token is derived from the master token (HMAC-SHA256 of `rproxy-gateway-ui/<id>`; not the controller's token). It is added to each Gateway's rproxy token file as `rproxy-ui` with the scopes **`rules:read` and `metrics:read` only**: rproxy refuses writes (rules, rule sets, ACME) with `403`, whatever the UI does. rproxy (v0.4.1) reads its token file only at start and on SIGHUP, so adding or removing the token (setting `ui.namespace`, showing or hiding a Gateway) rolls that Gateway's rproxy pods once (the rollout keeps traffic flowing: readiness gate, graceful shutdown; with `ui.namespace` empty the pods stay as they are).
+- **Whoever can read this Secret can read the rules (targets, labels) and statistics of every Gateway shown.** They cannot write, get no key, and get no token of Gateways not shown. Limit who can read Secrets in the UI's namespace (no `get secrets` beyond the UI chart's ServiceAccount). Hide a Gateway with `ui: {visible: false}` in its parameters; hide a class's Gateways by default with `ui: {visible: false}` in the chart's `managed.parameters`.
+- NetworkPolicy: a shown Gateway's NetworkPolicy also lets the pods of `ui.podSelector` (default `app.kubernetes.io/name: rproxy-ui`, `app.kubernetes.io/component: ui`) in the UI's namespace reach the control API (9443) only (not certsync's 9444).
+- RBAC: the chart makes a Role `rproxy-gateway-ui` in the UI's namespace (Secrets `create`; `get`, `update`, `patch`, `delete` of `rproxy-ui-discovery` only). It works with `controller.watchNamespaces` too.
+- fleet: fleet pods hold every Gateway's rules, so they are listed (and the UI's token `rproxy-gateway-ui/fleet` added to `rproxy-gateway-token`'s `tokens.yaml`) only when **every** Gateway they serve is shown. The fleet's DaemonSet is the chart's: after the token is added or removed, have rproxy read it with `kubectl -n rproxy-gateway-system rollout restart daemonset -l app.kubernetes.io/component=fleet`. The fleet's control API is not protected by a NetworkPolicy ("Network" above).
+- Turning it off: set `ui.namespace` back to empty (`helm upgrade`). The UI's tokens leave the token files and rproxy refuses them at once. The controller no longer looks at the old namespace: delete `rproxy-ui-discovery` there by hand (`kubectl -n <UI namespace> delete secret rproxy-ui-discovery`).
+- Rotation: the UI's tokens derive from the master token, so rotating it ("Control API credentials and rotation" below) changes them too, and the controller writes the rproxy token files and `rproxy-ui-discovery` again (the rproxy pods roll; the UI reads the Secret volume again when it changes, so until the kubelet updates it, 1 to 2 minutes, the old token is refused).
 
 ## Owners of rproxy's rule sets
 

@@ -21,7 +21,7 @@ scripts/acceptance.sh         # 受け入れテスト（同上。手動の accep
 ## 構成
 
 - `src/render/`：変換（純粋な関数。`World` のスナップショット → `GatewayPlan`）。`http.rs`（HTTPRoute）、`l4.rs`（TLS・TCP・UDP）、`policy.rs`（RproxyPolicy・RproxyRule）、`params.rs`（RproxyGatewayParameters の参照・検証・合わせ方。docs/DESIGN-v0.4.x.md の A）、`migrate.rs`・`traefik_mw.rs`（Ingress・Traefik、rproxy-api の `contrib/traefik2rproxy.py` と同じ変換）、`backends.rs`（EndpointSlice）、`hostname.rs`、`status.rs`
-- `src/controller/`：watch（`cache.rs`）、反映のループと `sync_pod`（`mod.rs`）、状態（`status.rs`）、rproxy の配置（`provision.rs`）、CA・トークンの Secret（`bootstrap.rs`）。`tests.rs` は制御 API の文書どおりの偽の rproxy
+- `src/controller/`：watch（`cache.rs`）、反映のループと `sync_pod`（`mod.rs`）、状態（`status.rs`）、rproxy の配置（`provision.rs`）、CA・トークンの Secret（`bootstrap.rs`）、UI に見せる発見の Secret と UI 用のトークン（`ui.rs`。`--ui-namespace`）。`tests.rs` は制御 API の文書どおりの偽の rproxy
 - `src/rproxy/`：制御 API のクライアントと形。`src/certsync.rs`：rproxy の Pod の中で証明書をファイルにする
 - `charts/rproxy-gateway/`：Helm chart（`crds/` は `rproxy-gateway crds` の出力。コントローラの設定は ConfigMap `rproxy-gateway-config` の `RPROXY_GATEWAY_*`）。`config/`：chart から描いた Kustomize の base（`default`・`fleet`・`crd`）と `samples/`（手で書く overlay の例）。`Dockerfile`（コントローラ）、`Dockerfile.rproxy`（rproxy）は Alpine で、Alpine のジョブが作った musl のバイナリを入れる
 - 決めごとは docs/DESIGN.md、移行は docs/MIGRATION.md、conformance の結果は docs/CONFORMANCE.md（どれも日本語・英語）
@@ -38,5 +38,6 @@ scripts/acceptance.sh         # 受け入れテスト（同上。手動の accep
 - PR のブランチに追加で push する前に、その PR がまだ開いているか（`gh pr view <n> --json state`）を確かめる。マージ後に push したコミットは main に入らない。
 - e2e・conformance は rproxy-api の master（`RPROXY_REF`、手動の実行ではタグやブランチも指定できる）から rproxy をビルドする。rproxy v0.4.0 が出たら、そのタグに固定するか考える。
 - managed の rproxy の Pod・Service の形（終わり方（preStop・`RPROXY_SHUTDOWN_*`）、readiness gate、プローブ、PDB、externalTrafficPolicy）を変えたら、受け入れテストをブランチから回す（`gh workflow run acceptance.yml --ref <branch> -f source=checkout -f topology=<形>`）。replicas が 2 以上では Pod の削除・drain・rollout restart・parameters の変更の途切れが `GAP_LIMIT`（既定 3 秒）を超えると失敗する（l2-local・l2-cluster・nodeport-lb。`bgp` とノードの喪失は CNI・ロードバランサ・ネットワークの側の時間なので記録だけ）。
+- UI（C）を変えたら受け入れテストを `-f source=checkout -f ui=true -f ui_ref=<UI のブランチ> -f scenarios=u` で回す（UI の chart とイメージを UI のリポジトリから作り、同梱の MariaDB で入れる。シナリオ u：発見の Secret、UI の見るだけの表示と 409、UI のトークンの 200 / 403、利用量の行、UI と MariaDB の Pod の再起動でデータが残ること。時間は記録だけ）。
 - 変換を変えたら、rproxy が受け付けるか（`tests/rproxy.rs`）と conformance の結果（docs/CONFORMANCE.md）も確かめる。`SUPPORTED_FEATURES`（`src/controller/mod.rs`）と `scripts/conformance.sh` の `FEATURES` を揃える。
 - バージョンは rproxy-api・UI と別々に進める。最初のリリース（v0.4.0）は rproxy v0.4.0 と一緒に出す。

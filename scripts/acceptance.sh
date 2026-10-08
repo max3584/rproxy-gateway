@@ -41,6 +41,14 @@ GAP_LIMIT=${GAP_LIMIT:-3}
 # true: a pod deletion, drain, rollout or parameters change also fails on any failed request (not only
 # on a gap over GAP_LIMIT)
 STRICT=${STRICT:-false}
+# the scenarios to run (a b1 b2 c d e f g h i; u is added with UI=true)
+SCENARIOS=${SCENARIOS:-a b1 b2 c d e f g h i}
+# true: also the UI chart of UI_DIR (a checkout of TCP-UDP-rproxy-ui) with the bundled MariaDB, the
+# controller's ui.namespace, and scenario u
+UI=${UI:-false}
+UI_DIR=${UI_DIR:-../TCP-UDP-rproxy-ui}
+# the UI's usage collection interval in scenario u (the chart's default is 60)
+UI_USAGE_SECS=${UI_USAGE_SECS:-15}
 FRR_IMAGE=${FRR_IMAGE:-quay.io/frrouting/frr:9.1.0}
 HAPROXY_IMAGE=${HAPROXY_IMAGE:-haproxy:3.0-alpine}
 case "$TOPOLOGY" in l2-local | l2-cluster | bgp | nodeport-lb) ;; *) echo "TOPOLOGY: l2-local, l2-cluster, bgp or nodeport-lb"; exit 1 ;; esac
@@ -89,6 +97,11 @@ dump() {
   docker logs "$CLUSTER-frr" > "$d/frr.log" 2>&1 || true
   docker exec "$CLUSTER-frr" vtysh -c 'show bgp summary' -c 'show bfd peers brief' -c 'show ip route' > "$d/frr-state.txt" 2>&1 || true
   docker logs "$CLUSTER-lb" > "$d/haproxy.log" 2>&1 || true
+  if [ "$UI" = true ]; then
+    kubectl -n rproxy-ui get all,pvc,secret,networkpolicy -o wide > "$d/ui.txt" 2>&1 || true
+    kubectl -n rproxy-ui logs -l app.kubernetes.io/part-of=rproxy-ui --prefix --all-containers --tail=-1 > "$d/ui.log" 2>&1 || true
+    kubectl -n "$APP" get networkpolicy -o yaml > "$d/networkpolicies.yaml" 2>&1 || true
+  fi
   if [ -n "${GITHUB_ACTIONS:-}" ]; then
     echo "::group::controller log (tail)"; tail -n 200 "$d/controller.log" || true; echo "::endgroup::"
   fi
@@ -105,6 +118,11 @@ finish() {
 trap finish EXIT
 
 for c in kind kubectl helm jq curl openssl docker; do command -v $c > /dev/null || { echo "$c is needed"; exit 1; }; done
+if [ "$UI" = true ]; then
+  command -v node > /dev/null || { echo "node is needed (UI=true)"; exit 1; }
+  [ -f "$UI_DIR/charts/rproxy-ui/Chart.yaml" ] || { echo "UI_DIR ($UI_DIR) has no charts/rproxy-ui"; exit 1; }
+  case " $SCENARIOS " in *" u "*) ;; *) SCENARIOS="$SCENARIOS u" ;; esac
+fi
 
 # ---------------------------------------------------------------- cluster
 log "== cluster: 1 control plane + 3 workers"
@@ -275,10 +293,16 @@ if [ "$SOURCE" = checkout ]; then
 else
   image_args=(--version "$CHART_VERSION")
 fi
-log "== helm install $CHART ($SOURCE) (controller 2 replicas, managed.replicas=$MANAGED_REPLICAS) $HELM_ARGS"
+ui_args=()
+if [ "$UI" = true ]; then
+  # the chart's Role for the discovery Secret lives in the UI's namespace: it must exist first
+  kubectl create namespace rproxy-ui --dry-run=client -o yaml | kubectl apply -f - > /dev/null
+  ui_args=(--set ui.namespace=rproxy-ui)
+fi
+log "== helm install $CHART ($SOURCE) (controller 2 replicas, managed.replicas=$MANAGED_REPLICAS) ${ui_args[*]} $HELM_ARGS"
 # shellcheck disable=SC2086
 helm install rproxy-gateway "$CHART" "${image_args[@]}" -n "$NS" --create-namespace --wait --timeout 10m \
-  --set controller.replicas=2 --set managed.replicas="$MANAGED_REPLICAS" $HELM_ARGS
+  --set controller.replicas=2 --set managed.replicas="$MANAGED_REPLICAS" "${ui_args[@]}" $HELM_ARGS
 helm -n "$NS" list
 kubectl wait --for=condition=Accepted gatewayclass/rproxy --timeout=120s
 
@@ -949,7 +973,149 @@ scenario_i() {
   record "$label" "$t0" "$(now_ms)" "$(secs $((t_fixed - t0)))s" "$ok" "${notes}accepted again $(secs $((t_fixed - t_bad)))s after the fix" limit
 }
 
-for s in a b1 b2 c d e f g h i; do
+# ---------------------------------------------------------------- u. the UI (UI=true)
+# The UI chart of UI_DIR (a checkout of TCP-UDP-rproxy-ui; its image built from it) with the bundled
+# MariaDB, reading the Gateway's rproxy pods through the controller's discovery Secret (ui.namespace).
+# Checks: the UI lists the Gateway's pods read-only to an admin and refuses changes (409 readonly_node),
+# the UI token reads but cannot write (rproxy 403), usage rows appear, and a UI pod restart and a
+# MariaDB pod restart keep the data (PVC). Timings are recorded only.
+UI_NS=rproxy-ui
+ui_install() {
+  log "== UI image from $UI_DIR ($(git -C "$UI_DIR" rev-parse --short HEAD 2> /dev/null || echo ?))"
+  docker build -q -t rproxy-ui:acc "$UI_DIR"
+  kind load docker-image --name "$CLUSTER" rproxy-ui:acc
+  kubectl create namespace "$UI_NS" --dry-run=client -o yaml | kubectl apply -f - > /dev/null
+  # secrets made here and never stored: the session secret also signs the test's admin session
+  UI_SESSION_SECRET=$(openssl rand -hex 32)
+  UI_ROOT_PW=$(openssl rand -hex 16)
+  kubectl -n "$UI_NS" create secret generic rproxy-ui --from-literal=NEXTAUTH_SECRET="$UI_SESSION_SECRET" \
+    --from-literal=KEYCLOAK_CLIENT_SECRET=unused --from-literal=DB_PASSWORD="$(openssl rand -hex 16)" > /dev/null
+  kubectl -n "$UI_NS" create secret generic rproxy-ui-mariadb --from-literal=MARIADB_ROOT_PASSWORD="$UI_ROOT_PW" > /dev/null
+  log "== helm install rproxy-ui ($UI_DIR/charts/rproxy-ui, bundled MariaDB)"
+  local t0
+  t0=$(now_ms)
+  helm install rproxy-ui "$UI_DIR/charts/rproxy-ui" -n "$UI_NS" --wait --timeout 10m \
+    --set image.repository=rproxy-ui --set image.tag=acc --set image.pullPolicy=Never \
+    --set replicas=1 --set url=http://rproxy-ui.acc.invalid \
+    --set keycloak.issuer=http://keycloak.acc.invalid/realms/rproxy \
+    --set existingSecret=rproxy-ui --set mariadb.enabled=true --set mariadb.existingSecret=rproxy-ui-mariadb \
+    --set mariadb.persistence.size=1Gi --set rproxy.discovery.enabled=true --set usage.intervalSeconds="$UI_USAGE_SECS"
+  UI_INSTALL_SECS=$(secs $(($(now_ms) - t0)))
+  kubectl -n "$UI_NS" get pods,pvc,secret -o wide
+}
+
+# an admin's NextAuth session cookie (next-auth v4: JWE dir + A256GCM, key HKDF-SHA256 of NEXTAUTH_SECRET)
+ui_session() {
+  UI_SECRET="$UI_SESSION_SECRET" node -e '
+    const c = require("node:crypto");
+    const b64 = (b) => Buffer.from(b).toString("base64url");
+    const key = Buffer.from(c.hkdfSync("sha256", process.env.UI_SECRET, "", "NextAuth.js Generated Encryption Key", 32));
+    const now = Math.floor(Date.now() / 1000);
+    const claims = { sub: "acceptance-admin", name: "acceptance", roles: ["rproxy-admin"], iat: now, exp: now + 7200, jti: c.randomUUID() };
+    const header = b64(JSON.stringify({ alg: "dir", enc: "A256GCM" }));
+    const iv = c.randomBytes(12);
+    const g = c.createCipheriv("aes-256-gcm", key, iv);
+    g.setAAD(Buffer.from(header));
+    const ct = Buffer.concat([g.update(JSON.stringify(claims)), g.final()]);
+    process.stdout.write([header, "", b64(iv), b64(ct), b64(g.getAuthTag())].join("."));'
+}
+ui_pod() { kubectl -n "$UI_NS" get pods -l app.kubernetes.io/name=rproxy-ui,app.kubernetes.io/component=ui -o json | jq -r '[.items[] | select(.metadata.deletionTimestamp == null and .status.podIP != null and ([.status.conditions[]? | select(.type == "Ready")][0].status == "True"))][0] | "\(.metadata.name) \(.status.podIP)"'; }
+# ui_get <path>: GET on the UI pod as the admin (the runner reaches pod IPs)
+ui_get() {
+  local ip
+  ip=$(ui_pod | cut -d' ' -f2)
+  [ -n "$ip" ] && [ "$ip" != null ] && curl -sf --max-time 10 -H "Cookie: next-auth.session-token=$UI_COOKIE" "http://$ip:3000$1"
+}
+ui_post_code() {
+  local ip
+  ip=$(ui_pod | cut -d' ' -f2)
+  curl -s -o "$work/ui-post.json" -w '%{http_code}' --max-time 10 -H "Cookie: next-auth.session-token=$UI_COOKIE" \
+    -H 'Content-Type: application/json' -d "$2" "http://$ip:3000$1" || true
+}
+ui_sql() {
+  kubectl -n "$UI_NS" exec rproxy-ui-mariadb-0 -- env MYSQL_PWD="$UI_ROOT_PW" mariadb -uroot -N -B rproxy -e "$1"
+}
+discovery_lists() {  # the Secret names every running rproxy pod of the Gateway
+  local y
+  y=$(kubectl -n "$UI_NS" get secret rproxy-ui-discovery -o jsonpath='{.data.nodes\.yaml}' | base64 -d) || return 1
+  local name ip ready
+  while read -r name ip ready; do
+    [ -n "$name" ] || continue
+    grep -Eq "name: \"?k8s:$APP/acc/$name\"?\$" <<< "$y" || return 1
+  done < <(rproxy_pods)
+}
+ui_lists() {  # the UI shows the Gateway's pods read-only
+  local n
+  n=$(ui_get /api/forward/nodes | jq '[.nodes[] | select(.readonly == true and (.name | startswith("k8s:'"$APP"'/acc/")))] | length') || return 1
+  [ "$n" -eq "$MANAGED_REPLICAS" ]
+}
+ui_rules() {  # the Gateway's rules on the dashboard, marked read-only
+  ui_get /api/forward/dashboard | jq -e '[.rules[] | select(.readonlyNode == true and .ruleset == "k8s/'"$APP"'/acc")] | length > 0' > /dev/null
+}
+usage_rows() { ui_sql "SELECT COUNT(*) FROM usage_hourly WHERE node = 'k8s:$APP/acc' AND origin = 'ruleset' AND rx_bytes > 0"; }
+usage_bytes() { ui_sql "SELECT COALESCE(SUM(rx_bytes + tx_bytes), 0) FROM usage_hourly WHERE node = 'k8s:$APP/acc'"; }
+usage_seen() { [ "$(usage_rows 2> /dev/null || echo 0)" -gt 0 ]; }
+usage_grew() { [ "$(usage_bytes 2> /dev/null || echo 0)" -gt "$1" ]; }
+ui_healthy() { [ -n "$(ui_get /api/healthz)" ]; }
+mariadb_ready() { [ "$(kubectl -n "$UI_NS" get pod rproxy-ui-mariadb-0 -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2> /dev/null)" = True ]; }
+# the UI token from the Secret: reads (GET /rules 200) and cannot write (PUT /rulesets/... 403), from the UI pod
+# (the Gateway's NetworkPolicy lets the UI namespace's UI pods reach 9443)
+ui_token_check() {
+  local pod
+  pod=$(ui_pod | cut -d' ' -f1)
+  kubectl -n "$UI_NS" exec "$pod" -- node -e '
+    const fs = require("node:fs");
+    const { parse } = require("/app/node_modules/yaml");
+    const { Agent, fetch } = require("/app/node_modules/undici");
+    const dir = "/etc/rproxy-ui/k8s";
+    const n = parse(fs.readFileSync(dir + "/nodes.yaml", "utf8")).nodes[0];
+    const token = fs.readFileSync(dir + "/" + n.token_file, "utf8").trim();
+    const dispatcher = new Agent({ connect: { ca: fs.readFileSync(dir + "/" + n.tls_ca), servername: n.tls_server_name } });
+    const h = { Authorization: "Bearer " + token, "Content-Type": "application/json" };
+    (async () => {
+      const read = await fetch(n.url + "/rules", { headers: h, dispatcher });
+      const write = await fetch(n.url + "/rulesets/k8s/acceptance-ui", { method: "PUT", headers: h, body: JSON.stringify({ rules: [] }), dispatcher });
+      console.log(read.status + " " + write.status);
+    })().catch((e) => { console.log("error " + e.message); });'
+}
+
+scenario_u() {
+  local t0 t_secret t_listed t_usage ok=PASS notes="" codes before t_r t_ui t_db rows_before rows_after
+  ui_install
+  UI_COOKIE=$(ui_session)
+  t0=$(now_ms)
+  log "== u. the UI lists the Gateway's rproxy read-only"
+  if wait_for 180 discovery_lists; then t_secret=$(now_ms); else ok=FAIL notes+="the discovery Secret never listed the pods; "; t_secret=$(now_ms); fi
+  # the kubelet updates the mounted Secret within a minute or two
+  if wait_for 240 ui_lists; then t_listed=$(now_ms); else ok=FAIL notes+="the UI never listed the pods read-only; "; t_listed=$(now_ms); fi
+  wait_for 60 ui_rules || { ok=FAIL notes+="the Gateway's rules are not on the dashboard read-only; "; }
+  codes=$(ui_post_code /api/forward/api-delete "{\"protocol\":\"tcp\",\"srcAddr\":\"0.0.0.0\",\"srcPort\":80,\"target\":\"$(ui_get /api/forward/nodes | jq -r '[.nodes[] | select(.readonly == true)][0].name')\"}")
+  if [ "$codes" != 409 ] || ! jq -e '.code == "readonly_node"' "$work/ui-post.json" > /dev/null; then ok=FAIL notes+="a change to a pod was not refused (HTTP $codes $(cat "$work/ui-post.json")); "; fi
+  codes=$(ui_token_check 2>&1 | tail -1)
+  if [ "$codes" != "200 403" ]; then ok=FAIL notes+="UI token: GET /rules and PUT /rulesets gave '$codes' (want 200 403); "; fi
+  log "== u. usage rows (every ${UI_USAGE_SECS}s)"
+  if wait_for $((UI_USAGE_SECS * 6 + 60)) usage_seen; then t_usage=$(now_ms); else ok=FAIL notes+="no usage rows for k8s:$APP/acc; "; t_usage=$(now_ms); fi
+  notes+="install ${UI_INSTALL_SECS}s; Secret $(secs $((t_secret - t0)))s, listed in the UI $(secs $((t_listed - t0)))s, first usage row $(secs $((t_usage - t0)))s after install; "
+  log "== u. UI pod and MariaDB pod restarted: the data stays (PVC)"
+  rows_before=$(ui_sql 'SELECT COUNT(*) FROM schema_migrations')
+  before=$(usage_bytes)
+  t_r=$(now_ms)
+  kubectl -n "$UI_NS" delete pod "$(ui_pod | cut -d' ' -f1)" --wait=false > /dev/null
+  kubectl -n "$UI_NS" delete pod rproxy-ui-mariadb-0 --wait=false > /dev/null
+  sleep 2
+  if wait_for 300 mariadb_ready; then t_db=$(now_ms); else ok=FAIL notes+="MariaDB not ready again; "; t_db=$(now_ms); fi
+  if wait_for 300 ui_healthy && wait_for 240 ui_lists; then t_ui=$(now_ms); else ok=FAIL notes+="the UI did not come back; "; t_ui=$(now_ms); fi
+  rows_after=$(ui_sql 'SELECT COUNT(*) FROM schema_migrations' 2> /dev/null || echo 0)
+  if [ "$rows_after" != "$rows_before" ] || [ "$(usage_bytes 2> /dev/null || echo 0)" -lt "$before" ]; then
+    ok=FAIL notes+="data lost over the restarts (schema_migrations $rows_before -> $rows_after, usage bytes $before -> $(usage_bytes 2> /dev/null || echo ?)); "
+  fi
+  wait_for $((UI_USAGE_SECS * 6 + 60)) usage_grew "$before" || { ok=FAIL notes+="usage did not grow after the restarts; "; }
+  notes+="after the restarts: MariaDB ready $(secs $((t_db - t_r)))s, UI listing again $(secs $((t_ui - t_r)))s (record only)"
+  record "u. UI (bundled MariaDB): read-only k8s rproxy, usage, restarts" "$t0" "$(now_ms)" "$(secs $((t_listed - t0)))s" "$ok" "$notes"
+  kubectl -n "$UI_NS" logs -l app.kubernetes.io/name=rproxy-ui --all-containers --prefix --tail=-1 > "$work/ui.log" 2>&1 || true
+}
+
+for s in $SCENARIOS; do
   if ! "scenario_$s"; then
     echo "scenario $s aborted" >&2
     printf '%s\t–\t–\t–\tFAIL\taborted\n' "$s" >> "$results"

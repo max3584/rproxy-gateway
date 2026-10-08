@@ -181,6 +181,14 @@ impl Default for Managed {
 	}
 }
 
+/// Where the UI reads rproxy (`--ui-namespace`, docs/DESIGN-v0.4.x.md 4.): the UI's namespace and the
+/// labels of its pods (let through the NetworkPolicy to the control API).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UiAccess {
+	pub namespace: String,
+	pub pod_selector: BTreeMap<String, String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Fleet {
 	/// Label selector of the rproxy pods (in the controller's namespace).
@@ -242,6 +250,10 @@ pub struct Target<'a> {
 	/// The rproxy image has a graceful shutdown (`features.graceful_shutdown`, rproxy v0.4.1):
 	/// `RPROXY_SHUTDOWN_*` and the readiness path instead of the preStop (`graceful`).
 	pub graceful: bool,
+	/// The UI reads this Gateway's rproxy (`--ui-namespace` set and the parameters' `ui.visible`
+	/// not false): its read-only token in the token file (the pods roll: rproxy reads the file at
+	/// start), the UI's pods let through the NetworkPolicy.
+	pub ui: Option<UiAccess>,
 }
 
 pub use crate::render::params::{SERVICE_ANNOTATION_DENY, service_annotation_allowed};
@@ -258,6 +270,7 @@ impl<'a> Target<'a> {
 			service_annotations: vec![],
 			params: Params::default(),
 			graceful: false,
+			ui: None,
 		}
 	}
 
@@ -390,11 +403,15 @@ pub fn api_secret(t: &Target, current: Option<&Secret>, boot: &bootstrap::Bootst
 		(c.into_bytes(), k.into_bytes())
 	};
 	let token = bootstrap::derive_token(&boot.token, &t.id);
+	let mut tokens = bootstrap::token_file(&token, &t.plan.ruleset);
+	if t.ui.is_some() {
+		tokens.push_str(&bootstrap::ui_token_entry(&bootstrap::derive_ui_token(&boot.token, &t.id)));
+	}
 	let data: BTreeMap<String, Vec<u8>> = [
 		("tls.crt".to_string(), crt),
 		("tls.key".to_string(), key),
 		("ca.crt".to_string(), boot.ca_pem.clone()),
-		("tokens.yaml".to_string(), bootstrap::token_file(&token, &t.plan.ruleset).into_bytes()),
+		("tokens.yaml".to_string(), tokens.into_bytes()),
 	]
 	.into();
 	let mut meta = t.meta(&api_secret_name(&t.id), t.secret_labels());
@@ -719,7 +736,8 @@ pub fn service(t: &Target, m: &Managed) -> Service {
 }
 
 /// Who may reach a Gateway's rproxy pods: anyone on the listener ports; on the control
-/// API and certsync ports only the controller's pods (`controller_ns`, `app.kubernetes.io/name: rproxy-gateway`).
+/// API and certsync ports only the controller's pods (`controller_ns`, `app.kubernetes.io/name: rproxy-gateway`);
+/// on the control API also the UI's pods when the UI reads the Gateway (`Target::ui`).
 pub fn network_policy(t: &Target, controller_ns: &str) -> k8s_openapi::api::networking::v1::NetworkPolicy {
 	use k8s_openapi::api::networking::v1::{
 		NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort, NetworkPolicySpec,
@@ -744,6 +762,20 @@ pub fn network_policy(t: &Target, controller_ns: &str) -> k8s_openapi::api::netw
 		from: Some(vec![controller]),
 		ports: Some(vec![port(API_PORT, "TCP"), port(CERTSYNC_PORT, "TCP")]),
 	}];
+	if let Some(ui) = &t.ui {
+		rules.push(NetworkPolicyIngressRule {
+			from: Some(vec![NetworkPolicyPeer {
+				namespace_selector: Some(LabelSelector {
+					match_labels: Some([("kubernetes.io/metadata.name".to_string(), ui.namespace.clone())].into()),
+					..Default::default()
+				}),
+				pod_selector: Some(LabelSelector { match_labels: Some(ui.pod_selector.clone()), ..Default::default() }),
+				..Default::default()
+			}]),
+			// the control API only (not certsync)
+			ports: Some(vec![port(API_PORT, "TCP")]),
+		});
+	}
 	let listeners: Vec<NetworkPolicyPort> = t.plan.ports().into_iter().map(|(proto, p)| port(p, proto.k8s())).collect();
 	if !listeners.is_empty() {
 		rules.push(NetworkPolicyIngressRule { from: None, ports: Some(listeners) });
@@ -872,6 +904,8 @@ pub struct Applied {
 	pub certs: String,
 	/// Whether the Gateway has a PodDisruptionBudget (else `collect_garbage` deletes it).
 	pub pdb: bool,
+	/// The hash of the control API Secret's content (the pod template's `ANNOTATION_API`).
+	pub api: String,
 }
 
 /// Writes a Gateway's certificate and control API Secrets; returns the hashes of their content.
@@ -891,6 +925,10 @@ pub async fn apply_secrets(
 	if current_api.is_none_or(|c| data_of(Some(c)) != data_of(Some(&api)) || !same_meta(&c.metadata, &api.metadata)) {
 		Api::<Secret>::namespaced(client.clone(), ns).patch(&api_secret_name(&t.id), &pp(), &Patch::Apply(&api)).await?;
 	}
+	// The UI's token is part of the hash: rproxy v0.4.1 reads its token file only at start (and on SIGHUP), so
+	// adding or removing it rolls the pods once.
+	// TODO(max3584/rproxy-api#253): when rproxy reports that it reloads a changed token file (in `features`),
+	// hash the Secret without the UI's entry (`bootstrap::without_ui_entry`) for those pods and skip the roll.
 	Ok((certs, content_hash(&data_of(Some(&api)))))
 }
 
@@ -927,10 +965,10 @@ pub async fn apply_managed(
 	if t.plan.ports().is_empty() {
 		// a Service needs a port; none until a listener is valid
 		let _ = svc_api.delete(&name, &DeleteParams::default()).await;
-		return Ok(Applied { service: None, certs, pdb: pdb.is_some() });
+		return Ok(Applied { service: None, certs, pdb: pdb.is_some(), api: api_hash });
 	}
 	let service = svc_api.patch(&name, &pp(), &Patch::Apply(&service(t, m))).await?;
-	Ok(Applied { service: Some(service), certs, pdb: pdb.is_some() })
+	Ok(Applied { service: Some(service), certs, pdb: pdb.is_some(), api: api_hash })
 }
 
 /// Whether a Gateway's rproxy Deployment exists (a Gateway kept in its last good shape when its
@@ -1062,6 +1100,10 @@ pub struct Endpoint {
 
 /// Running pods in `ns` matching `labels` (`key=value,...`).
 pub fn pods(store: &[std::sync::Arc<Pod>], ns: &str, selector: &BTreeMap<String, String>) -> Vec<Endpoint> {
+	pods_of(store, ns, selector, false)
+}
+
+fn pods_of(store: &[std::sync::Arc<Pod>], ns: &str, selector: &BTreeMap<String, String>, terminating: bool) -> Vec<Endpoint> {
 	let mut out: Vec<Endpoint> = store
 		.iter()
 		.filter(|p| p.metadata.namespace.as_deref() == Some(ns))
@@ -1069,7 +1111,7 @@ pub fn pods(store: &[std::sync::Arc<Pod>], ns: &str, selector: &BTreeMap<String,
 			let l = p.metadata.labels.clone().unwrap_or_default();
 			selector.iter().all(|(k, v)| l.get(k) == Some(v))
 		})
-		.filter(|p| p.metadata.deletion_timestamp.is_none())
+		.filter(|p| terminating || p.metadata.deletion_timestamp.is_none())
 		.filter_map(|p| {
 			let st = p.status.as_ref()?;
 			if st.phase.as_deref() != Some("Running") {
@@ -1108,6 +1150,35 @@ pub fn pods(store: &[std::sync::Arc<Pod>], ns: &str, selector: &BTreeMap<String,
 		.collect();
 	out.sort_by(|a, b| a.pod.cmp(&b.pod));
 	out
+}
+
+/// The pods the UI may be sent to: running, not being deleted, Ready (with the readiness gate
+/// `CONDITION_RULESET` True when the pod has it) and, with `api_hash`, made from the pod template that
+/// has the current control API Secret (`ANNOTATION_API`): only those already read the token file with the
+/// UI's token (rproxy v0.4.1 reads it at start). A pod that would answer the UI's token with 401 is not
+/// listed (rproxy locks a client out after repeated failures).
+pub fn ui_pods(store: &[std::sync::Arc<Pod>], ns: &str, selector: &BTreeMap<String, String>, api_hash: Option<&str>) -> Vec<Endpoint> {
+	let accepts: std::collections::BTreeSet<String> = store
+		.iter()
+		.filter(|p| p.metadata.namespace.as_deref() == Some(ns) && p.metadata.deletion_timestamp.is_none())
+		.filter(|p| {
+			let conds = p.status.as_ref().and_then(|s| s.conditions.as_ref());
+			let is_true = |t: &str| conds.into_iter().flatten().any(|c| c.type_ == t && c.status == "True");
+			let gated = p
+				.spec
+				.as_ref()
+				.and_then(|s| s.readiness_gates.as_ref())
+				.into_iter()
+				.flatten()
+				.any(|g| g.condition_type == CONDITION_RULESET);
+			is_true("Ready") && (!gated || is_true(CONDITION_RULESET))
+		})
+		.filter(|p| {
+			api_hash.is_none_or(|h| p.metadata.annotations.as_ref().and_then(|a| a.get(ANNOTATION_API)).map(String::as_str) == Some(h))
+		})
+		.filter_map(|p| p.metadata.name.clone())
+		.collect();
+	pods_of(store, ns, selector, false).into_iter().filter(|e| accepts.contains(&e.pod)).collect()
 }
 
 /// `a=b,c=d` → labels.
@@ -1482,6 +1553,46 @@ mod tests {
 	}
 
 	#[test]
+	fn the_ui_reads_with_its_own_token() {
+		let b = boot();
+		let p = plan();
+		let mut t = Target::new(&p);
+		let off = api_secret(&t, None, &b).unwrap();
+		let ui = UiAccess {
+			namespace: "rproxy-ui".into(),
+			pod_selector: [("app.kubernetes.io/name".to_string(), "rproxy-ui".to_string())].into(),
+		};
+		t.ui = Some(ui.clone());
+		let on = api_secret(&t, Some(&off), &b).unwrap();
+		let (d_off, d_on) = (data_of(Some(&off)), data_of(Some(&on)));
+		let tokens = String::from_utf8_lossy(&d_on["tokens.yaml"]).into_owned();
+		let ui_token = bootstrap::derive_ui_token("master", &t.id);
+		assert!(tokens.contains(&crate::pem::sha256_hex(ui_token.as_bytes())), "{tokens}");
+		assert!(tokens.ends_with("scopes: [rules:read, metrics:read]\n"));
+		assert!(!String::from_utf8_lossy(&d_off["tokens.yaml"]).contains("rproxy-ui"), "off: as before");
+		// rproxy v0.4.1 reads its token file at start (and on SIGHUP): the pods roll once for the UI's token
+		assert_ne!(content_hash(&d_on), content_hash(&d_off));
+		let mut stripped = d_on.clone();
+		stripped
+			.insert("tokens.yaml".into(), bootstrap::without_ui_entry(&String::from_utf8_lossy(&d_on["tokens.yaml"])).as_bytes().to_vec());
+		assert_eq!(content_hash(&stripped), content_hash(&d_off), "off: the same Secret (and hash) as before");
+		// the NetworkPolicy lets the UI's pods reach the control API only
+		let rules = network_policy(&t, "rproxy-gateway-system").spec.unwrap().ingress.unwrap();
+		let r = rules
+			.iter()
+			.find(|r| {
+				r.from.as_ref().is_some_and(|f| f[0].pod_selector.as_ref().and_then(|s| s.match_labels.as_ref()) == Some(&ui.pod_selector))
+			})
+			.unwrap();
+		assert_eq!(r.ports.as_ref().unwrap().len(), 1);
+		assert_eq!(r.ports.as_ref().unwrap()[0].port, Some(IntOrString::Int(API_PORT.into())), "not certsync");
+		let from = &r.from.as_ref().unwrap()[0];
+		assert_eq!(from.namespace_selector.as_ref().unwrap().match_labels.as_ref().unwrap()["kubernetes.io/metadata.name"], "rproxy-ui");
+		t.ui = None;
+		assert_eq!(network_policy(&t, "rproxy-gateway-system").spec.unwrap().ingress.unwrap().len(), rules.len() - 1);
+	}
+
+	#[test]
 	fn old_files_linger() {
 		let t0 = Instant::now();
 		let mut absent = BTreeMap::new();
@@ -1499,5 +1610,41 @@ mod tests {
 		with_linger(&f(&["a.crt"]), &f(&["a.crt"]), &mut absent, t0);
 		assert!(absent.is_empty());
 		assert_ne!(content_hash(&f(&["a.crt"])), content_hash(&f(&["b.crt"])));
+	}
+
+	#[test]
+	fn the_ui_gets_only_pods_that_take_its_token() {
+		// name, Ready, ruleset-applied, the pod template's api hash, being deleted
+		let pod = |name: &str, ready: bool, gate: bool, api: &str, deleting: bool| {
+			let mut v = serde_json::json!({
+				"metadata": {
+					"name": name, "namespace": "web", "uid": format!("uid-{name}"),
+					"labels": {LABEL_GATEWAY: "web-gw-1", "app.kubernetes.io/managed-by": MANAGER},
+					"annotations": {ANNOTATION_API: api},
+					"ownerReferences": [{"apiVersion": "apps/v1", "kind": "ReplicaSet", "name": format!("{}-abc", object_name("web-gw-1")), "uid": "rs", "controller": true}],
+				},
+				"spec": {"containers": [{"name": "rproxy"}], "readinessGates": [{"conditionType": CONDITION_RULESET}]},
+				"status": {"phase": "Running", "podIP": format!("10.0.0.{}", name.len()), "conditions": [
+					{"type": "Ready", "status": if ready { "True" } else { "False" }},
+					{"type": CONDITION_RULESET, "status": if gate { "True" } else { "False" }},
+				]},
+			});
+			if deleting {
+				v["metadata"]["deletionTimestamp"] = serde_json::json!("2026-10-08T00:00:00Z");
+			}
+			std::sync::Arc::new(serde_json::from_value::<Pod>(v).unwrap())
+		};
+		let store = vec![
+			pod("new", true, true, "h2", false),
+			pod("old-template", true, true, "h1", false),
+			pod("starting", false, false, "h2", false),
+			pod("no-rule-set-yet", true, false, "h2", false),
+			pod("stopping", true, true, "h2", true),
+		];
+		let sel: BTreeMap<String, String> = [(LABEL_GATEWAY.to_string(), "web-gw-1".to_string())].into();
+		let names = |eps: Vec<Endpoint>| eps.into_iter().map(|e| e.pod).collect::<Vec<_>>();
+		assert_eq!(names(ui_pods(&store, "web", &sel, Some("h2"))), ["new"]);
+		// without the hash (fleet; a pass that could not write the Secrets): Ready and not being deleted
+		assert_eq!(names(ui_pods(&store, "web", &sel, None)), ["new", "old-template"]);
 	}
 }

@@ -22,7 +22,7 @@ v0.4.0・v0.4.1 の受け入れテストで分かった、Kubernetes で運用�
 |---|---|---|
 | A. Gateway ごとの managed の rproxy | CRD `RproxyGatewayParameters`・合わせ方・状態・RBAC | v0.4.2 |
 | B. Kustomize で入れる | chart のコントローラの設定を ConfigMap に、`config/`、リリースの `install.yaml`・CI | v0.4.2 |
-| C. UI を Kubernetes で | UI 用の読むだけのトークンと発見の Secret（UI の chart は UI のリポジトリ） | 後のパッチ |
+| C. UI を Kubernetes で | UI 用の読むだけのトークンと発見の Secret（UI の chart は UI のリポジトリ） | v0.4.3 |
 | E. SIGTERM での終わり方 | rproxy の `RPROXY_SHUTDOWN_*` を渡す、猶予の秒数 | v0.4.2（rproxy v0.4.1） |
 | F. Pod が直接持つ VIP | fleet の `vip` サイドカー・Lease・状態 | 後のパッチ |
 
@@ -113,7 +113,7 @@ spec:
 | `rproxy.performance` | `RPROXY_WORKERS`・`RPROXY_UDP_SHARDS`・`RPROXY_CPU_AFFINITY`・`RPROXY_BUSY_POLL_USECS`・`RPROXY_SPLICE`・`RPROXY_SPLICE_AFTER`・`RPROXY_SPLICE_FULL_READS`・`RPROXY_SPLICE_PIPE_SIZE` | なし | rproxy の `global.performance` と同じ範囲（managed の rproxy は設定ファイルを使わないので環境変数で渡す） |
 | `rproxy.shutdown.delay`・`.drain` | `RPROXY_SHUTDOWN_DELAY`・`RPROXY_SHUTDOWN_DRAIN` と猶予（6.） | `--shutdown-delay`（15 秒）・`--shutdown-drain`（25 秒） | `0s`〜`10m`。`features.graceful_shutdown` のない rproxy には写さない（preStop のまま） |
 | `rproxy.extraEnv` | rproxy のコンテナ | なし | `RPROXY_*` だけ。コントローラが決める名前（`RPROXY_API_*`・`RPROXY_TOKEN_FILE`・`RPROXY_TLS_*`・`RPROXY_FILES_*`・`RPROXY_CONFIG`・`RPROXY_DATABASE_URL`・`RPROXY_UPDATE*`・`RPROXY_HANDOFF*`・`RPROXY_STATIC_RULES`・`RPROXY_SHUTDOWN_*`、上の項目で渡す名前）は誤り |
-| `ui.visible` | C の発見の Secret に載せるか | クラスの値、なければ `true` | Gateway はクラスが `false` のとき `true` にできない。C が入るまでは写す先がない |
+| `ui.visible` | C の発見の Secret に載せるか | クラスの値、なければ `true` | Gateway はクラスが `false` のとき `true` にできない（v0.4.3 から。`ui.namespace` のときだけ効く） |
 
 ### 2.3 参照と合わせ方
 
@@ -220,9 +220,9 @@ UI のイメージ・chart（`oci://ghcr.io/max3584/charts/rproxy-ui`）・migra
 
 **コントローラが UI 用の読むだけの資格を作り、UI の namespace に 1 つの Secret で渡す**（両側の明示が要る）。
 
-1. 管理者が gateway の chart で `ui.namespace: rproxy-ui`（`--ui-namespace`）と `ui.podSelector`（既定 `app.kubernetes.io/name: rproxy-ui`）を決める。決めなければ何も作らない（今と同じ）。
-2. 各 Gateway の `tokens.yaml` に 2 つ目のトークン `rproxy-ui` を足す：導き方は `HMAC(master, "rproxy-gateway-ui/<id>")`（コントローラのトークンと別の値）、スコープは **`rules:read`・`metrics:read` だけ**。書き込みは rproxy が `403` で断るので、UI の作りに頼らない。rproxy はトークンファイルを読み直すので Pod の入れ替えは要らない。
-3. コントローラは UI の namespace に Secret `rproxy-ui-discovery` を書く：`nodes.yaml`（Gateway ごとのグループ `k8s:<ns>/<name>` と Pod ごとのノード、`url: https://<Pod の IP>:9443`、`tls_server_name: <id>.rproxy-api.rproxy-gateway.internal`、`readonly: true`）、`ca.crt`（CA の証明書だけ。鍵は入れない）、`token-<id>`。parameters の `ui.visible: false` の Gateway は載せない。fleet ではすべての fleet の Pod（トークンは `rproxy-gateway-token` に足す）。終わりかけの Pod も消えるまで載せる（利用量を最後まで取るため）。
+1. 管理者が gateway の chart で `ui.namespace: rproxy-ui`（`--ui-namespace`）と `ui.podSelector`（既定 `app.kubernetes.io/name: rproxy-ui`・`app.kubernetes.io/component: ui`）を決める。決めなければ何も作らない（今と同じ）。
+2. 各 Gateway の `tokens.yaml` に 2 つ目のトークン `rproxy-ui` を足す：導き方は `HMAC(master, "rproxy-gateway-ui/<id>")`（コントローラのトークンと別の値）、スコープは **`rules:read`・`metrics:read` だけ**。書き込みは rproxy が `403` で断るので、UI の作りに頼らない。（実装で分かったこと：rproxy v0.4.1 はトークンファイルを起動時と SIGHUP でしか読み直さないので、Pod が 1 回入れ替わる。4.2）
+3. コントローラは UI の namespace に Secret `rproxy-ui-discovery` を書く：`nodes.yaml`（Gateway ごとのグループ `k8s:<ns>/<name>` と Pod ごとのノード、`url: https://<Pod の IP>:9443`、`tls_server_name: <id>.rproxy-api.rproxy-gateway.internal`、`readonly: true`）、`ca.crt`（CA の証明書だけ。鍵は入れない）、`token-<id>`。parameters の `ui.visible: false` の Gateway は載せない。fleet ではすべての fleet の Pod（トークンは `rproxy-gateway-token` に足す）。載せるのは UI のトークンを受け付ける Pod だけ：Ready（readiness gate の `ruleset-applied` も True）、終わりかけでない、今のトークンファイルの Pod のテンプレート（`rproxy.max3584.net/api` のハッシュ）から作られた Pod（v0.4.3 で決めた。古い Pod に 401 を受け続けると rproxy が UI の送信元を締め出すため。終わる Pod の最後の 1 間隔の利用量は取らない、Q16）。
 4. NetworkPolicy：managed の Gateway の NetworkPolicy に、UI の namespace の `ui.podSelector` から 9443 を足す（`ui.visible` の Gateway だけ）。certsync（9444）は足さない。
 5. UI：`RPROXY_UI_K8S_DISCOVERY=/etc/rproxy-ui/k8s`（Secret のボリューム）を読み、ファイルの更新時刻で読み直す。
 
@@ -236,7 +236,17 @@ UI のイメージ・chart（`oci://ghcr.io/max3584/charts/rproxy-ui`）・migra
 | UI がコントローラに聞き、コントローラが rproxy に取り次ぐ | コントローラが UI の通信の道になり、UI の認証という新しい口が要る。中身は同じ読むだけ。Pod の IP の遅れが困るなら考える |
 | コントローラのトークンを UI に渡す | 書ける（`rules:write`）。組の持ち主も同じになり `409 owned` の守りが効かない |
 
-### 4.2 試験（gateway の側）
+### 4.2 v0.4.3 で入れた形
+
+4.1 のとおり。細かいところ：
+
+- `nodes.yaml` のノードは `k8s:<ns>/<gateway>/<Pod の名前>`（fleet は `k8s:fleet/<Pod の名前>`）、各ノードに `url`・`tls_server_name`・`tls_ca: ca.crt`・`token_file: token-<id>`・`readonly: true`。グループも `readonly: true`。グループは名前の順、Pod は名前の順で、中身が変わったときだけ書く。Pod のない Gateway はグループを作らない。
+- 見せる Gateway がなくなったら Secret を消す（UI の chart は Secret のボリュームを `optional: true` でマウントする）。`ui.namespace` を外したときは、前の namespace の Secret を手で消す。
+- 見せるのは parameters が正しい Gateway だけ（`InvalidParameters` で前の形のまま残した Gateway は載せず、UI のトークンも外す）。
+- fleet の Pod は、受け持つ Gateway がすべて見せるときだけ載せる（fleet の Pod はすべての Gateway のルールを持つため）。
+- UI のトークンはトークンファイルにあり、トークンファイルは Pod のテンプレートのハッシュ（`rproxy.max3584.net/api`）に入る。rproxy v0.4.1 はトークンファイルを起動時と SIGHUP でしか読み直さない（rproxy-api docs/API.md）ので、`ui.namespace` を決めたとき・Gateway を見せる／隠すときに、その Gateway の Pod が 1 回入れ替わる（rollout は `maxUnavailable: 0`・readiness gate・graceful shutdown）。`ui.namespace` が空なら Secret も Deployment も今までと同じ。fleet の DaemonSet は chart のものなので、UI のトークンを足した後は手で `rollout restart` する。入れ替えをなくすには rproxy がトークンファイルの変化を見て読み直す（証明書の `RPROXY_CERT_CHECK_SECS` と同じ）必要がある（max3584/rproxy-api#253。入ったら、その機能を `features` で答える rproxy では入れ替えない。コードの TODO）。replicas が 2 以上なら入れ替えの途切れは 1 秒に満たない（受け入れテストの d. rollout restart と同じ形）。
+
+### 4.3 試験（gateway の側）
 
 - 単体：UI のトークンの導き方とスコープ、発見の Secret の中身（鍵がない、`ui.visible: false` が載らない）、NetworkPolicy。
 - 受け入れ：入力 `ui: true` で UI の chart も入れ、発見の Secret の Pod が UI に出る、UI のトークンで `PUT /rulesets` が `403`。
@@ -380,7 +390,7 @@ fleet:
 |---|---|---|---|
 | `managed_replicas` | `2` | 今と同じ（`managed.replicas`） | — |
 | `install` | `helm` | `kustomize` で `config/default` に overlay を当てて入れる | B の後 |
-| `ui` | `false` | UI の chart も入れ、4.2 の確認をする | C |
+| `ui` | `false` | UI の chart も入れ、4.3 の確認をする | C |
 | `strict` | `false` | E の確認で失敗のリクエストが 1 つでもあれば落とす | E |
 | `mode` | `managed` | `fleet-vip` で 7.8 のシナリオ j〜o | F |
 

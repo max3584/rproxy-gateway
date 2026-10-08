@@ -145,6 +145,39 @@ subjects:
   - kind: ServiceAccount
     name: rproxy-gateway
     namespace: {{ .Release.Namespace }}
+{{- with .Values.ui.namespace }}
+---
+# the UI's namespace: the discovery Secret only (docs/SECURITY.md)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rproxy-gateway-ui
+  namespace: {{ . }}
+  labels: {{- include "rproxy-gateway.labels" $ | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [rproxy-ui-discovery]
+    verbs: [get, update, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rproxy-gateway-ui
+  namespace: {{ . }}
+  labels: {{- include "rproxy-gateway.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: rproxy-gateway-ui
+subjects:
+  - kind: ServiceAccount
+    name: rproxy-gateway
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
 {{- if .Values.rbac.aggregateToAdmin }}
 ---
 # namespace admins write their Gateways' RproxyGatewayParameters (spec.infrastructure.parametersRef);

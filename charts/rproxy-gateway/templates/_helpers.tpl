@@ -96,6 +96,10 @@ RPROXY_GATEWAY_ADDRESS_CIDR: {{ join "," . | quote }}
 RPROXY_GATEWAY_SERVICE_ANNOTATION_PREFIX: {{ join "," . | quote }}
 {{- end }}
 {{- end }}
+{{- with .Values.ui.namespace }}
+RPROXY_GATEWAY_UI_NAMESPACE: {{ . | quote }}
+RPROXY_GATEWAY_UI_POD_SELECTOR: {{ include "rproxy-gateway.selector" ($.Values.ui.podSelector | default (dict "app.kubernetes.io/name" "rproxy-ui" "app.kubernetes.io/component" "ui")) | quote }}
+{{- end }}
 {{- if .Values.migration.migrateTo }}
 RPROXY_GATEWAY_MIGRATE_TO: {{ .Values.migration.migrateTo | quote }}
 RPROXY_GATEWAY_INGRESS_CLASS: {{ .Values.migration.ingressClass | quote }}
@@ -104,4 +108,13 @@ RPROXY_GATEWAY_TRAEFIK_ENTRYPOINTS: {{ join "," .Values.migration.traefikEntryPo
 RPROXY_GATEWAY_MIGRATION_ALLOW_CROSS_NAMESPACE: "true"
 {{- end }}
 {{- end }}
+{{- end -}}
+
+{{/* a label map as k=v,k2=v2 (sorted) */}}
+{{- define "rproxy-gateway.selector" -}}
+{{- $out := list -}}
+{{- range $k, $v := . -}}
+{{- $out = append $out (printf "%s=%s" $k $v) -}}
+{{- end -}}
+{{- join "," $out -}}
 {{- end -}}

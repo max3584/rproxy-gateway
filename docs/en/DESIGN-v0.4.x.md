@@ -22,7 +22,7 @@ The current decisions: [DESIGN.md](DESIGN.md); the tenant boundaries: [SECURITY.
 |---|---|---|
 | A. managed rproxy per Gateway | the `RproxyGatewayParameters` CRD, merging, status, RBAC | v0.4.2 |
 | B. Install with Kustomize | the chart's controller settings in a ConfigMap, `config/`, `install.yaml` on releases, CI | v0.4.2 |
-| C. The UI on Kubernetes | read-only tokens for the UI and a discovery Secret (the UI's chart is in the UI's repository) | a later patch |
+| C. The UI on Kubernetes | read-only tokens for the UI and a discovery Secret (the UI's chart is in the UI's repository) | v0.4.3 |
 | E. Stopping on SIGTERM | passing rproxy's `RPROXY_SHUTDOWN_*`, the grace period | v0.4.2 (rproxy v0.4.1) |
 | F. VIPs held by pods | the fleet's `vip` sidecar, Leases, status | a later patch |
 
@@ -113,7 +113,7 @@ The default column applies when neither reference sets the field; each is the v0
 | `rproxy.performance` | `RPROXY_WORKERS`, `RPROXY_UDP_SHARDS`, `RPROXY_CPU_AFFINITY`, `RPROXY_BUSY_POLL_USECS`, `RPROXY_SPLICE`, `RPROXY_SPLICE_AFTER`, `RPROXY_SPLICE_FULL_READS`, `RPROXY_SPLICE_PIPE_SIZE` | none | the ranges of rproxy's `global.performance` (managed rproxy has no settings file, so environment variables) |
 | `rproxy.shutdown.delay`, `.drain` | `RPROXY_SHUTDOWN_DELAY`, `RPROXY_SHUTDOWN_DRAIN` and the grace period (6.) | `--shutdown-delay` (15 s), `--shutdown-drain` (25 s) | `0s` to `10m`. Not put on rproxy without `features.graceful_shutdown` (it keeps the preStop) |
 | `rproxy.extraEnv` | the rproxy container | none | `RPROXY_*` only. Names the controller sets (`RPROXY_API_*`, `RPROXY_TOKEN_FILE`, `RPROXY_TLS_*`, `RPROXY_FILES_*`, `RPROXY_CONFIG`, `RPROXY_DATABASE_URL`, `RPROXY_UPDATE*`, `RPROXY_HANDOFF*`, `RPROXY_STATIC_RULES`, `RPROXY_SHUTDOWN_*`, and those of the fields above) are refused |
-| `ui.visible` | whether C's discovery Secret lists the Gateway | the class's value, else `true` | a Gateway cannot make it `true` when the class says `false`. Goes nowhere until C |
+| `ui.visible` | whether C's discovery Secret lists the Gateway | the class's value, else `true` | a Gateway cannot make it `true` when the class says `false` (v0.4.3; only with `ui.namespace`) |
 
 ### 2.3 References and merging
 
@@ -220,9 +220,9 @@ Today's credentials: managed rproxy has a token per Gateway (derived from the ma
 
 **The controller makes read-only credentials for the UI and hands them over in one Secret in the UI's namespace** (both sides must opt in).
 
-1. The administrator sets `ui.namespace: rproxy-ui` (`--ui-namespace`) and `ui.podSelector` (default `app.kubernetes.io/name: rproxy-ui`) in rproxy-gateway's chart. Unset, nothing is made (as today).
-2. Each Gateway's `tokens.yaml` gets a second token `rproxy-ui`: derived as `HMAC(master, "rproxy-gateway-ui/<id>")` (a value different from the controller's), scopes **`rules:read` and `metrics:read` only**. rproxy refuses writes with `403`, so this does not rely on the UI. rproxy reads the token file again, so pods are not replaced.
-3. The controller writes a Secret `rproxy-ui-discovery` in the UI's namespace: `nodes.yaml` (a group `k8s:<ns>/<name>` per Gateway and a node per pod, `url: https://<pod IP>:9443`, `tls_server_name: <id>.rproxy-api.rproxy-gateway.internal`, `readonly: true`), `ca.crt` (the CA certificate only, no key), `token-<id>`. Gateways whose parameters say `ui.visible: false` are left out. In fleet mode, every fleet pod (the token is added to `rproxy-gateway-token`). Stopping pods stay listed until they are gone (usage to the end).
+1. The administrator sets `ui.namespace: rproxy-ui` (`--ui-namespace`) and `ui.podSelector` (default `app.kubernetes.io/name: rproxy-ui`, `app.kubernetes.io/component: ui`) in rproxy-gateway's chart. Unset, nothing is made (as today).
+2. Each Gateway's `tokens.yaml` gets a second token `rproxy-ui`: derived as `HMAC(master, "rproxy-gateway-ui/<id>")` (a value different from the controller's), scopes **`rules:read` and `metrics:read` only**. rproxy refuses writes with `403`, so this does not rely on the UI. (Found while building it: rproxy v0.4.1 reads its token file only at start and on SIGHUP, so the pods roll once; 4.2.)
+3. The controller writes a Secret `rproxy-ui-discovery` in the UI's namespace: `nodes.yaml` (a group `k8s:<ns>/<name>` per Gateway and a node per pod, `url: https://<pod IP>:9443`, `tls_server_name: <id>.rproxy-api.rproxy-gateway.internal`, `readonly: true`), `ca.crt` (the CA certificate only, no key), `token-<id>`. Gateways whose parameters say `ui.visible: false` are left out. In fleet mode, every fleet pod (the token is added to `rproxy-gateway-token`). Only pods that take the UI's token are listed: Ready (with the readiness gate `ruleset-applied` True), not being deleted, and made from the pod template with the current token file (the `rproxy.max3584.net/api` hash) (decided in v0.4.3: repeated 401s from old pods would make rproxy lock the UI out; the last interval of a stopping pod's usage is not collected, Q16).
 4. NetworkPolicy: each managed Gateway's NetworkPolicy also lets `ui.podSelector` in the UI's namespace reach 9443 (only Gateways with `ui.visible`). Not certsync (9444).
 5. The UI reads `RPROXY_UI_K8S_DISCOVERY=/etc/rproxy-ui/k8s` (the Secret's volume) and reads it again when the files change.
 
@@ -236,7 +236,17 @@ Today's credentials: managed rproxy has a token per Gateway (derived from the ma
 | The UI asks the controller, which relays to rproxy | the controller becomes the UI's data path and needs a new entry point with UI authentication, for the same read-only data. Considered if the pod IP delay hurts |
 | Give the UI the controller's token | it writes (`rules:write`); the rule set owner would be the same and `409 owned` would no longer protect |
 
-### 4.2 Tests (the gateway side)
+### 4.2 As built in v0.4.3
+
+As in 4.1. Details:
+
+- The nodes of `nodes.yaml` are `k8s:<ns>/<gateway>/<pod name>` (fleet: `k8s:fleet/<pod name>`), each with `url`, `tls_server_name`, `tls_ca: ca.crt`, `token_file: token-<id>` and `readonly: true`; the groups have `readonly: true` too. Groups by name, pods by name; written only when the content changes. A Gateway without a pod gets no group.
+- When no Gateway is shown, the Secret is deleted (the UI's chart mounts the Secret volume with `optional: true`). When `ui.namespace` is unset, delete the Secret in the former namespace by hand.
+- Only Gateways with valid parameters are shown (one kept in its last good shape with `InvalidParameters` is not listed and loses the UI's token).
+- Fleet pods are listed only when every Gateway they serve is shown (fleet pods hold every Gateway's rules).
+- The UI's token is in the token file, which is part of the pod template's hash (`rproxy.max3584.net/api`). rproxy v0.4.1 reads its token file only at start and on SIGHUP (rproxy-api docs/API.md), so setting `ui.namespace` and showing or hiding a Gateway roll that Gateway's pods once (`maxUnavailable: 0`, readiness gate, graceful shutdown). With `ui.namespace` empty the Secrets and Deployments are as before. The fleet's DaemonSet is the chart's: `rollout restart` it by hand after the UI's token is added. Avoiding the roll needs rproxy to read its token file again when it changes (like `RPROXY_CERT_CHECK_SECS` for certificates): max3584/rproxy-api#253; once it ships, rproxy that reports it in `features` is not rolled (a TODO in the code). With 2 or more replicas the roll's gap is under a second (the same as the acceptance test's d. rollout restart).
+
+### 4.3 Tests (the gateway side)
 
 - Unit: how the UI token is derived and its scopes, the discovery Secret (no keys, `ui.visible: false` not listed), the NetworkPolicy.
 - Acceptance: an input `ui: true` also installs the UI's chart: the discovery Secret's pods show in the UI, the UI's token gets `403` on `PUT /rulesets`.
@@ -380,7 +390,7 @@ fleet:
 |---|---|---|---|
 | `managed_replicas` | `2` | as today (`managed.replicas`) | — |
 | `install` | `helm` | `kustomize` installs `config/default` with an overlay | after B |
-| `ui` | `false` | also installs the UI's chart and checks 4.2 | C |
+| `ui` | `false` | also installs the UI's chart and checks 4.3 | C |
 | `strict` | `false` | fails if E's checks see any failed request | E |
 | `mode` | `managed` | `fleet-vip` runs 7.8's scenarios j-o | F |
 

@@ -119,6 +119,20 @@ gatewayClass:
   create: true
   name: rproxy
 
+# the UI (TCP-UDP-rproxy-ui's chart, installed apart; docs/SECURITY.md): with a namespace, the
+# controller writes the Secret rproxy-ui-discovery there: the rproxy pods of the Gateways shown to
+# the UI (RproxyGatewayParameters ui.visible, true unless set false), the control API's CA certificate
+# and per Gateway a token rproxy takes for reading only (rules:read, metrics:read). The Gateways'
+# NetworkPolicy lets the UI's pods (podSelector, in that namespace) reach the control API (9443).
+# The controller gets a Role there for that one Secret. Empty: off (nothing is written)
+ui:
+  namespace: ""
+  # the UI pods' labels: the UI chart's UI pods only (not its migration and backup pods). Helm merges
+  # maps: set a key to null to drop it
+  podSelector:
+    app.kubernetes.io/name: rproxy-ui
+    app.kubernetes.io/component: ui
+
 # migration from Ingress and Traefik (docs/MIGRATION.md): off unless migrateTo is set
 migration:
   # namespace/name of the Gateway whose rule set gets Ingress and Traefik routes
