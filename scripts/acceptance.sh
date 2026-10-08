@@ -844,7 +844,75 @@ scenario_g() {
     "paused $node (announcing node: $ann; controller leader there: $([ "$node" = "$ld_node" ] && echo yes || echo no)); steady again (5 s without a failure) by $(secs $((t_ok - t0)))s; announcing node → $(announcer)"
 }
 
-for s in a b1 b2 c d e f g; do
+# ---------------------------------------------------------------- h, i. RproxyGatewayParameters
+# a namespace admin (the chart's ClusterRole aggregated to admin) writes the Gateway's parameters
+params_crd() { kubectl get crd rproxygatewayparameters.rproxy.max3584.net > /dev/null 2>&1; }
+as_tenant() { kubectl --as="system:serviceaccount:$APP:tenant" "$@"; }
+tenant_params() {  # tenant_params <replicas> [more pod fields]: writes RproxyGatewayParameters acc as the tenant
+  cat << YAML | as_tenant apply -f - > /dev/null
+apiVersion: rproxy.max3584.net/v1alpha1
+kind: RproxyGatewayParameters
+metadata: {name: acc, namespace: $APP}
+spec:
+  replicas: $1
+  pod:
+    resources: {rproxy: {requests: {cpu: 50m, memory: 64Mi}}}
+    ${2:-}
+YAML
+}
+gw_cond() { cond gateway/acc "{.status.conditions[?(@.type==\"$1\")].$2}"; }
+gw_reason_is() { [ "$(gw_cond Accepted reason)" = "$1" ]; }
+skip_params() {
+  printf '%s\t–\t–\t–\tSKIP\tno RproxyGatewayParameters CRD (a chart before 0.4.2)\n' "$1" >> "$results"
+}
+scenario_h() {
+  local label="h. Gateway parameters changed (replicas +1, resources)" t0 old ok=PASS want served
+  params_crd || { skip_params "$label"; return 0; }
+  kubectl -n "$APP" create serviceaccount tenant --dry-run=client -o yaml | kubectl apply -f - > /dev/null
+  kubectl -n "$APP" create rolebinding tenant-admin --clusterrole=admin --serviceaccount="$APP:tenant" --dry-run=client -o yaml | kubectl apply -f - > /dev/null
+  wait_for 60 sh -c "kubectl auth can-i create rproxygatewayparameters.rproxy.max3584.net -n $APP --as=system:serviceaccount:$APP:tenant | grep -qx yes" || return 1
+  want=$((MANAGED_REPLICAS + 1))
+  old=$(rproxy_pods | awk '{print $1}' | tr '\n' ' ')
+  log "== $label: replicas $MANAGED_REPLICAS → $want"
+  t0=$(now_ms)
+  tenant_params "$want" || ok=FAIL
+  kubectl -n "$APP" patch gateway acc --type=merge \
+    -p '{"spec":{"infrastructure":{"parametersRef":{"group":"rproxy.max3584.net","kind":"RproxyGatewayParameters","name":"acc"}}}}' > /dev/null
+  MANAGED_REPLICAS=$want
+  wait_for 60 sh -c "test \"\$(kubectl -n $APP get deploy $DEPLOY -o jsonpath='{.spec.replicas}')\" = $want" || ok=FAIL
+  kubectl -n "$APP" rollout status "deploy/$DEPLOY" --timeout="${RECOVERY_TIMEOUT}s" > /dev/null || ok=FAIL
+  new_pods_serve "$old" "$RECOVERY_TIMEOUT" || ok=FAIL
+  served=$SERVED_AT
+  [ "$served" -gt 0 ] || served=$(now_ms)
+  gw_reason_is Accepted || ok=FAIL
+  [ "$(kubectl -n "$APP" get deploy "$DEPLOY" -o jsonpath='{.spec.template.spec.containers[0].resources.requests.cpu}')" = 50m ] || ok=FAIL
+  settle || ok=FAIL
+  wait_for 60 statuses_ok || ok=FAIL
+  record "$label" "$t0" "$(now_ms)" "$(secs $((served - t0)))s" "$ok" "every pod replaced and serving after $(secs $((served - t0)))s; Accepted $(gw_cond Accepted status); ${NEW_GAPS}" limit
+}
+scenario_i() {
+  local label="i. invalid Gateway parameters (the running rproxy is kept)" t0 gen ok=PASS t_bad t_fixed notes
+  params_crd || { skip_params "$label"; return 0; }
+  gen=$(kubectl -n "$APP" get deploy "$DEPLOY" -o jsonpath='{.metadata.generation}')
+  log "== $label: tolerations (not allowed to tenants by default)"
+  t0=$(now_ms)
+  tenant_params "$MANAGED_REPLICAS" "tolerations: [{key: node-role.kubernetes.io/control-plane, operator: Exists}]" || ok=FAIL
+  if wait_for 60 gw_reason_is InvalidParameters; then t_bad=$(now_ms); else t_bad=$(now_ms) ok=FAIL; fi
+  # passes go on meanwhile: the Deployment must stay as it was, the rule set still applied
+  route changed-i
+  wait_for "$APPLY_TIMEOUT" lb_host_ok changed-i.example.com || { ok=FAIL; notes="a route change did not reach the kept rproxy; "; }
+  sleep 10
+  [ "$(gw_cond Programmed status)" = True ] || { ok=FAIL; notes+="Programmed $(gw_cond Programmed status); "; }
+  [ "$(kubectl -n "$APP" get deploy "$DEPLOY" -o jsonpath='{.metadata.generation}')" = "$gen" ] || { ok=FAIL; notes+="the Deployment changed; "; }
+  notes+="InvalidParameters after $(secs $((t_bad - t0)))s ($(gw_cond Accepted message)); Programmed $(gw_cond Programmed status); "
+  tenant_params "$MANAGED_REPLICAS" || ok=FAIL
+  if wait_for 60 gw_reason_is Accepted; then t_fixed=$(now_ms); else t_fixed=$(now_ms) ok=FAIL; fi
+  settle || ok=FAIL
+  [ "$(kubectl -n "$APP" get deploy "$DEPLOY" -o jsonpath='{.metadata.generation}')" = "$gen" ] || { ok=FAIL; notes+="fixed: the Deployment changed; "; }
+  record "$label" "$t0" "$(now_ms)" "$(secs $((t_fixed - t0)))s" "$ok" "${notes}accepted again $(secs $((t_fixed - t_bad)))s after the fix" limit
+}
+
+for s in a b1 b2 c d e f g h i; do
   if ! "scenario_$s"; then
     echo "scenario $s aborted" >&2
     printf '%s\t–\t–\t–\tFAIL\taborted\n' "$s" >> "$results"

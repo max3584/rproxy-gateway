@@ -27,6 +27,7 @@ A Kubernetes controller for [rproxy](https://github.com/max3584/rproxy-api). It 
 | Backends | the pod IPs from EndpointSlices (rproxy balances and health-checks them) |
 | Status | `Accepted`, `Programmed`, `ResolvedRefs` of Gateways, listeners and routes (from the rproxy rules' `conditions`) |
 | `RproxyMiddleware`, `RproxyPolicy`, `RproxyRule` (`rproxy.max3584.net/v1alpha1`) | settings Gateway API lacks (middlewares; L4 limits, bandwidth, GeoIP, passive health checks; rules verbatim) |
+| `RproxyGatewayParameters` (GatewayClass and Gateway `parametersRef`) | managed rproxy per Gateway (replicas, PDB, resources, pod and Service settings, rproxy's performance settings) |
 | Migration (`--migrate-to`) | reads Ingress and Traefik's IngressRoute, IngressRouteTCP, IngressRouteUDP, Middleware, TLSOption ([docs/en/MIGRATION.md](docs/en/MIGRATION.md)) |
 
 Decisions and the mapping tables: [docs/en/DESIGN.md](docs/en/DESIGN.md). Gateway API conformance results: [docs/en/CONFORMANCE.md](docs/en/CONFORMANCE.md). Tenant separation, what is off by default, and permissions: [docs/en/SECURITY.md](docs/en/SECURITY.md).
@@ -60,6 +61,19 @@ spec:
 ```
 
 - By default (managed), the controller creates one rproxy Deployment and `LoadBalancer` Service per Gateway in the Gateway's namespace (`managed.serviceType`, `managed.replicas`), with the Gateway's `spec.infrastructure` labels and annotations and its `spec.addresses` (the Service's `externalIPs`).
+- A Gateway's own rproxy shape (replicas, resources, PDB, Service settings, ...): write an `RproxyGatewayParameters` in the Gateway's namespace and name it in `spec.infrastructure.parametersRef`. Every Gateway's defaults and what Gateways may set (`policy`): the chart's `managed.parameters` (the GatewayClass's reference). When upgrading from v0.4.1 with `helm upgrade`, apply the CRDs first (`helm upgrade` does not install new CRDs): `kubectl apply --server-side -f https://github.com/max3584/rproxy-gateway/releases/download/v<version>/rproxy.max3584.net.yaml`.
+
+```yaml
+apiVersion: rproxy.max3584.net/v1alpha1
+kind: RproxyGatewayParameters
+metadata: {name: web, namespace: default}
+spec:
+  replicas: 3
+  pod: {resources: {rproxy: {requests: {cpu: 500m, memory: 128Mi}}}}
+---
+# in the Gateway's spec:
+#   infrastructure: {parametersRef: {group: rproxy.max3584.net, kind: RproxyGatewayParameters, name: web}}
+```
 - The controller runs 2 replicas by default; they elect a leader with a Lease and only it applies rule sets (docs/en/DESIGN.md, "High availability").
 - With `fleet.enabled=true`, the chart's DaemonSet (`hostNetwork: true`) runs rproxy, which serves every Gateway.
 - Chart values: [charts/rproxy-gateway/values.yaml](charts/rproxy-gateway/values.yaml).

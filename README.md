@@ -27,6 +27,7 @@ English: [README.en.md](README.en.md)
 | backend | EndpointSlice の Pod の IP（rproxy が振り分けとヘルスチェックをする） |
 | 状態 | Gateway・リスナー・ルートの `Accepted`・`Programmed`・`ResolvedRefs`（rproxy のルールの `conditions` から） |
 | `RproxyMiddleware`・`RproxyPolicy`・`RproxyRule`（`rproxy.max3584.net/v1alpha1`） | Gateway API にない設定（ミドルウェア、L4 の制限・帯域・GeoIP・受け身のヘルスチェック、ルールそのもの） |
+| `RproxyGatewayParameters`（GatewayClass・Gateway の `parametersRef`） | managed の rproxy の形を Gateway ごとに（replicas、PDB、resources、Pod・Service の設定、rproxy の性能の設定） |
 | 移行（`--migrate-to`） | Ingress と Traefik の IngressRoute・IngressRouteTCP・IngressRouteUDP・Middleware・TLSOption を読む（[docs/MIGRATION.md](docs/MIGRATION.md)） |
 
 決めごとと変換の表は [docs/DESIGN.md](docs/DESIGN.md)。Gateway API の conformance の結果は [docs/CONFORMANCE.md](docs/CONFORMANCE.md)。テナントの分け方・既定で止めているもの・権限は [docs/SECURITY.md](docs/SECURITY.md)。
@@ -60,6 +61,19 @@ spec:
 ```
 
 - 既定（managed）では、Gateway ごとに rproxy の Deployment と `LoadBalancer` の Service を Gateway の namespace に作る（`managed.serviceType`、`managed.replicas`）。Gateway の `spec.infrastructure` のラベル・注釈と `spec.addresses`（Service の `externalIPs`）を使う。
+- Gateway ごとの rproxy の形（replicas・resources・PDB・Service の設定など）は `RproxyGatewayParameters` を Gateway の namespace に書き、`spec.infrastructure.parametersRef` で指す。全 Gateway の既定と、Gateway に許す項目（`policy`）は chart の `managed.parameters`（GatewayClass の参照）。v0.4.1 から `helm upgrade` するときは、先に CRD を入れる（`helm upgrade` は新しい CRD を入れない）：`kubectl apply --server-side -f https://github.com/max3584/rproxy-gateway/releases/download/v<版>/rproxy.max3584.net.yaml`。
+
+```yaml
+apiVersion: rproxy.max3584.net/v1alpha1
+kind: RproxyGatewayParameters
+metadata: {name: web, namespace: default}
+spec:
+  replicas: 3
+  pod: {resources: {rproxy: {requests: {cpu: 500m, memory: 128Mi}}}}
+---
+# Gateway の spec に
+#   infrastructure: {parametersRef: {group: rproxy.max3584.net, kind: RproxyGatewayParameters, name: web}}
+```
 - コントローラは既定で 2 レプリカ。Lease でリーダーを選び、1 つだけが反映する（docs/DESIGN.md の「冗長化」）。
 - `fleet.enabled=true` では、chart の DaemonSet（`hostNetwork: true`）の rproxy がすべての Gateway を受け持つ。
 - chart の値は [charts/rproxy-gateway/values.yaml](charts/rproxy-gateway/values.yaml)。

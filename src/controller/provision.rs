@@ -39,7 +39,9 @@ use kube::api::{DeleteParams, ListParams, Patch, PatchParams};
 use tracing::info;
 
 use crate::controller::bootstrap;
+use crate::k8s::params::RproxyGatewayParametersSpec as Params;
 use crate::render::GatewayPlan;
+use crate::render::params::{object, objects};
 use crate::rproxy::client::server_name_for;
 
 pub const MANAGER: &str = "rproxy-gateway";
@@ -216,29 +218,11 @@ pub struct Target<'a> {
 	pub addresses: Vec<String>,
 	/// Annotation prefixes let onto the Service though they steer addresses (`--service-annotation-prefix`).
 	pub service_annotations: Vec<String>,
+	/// The GatewayClass's and the Gateway's RproxyGatewayParameters, merged (checked by `render::params`).
+	pub params: Params,
 }
 
-/// Annotation prefixes of `spec.infrastructure` kept off the Service: they ask load
-/// balancers for addresses (a tenant could take an address that is not theirs).
-pub const SERVICE_ANNOTATION_DENY: &[&str] = &[
-	"metallb.universe.tf/",
-	"metallb.io/",
-	"lbipam.cilium.io/",
-	"io.cilium/",
-	"service.beta.kubernetes.io/",
-	"service.kubernetes.io/",
-	"cloud.google.com/",
-	"networking.gke.io/",
-	"kube-vip.io/",
-	"purelb.io/",
-	"load-balancer.hetzner.cloud/",
-	"loadbalancer.openstack.org/",
-];
-
-/// Whether an infrastructure annotation may go onto the Service.
-pub fn service_annotation_allowed(key: &str, allow: &[String]) -> bool {
-	allow.iter().any(|p| key.starts_with(p.as_str())) || !SERVICE_ANNOTATION_DENY.iter().any(|p| key.starts_with(p))
-}
+pub use crate::render::params::{SERVICE_ANNOTATION_DENY, service_annotation_allowed};
 
 impl<'a> Target<'a> {
 	pub fn new(plan: &'a GatewayPlan) -> Target<'a> {
@@ -250,7 +234,18 @@ impl<'a> Target<'a> {
 			annotations: BTreeMap::new(),
 			addresses: vec![],
 			service_annotations: vec![],
+			params: Params::default(),
 		}
+	}
+
+	/// rproxy pods: the parameters' `replicas`, else `--replicas`.
+	pub fn replicas(&self, m: &Managed) -> i32 {
+		self.params.replicas.unwrap_or(m.replicas)
+	}
+
+	/// The Service's type: the parameters', else `--service-type`.
+	pub fn service_type(&self, m: &Managed) -> String {
+		self.params.service.as_ref().and_then(|s| s.type_).map_or_else(|| m.service_type.clone(), |t| t.as_str().to_string())
 	}
 
 	fn ns(&self) -> &str {
@@ -438,19 +433,26 @@ pub fn deployment(t: &Target, m: &Managed, api_hash: &str) -> Deployment {
 		initial_delay_seconds: Some(t.initial_delay),
 		..Default::default()
 	};
+	let pp = t.params.pod.clone().unwrap_or_default();
+	let resources = pp.resources.clone().unwrap_or_default();
+	let replicas = t.replicas(m);
+	let mut rproxy_env = vec![
+		env("RPROXY_API_ADDR", "0.0.0.0"),
+		env("RPROXY_API_PORT", &API_PORT.to_string()),
+		env("RPROXY_TOKEN_FILE", &format!("{API_DIR}/tokens.yaml")),
+		env("RPROXY_TLS_CERT", &format!("{API_DIR}/tls.crt")),
+		env("RPROXY_TLS_KEY", &format!("{API_DIR}/tls.key")),
+		// the kubelet mounts Secrets as root (0440, group fsGroup): rproxy may use root's files there
+		env("RPROXY_FILES_TRUSTED_DIRS", &format!("{CERT_DIR},{API_DIR}")),
+	];
+	// the parameters' logLevel, performance and extraEnv (names the controller sets are refused there)
+	rproxy_env.extend(crate::render::params::rproxy_env(&t.params));
 	let rproxy = Container {
 		name: "rproxy".into(),
-		image: Some(m.rproxy_image.clone()),
+		image: Some(t.params.rproxy.as_ref().and_then(|r| r.image.clone()).unwrap_or_else(|| m.rproxy_image.clone())),
 		image_pull_policy: Some(m.pull_policy.clone()),
-		env: Some(vec![
-			env("RPROXY_API_ADDR", "0.0.0.0"),
-			env("RPROXY_API_PORT", &API_PORT.to_string()),
-			env("RPROXY_TOKEN_FILE", &format!("{API_DIR}/tokens.yaml")),
-			env("RPROXY_TLS_CERT", &format!("{API_DIR}/tls.crt")),
-			env("RPROXY_TLS_KEY", &format!("{API_DIR}/tls.key")),
-			// the kubelet mounts Secrets as root (0440, group fsGroup): rproxy may use root's files there
-			env("RPROXY_FILES_TRUSTED_DIRS", &format!("{CERT_DIR},{API_DIR}")),
-		]),
+		env: Some(rproxy_env),
+		resources: object(resources.rproxy.as_ref()),
 		ports: Some(vec![ContainerPort { name: Some("api".into()), container_port: API_PORT.into(), ..Default::default() }]),
 		// liveness needs successThreshold 1
 		liveness_probe: Some(probe("/healthz", &ProbeTiming { success: 1, ..m.liveness })),
@@ -480,15 +482,38 @@ pub fn deployment(t: &Target, m: &Managed, api_hash: &str) -> Deployment {
 		}]),
 		volume_mounts: Some(vec![mount("certs", CERT_DIR)]),
 		security_context: Some(restricted),
+		resources: object(resources.certsync.as_ref()),
 		..Default::default()
 	};
 	let item = |k: &str| KeyToPath { key: k.into(), path: k.into(), ..Default::default() };
 	let mut pod_meta = t.meta(&name, labels(&t.id));
 	pod_meta.annotations.get_or_insert_default().insert(ANNOTATION_API.into(), api_hash.into());
+	// the parameters' pod labels and annotations: under the infrastructure's and ours
+	under(&mut pod_meta.labels, pp.labels.as_ref());
+	under(&mut pod_meta.annotations, pp.annotations.as_ref());
+	let selector = || LabelSelector { match_labels: Some(labels(&t.id)), ..Default::default() };
+	let spread = match objects::<TopologySpreadConstraint>(pp.topology_spread_constraints.as_ref()) {
+		// a constraint without a selector spreads the Gateway's own pods
+		Some(list) => Some(
+			list.into_iter()
+				.map(|c| TopologySpreadConstraint { label_selector: c.label_selector.or_else(|| Some(selector())), ..c })
+				.collect(),
+		),
+		// replicas on different nodes when they can be
+		None => (replicas >= 2).then(|| {
+			vec![TopologySpreadConstraint {
+				max_skew: 1,
+				topology_key: "kubernetes.io/hostname".into(),
+				when_unsatisfiable: "ScheduleAnyway".into(),
+				label_selector: Some(selector()),
+				..Default::default()
+			}]
+		}),
+	};
 	Deployment {
 		metadata: t.meta(&name, labels(&t.id)),
 		spec: Some(DeploymentSpec {
-			replicas: Some(m.replicas),
+			replicas: Some(replicas),
 			selector: LabelSelector { match_labels: Some(labels(&t.id)), ..Default::default() },
 			// a new pod takes traffic (its readiness gate) before an old one stops
 			strategy: Some(DeploymentStrategy {
@@ -517,16 +542,11 @@ pub fn deployment(t: &Target, m: &Managed, api_hash: &str) -> Deployment {
 					containers: vec![rproxy, certsync],
 					readiness_gates: Some(vec![PodReadinessGate { condition_type: CONDITION_RULESET.into() }]),
 					termination_grace_period_seconds: (m.pre_stop_secs > 0).then(|| i64::from(m.pre_stop_secs) + STOP_GRACE),
-					// replicas on different nodes when they can be
-					topology_spread_constraints: (m.replicas >= 2).then(|| {
-						vec![TopologySpreadConstraint {
-							max_skew: 1,
-							topology_key: "kubernetes.io/hostname".into(),
-							when_unsatisfiable: "ScheduleAnyway".into(),
-							label_selector: Some(LabelSelector { match_labels: Some(labels(&t.id)), ..Default::default() }),
-							..Default::default()
-						}]
-					}),
+					topology_spread_constraints: spread,
+					node_selector: pp.node_selector.clone(),
+					tolerations: objects(pp.tolerations.as_ref()),
+					affinity: object(pp.affinity.as_ref()),
+					priority_class_name: pp.priority_class_name.clone(),
 					volumes: Some(vec![
 						secret_volume("api", &api_secret_name(&t.id), Some(vec![item("tokens.yaml"), item("tls.crt"), item("tls.key")])),
 						secret_volume("certs", &certs_secret_name(&t.id), None),
@@ -558,25 +578,42 @@ fn pre_stop(m: &Managed) -> Option<Lifecycle> {
 	Some(Lifecycle { pre_stop: Some(handler), ..Default::default() })
 }
 
-/// A Gateway's PodDisruptionBudget (with 2 or more replicas): one pod at a time goes in a drain.
-pub fn pod_disruption_budget(t: &Target) -> PodDisruptionBudget {
-	PodDisruptionBudget {
+/// A Gateway's PodDisruptionBudget: the parameters', else (with 2 or more replicas) one pod at a
+/// time goes in a drain. `None`: none.
+pub fn pod_disruption_budget(t: &Target, m: &Managed) -> Option<PodDisruptionBudget> {
+	let (min_available, max_unavailable) = match &t.params.pod_disruption_budget {
+		Some(p) => (p.min_available.clone().map(|v| v.0), p.max_unavailable.clone().map(|v| v.0)),
+		None if t.replicas(m) >= 2 => (None, Some(IntOrString::Int(1))),
+		None => return None,
+	};
+	Some(PodDisruptionBudget {
 		metadata: t.meta(&object_name(&t.id), labels(&t.id)),
 		spec: Some(PodDisruptionBudgetSpec {
-			max_unavailable: Some(IntOrString::Int(1)),
+			min_available,
+			max_unavailable,
 			selector: Some(LabelSelector { match_labels: Some(labels(&t.id)), ..Default::default() }),
 			// a pod that is not ready (its rule set never applied) does not block a drain
 			unhealthy_pod_eviction_policy: Some("AlwaysAllow".into()),
-			..Default::default()
 		}),
 		..Default::default()
+	})
+}
+
+/// Adds `extra` to `to` where `to` has no such key (the parameters' labels and annotations lose
+/// to the infrastructure's and the controller's).
+fn under(to: &mut Option<BTreeMap<String, String>>, extra: Option<&BTreeMap<String, String>>) {
+	let to = to.get_or_insert_default();
+	for (k, v) in extra.into_iter().flatten() {
+		to.entry(k.clone()).or_insert_with(|| v.clone());
 	}
 }
 
-/// The Service's `externalTrafficPolicy` (none for ClusterIP).
-fn external_traffic_policy(m: &Managed) -> Option<String> {
-	match (m.service_type.as_str(), &m.external_traffic_policy) {
-		("LoadBalancer" | "NodePort", Some(p)) => Some(p.clone()),
+/// The Service's `externalTrafficPolicy` (none for ClusterIP): the parameters', else the flag's,
+/// else `Local` for LoadBalancer.
+fn external_traffic_policy(t: &Target, m: &Managed) -> Option<String> {
+	let set = t.params.service.as_ref().and_then(|s| s.external_traffic_policy).map(|p| p.as_str().to_string());
+	match (t.service_type(m).as_str(), set.or_else(|| m.external_traffic_policy.clone())) {
+		("LoadBalancer" | "NodePort", Some(p)) => Some(p),
 		("LoadBalancer", None) => Some("Local".into()),
 		_ => None,
 	}
@@ -595,21 +632,29 @@ pub fn service(t: &Target, m: &Managed) -> Service {
 			..Default::default()
 		})
 		.collect();
+	let sp = t.params.service.clone().unwrap_or_default();
+	let service_type = t.service_type(m);
 	Service {
 		metadata: {
 			let mut meta = t.meta(&object_name(&t.id), labels(&t.id));
 			if let Some(a) = meta.annotations.as_mut() {
 				a.retain(|k, _| k == ANNOTATION_GATEWAY || service_annotation_allowed(k, &t.service_annotations));
 			}
+			// the parameters' (a Gateway's load balancer annotations were checked against the allow list)
+			under(&mut meta.labels, sp.labels.as_ref());
+			under(&mut meta.annotations, sp.annotations.as_ref());
 			meta
 		},
 		spec: Some(ServiceSpec {
-			type_: Some(m.service_type.clone()),
 			selector: Some(labels(&t.id)),
 			ports: Some(ports),
-			external_traffic_policy: external_traffic_policy(m),
-			allocate_load_balancer_node_ports: (m.service_type == "LoadBalancer").then_some(m.allocate_node_ports),
+			external_traffic_policy: external_traffic_policy(t, m),
+			allocate_load_balancer_node_ports: (service_type == "LoadBalancer").then_some(m.allocate_node_ports),
 			external_ips: (!t.addresses.is_empty()).then(|| t.addresses.clone()),
+			load_balancer_class: sp.load_balancer_class.clone().filter(|_| service_type == "LoadBalancer"),
+			load_balancer_source_ranges: sp.load_balancer_source_ranges.clone(),
+			ip_family_policy: sp.ip_family_policy.map(|p| p.as_str().to_string()),
+			type_: Some(service_type),
 			..Default::default()
 		}),
 		..Default::default()
@@ -768,9 +813,31 @@ pub struct Applied {
 	pub service: Option<Service>,
 	/// The hash of the certificate Secret's content.
 	pub certs: String,
+	/// Whether the Gateway has a PodDisruptionBudget (else `collect_garbage` deletes it).
+	pub pdb: bool,
 }
 
-/// Applies a Gateway's Secrets, ServiceAccount, Deployment and Service.
+/// Writes a Gateway's certificate and control API Secrets; returns the hashes of their content.
+pub async fn apply_secrets(
+	client: &kube::Client,
+	t: &Target<'_>,
+	boot: &bootstrap::Bootstrap,
+	current_api: Option<&Secret>,
+	absent: &mut BTreeMap<String, Instant>,
+) -> anyhow::Result<(String, String)> {
+	let ns = t.ns();
+	let certs = apply_certs(client, ns, &certs_secret_name(&t.id), &t.plan.files, absent, |data| {
+		secret(t.meta(&certs_secret_name(&t.id), t.secret_labels()), data)
+	})
+	.await?;
+	let api = api_secret(t, current_api, boot)?;
+	if current_api.is_none_or(|c| data_of(Some(c)) != data_of(Some(&api)) || !same_meta(&c.metadata, &api.metadata)) {
+		Api::<Secret>::namespaced(client.clone(), ns).patch(&api_secret_name(&t.id), &pp(), &Patch::Apply(&api)).await?;
+	}
+	Ok((certs, content_hash(&data_of(Some(&api)))))
+}
+
+/// Applies a Gateway's Secrets, ServiceAccount, Deployment, PodDisruptionBudget and Service.
 /// `current_api`: the control API Secret as it is (from the cache).
 pub async fn apply_managed(
 	client: &kube::Client,
@@ -781,14 +848,7 @@ pub async fn apply_managed(
 	absent: &mut BTreeMap<String, Instant>,
 ) -> anyhow::Result<Applied> {
 	let ns = t.ns();
-	let certs = apply_certs(client, ns, &certs_secret_name(&t.id), &t.plan.files, absent, |data| {
-		secret(t.meta(&certs_secret_name(&t.id), t.secret_labels()), data)
-	})
-	.await?;
-	let api = api_secret(t, current_api, boot)?;
-	if current_api.is_none_or(|c| data_of(Some(c)) != data_of(Some(&api)) || !same_meta(&c.metadata, &api.metadata)) {
-		Api::<Secret>::namespaced(client.clone(), ns).patch(&api_secret_name(&t.id), &pp(), &Patch::Apply(&api)).await?;
-	}
+	let (certs, api_hash) = apply_secrets(client, t, boot, current_api, absent).await?;
 	let name = object_name(&t.id);
 	if let Some(cns) = &m.network_policy {
 		let np = network_policy(t, cns);
@@ -797,12 +857,12 @@ pub async fn apply_managed(
 			.await?;
 	}
 	Api::<ServiceAccount>::namespaced(client.clone(), ns).patch(&name, &pp(), &Patch::Apply(&service_account(t))).await?;
-	let api_hash = content_hash(&data_of(Some(&api)));
 	Api::<Deployment>::namespaced(client.clone(), ns).patch(&name, &pp(), &Patch::Apply(&deployment(t, m, &api_hash))).await?;
-	// with fewer replicas, `collect_garbage` deletes it
-	if m.replicas >= 2 {
-		let pdb = Api::<PodDisruptionBudget>::namespaced(client.clone(), ns);
-		if let Err(e) = pdb.patch(&name, &pp(), &Patch::Apply(&pod_disruption_budget(t))).await {
+	// none wanted: `collect_garbage` deletes it
+	let pdb = pod_disruption_budget(t, m);
+	if let Some(want) = &pdb {
+		let api = Api::<PodDisruptionBudget>::namespaced(client.clone(), ns);
+		if let Err(e) = api.patch(&name, &pp(), &Patch::Apply(want)).await {
 			tracing::warn!(gateway = %t.plan.ruleset, error = %e, "cannot write the PodDisruptionBudget");
 		}
 	}
@@ -810,20 +870,26 @@ pub async fn apply_managed(
 	if t.plan.ports().is_empty() {
 		// a Service needs a port; none until a listener is valid
 		let _ = svc_api.delete(&name, &DeleteParams::default()).await;
-		return Ok(Applied { service: None, certs });
+		return Ok(Applied { service: None, certs, pdb: pdb.is_some() });
 	}
 	let service = svc_api.patch(&name, &pp(), &Patch::Apply(&service(t, m))).await?;
-	Ok(Applied { service: Some(service), certs })
+	Ok(Applied { service: Some(service), certs, pdb: pdb.is_some() })
+}
+
+/// Whether a Gateway's rproxy Deployment exists (a Gateway kept in its last good shape when its
+/// parameters become invalid).
+pub async fn deployed(client: &kube::Client, ns: &str, id: &str) -> anyhow::Result<bool> {
+	Ok(Api::<Deployment>::namespaced(client.clone(), ns).get_opt(&object_name(id)).await?.is_some())
 }
 
 /// Deletes managed objects of Gateways that are gone or no longer ours (`keep`:
 /// ids still in use), in every namespace. (Deleting a Gateway deletes them as
-/// well: the Gateway owns them.) PodDisruptionBudgets go as well unless `keep_pdb`
-/// (2 or more replicas).
+/// well: the Gateway owns them.) PodDisruptionBudgets go as well unless their
+/// Gateway is in `keep_pdb` (it wants one, or is kept in its last good shape).
 pub async fn collect_garbage(
 	client: &kube::Client,
 	keep: &[String],
-	keep_pdb: bool,
+	keep_pdb: &[String],
 	scope: &crate::controller::cache::Scope,
 ) -> anyhow::Result<()> {
 	let nss: Vec<Option<String>> = match scope {
@@ -857,7 +923,8 @@ pub async fn collect_garbage(
 	}
 	if let Ok(list) = list_in::<PodDisruptionBudget>(client, &nss, &lp).await {
 		for pdb in list {
-			if gone(&pdb.metadata) || !keep_pdb {
+			let id = pdb.metadata.labels.as_ref().and_then(|l| l.get(LABEL_GATEWAY));
+			if gone(&pdb.metadata) || id.is_none_or(|id| !keep_pdb.contains(id)) {
 				let (ns, name) = ns_name(&pdb.metadata);
 				Api::<PodDisruptionBudget>::namespaced(client.clone(), &ns).delete(&name, &dp).await?;
 			}
@@ -1120,13 +1187,86 @@ mod tests {
 		assert!(pod.containers[0].lifecycle.is_none());
 		assert_eq!(pod.termination_grace_period_seconds, None);
 		// the PodDisruptionBudget
-		let pdb = pod_disruption_budget(&t);
+		assert!(pod_disruption_budget(&t, &Managed::default()).is_none(), "one replica: none");
+		let pdb = pod_disruption_budget(&t, &m).unwrap();
 		assert_eq!(pdb.metadata.name, Some(object_name(&t.id)));
 		assert_eq!(pdb.metadata.labels.as_ref().unwrap()[LABEL_GATEWAY], t.id, "collected with the Gateway's objects");
 		let spec = pdb.spec.unwrap();
 		assert_eq!(spec.max_unavailable, Some(IntOrString::Int(1)));
 		assert_eq!(spec.selector.unwrap().match_labels, Some(labels(&t.id)));
 		assert_eq!(spec.unhealthy_pod_eviction_policy.as_deref(), Some("AlwaysAllow"));
+	}
+
+	#[test]
+	fn parameters() {
+		use crate::k8s::params::RproxyGatewayParametersSpec;
+		let p = plan();
+		let mut t = Target::new(&p);
+		t.labels = [("team".to_string(), "infra".to_string())].into();
+		t.annotations = [("metallb.universe.tf/loadBalancerIPs".to_string(), "10.0.0.1".to_string())].into();
+		t.params = serde_json::from_value::<RproxyGatewayParametersSpec>(serde_json::json!({
+			"replicas": 3,
+			"podDisruptionBudget": {"minAvailable": 2},
+			"pod": {
+				"labels": {"team": "params", "cost": "a"},
+				"annotations": {"prometheus.io/scrape": "true"},
+				"resources": {"rproxy": {"requests": {"cpu": "500m"}}, "certsync": {"limits": {"memory": "32Mi"}}},
+				"topologySpreadConstraints": [{"maxSkew": 1, "topologyKey": "topology.kubernetes.io/zone", "whenUnsatisfiable": "DoNotSchedule"}],
+				"nodeSelector": {"pool": "edge"},
+				"tolerations": [{"key": "edge", "operator": "Exists"}],
+				"priorityClassName": "high"
+			},
+			"service": {
+				"type": "NodePort", "externalTrafficPolicy": "Local", "ipFamilyPolicy": "PreferDualStack",
+				"loadBalancerSourceRanges": ["203.0.113.0/24"], "labels": {"svc": "x"},
+				"annotations": {"metallb.universe.tf/address-pool": "edge"}
+			},
+			"rproxy": {"image": "example.com/rproxy:9", "logLevel": "debug", "performance": {"workers": 4}}
+		}))
+		.unwrap();
+		let m = Managed { replicas: 1, rproxy_image: "rproxy:1".into(), ..Default::default() };
+		let d = deployment(&t, &m, "h").spec.unwrap();
+		assert_eq!(d.replicas, Some(3));
+		let tmpl = d.template.metadata.unwrap();
+		let l = tmpl.labels.unwrap();
+		assert_eq!((l["team"].as_str(), l["cost"].as_str()), ("infra", "a"), "the infrastructure's labels win over the parameters'");
+		assert_eq!(l["app.kubernetes.io/name"], "rproxy");
+		assert_eq!(tmpl.annotations.unwrap()["prometheus.io/scrape"], "true");
+		let pod = d.template.spec.unwrap();
+		let rproxy = &pod.containers[0];
+		assert_eq!(rproxy.image.as_deref(), Some("example.com/rproxy:9"));
+		assert_eq!(rproxy.resources.as_ref().unwrap().requests.as_ref().unwrap()["cpu"].0, "500m");
+		assert_eq!(pod.containers[1].resources.as_ref().unwrap().limits.as_ref().unwrap()["memory"].0, "32Mi");
+		let env: BTreeMap<String, String> =
+			rproxy.env.iter().flatten().map(|e| (e.name.clone(), e.value.clone().unwrap_or_default())).collect();
+		assert_eq!((env["RPROXY_LOG_LEVEL"].as_str(), env["RPROXY_WORKERS"].as_str()), ("debug", "4"));
+		assert_eq!(env["RPROXY_API_PORT"], "9443", "the controller's own settings stay");
+		let spread = pod.topology_spread_constraints.unwrap();
+		assert_eq!(spread.len(), 1, "the parameters' constraints replace the default");
+		assert_eq!(spread[0].topology_key, "topology.kubernetes.io/zone");
+		assert_eq!(spread[0].label_selector.as_ref().unwrap().match_labels, Some(labels(&t.id)), "the Gateway's pods");
+		assert_eq!(pod.node_selector.unwrap()["pool"], "edge");
+		assert_eq!(pod.tolerations.unwrap()[0].key.as_deref(), Some("edge"));
+		assert_eq!(pod.priority_class_name.as_deref(), Some("high"));
+		assert_eq!(pod.readiness_gates.unwrap().len(), 1, "the readiness gate stays");
+		let pdb = pod_disruption_budget(&t, &m).unwrap().spec.unwrap();
+		assert_eq!((pdb.min_available, pdb.max_unavailable), (Some(IntOrString::Int(2)), None));
+		let s = service(&t, &m);
+		let a = s.metadata.annotations.unwrap();
+		assert!(!a.contains_key("metallb.universe.tf/loadBalancerIPs"), "the infrastructure's stay filtered");
+		assert_eq!(a["metallb.universe.tf/address-pool"], "edge", "the parameters' were checked before");
+		assert_eq!(s.metadata.labels.unwrap()["svc"], "x");
+		let spec = s.spec.unwrap();
+		assert_eq!(spec.type_.as_deref(), Some("NodePort"));
+		assert_eq!(spec.external_traffic_policy.as_deref(), Some("Local"));
+		assert_eq!(spec.ip_family_policy.as_deref(), Some("PreferDualStack"));
+		assert_eq!(spec.load_balancer_source_ranges, Some(vec!["203.0.113.0/24".to_string()]));
+		assert_eq!(spec.allocate_load_balancer_node_ports, None, "NodePort");
+		// without parameters: the flags, as in v0.4.1
+		let t = Target::new(&p);
+		let m = Managed { replicas: 2, ..Default::default() };
+		assert_eq!(deployment(&t, &m, "h").spec.unwrap().replicas, Some(2));
+		assert_eq!(pod_disruption_budget(&t, &m).unwrap().spec.unwrap().max_unavailable, Some(IntOrString::Int(1)));
 	}
 
 	#[test]

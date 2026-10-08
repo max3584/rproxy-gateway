@@ -1053,8 +1053,28 @@ fn gateway_addresses_and_parameters() {
 	let p = with("  addresses: [{value: 0.0.0.0}, {value: 192.0.2.10}]\n");
 	assert!(p.accepted(), "accepted, but not programmed");
 	assert!(p.address_error.as_deref().is_some_and(|e| e.contains("0.0.0.0")));
+	// parameters: another kind (Gateway API's conformance uses this one), missing, invalid, working
 	let p = with("  infrastructure: {parametersRef: {group: invalid.io, kind: InvalidParameters, name: invalid}}\n");
 	assert_eq!((cond(&p.conds, "Accepted").status, cond(&p.conds, "Accepted").reason.as_str()), (false, "InvalidParameters"));
+	assert!(p.parameters_error.is_some() && p.parameters.is_none());
+	let reference = "  infrastructure: {parametersRef: {group: rproxy.max3584.net, kind: RproxyGatewayParameters, name: web}}\n";
+	let p = with(reference);
+	assert_eq!(cond(&p.conds, "Accepted").reason, "InvalidParameters");
+	assert!(cond(&p.conds, "Accepted").message.contains("default/web: not found"));
+	let params = |spec: &str| {
+		format!(
+			"\n---\napiVersion: rproxy.max3584.net/v1alpha1\nkind: RproxyGatewayParameters\nmetadata: {{name: web, namespace: default}}\nspec: {spec}\n"
+		)
+	};
+	let w = world(&(yaml_with(reference) + &params("{replicas: 3, pod: {tolerations: [{operator: Exists}]}}")));
+	let p = render_gateway(&w, &w.gateways[0], &allowed);
+	assert!(!p.accepted());
+	assert!(cond(&p.conds, "Accepted").message.contains("spec.pod.tolerations: not allowed by the GatewayClass"));
+	let w = world(&(yaml_with(reference) + &params("{replicas: 3, pod: {labels: {team: a}}}")));
+	let p = render_gateway(&w, &w.gateways[0], &allowed);
+	assert!(p.accepted(), "{:?}", p.conds);
+	assert_eq!(p.parameters.as_ref().and_then(|s| s.replicas), Some(3));
+	assert!(!p.rules.is_empty());
 	let p = with("  infrastructure: {labels: {a: b}, annotations: {c: d}}\n");
 	assert!(p.accepted());
 }

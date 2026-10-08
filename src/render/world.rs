@@ -41,6 +41,8 @@ pub struct World {
 	pub middlewares: BTreeMap<Key, RproxyMiddleware>,
 	pub policies: Vec<RproxyPolicy>,
 	pub raw_rules: Vec<RproxyRule>,
+	/// RproxyGatewayParameters (GatewayClasses' and Gateways' parametersRef).
+	pub gateway_parameters: BTreeMap<Key, crate::k8s::params::RproxyGatewayParameters>,
 	/// Whether ExternalName Services may be backends (the controller's setting, copied in for rendering).
 	pub allow_external_name: bool,
 	/// Ingress and Traefik resources (only when migration is on).

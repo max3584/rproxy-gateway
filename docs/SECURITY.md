@@ -28,6 +28,7 @@ English: [en/SECURITY.md](en/SECURITY.md)
 | 移行（Ingress・Traefik）のほかの namespace への参照（Service・Middleware・TLSOption・errors の service） | 参照先の namespace の ReferenceGrant（from `traefik.io` の `IngressRoute*`・`Middleware`）がなければ変換しない（Traefik の `allowCrossNamespace=false` と同じ） | `migration.allowCrossNamespace` / `--migration-allow-cross-namespace` |
 | Ingress の path | バッククォート・引用符・制御文字・`/` で始まらないものは変換しない（`match` の式に埋め込むため） | — |
 | Ingress の `defaultBackend` | 移行先の Gateway の namespace のものだけ | — |
+| Gateway の `RproxyGatewayParameters`（`infrastructure.parametersRef`、同じ namespace のものだけ） | replicas（`policy.maxReplicas`、既定 10 まで）・PDB・resources・Pod と Service のラベル／注釈・topologySpread・externalTrafficPolicy・sourceRanges・ipFamilyPolicy・logLevel・performance だけ。LB のアドレスを決める注釈は上の許可リストを通ったものだけ（ほかは `InvalidParameters`）。`service.type`・`loadBalancerClass`・nodeSelector・tolerations・affinity・priorityClassName は既定で使えない。rproxy のイメージ・追加の環境変数・`policy` は使えない。コントローラの接頭辞（`rproxy.max3584.net/` など）のラベル・注釈も使えない | GatewayClass の `RproxyGatewayParameters`（chart の `managed.parameters`）の `policy`（`gatewayOverrides`・`maxReplicas`・`allowedPriorityClasses`・`allowedLoadBalancerClasses`）。イメージと環境変数は開けない（[DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) の 2.5） |
 
 ## ほかの namespace の秘密鍵（M7）
 
@@ -39,6 +40,7 @@ English: [en/SECURITY.md](en/SECURITY.md)
 ## コントローラの権限（M10）
 
 - 既定ではすべての namespace の Gateway API の型・Secret・Service・Deployment・ServiceAccount・NetworkPolicy・PodDisruptionBudget・Pod（patch。rproxy の Pod の readiness gate のため `pods/status` の patch も）を扱う ClusterRole を持つ（Gateway の namespace に rproxy を置き、どこの証明書でも参照できるため）。コントローラが乗っ取られると、クラスタ全体の Secret が読める。readiness gate の条件は、その gate を持つ Pod にだけ書く。
+- chart は ClusterRole `rproxy-gateway-parameters-edit`（`rproxygatewayparameters` の読み書き）を namespace の admin に集約する（`rbac.authorization.k8s.io/aggregate-to-admin`。edit には渡さない。`rbac.aggregateToAdmin: false` で切れる）。書ける範囲はクラスの `policy` で抑える。GatewayClass の `parametersRef` はコントローラの namespace のものしか使わないので、テナントはクラスの既定を変えられない。
 - `controller.watchNamespaces`（`--watch-namespaces`）を決めると、そこ（とコントローラの namespace）だけを watch し、chart はその namespace ごとの Role を作る。ClusterRole に残るのは GatewayClass と namespace（allowedRoutes の selector）だけ。
 
 ## ネットワーク

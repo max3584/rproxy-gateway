@@ -19,7 +19,7 @@ scripts/acceptance.sh         # 受け入れテスト（同上。手動の accep
 
 ## 構成
 
-- `src/render/`：変換（純粋な関数。`World` のスナップショット → `GatewayPlan`）。`http.rs`（HTTPRoute）、`l4.rs`（TLS・TCP・UDP）、`policy.rs`（RproxyPolicy・RproxyRule）、`migrate.rs`・`traefik_mw.rs`（Ingress・Traefik、rproxy-api の `contrib/traefik2rproxy.py` と同じ変換）、`backends.rs`（EndpointSlice）、`hostname.rs`、`status.rs`
+- `src/render/`：変換（純粋な関数。`World` のスナップショット → `GatewayPlan`）。`http.rs`（HTTPRoute）、`l4.rs`（TLS・TCP・UDP）、`policy.rs`（RproxyPolicy・RproxyRule）、`params.rs`（RproxyGatewayParameters の参照・検証・合わせ方。docs/DESIGN-v0.4.x.md の A）、`migrate.rs`・`traefik_mw.rs`（Ingress・Traefik、rproxy-api の `contrib/traefik2rproxy.py` と同じ変換）、`backends.rs`（EndpointSlice）、`hostname.rs`、`status.rs`
 - `src/controller/`：watch（`cache.rs`）、反映のループと `sync_pod`（`mod.rs`）、状態（`status.rs`）、rproxy の配置（`provision.rs`）、CA・トークンの Secret（`bootstrap.rs`）。`tests.rs` は制御 API の文書どおりの偽の rproxy
 - `src/rproxy/`：制御 API のクライアントと形。`src/certsync.rs`：rproxy の Pod の中で証明書をファイルにする
 - `charts/rproxy-gateway/`：Helm chart（`crds/` は `rproxy-gateway crds` の出力）。`Dockerfile`（コントローラ）、`Dockerfile.rproxy`（rproxy）は Alpine で、Alpine のジョブが作った musl のバイナリを入れる

@@ -7,6 +7,26 @@ metadata:
 spec:
   controllerName: {{ .Values.controller.controllerName }}
   description: rproxy (rproxy-gateway)
+  {{- if .Values.managed.parameters }}
+  parametersRef:
+    group: rproxy.max3584.net
+    kind: RproxyGatewayParameters
+    name: rproxy-default
+    namespace: {{ .Release.Namespace }}
+  {{- end }}
+{{- end }}
+{{- if .Values.managed.parameters }}
+---
+# the GatewayClass's defaults for every managed Gateway's rproxy (docs/DESIGN-v0.4.x.md, A).
+# Its CRD must be installed first when upgrading from a chart without it (helm upgrade does not
+# install new CRDs): kubectl apply --server-side -f crds/rproxy.max3584.net.yaml
+apiVersion: rproxy.max3584.net/v1alpha1
+kind: RproxyGatewayParameters
+metadata:
+  name: rproxy-default
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "rproxy-gateway.labels" . | nindent 4 }}
+spec: {{- toYaml .Values.managed.parameters | nindent 2 }}
 {{- end }}
 {{- if and .Values.migration.migrateTo .Values.migration.createIngressClass }}
 ---
