@@ -10,9 +10,11 @@
 //! - `ca.crt`: the CA's certificate (never its key).
 //! - `token-<id>` (`token-fleet`): the UI's token of that Gateway (the fleet).
 //!
-//! Only pods that take the UI's token are listed (`provision::ui_pods`): Ready (and their rule set
-//! applied), not being deleted, and made from the pod template with the current token file (rproxy
-//! v0.4.1 reads it at start; a pod answering 401 again and again would lock the UI out). The last
+//! Only pods that take the UI's token are listed (`provision::ui_pods`, `accepting`): Ready (and their
+//! rule set applied), not being deleted, made from the pod template with the current token file (rproxy
+//! v0.4.1 reads it at start), and seen to take the token (rproxy v0.4.2 reads a changed token file
+//! again, a little after the kubelet updates the mounted Secret; a pod answering 401 again and again
+//! would lock the UI out). The last
 //! interval of a stopping pod's usage is not collected (design 10. Q16). The Secret is written only
 //! when its content changes, and deleted when nothing is visible.
 
@@ -29,7 +31,7 @@ use tracing::info;
 use crate::controller::bootstrap;
 use crate::controller::provision::{API_PORT, Endpoint, MANAGER};
 use crate::render::GatewayPlan;
-use crate::rproxy::client::{API_SERVER_NAME, server_name_for};
+use crate::rproxy::client::{API_SERVER_NAME, Client, server_name_for};
 
 /// The Secret in the UI's namespace.
 pub const DISCOVERY_SECRET: &str = "rproxy-ui-discovery";
@@ -82,6 +84,60 @@ pub fn fleet_group(master: &str, pods: &[Endpoint]) -> Option<Group> {
 		token: bootstrap::derive_ui_token(master, "fleet"),
 		pods,
 	})
+}
+
+/// Pods asked whether they take the UI's token: (pod uid, the token's hash) → taken, or when last asked.
+static ASKED: std::sync::Mutex<BTreeMap<(String, String), Result<(), std::time::Instant>>> = std::sync::Mutex::new(BTreeMap::new());
+
+/// How soon a pod that did not take the UI's token yet is asked again: rproxy locks a source out after
+/// 20 failed tokens in a minute (`RPROXY_API_LOCKOUT_FAILURES`), and reads a changed token file within
+/// 10 s (`RPROXY_TOKENS_CHECK_SECS`) of the kubelet updating it.
+pub const ASK_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Whether to ask a pod now (`None`: never asked).
+pub fn ask_now(asked: Option<&Result<(), std::time::Instant>>, now: std::time::Instant) -> bool {
+	match asked {
+		None => true,
+		Some(Ok(())) => false,
+		Some(Err(t)) => now.saturating_duration_since(*t) >= ASK_EVERY,
+	}
+}
+
+/// The pods of `pods` that take the UI's `token` (`GET /rules` answers 200), asking each at most
+/// every `ASK_EVERY` until it does. Pods gone are forgotten (`forget`).
+pub async fn accepting(rp: &Client, pods: &[Endpoint], token: &str, server_name: &str) -> Vec<Endpoint> {
+	let ui = rp.with_token(token, server_name);
+	let hash = crate::pem::short_hash(token.as_bytes());
+	let mut out = vec![];
+	for ep in pods {
+		let key = (ep.uid.clone(), hash.clone());
+		let now = std::time::Instant::now();
+		let asked = ASKED.lock().unwrap().get(&key).cloned();
+		if asked == Some(Ok(())) {
+			out.push(ep.clone());
+			continue;
+		}
+		if !ask_now(asked.as_ref(), now) {
+			continue;
+		}
+		let Ok(addr) = format!("{}:{}", if ep.ip.contains(':') { format!("[{}]", ep.ip) } else { ep.ip.clone() }, ep.api_port).parse()
+		else {
+			continue;
+		};
+		let took = matches!(ui.can_read(addr).await, Ok(true));
+		ASKED.lock().unwrap().insert(key, if took { Ok(()) } else { Err(now) });
+		if took {
+			out.push(ep.clone());
+		} else {
+			tracing::debug!(pod = ep.pod, "the pod does not take the UI's token yet");
+		}
+	}
+	out
+}
+
+/// Forgets pods that are gone (their uids not in `live`).
+pub fn forget(live: &std::collections::BTreeSet<String>) {
+	ASKED.lock().unwrap().retain(|(uid, _), _| live.contains(uid));
 }
 
 /// A YAML scalar (a JSON string is one).
@@ -208,6 +264,15 @@ pub async fn apply_fleet_token(client: &kube::Client, ns: &str, master: &str, sh
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn asks_again_later() {
+		let t0 = std::time::Instant::now();
+		assert!(ask_now(None, t0));
+		assert!(!ask_now(Some(&Ok(())), t0 + ASK_EVERY * 10), "taken: not asked again");
+		assert!(!ask_now(Some(&Err(t0)), t0 + ASK_EVERY / 2));
+		assert!(ask_now(Some(&Err(t0)), t0 + ASK_EVERY));
+	}
 
 	fn ep(pod: &str, ip: &str) -> Endpoint {
 		Endpoint {

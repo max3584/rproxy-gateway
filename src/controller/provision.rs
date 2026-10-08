@@ -72,8 +72,9 @@ pub const STOP_GRACE: i64 = 5;
 pub const OLD_STOP_GRACE: i64 = 15;
 /// The preStop of an rproxy without a graceful shutdown when `--pre-stop-secs` is unset.
 pub const PRE_STOP_SECS: u32 = 15;
-/// The rproxy image this controller deploys by default (`--rproxy-image`): it has a graceful shutdown.
-pub const RPROXY_IMAGE: &str = "ghcr.io/max3584/rproxy-gateway/rproxy:0.4.1";
+/// The rproxy image this controller deploys by default (`--rproxy-image`): it has a graceful shutdown
+/// and reads a changed token file again (rproxy v0.4.2).
+pub const RPROXY_IMAGE: &str = "ghcr.io/max3584/rproxy-gateway/rproxy:0.4.2";
 const API_DIR: &str = "/etc/rproxy-gateway/api";
 
 /// How rproxy is deployed.
@@ -250,9 +251,12 @@ pub struct Target<'a> {
 	/// The rproxy image has a graceful shutdown (`features.graceful_shutdown`, rproxy v0.4.1):
 	/// `RPROXY_SHUTDOWN_*` and the readiness path instead of the preStop (`graceful`).
 	pub graceful: bool,
+	/// The rproxy image reads a changed token file again (`features.tokens_reload`, rproxy v0.4.2):
+	/// adding or removing the UI's token does not roll the pods (`api_hash`).
+	pub tokens_reload: bool,
 	/// The UI reads this Gateway's rproxy (`--ui-namespace` set and the parameters' `ui.visible`
-	/// not false): its read-only token in the token file (the pods roll: rproxy reads the file at
-	/// start), the UI's pods let through the NetworkPolicy.
+	/// not false): its read-only token in the token file (rproxy before v0.4.2 reads the file at
+	/// start: the pods roll), the UI's pods let through the NetworkPolicy.
 	pub ui: Option<UiAccess>,
 }
 
@@ -270,6 +274,7 @@ impl<'a> Target<'a> {
 			service_annotations: vec![],
 			params: Params::default(),
 			graceful: false,
+			tokens_reload: false,
 			ui: None,
 		}
 	}
@@ -925,11 +930,22 @@ pub async fn apply_secrets(
 	if current_api.is_none_or(|c| data_of(Some(c)) != data_of(Some(&api)) || !same_meta(&c.metadata, &api.metadata)) {
 		Api::<Secret>::namespaced(client.clone(), ns).patch(&api_secret_name(&t.id), &pp(), &Patch::Apply(&api)).await?;
 	}
-	// The UI's token is part of the hash: rproxy v0.4.1 reads its token file only at start (and on SIGHUP), so
-	// adding or removing it rolls the pods once.
-	// TODO(max3584/rproxy-api#253): when rproxy reports that it reloads a changed token file (in `features`),
-	// hash the Secret without the UI's entry (`bootstrap::without_ui_entry`) for those pods and skip the roll.
-	Ok((certs, content_hash(&data_of(Some(&api)))))
+	Ok((certs, api_hash(&data_of(Some(&api)), t.tokens_reload)))
+}
+
+/// The hash of a control API Secret's content in the pod template (`ANNOTATION_API`): a change rolls
+/// the pods. rproxy before v0.4.2 reads its token file only at start (and on SIGHUP), so the UI's token
+/// is part of it (adding or removing it rolls the pods once); an rproxy that reads a changed token file
+/// again (`tokens_reload`, max3584/rproxy-api#253) takes it without a roll.
+pub fn api_hash(data: &BTreeMap<String, Vec<u8>>, tokens_reload: bool) -> String {
+	if !tokens_reload {
+		return content_hash(data);
+	}
+	let mut d = data.clone();
+	if let Some(f) = d.get_mut("tokens.yaml") {
+		*f = bootstrap::without_ui_entry(&String::from_utf8_lossy(f)).as_bytes().to_vec();
+	}
+	content_hash(&d)
 }
 
 /// Applies a Gateway's Secrets, ServiceAccount, Deployment, PodDisruptionBudget and Service.
@@ -1154,9 +1170,10 @@ fn pods_of(store: &[std::sync::Arc<Pod>], ns: &str, selector: &BTreeMap<String, 
 
 /// The pods the UI may be sent to: running, not being deleted, Ready (with the readiness gate
 /// `CONDITION_RULESET` True when the pod has it) and, with `api_hash`, made from the pod template that
-/// has the current control API Secret (`ANNOTATION_API`): only those already read the token file with the
-/// UI's token (rproxy v0.4.1 reads it at start). A pod that would answer the UI's token with 401 is not
-/// listed (rproxy locks a client out after repeated failures).
+/// has the current control API Secret (`ANNOTATION_API`): with rproxy v0.4.1 (which reads its token file at
+/// start) only those have the UI's token. A pod that would answer the UI's token with 401 is not listed
+/// (rproxy locks a client out after repeated failures): `ui::accepting` then asks each pod (rproxy v0.4.2
+/// reads a changed token file again, without a new pod).
 pub fn ui_pods(store: &[std::sync::Arc<Pod>], ns: &str, selector: &BTreeMap<String, String>, api_hash: Option<&str>) -> Vec<Endpoint> {
 	let accepts: std::collections::BTreeSet<String> = store
 		.iter()
@@ -1572,6 +1589,10 @@ mod tests {
 		assert!(!String::from_utf8_lossy(&d_off["tokens.yaml"]).contains("rproxy-ui"), "off: as before");
 		// rproxy v0.4.1 reads its token file at start (and on SIGHUP): the pods roll once for the UI's token
 		assert_ne!(content_hash(&d_on), content_hash(&d_off));
+		assert_ne!(api_hash(&d_on, false), api_hash(&d_off, false));
+		// rproxy v0.4.2 reads it again when it changes: no roll
+		assert_eq!(api_hash(&d_on, true), api_hash(&d_off, true));
+		assert_eq!(api_hash(&d_off, true), content_hash(&d_off), "without the UI: the same hash as before");
 		let mut stripped = d_on.clone();
 		stripped
 			.insert("tokens.yaml".into(), bootstrap::without_ui_entry(&String::from_utf8_lossy(&d_on["tokens.yaml"])).as_bytes().to_vec());
