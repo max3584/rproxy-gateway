@@ -480,7 +480,7 @@ Q10〜Q16（UI の migration・MariaDB、rproxy-api の #240・#241、利用量�
 |---|---|---|
 | a. EndpointSlice の条件 | `ready`（なしは true）の endpoint だけを使う。`terminating` のものは使わず、ready な endpoint が 1 つもないときだけ `serving` で終了中のものを使う（KEP-1669、kube-proxy と同じ：全部の Pod が止まりかけでも drain の間は答える）。`ready: true` でも `terminating: true` なら ready とみなさない | 常に（今までは `ready` だけを見て、終了中で serving のものも捨てていた） |
 | b. 受け身のヘルスチェック | rproxy の `outlier_detection` を、コントローラが描くすべてのバックエンドに付ける。HTTP（HTTPRoute・GRPCRoute のサービス）：`consecutive_gateway_failures: 3`（502・503・504・接続できない・応答の時間切れ）、`consecutive_5xx: 0`（アプリの 5xx では外さない）、`ejection_time: 10s`、`max_ejection_time: 1m`、`max_ejected_percent: 50`。L4（TCP・TLS・UDP のルール）：`consecutive_failures: 1`、`ejection_time: 10s`、`max_ejection_time: 1m`（rproxy の既定の 1 回・10 秒に、続けて外れたら倍にする上限を足したもの） | 有効（chart の `backends.outlierDetection`。`null` で外す） |
-| c. 接続の時間 | HTTP のサービスの `timeouts.connect: 2s`（失敗は 502 なので長め）、L4 の tcp のルールの `connect_timeout: 1s`（rproxy v0.4.3。過ぎたら次の宛先へ。宛先が 1 つならクライアントの接続を閉じる） | 有効（chart の `backends.connectTimeout`。`""` で rproxy の既定） |
+| c. 接続の時間 | HTTP のサービスの `timeouts.connect: 1s`、L4 の tcp のルールの `connect_timeout: 1s`（rproxy v0.4.3。過ぎたら次の宛先へ。宛先が 1 つならクライアントの接続を閉じる） | 有効（chart の `backends.connectTimeout`。`""` で rproxy の既定） |
 
 - 上書き：RproxyPolicy の `outlierDetection`（Gateway・リスナー・Service）があればそれを使い、既定は足さない。外すには `outlierDetection: {max_ejected_percent: 0}`。接続の時間はコントローラ全体の値だけ（RproxyPolicy に項目を足すのは CRD の変更なので、要るなら別に決める）。
 - コントローラの引数：`--backend-outlier-http`・`--backend-outlier-l4`（`key=value,...`、空で外す）、`--backend-connect-timeout-http`・`--backend-connect-timeout-l4`（空で rproxy の既定）。`RPROXY_GATEWAY_BACKEND_*`。

@@ -161,7 +161,7 @@ backends:
   # how long rproxy may take to connect to a backend pod: http (timeouts.connect; a failure is a 502)
   # and l4 (connect_timeout, then the next pod is tried; rproxy v0.4.3). "": rproxy's own (5 s; L4
   # with one pod: the OS's, about 2 minutes)
-  connectTimeout: {http: 2s, l4: 1s}
+  connectTimeout: {http: 1s, l4: 1s}
 
 # a GatewayClass for this controller
 gatewayClass:

@@ -1604,7 +1604,7 @@ spec:
 	let svc = &rule(&rules, 80)["http"]["services"]["default/web/r0"];
 	assert_eq!(svc["outlier_detection"]["consecutive_gateway_failures"], 3);
 	assert_eq!(svc["outlier_detection"]["max_ejected_percent"], 50);
-	assert_eq!(svc["timeouts"], json!({"connect": "2s"}));
+	assert_eq!(svc["timeouts"], json!({"connect": "1s"}));
 	assert!(rule(&rules, 80).get("outlier_detection").is_none() && rule(&rules, 80).get("connect_timeout").is_none(), "not on http rules");
 	// an rproxy without connect_timeout (before v0.4.3)
 	let old = Options { features: Features { connect_timeout: false, ..Features::default() }, ..opts.clone() };

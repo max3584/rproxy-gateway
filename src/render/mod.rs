@@ -76,8 +76,8 @@ impl BackendDefaults {
 	/// The controller's defaults (`--backend-*`): eject a server after 3 gateway failures in a row
 	/// (502/503/504, no connection, `timeouts.response`; not the app's own 5xx) for 10 s, doubling
 	/// up to 1 m, at most half of a service's servers; an L4 target after a failed connection (as
-	/// rproxy does), doubling up to 1 m; connect within 1 s (L4, where the next target is tried) and
-	/// 2 s (HTTP, where a failure is a 502).
+	/// rproxy does), doubling up to 1 m; connect within 1 s (a pod in the cluster answers in
+	/// milliseconds; a client that gives up first is not counted as the backend's failure).
 	pub fn standard() -> BackendDefaults {
 		BackendDefaults {
 			http_outlier: Some(serde_json::json!({
@@ -85,7 +85,7 @@ impl BackendDefaults {
 				"max_ejected_percent": 50
 			})),
 			l4_outlier: Some(serde_json::json!({"consecutive_failures": 1, "ejection_time": "10s", "max_ejection_time": "1m"})),
-			http_connect_timeout: Some("2s".into()),
+			http_connect_timeout: Some("1s".into()),
 			l4_connect_timeout: Some("1s".into()),
 		}
 	}

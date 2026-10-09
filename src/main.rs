@@ -120,7 +120,7 @@ struct ControllerArgs {
 	#[arg(long, env = "RPROXY_GATEWAY_BACKEND_OUTLIER_L4", default_value = "consecutive_failures=1,ejection_time=10s,max_ejection_time=1m", value_parser = key_values)]
 	backend_outlier_l4: serde_json::Value,
 	/// How long rproxy may take to connect to an `http` backend (`timeouts.connect`). "": rproxy's 5 s.
-	#[arg(long, env = "RPROXY_GATEWAY_BACKEND_CONNECT_TIMEOUT_HTTP", default_value = "2s", value_parser = duration_opt)]
+	#[arg(long, env = "RPROXY_GATEWAY_BACKEND_CONNECT_TIMEOUT_HTTP", default_value = "1s", value_parser = duration_opt)]
 	backend_connect_timeout_http: String,
 	/// How long rproxy may take to connect to an L4 tcp backend before trying the next (`connect_timeout`,
 	/// rproxy v0.4.3). "": rproxy's (5 s with other backends, else the OS's).
