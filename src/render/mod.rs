@@ -134,6 +134,15 @@ pub struct Features {
 	pub server_cors: bool,
 	pub server_redirect: bool,
 	pub server_mirror: bool,
+	/// `forward_auth` per server (`server_middleware_kinds`, rproxy v0.4.3).
+	pub server_forward_auth: bool,
+	/// The ExternalAuth filter over HTTP: `forward_auth` with `service`, `client_request`,
+	/// `allow_status`, `all_response_headers` (`features.forward_auth`, rproxy v0.4.3).
+	pub ext_auth_http: bool,
+	/// ... over gRPC: `forward_auth` with `service`, `grpc`.
+	pub ext_auth_grpc: bool,
+	/// ... with the body: `forward_body`.
+	pub ext_auth_body: bool,
 }
 
 impl Default for Features {
@@ -157,6 +166,10 @@ impl Default for Features {
 			server_cors: true,
 			server_redirect: true,
 			server_mirror: true,
+			server_forward_auth: true,
+			ext_auth_http: true,
+			ext_auth_grpc: true,
+			ext_auth_body: true,
 		}
 	}
 }
@@ -182,6 +195,10 @@ impl Features {
 			server_cors: c.lists("server_middleware_kinds", "cors"),
 			server_redirect: c.lists("server_middleware_kinds", "redirect_regex"),
 			server_mirror: c.lists("server_middleware_kinds", "mirror"),
+			server_forward_auth: c.lists("server_middleware_kinds", "forward_auth"),
+			ext_auth_http: ["service", "client_request", "allow_status", "all_response_headers"].iter().all(|n| c.lists("forward_auth", n)),
+			ext_auth_grpc: ["service", "grpc"].iter().all(|n| c.lists("forward_auth", n)),
+			ext_auth_body: c.lists("forward_auth", "forward_body"),
 		}
 	}
 
@@ -205,6 +222,10 @@ impl Features {
 			server_cors: self.server_cors && o.server_cors,
 			server_redirect: self.server_redirect && o.server_redirect,
 			server_mirror: self.server_mirror && o.server_mirror,
+			server_forward_auth: self.server_forward_auth && o.server_forward_auth,
+			ext_auth_http: self.ext_auth_http && o.ext_auth_http,
+			ext_auth_grpc: self.ext_auth_grpc && o.ext_auth_grpc,
+			ext_auth_body: self.ext_auth_body && o.ext_auth_body,
 		}
 	}
 }

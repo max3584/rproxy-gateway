@@ -489,3 +489,12 @@ docs/CONFORMANCE.md の「名乗っていないもの」を埋める（オーナ
 - ミラーはその backend に当たったリクエストだけを写す（rproxy が 1 つのリクエストで 1 回だけ写す）。ミラー先が見つからなければ規則のフィルタと同じく `ResolvedRefs: False` でミラーだけ外す。
 - backendRef の `ExtensionRef` は今までどおり断る（`RproxyMiddleware` の種類を転送先ごとに確かめる口がないため）。
 
+### 11.3 `ExternalAuth`（HTTP・gRPC）
+
+- `ExternalAuth` のフィルタを rproxy の `forward_auth`（v0.4.3 で足した `service`・`client_request`・`allow_status`・`response_headers: ["*"]`・`forward_body`・`protocol: grpc`）にする。宛先は backendRef の Service の Pod の IP のサービス（ほかの backend と同じく EndpointSlice から。BackendTLSPolicy も同じく効く）。
+- HTTP：Gateway API が必ず送るとする Host・メソッド・パス・Content-Length は `client_request` が送る。`Authorization` は `request_headers` に必ず入れる（Gateway API の「`allowedHeaders` が空なら決まったものだけ」。rproxy の `request_headers` は空だとすべてを送るため）。`allowedResponseHeaders` が空なら `["*"]`（応答そのものを表すヘッダは写さない）。200 だけが通す（`allow_status`）。
+- gRPC：`allowedHeaders` が空ならすべて（Gateway API と rproxy で同じ意味）。サービスは h2c（BackendTLSPolicy があれば h2 と `tls`）。
+- `forwardBody.maxSize`（0 は送らない）。大きい本文は 413（型の説明の「切って送る」ではなく、フィルタの説明と Envoy の既定の「断る」。rproxy-api の設計 7.3）。
+- 宛先が使えない（見つからない・ReferenceGrant がない・ready な Pod がない・BackendTLSPolicy に使える CA がない）ときは、確かめずに通すことのないよう、その規則は 500（`ResolvedRefs: False`）。backendRef の `ExternalAuth` なら、その backend の分だけ 500（`servers[].status`。ない rproxy ではその backend を外す）。
+- 名乗る機能：`HTTPRouteExternalAuth`・`HTTPRouteExternalAuthHTTP`・`HTTPRouteExternalAuthGRPC`・`HTTPRouteExternalAuthForwardBody`（GatewayClass の `supportedFeatures`）。Gateway API v1.6.3 の conformance にはこの機能の名前も試験もない（`pkg/features` にない）ので、試験は `tests/rproxy.rs`（本物の rproxy）・単体と rproxy-api の `tests/ext_authz.rs`。
+

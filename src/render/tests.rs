@@ -454,6 +454,93 @@ spec:
 }
 
 #[test]
+fn external_auth() {
+	let yaml = format!(
+		"{BASE}{}{}",
+		gw("  - {name: http, port: 8080, protocol: HTTP}"),
+		r#"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: ea, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  rules:
+    - matches: [{path: {value: /http}}]
+      filters:
+        - type: ExternalAuth
+          externalAuth:
+            protocol: HTTP
+            backendRef: {name: api, namespace: other, port: 8000}
+            http: {path: auth, allowedHeaders: [X-Tenant, authorization]}
+            forwardBody: {maxSize: 1024}
+      backendRefs: [{name: web, port: 80}]
+    - matches: [{path: {value: /grpc}}]
+      filters:
+        - type: ExternalAuth
+          externalAuth: {protocol: GRPC, backendRef: {name: api, namespace: other, port: 8000}, grpc: {}}
+      backendRefs: [{name: web, port: 80}]
+    - matches: [{path: {value: /gone}}]
+      filters:
+        - type: ExternalAuth
+          externalAuth: {protocol: HTTP, backendRef: {name: nothing, port: 80}}
+      backendRefs: [{name: web, port: 80}]
+    - matches: [{path: {value: /per-backend}}]
+      backendRefs:
+        - name: web
+          port: 80
+          filters:
+            - type: ExternalAuth
+              externalAuth: {protocol: GRPC, backendRef: {name: api, namespace: other, port: 8000}, grpc: {allowedHeaders: [Authorization]}}
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata: {name: g, namespace: other}
+spec:
+  from: [{group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: default}]
+  to: [{group: "", kind: Service}]
+"#
+	);
+	let p = plan(&yaml);
+	assert!(cond(&p.parents[0].conds, "Accepted").status, "{:?}", p.parents[0].conds);
+	assert_eq!(cond(&p.parents[0].conds, "ResolvedRefs").reason, "BackendNotFound", "the /gone auth server");
+	let http = &p.rules_json()[0]["http"];
+	let route = |n: &str| http["routes"].as_array().unwrap().iter().find(|r| r["name"] == n).unwrap().clone();
+	let mw = |r: &serde_json::Value, i: usize| http["middlewares"][r["middlewares"][i].as_str().unwrap()].clone();
+	let fa = mw(&route("default/ea/r0/m0/h0"), 0)["forward_auth"].clone();
+	assert_eq!(
+		fa,
+		json!({"service": "default/ea/r0/f0/extauth", "path": "/auth", "client_request": true, "allow_status": ["200"],
+			"request_headers": ["authorization", "x-tenant"], "response_headers": ["*"], "forward_body": {"max_size": 1024}})
+	);
+	assert_eq!(http["services"]["default/ea/r0/f0/extauth"]["servers"], json!([{"url": "http://10.1.0.1:9000"}]));
+	let g = mw(&route("default/ea/r1/m0/h0"), 0)["forward_auth"].clone();
+	assert_eq!(g, json!({"service": "default/ea/r1/f0/extauth", "protocol": "grpc"}), "no headers listed: all");
+	assert_eq!(http["services"]["default/ea/r1/f0/extauth"]["protocol"], "h2c");
+	// an auth server that cannot be asked: the rule answers 500 instead of letting requests through
+	let gone = route("default/ea/r2/m0/h0");
+	assert!(gone.get("service").is_none());
+	assert_eq!(gone["middlewares"], json!([http::RESPOND_500]));
+	// on a backendRef: that server's middlewares
+	let server = &http["services"]["default/ea/r3"]["servers"][0];
+	let per = &http["middlewares"][server["middlewares"][0].as_str().unwrap()]["forward_auth"];
+	assert_eq!((per["protocol"].as_str(), per["request_headers"].clone()), (Some("grpc"), json!(["authorization"])));
+	// an rproxy without these
+	let w = world(&yaml);
+	for features in [
+		Features { ext_auth_http: false, ..Default::default() },
+		Features { ext_auth_grpc: false, ..Default::default() },
+		Features { ext_auth_body: false, ..Default::default() },
+		Features { server_forward_auth: false, ..Default::default() },
+	] {
+		let p = render_gateway(&w, &w.gateways[0], &Options { features: features.clone(), ..Default::default() });
+		let c = cond(&p.parents[0].conds, "Accepted");
+		assert_eq!((c.status, c.reason.as_str()), (false, "UnsupportedValue"), "{features:?}");
+		assert!(c.message.contains("forward_auth"), "{}", c.message);
+	}
+}
+
+#[test]
 fn unsupported_filters_are_not_accepted() {
 	let yaml = format!(
 		"{BASE}{}{}",
