@@ -122,7 +122,7 @@ rproxy は `RPROXY_API_ADDR=0.0.0.0`、`RPROXY_API_PORT=9443`、`RPROXY_TOKEN_FI
 | `URLRewrite` | hostname は `replace_host`、path は `replace_path`（ReplaceFullPath）・`replace_path_regex`（ReplacePrefixMatch） |
 | `CORS` | `cors`（`allow_origins`・`allow_methods`・`allow_headers`・`expose_headers`・`allow_credentials`・`max_age`、`maxAge` の既定は 5） |
 | `RequestMirror` | `mirror`（ミラー先の Pod の IP のサービスを作る。`percent` / `fraction`）。ミラー先が見つからなければ `ResolvedRefs: False` でミラーだけ外す |
-| backendRef の `filters` | その backend の `servers[].middlewares`（`RequestHeaderModifier`・`ResponseHeaderModifier`・`URLRewrite`。ReplacePrefixMatch は規則の path の接頭辞が 1 つのときだけ） |
+| backendRef の `filters` | その backend の `servers[].middlewares`（`RequestHeaderModifier`・`ResponseHeaderModifier`・`URLRewrite`、rproxy v0.4.3 の `server_middleware_kinds` があれば `CORS`・`RequestRedirect`・`RequestMirror` も。URLRewrite・RequestRedirect の ReplacePrefixMatch は規則の path の接頭辞が 1 つのときだけ。ミラーはその backend に送るリクエストだけを写す） |
 | `retry` | `retry`（`attempts` は Gateway API の回数 + 1、`codes` は `status`、`backoff` は `initial_interval`）。ミドルウェアの最後 |
 | `ExtensionRef`（`RproxyMiddleware`） | そのミドルウェア（`spec` をそのまま） |
 | `timeouts.request` / `timeouts.backendRequest` | ルートの `timeouts.request` / `timeouts.backend_request` |
@@ -151,7 +151,7 @@ rproxy は `RPROXY_API_ADDR=0.0.0.0`、`RPROXY_API_PORT=9443`、`RPROXY_TOKEN_FI
 | `RproxyGatewayParameters` | managed の Gateway の rproxy の形（replicas、PDB、Pod のラベル・注釈・resources・topologySpread・nodeSelector・tolerations・affinity・priorityClass、Service の型・externalTrafficPolicy・loadBalancerClass・sourceRanges・ipFamilyPolicy・ラベル・注釈、rproxy のイメージ・logLevel・performance・追加の環境変数）。GatewayClass の `parametersRef`（コントローラの namespace、`policy` で Gateway に許す項目を決める）と Gateway の `infrastructure.parametersRef`（同じ namespace）から。合わせ方・検証・誰が何を決められるかは [DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) の 2. |
 | `RproxyRule` | `spec.rule` はルールそのもの（`POST /rules` の本文）。`spec.parentRef` の Gateway のルールセットに足す。ほかの namespace の Gateway には、その namespace の ReferenceGrant（from `rproxy.max3584.net/RproxyRule`、to `Gateway`）が要る。同じキーのルールが既にあれば `Accepted: False`（`Conflicted`）。状態は rproxy のルールの `conditions` を写す |
 
-できないもの（ルートは `Accepted: False`、理由 `UnsupportedValue`）：backendRef の `RequestMirror`・`CORS`・`RequestRedirect` フィルタ、`ExternalAuth`。
+できないもの（ルートは `Accepted: False`、理由 `UnsupportedValue`）：`ExternalAuth`、backendRef の `ExtensionRef` フィルタ。rproxy に機能がないもの（下の「rproxy の機能」）。
 
 ### rproxy の機能（`features`）
 

@@ -389,6 +389,71 @@ spec:
 }
 
 #[test]
+fn filters_on_backend_refs() {
+	let yaml = format!(
+		"{BASE}{}{}",
+		gw("  - {name: http, port: 8080, protocol: HTTP}"),
+		r#"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: b, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  rules:
+    - matches: [{path: {value: /b}}]
+      backendRefs:
+        - name: web
+          port: 80
+          filters:
+            - type: CORS
+              cors: {allowOrigins: ["https://www.foo.com"], allowMethods: [GET]}
+            - type: RequestMirror
+              requestMirror: {backendRef: {name: api, namespace: other, port: 8000}, percent: 50}
+        - name: web
+          port: 80
+          filters:
+            - type: RequestRedirect
+              requestRedirect: {scheme: https, statusCode: 302}
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata: {name: g, namespace: other}
+spec:
+  from: [{group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: default}]
+  to: [{group: "", kind: Service}]
+"#
+	);
+	let p = plan(&yaml);
+	assert!(cond(&p.parents[0].conds, "Accepted").status, "{:?}", p.parents[0].conds);
+	let http = &p.rules_json()[0]["http"];
+	let servers = http["services"]["default/b/r0"]["servers"].as_array().unwrap().clone();
+	let mws = |s: &serde_json::Value| -> Vec<serde_json::Value> {
+		s["middlewares"].as_array().unwrap().iter().map(|n| http["middlewares"][n.as_str().unwrap()].clone()).collect()
+	};
+	let first = mws(&servers[0]);
+	assert_eq!(first[0]["cors"]["allow_origins"], json!(["https://www.foo.com"]));
+	let mirror = first[1]["mirror"].clone();
+	assert_eq!(mirror["percent"], 50);
+	assert_eq!(http["services"][mirror["service"].as_str().unwrap()]["servers"], json!([{"url": "http://10.1.0.1:9000"}]));
+	let last = mws(servers.last().unwrap());
+	assert_eq!(last[0]["redirect_regex"]["replacement"], "https://${1}${2}${3}");
+	assert_eq!(last[0]["redirect_regex"]["status"], 302);
+	// an rproxy that runs only rewrites per server
+	let w = world(&yaml);
+	for features in [
+		Features { server_cors: false, ..Default::default() },
+		Features { server_mirror: false, ..Default::default() },
+		Features { server_redirect: false, ..Default::default() },
+	] {
+		let p = render_gateway(&w, &w.gateways[0], &Options { features, ..Default::default() });
+		let c = cond(&p.parents[0].conds, "Accepted");
+		assert_eq!((c.status, c.reason.as_str()), (false, "UnsupportedValue"));
+		assert!(c.message.contains("server_middleware_kinds"), "{}", c.message);
+	}
+}
+
+#[test]
 fn unsupported_filters_are_not_accepted() {
 	let yaml = format!(
 		"{BASE}{}{}",

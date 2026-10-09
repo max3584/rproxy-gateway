@@ -482,3 +482,10 @@ docs/CONFORMANCE.md の「名乗っていないもの」を埋める（オーナ
 - 1 つしかなければ付けない（分けるものがない）。`TLS`（Terminate）のリスナーは HTTP を話さないので入れない。
 - rproxy v0.4.3 の `http_options` の `misdirected` がない rproxy には付けない（今までどおり、ほかのリスナーのルートに届く）。
 
+### 11.2 backendRef の `CORS`・`RequestRedirect`・`RequestMirror` のフィルタ
+
+- その backend の `servers[].middlewares` に、規則のフィルタと同じ形のミドルウェア（`cors`、`redirect_regex`、`mirror` とミラー先のサービス）を書く。rproxy v0.4.3 の `server_middleware_kinds` に `cors`・`redirect_regex`・`mirror` があるときだけ（ない rproxy ではルートが `UnsupportedValue`）。
+- `RequestRedirect` の ReplacePrefixMatch は `URLRewrite` と同じく、規則の path の接頭辞が 1 つのときだけ（転送先は規則のすべての match に使われる）。
+- ミラーはその backend に当たったリクエストだけを写す（rproxy が 1 つのリクエストで 1 回だけ写す）。ミラー先が見つからなければ規則のフィルタと同じく `ResolvedRefs: False` でミラーだけ外す。
+- backendRef の `ExtensionRef` は今までどおり断る（`RproxyMiddleware` の種類を転送先ごとに確かめる口がないため）。
+

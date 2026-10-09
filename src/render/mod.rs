@@ -129,6 +129,11 @@ pub struct Features {
 	pub client_auth_no_verify: bool,
 	/// `tls.misdirected` (`http_options` `misdirected`, rproxy v0.4.3).
 	pub misdirected: bool,
+	/// `cors`, `redirect_regex` and `mirror` in `servers[].middlewares`
+	/// (`server_middleware_kinds`, rproxy v0.4.3).
+	pub server_cors: bool,
+	pub server_redirect: bool,
+	pub server_mirror: bool,
 }
 
 impl Default for Features {
@@ -149,6 +154,9 @@ impl Default for Features {
 			tls_route_targets: true,
 			client_auth_no_verify: true,
 			misdirected: true,
+			server_cors: true,
+			server_redirect: true,
+			server_mirror: true,
 		}
 	}
 }
@@ -171,6 +179,9 @@ impl Features {
 			tls_route_targets: c.feature("tls_route_targets"),
 			client_auth_no_verify: c.lists("client_auth_modes", "optional_no_verify"),
 			misdirected: opt("misdirected"),
+			server_cors: c.lists("server_middleware_kinds", "cors"),
+			server_redirect: c.lists("server_middleware_kinds", "redirect_regex"),
+			server_mirror: c.lists("server_middleware_kinds", "mirror"),
 		}
 	}
 
@@ -191,6 +202,9 @@ impl Features {
 			tls_route_targets: self.tls_route_targets && o.tls_route_targets,
 			client_auth_no_verify: self.client_auth_no_verify && o.client_auth_no_verify,
 			misdirected: self.misdirected && o.misdirected,
+			server_cors: self.server_cors && o.server_cors,
+			server_redirect: self.server_redirect && o.server_redirect,
+			server_mirror: self.server_mirror && o.server_mirror,
 		}
 	}
 }

@@ -441,27 +441,56 @@ fn filter(ctx: &Ctx, ns: &str, f: &HttpRouteFilter, m: &HttpRouteMatch, base: &s
 	}))
 }
 
-/// The middlewares of a backendRef's filters (rproxy's per-server middlewares:
-/// header changes, the host and the full path).
-fn backend_filter(ctx: &Ctx, f: &HttpRouteFilter, matches: &[HttpRouteMatch]) -> Result<Vec<Value>, String> {
+/// The middlewares of a backendRef's filters (rproxy's per-server middlewares: header changes,
+/// the host and the full path; CORS, redirects and mirrors with rproxy v0.4.3's
+/// `server_middleware_kinds`). `base`: names for what a filter adds (a mirror's service).
+fn backend_filter(
+	ctx: &Ctx,
+	ns: &str,
+	f: &HttpRouteFilter,
+	matches: &[HttpRouteMatch],
+	base: &str,
+	out: &mut Output,
+) -> Result<Vec<Value>, String> {
 	crate::render::needs(ctx.features.server_middlewares, "filters on backendRefs", "http_options server_middlewares")?;
+	let kind = |have: bool, what: &str, rproxy: &str| {
+		crate::render::needs(have, &format!("the {what} filter on a backendRef"), &format!("server_middleware_kinds {rproxy}"))
+	};
+	// a prefix replacement depends on the match; a server serves all of the rule's matches
+	let one_prefix = |what: &str| {
+		let distinct: std::collections::BTreeSet<String> = matches.iter().map(matched_prefix).collect();
+		if distinct.len() > 1 {
+			return Err(format!("{what} ReplacePrefixMatch on a backendRef of a rule with several path prefixes is not supported"));
+		}
+		Ok(())
+	};
+	let first = matches.first().cloned().unwrap_or_default();
 	match f.kind.as_str() {
-		"RequestHeaderModifier" | "ResponseHeaderModifier" => {
-			let mut dummy = Output::default();
-			match filter(ctx, "", f, &HttpRouteMatch::default(), "", &mut dummy)? {
+		"RequestHeaderModifier" | "ResponseHeaderModifier" | "CORS" | "RequestMirror" => {
+			match f.kind.as_str() {
+				"CORS" => kind(ctx.features.server_cors, "CORS", "cors")?,
+				"RequestMirror" => kind(ctx.features.server_mirror, "RequestMirror", "mirror")?,
+				_ => {}
+			}
+			match filter(ctx, ns, f, &first, base, out)? {
 				Filtered::Middlewares(m) => Ok(m),
 				Filtered::Missing => Err("unreachable".into()),
 			}
 		}
 		"URLRewrite" => {
 			let r = f.url_rewrite.as_ref().ok_or("urlRewrite is missing")?;
-			let prefix = r.path.as_ref().is_some_and(|p| p.kind == "ReplacePrefixMatch");
-			// a prefix replacement depends on the match; a server serves all of the rule's matches
-			let distinct: std::collections::BTreeSet<String> = matches.iter().map(matched_prefix).collect();
-			if prefix && distinct.len() > 1 {
-				return Err("URLRewrite ReplacePrefixMatch on a backendRef of a rule with several path prefixes is not supported".into());
+			if r.path.as_ref().is_some_and(|p| p.kind == "ReplacePrefixMatch") {
+				one_prefix("URLRewrite")?;
 			}
-			rewrite(ctx, r, matches.first().unwrap_or(&HttpRouteMatch::default()))
+			rewrite(ctx, r, &first)
+		}
+		"RequestRedirect" => {
+			kind(ctx.features.server_redirect, "RequestRedirect", "redirect_regex")?;
+			let r = f.request_redirect.as_ref().ok_or("requestRedirect is missing")?;
+			if r.path.as_ref().is_some_and(|p| p.kind == "ReplacePrefixMatch") {
+				one_prefix("RequestRedirect")?;
+			}
+			redirect(ctx, r, &first)
 		}
 		other => Err(format!("filter {other} on a backendRef is not supported")),
 	}
@@ -582,7 +611,7 @@ pub fn build(ctx: &Ctx, route: &HttpRoute, hosts: Option<&[String]>, exclusions:
 					out.backends.entry(base.clone()).or_default().push(svc);
 					let mut names = vec![];
 					for (k, f) in b.filters.iter().enumerate() {
-						match backend_filter(ctx, f, matches) {
+						match backend_filter(ctx, &ns, f, matches, &format!("{base}/b{bi}/f{k}"), &mut out) {
 							Ok(mws) => {
 								for (x, mw) in mws.into_iter().enumerate() {
 									let n = format!("{base}/b{bi}/f{k}.{x}");
