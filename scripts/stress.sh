@@ -144,6 +144,16 @@ for pod in $(kubectl -n stress get pods -l gateway.networking.k8s.io/gateway-nam
 "
 done
 printf '%s' "$mem" | tee "$work/memory.txt"
+# why requests failed, from rproxy's own log (the reasons of http.error / conn.error)
+errors=""
+for pod in $(kubectl -n stress get pods -l gateway.networking.k8s.io/gateway-name=stress -o name); do
+  errors+=$(kubectl -n stress logs "$pod" -c rproxy --tail=-1 2>/dev/null \
+    | jq -Rr 'fromjson? | select(.fields.event == "http.error" or .fields.event == "conn.error" or .event == "http.error" or .event == "conn.error")
+      | "\(.fields.event // .event) \(.fields.status // .status // "") \(.fields.error // .error // "")"' \
+    | sort | uniq -c | sort -rn | head -20)
+  errors+=$'\n'
+done
+printf 'rproxy errors:\n%s' "$errors" | tee "$work/errors.txt"
 if [ "$restarts" != 0 ]; then echo "::error::rproxy restarted $restarts times during the load"; status=1; fi
 
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
@@ -160,6 +170,7 @@ if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     echo
     echo '```'
     cat "$work/memory.txt"
+    cat "$work/errors.txt"
     echo '```'
   } >> "$GITHUB_STEP_SUMMARY"
 fi
