@@ -6,8 +6,6 @@ name: acceptance
 # of the ref the workflow runs on with a controller image built from it (rproxy: the chart's
 # published image). Heavy: run by hand only, e.g.
 #   gh workflow run acceptance.yml --ref <branch> -f source=checkout -f topology=bgp
-# fleet with a VIP held by the fleet's pods (the vip sidecar), e.g.
-#   gh workflow run acceptance.yml --ref <branch> -f source=checkout -f mode=fleet-vip
 # fleet listening on each Gateway's addresses (fleet.listen=addresses; rproxy built from an rproxy-api ref), e.g.
 #   gh workflow run acceptance.yml --ref <branch> -f source=checkout -f mode=fleet -f rproxy_ref=master
 # The UI (TCP-UDP-rproxy-ui's chart and image from ui_ref, bundled MariaDB) only, e.g.
@@ -32,11 +30,11 @@ on:
         type: choice
         options: [l2-local, l2-cluster, bgp, nodeport-lb]
       mode:
-        description: "managed (topology decides how traffic reaches the Gateway), fleet (fleet.listen=addresses; scenario q, needs rproxy v0.4.3: rproxy_ref) or fleet-vip (fleet with a VIP held by the fleet's pods; scenarios j k l o n m)"
+        description: "managed (topology decides how traffic reaches the Gateway) or fleet (fleet.listen=addresses; scenario q; needs rproxy v0.4.3)"
         required: false
         default: managed
         type: choice
-        options: [managed, fleet, fleet-vip]
+        options: [managed, fleet]
       managed_replicas:
         description: "rproxy replicas per Gateway (managed.replicas)"
         required: false
@@ -154,8 +152,8 @@ jobs:
           HELM_ARGS: ${{ inputs.helm_args }}
           GAP_LIMIT: ${{ inputs.gap_limit || '3' }}
           STRICT: ${{ inputs.strict && 'true' || 'false' }}
-          # fleet-vip: its own default (j k l o n m) unless scenarios are given
-          SCENARIOS: ${{ (inputs.mode == 'fleet-vip' && inputs.scenarios == 'a b1 b2 c d e f g h i') && 'j k l o n m' || (inputs.mode == 'fleet' && inputs.scenarios == 'a b1 b2 c d e f g h i') && 'q' || inputs.scenarios || 'a b1 b2 c d e f g h i' }}
+          # fleet: its own default (q) unless scenarios are given
+          SCENARIOS: ${{ (inputs.mode == 'fleet' && inputs.scenarios == 'a b1 b2 c d e f g h i') && 'q' || inputs.scenarios || 'a b1 b2 c d e f g h i' }}
           UI: ${{ inputs.ui && 'true' || 'false' }}
           RPROXY_IMAGE_FROM: ${{ inputs.rproxy_ref != '' && 'dist' || 'chart' }}
           UI_DIR: ${{ github.workspace }}/ui-src

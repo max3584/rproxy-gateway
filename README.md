@@ -30,7 +30,7 @@ English: [README.en.md](README.en.md)
 | `RproxyGatewayParameters`（GatewayClass・Gateway の `parametersRef`） | managed の rproxy の形を Gateway ごとに（replicas、PDB、resources、Pod・Service の設定、rproxy の性能の設定） |
 | 移行（`--migrate-to`） | Ingress と Traefik の IngressRoute・IngressRouteTCP・IngressRouteUDP・Middleware・TLSOption を読む（[docs/MIGRATION.md](docs/MIGRATION.md)） |
 
-決めごとと変換の表は [docs/DESIGN.md](docs/DESIGN.md)。Gateway API の conformance の結果は [docs/CONFORMANCE.md](docs/CONFORMANCE.md)。テナントの分け方・既定で止めているもの・権限は [docs/SECURITY.md](docs/SECURITY.md)。v0.4 の系列のパッチで足していく Kubernetes での運用（Gateway ごとの rproxy の設定、Kustomize、UI、VIP）の設計は [docs/DESIGN-v0.4.x.md](docs/DESIGN-v0.4.x.md)。
+決めごとと変換の表は [docs/DESIGN.md](docs/DESIGN.md)。Gateway API の conformance の結果は [docs/CONFORMANCE.md](docs/CONFORMANCE.md)。テナントの分け方・既定で止めているもの・権限は [docs/SECURITY.md](docs/SECURITY.md)。v0.4 の系列のパッチで足していく Kubernetes での運用（Gateway ごとの rproxy の設定、Kustomize、UI）の設計は [docs/DESIGN-v0.4.x.md](docs/DESIGN-v0.4.x.md)。Gateway のアドレスをプラットフォーム（MetalLB・kube-vip・Cilium・クラウドのロードバランサ・NodePort + 自前の L4・fleet の keepalived）で用意する書き方は [docs/PLATFORM.md](docs/PLATFORM.md)。
 
 ## 入れ方
 
@@ -76,16 +76,7 @@ spec:
 ```
 - 管理 UI（[TCP-UDP-rproxy-ui](https://github.com/max3584/TCP-UDP-rproxy-ui) の chart。別に入れる）に Gateway の rproxy を読むだけで見せるには、chart の `ui.namespace` に UI の namespace を書く。コントローラがそこに Secret `rproxy-ui-discovery`（rproxy の Pod・CA の証明書・読むだけのトークン）を書く。rproxy v0.4.2 はトークンファイルの変化を読み直すので、`ui.namespace` を決めても・Gateway を見せる／隠しても Pod は入れ替わらない（UI に載るのは Pod が UI 用のトークンを受け付けてから。1〜2 分。古い rproxy のイメージでは Pod が 1 回入れ替わる）。見せない Gateway は parameters の `ui: {visible: false}`（[docs/SECURITY.md](docs/SECURITY.md) の「UI に見せる」）。
 - コントローラは既定で 2 レプリカ。Lease でリーダーを選び、1 つだけが反映する（docs/DESIGN.md の「冗長化」）。
-- `fleet.enabled=true` では、chart の DaemonSet（`hostNetwork: true`）の rproxy がすべての Gateway を受け持つ。`fleet.listen: addresses`（既定は `wildcard`。rproxy v0.4.3 の `listen_freebind`）で、`spec.addresses` を持つ Gateway は自分のアドレス（`managed.addressCIDRs` の内）でだけ待ち受ける：アドレスが違えば同じポート（443 など）を別の Gateway が使え、ノードにまだアドレスがなくても待ち受ける（アドレスを置くのは MetalLB・kube-vip・keepalived・クラウドの LB など。[docs/DESIGN-v0.4.x.md](docs/DESIGN-v0.4.x.md) の 12.）。同じアドレス（かワイルドカード）の同じポートは古い Gateway が持つ。止まるときは `fleet.shutdown.delay`（既定 5 秒）受け付けを続け、`fleet.shutdown.drain`（既定 25 秒）まで今の接続を待つ。前に置くロードバランサ・VIP のヘルスチェックを `https://<ノード>:9443/readyz`（止まり始めると 503）に向け、それがノードを外すまでの時間より delay を長くする。
-- fleet の Pod に VIP を直接持たせるには `fleet.vip`（Service・ロードバランサなし。[docs/DESIGN-v0.4.x.md](docs/DESIGN-v0.4.x.md) の 7.）。VIP ごとの Lease を取った Pod の `vip` サイドカー（`NET_ADMIN`・`NET_RAW` はそのコンテナだけ）がノードのインタフェースに VIP を足して gratuitous ARP（IPv6 は unsolicited NA）を出す。持つのは rproxy が ready でルールセットを反映した Pod だけで、rproxy の draining・Pod の停止・ノードの cordon（drain）では先に手放すので、予定の移動は 1 秒に満たない（ノードの喪失は Lease の期限、既定 3 秒）。VIP は `managed.addressCIDRs` の内に置き、Gateway は `spec.addresses` で VIP を選ぶ（なければすべて）。namespace の PodSecurity は `privileged`（[docs/SECURITY.md](docs/SECURITY.md) の「fleet の VIP」）。
-  ```yaml
-  fleet:
-    enabled: true
-    vip:
-      enabled: true
-      addresses: ["192.0.2.10", {address: "192.0.2.11", interface: eth1, nodeSelector: {zone: a}}]
-  managed: {addressCIDRs: [192.0.2.0/24]}
-  ```
+- `fleet.enabled=true` では、chart の DaemonSet（`hostNetwork: true`）の rproxy がすべての Gateway を受け持つ。`fleet.listen: addresses`（既定は `wildcard`。rproxy v0.4.3 の `listen_freebind`）で、`spec.addresses` を持つ Gateway は自分のアドレス（`managed.addressCIDRs` の内）でだけ待ち受ける：アドレスが違えば同じポート（443 など）を別の Gateway が使え、ノードにまだアドレスがなくても待ち受ける（アドレスを置くのは MetalLB・kube-vip・keepalived・クラウドの LB など。[docs/DESIGN-v0.4.x.md](docs/DESIGN-v0.4.x.md) の 12.）。同じアドレス（かワイルドカード）の同じポートは古い Gateway が持つ。止まるときは `fleet.shutdown.delay`（既定 5 秒）受け付けを続け、`fleet.shutdown.drain`（既定 25 秒）まで今の接続を待つ。前に置くロードバランサ・VIP のヘルスチェックを `https://<ノード>:9443/readyz`（止まり始めると 503）に向け、それがノードを外すまでの時間より delay を長くする。アドレス（VIP）は rproxy-gateway では持たない（v0.4.4 の `fleet.vip` は v0.4.5 で外した）。keepalived・自前の L4・fleet の Pod を選ぶ Service の書き方は [docs/PLATFORM.md](docs/PLATFORM.md) の「fleet」。
 - chart の値は [charts/rproxy-gateway/values.yaml](charts/rproxy-gateway/values.yaml)。コントローラの設定は ConfigMap `rproxy-gateway-config`（`RPROXY_GATEWAY_*` の環境変数）にして渡す（`controller.extraArgs` は引数のままで、ConfigMap より強い）。
 
 ### Helm を使わずに入れる（kubectl・Kustomize）
@@ -96,7 +87,7 @@ spec:
 kubectl apply --server-side -f https://github.com/max3584/rproxy-gateway/releases/download/v<版>/install.yaml
 ```
 
-Kustomize では [config/default](config/default)（fleet は [config/fleet](config/fleet)）を base にする。コントローラの設定は `rproxy-gateway controller --help` の `RPROXY_GATEWAY_*` で、`configMapGenerator` の `behavior: merge` で変える（ConfigMap の名前にハッシュが付くので、変えるとコントローラが入れ替わる）。例は [config/samples](config/samples)（イメージのダイジェスト固定、managed の replicas、コントローラ 1 台、クラスの既定の `RproxyGatewayParameters`（chart の `managed.parameters`）、fleet の VIP（chart の `fleet.vip`。例の VIP で描いたもの））。
+Kustomize では [config/default](config/default)（fleet は [config/fleet](config/fleet)）を base にする。コントローラの設定は `rproxy-gateway controller --help` の `RPROXY_GATEWAY_*` で、`configMapGenerator` の `behavior: merge` で変える（ConfigMap の名前にハッシュが付くので、変えるとコントローラが入れ替わる）。例は [config/samples](config/samples)（イメージのダイジェスト固定、managed の replicas、コントローラ 1 台、クラスの既定の `RproxyGatewayParameters`（chart の `managed.parameters`））。
 
 ```yaml
 apiVersion: kustomize.config.k8s.io/v1beta1
@@ -116,6 +107,8 @@ configMapGenerator:
 ## 可用性（`managed.replicas` が 2 以上）
 
 rproxy の Pod は、コントローラがルールセットを反映してから Ready になり（readiness gate）、止まるときは SIGTERM の後 15 秒（`managed.shutdown.delay`）受け付けを続けながら `/readyz` で Service から外れ、そのあと待ち受けを閉じて今の接続の終わりを 25 秒（`managed.shutdown.drain`）まで待つ（rproxy v0.4.1。古い rproxy のイメージでは preStop 15 秒）。`managed.preStopSeconds` は 0.4.2 から既定で未設定。0.4.1 で値を書いていた場合はその preStop がどの Pod にも付き、delay と drain はその後に続く（要らなければ値を消す）。Gateway ごとに PodDisruptionBudget と、ノードへの分散が付く（docs/DESIGN.md の「rproxy の可用性」）。
+
+形ごとのプラットフォームの書き方（MetalLB L2・BGP + BFD・kube-vip・Cilium・クラウド・NodePort + HAProxy・ClusterIP）は [docs/PLATFORM.md](docs/PLATFORM.md)。
 
 受け入れテスト（kind 1+3 ノード、`managed.replicas=2`、HTTP・HTTPS・TCP を 100 ms ごとに新しい接続で）の、通らなかった最も長い間（秒）：
 

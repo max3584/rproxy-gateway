@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use rproxy_gateway::controller::provision::{Fleet, Managed, Mode, ProbeTiming};
-use rproxy_gateway::{certsync, controller, k8s, render, vip};
+use rproxy_gateway::{certsync, controller, k8s, render};
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -28,8 +28,6 @@ enum Command {
 	Controller(Box<ControllerArgs>),
 	/// Write certificate Secrets into rproxy's certificate directory (runs next to rproxy).
 	Certsync(certsync::Args),
-	/// Hold VIPs on the node for the fleet's rproxy (a sidecar with hostNetwork, NET_ADMIN and NET_RAW).
-	Vip(Box<vip::Args>),
 	/// Print rproxy-gateway's CRDs (RproxyMiddleware, RproxyPolicy, RproxyRule, RproxyGatewayParameters) as YAML.
 	Crds,
 	/// Render manifests (YAML files) into rule sets without a cluster: what the controller would PUT.
@@ -108,10 +106,6 @@ struct ControllerArgs {
 	/// fleet: addresses written to Gateway status (default: the pods' host IPs).
 	#[arg(long, env = "RPROXY_GATEWAY_FLEET_ADDRESS", value_delimiter = ',')]
 	fleet_address: Vec<String>,
-	/// fleet: VIPs the fleet pods' `vip` sidecars hold (one Lease each): the fleet's addresses instead
-	/// (inside `--address-cidr`; a Gateway picks some with `spec.addresses`).
-	#[arg(long, env = "RPROXY_GATEWAY_FLEET_VIPS", value_delimiter = ',', value_parser = |s: &str| vip::parse_vip(s.trim()).map(|_| s.trim().to_string()))]
-	fleet_vip: Vec<String>,
 	/// fleet: where Gateways' rules listen. `wildcard` (--listen-addr: every Gateway's port on every
 	/// address) or `addresses` (a Gateway with spec.addresses, inside --address-cidr, on those only, so
 	/// Gateways on different addresses can use the same port; rproxy with features.listen_freebind, v0.4.3).
@@ -288,10 +282,6 @@ fn main() -> anyhow::Result<()> {
 			init_logging(&cli.log_format);
 			tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(certsync::run(args))
 		}
-		Command::Vip(args) => {
-			init_logging(&cli.log_format);
-			tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(vip::run(*args))
-		}
 		Command::Controller(a) => {
 			init_logging(&cli.log_format);
 			let mode = match a.mode.as_str() {
@@ -299,7 +289,6 @@ fn main() -> anyhow::Result<()> {
 					selector: a.fleet_selector,
 					addresses: a.fleet_address,
 					listen_on_addresses: a.fleet_listen == "addresses",
-					vips: a.fleet_vip,
 				}),
 				_ => Mode::Managed(Managed {
 					rproxy_image: a.rproxy_image,

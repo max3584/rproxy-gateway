@@ -196,8 +196,6 @@ pub struct Fleet {
 	pub selector: String,
 	/// Addresses written to Gateway status (else the pods' host IPs).
 	pub addresses: Vec<String>,
-	/// VIPs the fleet's `vip` sidecars hold (canonical addresses): the fleet's addresses instead.
-	pub vips: Vec<String>,
 	/// A Gateway with `spec.addresses` listens on them (`listen_freebind`) instead of the wildcard, so
 	/// Gateways on different addresses can use the same port (`--fleet-listen addresses`).
 	pub listen_on_addresses: bool,
@@ -860,14 +858,6 @@ fn rproxy_restarts(pod: &Pod) -> i32 {
 /// The message of a `True` readiness gate condition: the rproxy restart count it was set for.
 fn gate_message(restarts: i32) -> String {
 	format!("rule sets applied (rproxy restarts: {restarts})")
-}
-
-/// Whether the controller has applied the rule sets to the pod's rproxy since it last
-/// started: the readiness gate is `True` for its current restart count (the `vip`
-/// sidecar holds VIPs only then).
-pub fn gate_applied(pod: &Pod) -> bool {
-	let cond = pod.status.as_ref().and_then(|s| s.conditions.as_ref()).and_then(|c| c.iter().find(|c| c.type_ == CONDITION_RULESET));
-	cond.is_some_and(|c| c.status == "True" && c.message.as_deref() == Some(gate_message(rproxy_restarts(pod)).as_str()))
 }
 
 /// What the pod's readiness gate (`CONDITION_RULESET`) should become, if it must change.
