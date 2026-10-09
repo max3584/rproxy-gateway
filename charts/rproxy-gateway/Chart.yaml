@@ -2,8 +2,8 @@ apiVersion: v2
 name: rproxy-gateway
 description: Kubernetes Gateway API controller for rproxy (drives rproxy through its control API)
 type: application
-version: 0.4.4
-appVersion: "0.4.4"
+version: 0.4.5
+appVersion: "0.4.5"
 home: https://github.com/max3584/rproxy-gateway
 sources:
   - https://github.com/max3584/rproxy-gateway

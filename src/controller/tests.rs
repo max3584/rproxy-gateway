@@ -323,7 +323,7 @@ async fn tokens_reload_is_known_from_the_image_or_the_pods() {
 		..Default::default()
 	};
 	let mut caps = HashMap::new();
-	assert!(image_feature(&rp, provision::RPROXY_IMAGE, "tokens_reload", &[], &mut caps).await, "the shipped image (v0.4.2)");
+	assert!(image_feature(&rp, provision::RPROXY_IMAGE, "tokens_reload", &[], &mut caps).await, "the shipped image (v0.4.3)");
 	assert!(!image_feature(&rp, provision::RPROXY_IMAGE, "another", &[], &mut caps).await);
 	assert!(!image_feature(&rp, "example/rproxy:reload", "tokens_reload", &[ep("r1")], &mut caps).await, "rproxy before v0.4.2");
 	fake.lock().unwrap().tokens_reload = true;
