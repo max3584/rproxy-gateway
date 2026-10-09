@@ -116,7 +116,7 @@ fleet:
 
 # what every backend the controller renders gets (the pods of the Services behind HTTPRoutes,
 # GRPCRoutes, TLSRoutes, TCPRoutes, UDPRoutes), unless an RproxyPolicy sets outlierDetection
-# (docs/DESIGN-v0.4.x.md 11.). A pod on a node that died stays in its EndpointSlice until the node is
+# (docs/DESIGN-v0.4.x.md 13.). A pod on a node that died stays in its EndpointSlice until the node is
 # NotReady (40-60 s); rproxy's passive health checks leave it out after a few failed connections.
 backends:
   # rproxy's outlier_detection (rproxy-api docs/API.md "受け身のヘルスチェック"): http for the services

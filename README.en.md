@@ -26,7 +26,7 @@ A Kubernetes controller for [rproxy](https://github.com/max3584/rproxy-api). It 
 | `ReferenceGrant` | Services and Secrets in other namespaces |
 | Backends | the pod IPs from EndpointSlices (rproxy balances and health-checks them) |
 | Status | `Accepted`, `Programmed`, `ResolvedRefs` of Gateways, listeners and routes (from the rproxy rules' `conditions`) |
-| `RproxyMiddleware`, `RproxyPolicy`, `RproxyRule` (`rproxy.max3584.net/v1alpha1`) | settings Gateway API lacks (middlewares; L4 limits, bandwidth, GeoIP, passive health checks; rules verbatim) |
+| `RproxyMiddleware`, `RproxyPolicy`, `RproxyRule` (`rproxy.max3584.net/v1beta1`; v0.4.4's `v1alpha1` works too, same shape, deprecated) | settings Gateway API lacks (middlewares; L4 limits, bandwidth, GeoIP, passive health checks; rules verbatim) |
 | `RproxyGatewayParameters` (GatewayClass and Gateway `parametersRef`) | managed rproxy per Gateway (replicas, PDB, resources, pod and Service settings, rproxy's performance settings) |
 | Migration (`--migrate-to`) | reads Ingress and Traefik's IngressRoute, IngressRouteTCP, IngressRouteUDP, Middleware, TLSOption ([docs/en/MIGRATION.md](docs/en/MIGRATION.md)) |
 
@@ -61,10 +61,10 @@ spec:
 ```
 
 - By default (managed), the controller creates one rproxy Deployment and `LoadBalancer` Service per Gateway in the Gateway's namespace (`managed.serviceType`, `managed.replicas`), with the Gateway's `spec.infrastructure` labels and annotations and its `spec.addresses` (the Service's `externalIPs`).
-- A Gateway's own rproxy shape (replicas, resources, PDB, Service settings, ...): write an `RproxyGatewayParameters` in the Gateway's namespace and name it in `spec.infrastructure.parametersRef`. Every Gateway's defaults and what Gateways may set (`policy`): the chart's `managed.parameters` (the GatewayClass's reference). When upgrading from v0.4.1 with `helm upgrade`, apply the CRDs first (`helm upgrade` does not install new CRDs): `kubectl apply --server-side -f https://github.com/max3584/rproxy-gateway/releases/download/v<version>/rproxy.max3584.net.yaml`.
+- A Gateway's own rproxy shape (replicas, resources, PDB, Service settings, ...): write an `RproxyGatewayParameters` in the Gateway's namespace and name it in `spec.infrastructure.parametersRef`. Every Gateway's defaults and what Gateways may set (`policy`): the chart's `managed.parameters` (the GatewayClass's reference). When upgrading from v0.4.1 with `helm upgrade`, apply the CRDs first (`helm upgrade` does not install new CRDs): `kubectl apply --server-side -f https://github.com/max3584/rproxy-gateway/releases/download/v<version>/rproxy.max3584.net.yaml`. From v0.4.4, applying the CRDs makes `v1beta1` available (without it everything keeps working on `v1alpha1`; [docs/en/DESIGN-v0.4.x.md](docs/en/DESIGN-v0.4.x.md) 11.4).
 
 ```yaml
-apiVersion: rproxy.max3584.net/v1alpha1
+apiVersion: rproxy.max3584.net/v1beta1
 kind: RproxyGatewayParameters
 metadata: {name: web, namespace: default}
 spec:
@@ -126,7 +126,7 @@ The acceptance test (kind 1+3 nodes, `managed.replicas=2`, HTTP, HTTPS and TCP e
 - **`Cluster`** hardly drops anything when pods are replaced (every node sends to ready pods), but clients' IPs are lost, and when a node is lost some connections keep failing until its pods leave the endpoints (when the node turns NotReady: 40–50 s).
 - **BGP + ECMP**: with `Local`, MetalLB withdraws the route of a node with a terminating pod only once the pod is gone (3–4 s in FRR mode), so that much is lost (3–4 s). For close to 0 on planned replacements use `Cluster` (with the same tail when a node is lost). BFD takes a lost node out of the routes in about a second. BGP convergence is network-side tuning (BFD, timers), so the acceptance test's `bgp` topology is measured and recorded only (gaps do not fail it).
 - **NodePort behind your own L4 load balancer**: with `Local`, the load balancer can take a node out only once rproxy has stopped (NodePort has no `healthCheckNodePort`), so the connections of that moment fail (about 2 s). If your load balancer can check the Service's `healthCheckNodePort`, use type `LoadBalancer` (a node whose pods are all terminating fails it, so it is taken out while rproxy still accepts).
-- When a node is lost, its **backend** pods also stay in their EndpointSlices until the node turns NotReady (in every topology, some failures may follow the table's values for 40–60 s). From v0.4.5 the controller gives every backend rproxy's passive health checks (`outlier_detection`) and short connect timeouts, so such a pod is left out after a few failures (the chart's `backends`; RproxyPolicy's `outlierDetection` wins per Gateway, listener or Service; [docs/en/DESIGN-v0.4.x.md](docs/en/DESIGN-v0.4.x.md) 11.), and let backends stop with a preStop too (5 s in the acceptance test; without it, each drain loses 1–3 s).
+- When a node is lost, its **backend** pods also stay in their EndpointSlices until the node turns NotReady (in every topology, some failures may follow the table's values for 40–60 s). From v0.4.5 the controller gives every backend rproxy's passive health checks (`outlier_detection`) and short connect timeouts, so such a pod is left out after a few failures (the chart's `backends`; RproxyPolicy's `outlierDetection` wins per Gateway, listener or Service; [docs/en/DESIGN-v0.4.x.md](docs/en/DESIGN-v0.4.x.md) 13.), and let backends stop with a preStop too (5 s in the acceptance test; without it, each drain loses 1–3 s).
 
 ## Commands
 

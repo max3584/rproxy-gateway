@@ -1,4 +1,4 @@
-apiVersion: rproxy.max3584.net/v1alpha1
+apiVersion: rproxy.max3584.net/v1beta1
 kind: RproxyGatewayParameters
 metadata:
   name: rproxy-default

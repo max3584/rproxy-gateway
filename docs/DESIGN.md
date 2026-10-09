@@ -122,8 +122,9 @@ rproxy は `RPROXY_API_ADDR=0.0.0.0`、`RPROXY_API_PORT=9443`、`RPROXY_TOKEN_FI
 | `URLRewrite` | hostname は `replace_host`、path は `replace_path`（ReplaceFullPath）・`replace_path_regex`（ReplacePrefixMatch） |
 | `CORS` | `cors`（`allow_origins`・`allow_methods`・`allow_headers`・`expose_headers`・`allow_credentials`・`max_age`、`maxAge` の既定は 5） |
 | `RequestMirror` | `mirror`（ミラー先の Pod の IP のサービスを作る。`percent` / `fraction`）。ミラー先が見つからなければ `ResolvedRefs: False` でミラーだけ外す |
-| backendRef の `filters` | その backend の `servers[].middlewares`（`RequestHeaderModifier`・`ResponseHeaderModifier`・`URLRewrite`。ReplacePrefixMatch は規則の path の接頭辞が 1 つのときだけ） |
+| backendRef の `filters` | その backend の `servers[].middlewares`（`RequestHeaderModifier`・`ResponseHeaderModifier`・`URLRewrite`、rproxy v0.4.3 の `server_middleware_kinds` があれば `CORS`・`RequestRedirect`・`RequestMirror` も。URLRewrite・RequestRedirect の ReplacePrefixMatch は規則の path の接頭辞が 1 つのときだけ。ミラーはその backend に送るリクエストだけを写す） |
 | `retry` | `retry`（`attempts` は Gateway API の回数 + 1、`codes` は `status`、`backoff` は `initial_interval`）。ミドルウェアの最後 |
+| `ExternalAuth`（experimental） | `forward_auth`（rproxy v0.4.3 の `features.forward_auth`）。backendRef の Service の Pod の IP のサービス（`<規則>/f<n>/extauth`、BackendTLSPolicy があれば `https://` と `tls`）を `service` で指す。HTTP：`client_request`（クライアントのメソッド、`http.path` の後ろにパス、Host、Content-Length）、`allow_status: ["200"]`、`request_headers` は `authorization` と `allowedHeaders`、`response_headers` は `allowedResponseHeaders`（空なら `["*"]`）。gRPC：`protocol: grpc`（サービスは h2c、TLS なら h2）、`request_headers` は `allowedHeaders`（空ならすべて）。`forwardBody.maxSize` は `forward_body`。backend が見つからない・ready な Pod がない・使える CA がないときは、確かめずに通さないよう規則は 500（`ResolvedRefs: False`）。backendRef の `ExternalAuth` はその backend の `servers[].middlewares` |
 | `ExtensionRef`（`RproxyMiddleware`） | そのミドルウェア（`spec` をそのまま） |
 | `timeouts.request` / `timeouts.backendRequest` | ルートの `timeouts.request` / `timeouts.backend_request` |
 | GRPCRoute | 同じポートの HTTPRoute と同じ `http` のルールに。メソッドの一致はパスの一致にする（`service` と `method`：`Path(/<service>/<method>)`、`service` だけ：`PathPrefix(/<service>/)`、`method` だけ・`RegularExpression`：`PathRegexp`）。ヘッダの一致・フィルタ（`RequestHeaderModifier`・`ResponseHeaderModifier`・`RequestMirror`・`ExtensionRef`）・backendRef のフィルタは HTTPRoute と同じ。転送先とは h2c（サービスの `protocol: h2c`）。rproxy の名前は `grpc:` で始める |
@@ -131,6 +132,7 @@ rproxy は `RPROXY_API_ADDR=0.0.0.0`、`RPROXY_API_PORT=9443`、`RPROXY_TOKEN_FI
 | Gateway の `spec.tls.backend.clientCertificateRef` | BackendTLSPolicy のサービスの `tls` の `cert_file` / `key_file`。Gateway の `ResolvedRefs`（`InvalidClientCertificateRef`・`RefNotPermitted`） |
 | リスナー `TLS`（`tls.mode: Passthrough`） | tcp のルール、`tls.mode: sni`、`unmatched: reject`。TLSRoute のホスト名ごとに `tls.routes` |
 | 同じポートの `HTTPS` と `TLS`（Passthrough） | `http` のルールの `tls.routes`（`passthrough: true`）。そのホスト名だけ復号しない |
+| 同じポートの複数の `HTTPS` のリスナー（HTTP/2 の接続の使い回し） | `tls.misdirected`：リスナーごとに 1 つのグループ（ホスト名、ないものは `*`）。SNI で選んだリスナーとは別のリスナーのホスト名のリクエストは 421（`GatewayHTTPSListenerDetectMisdirectedRequests`、rproxy v0.4.3 の `http_options` の `misdirected`。ない rproxy では付けない） |
 | リスナー `TLS`（`tls.mode: Terminate`） | tcp のルール、`tls.mode: terminate`、TLSRoute のホスト名ごとに `tls.routes`（同じポートの Passthrough のリスナーの分は `passthrough: true`） |
 | TLSRoute の宛先 | `tls.routes[].targets`：すべての backend の Pod の IP（weight を Pod の数で配る） |
 | リスナー `TCP` / `UDP` | tcp / udp のルール、`targets`（TCPRoute / UDPRoute のすべての backend の Pod の IP、weight を Pod の数で配る） |
@@ -141,7 +143,7 @@ rproxy は `RPROXY_API_ADDR=0.0.0.0`、`RPROXY_API_PORT=9443`、`RPROXY_TOKEN_FI
 | Gateway の `spec.tls.frontend`（クライアント証明書の検証） | そのポートのルールの `tls.client_auth`（`mode: required`、`ca_file` は `caCertificateRefs` の ConfigMap の `ca.crt` をまとめたファイル）。`perPort` があればそのポート、なければ `default`。ConfigMap 以外は `InvalidCACertificateKind`、見つからない・`ca.crt` のないものは `InvalidCACertificateRef`、ほかの namespace は ReferenceGrant（to `ConfigMap`）が要る（`RefNotPermitted`）。使えるものが 1 つもなければリスナーは `Accepted: False`（`NoValidCACertificate`）。`AllowInsecureFallback` は `mode: optional_no_verify`（証明書を求めて確かめるが、なくても通らなくてもつなぐ。結果は `X-Client-Verify: SUCCESS / FAILED / NONE` と `X-Forwarded-Client-Cert` で backend に渡る）で、Gateway に `InsecureFrontendValidationMode: True`。そのモードのない rproxy（`features.client_auth_modes`）では証明書を求めない |
 | 証明書の使えない `HTTPS` のリスナー | ルートはつながる（`attachedRoutes` に数える）が、ルールは作らない（`ResolvedRefs: False`、`Programmed: False`） |
 
-### rproxy の CRD（`rproxy.max3584.net/v1alpha1`）
+### rproxy の CRD（`rproxy.max3584.net/v1beta1`、`v1alpha1` も同じ形で非推奨のまま使える。[DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) の 11.4）
 
 | CRD | 使い方 |
 |---|---|
@@ -150,7 +152,7 @@ rproxy は `RPROXY_API_ADDR=0.0.0.0`、`RPROXY_API_PORT=9443`、`RPROXY_TOKEN_FI
 | `RproxyGatewayParameters` | managed の Gateway の rproxy の形（replicas、PDB、Pod のラベル・注釈・resources・topologySpread・nodeSelector・tolerations・affinity・priorityClass、Service の型・externalTrafficPolicy・loadBalancerClass・sourceRanges・ipFamilyPolicy・ラベル・注釈、rproxy のイメージ・logLevel・performance・追加の環境変数）。GatewayClass の `parametersRef`（コントローラの namespace、`policy` で Gateway に許す項目を決める）と Gateway の `infrastructure.parametersRef`（同じ namespace）から。合わせ方・検証・誰が何を決められるかは [DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) の 2. |
 | `RproxyRule` | `spec.rule` はルールそのもの（`POST /rules` の本文）。`spec.parentRef` の Gateway のルールセットに足す。ほかの namespace の Gateway には、その namespace の ReferenceGrant（from `rproxy.max3584.net/RproxyRule`、to `Gateway`）が要る。同じキーのルールが既にあれば `Accepted: False`（`Conflicted`）。状態は rproxy のルールの `conditions` を写す |
 
-できないもの（ルートは `Accepted: False`、理由 `UnsupportedValue`）：backendRef の `RequestMirror`・`CORS`・`RequestRedirect` フィルタ、`ExternalAuth`。
+できないもの（ルートは `Accepted: False`、理由 `UnsupportedValue`）：backendRef の `ExtensionRef` フィルタ。rproxy に機能がないもの（下の「rproxy の機能」）。
 
 ### rproxy の機能（`features`）
 

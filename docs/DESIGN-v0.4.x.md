@@ -44,7 +44,7 @@ managed の Deployment・Service はコントローラが実行時に作るの�
 
 ### 2.1 形
 
-CRD `RproxyGatewayParameters`（`rproxy.max3584.net/v1alpha1`、namespaced、shortname `rpgwp`）。GatewayClass の `spec.parametersRef`（クラスの既定）と、Gateway の `spec.infrastructure.parametersRef`（その Gateway の上書き）の両方から指す。
+CRD `RproxyGatewayParameters`（`rproxy.max3584.net/v1alpha1`（v0.4.5 から `v1beta1`、11.4）、namespaced、shortname `rpgwp`）。GatewayClass の `spec.parametersRef`（クラスの既定）と、Gateway の `spec.infrastructure.parametersRef`（その Gateway の上書き）の両方から指す。
 
 ```yaml
 apiVersion: rproxy.max3584.net/v1alpha1
@@ -358,7 +358,63 @@ v0.4.4 で fleet の `vip` サイドカー（`rproxy-gateway vip`、chart の `f
 
 Q10〜Q16（UI の migration・MariaDB、rproxy-api の #240・#241、利用量）は UI・rproxy-api の設計にある。
 
-## 11. ノードの喪失とバックエンド（v0.4.5）
+## 11. Gateway API の残り（v0.4.5、rproxy v0.4.3）
+
+docs/CONFORMANCE.md の「名乗っていないもの」を埋める（オーナーの依頼、2026-10-08）。rproxy に要る口は rproxy-api の docs/DESIGN-v0.4.x.md の 7.。どれも rproxy の `features` で見分け、ない rproxy では前のとおり（名乗る機能のルートは `UnsupportedValue`、421 は付けない）。
+
+### 11.1 421 Misdirected Request（`GatewayHTTPSListenerDetectMisdirectedRequests`）
+
+- 同じポートの `HTTPS` のリスナーが 2 つ以上なら、ルールの `tls.misdirected.groups` にリスナーごとのグループを書く（ホスト名は rproxy の形（`*.example.com` → `**.example.com`）、ホスト名のないリスナーは `*`）。rproxy は SNI と Host が違うグループなら 421 を返す。Host がどのリスナーにも当たらなければ（`*` のリスナーがないとき）ルートで選ばれて 404。
+- 1 つしかなければ付けない（分けるものがない）。`TLS`（Terminate）のリスナーは HTTP を話さないので入れない。
+- rproxy v0.4.3 の `http_options` の `misdirected` がない rproxy には付けない（今までどおり、ほかのリスナーのルートに届く）。
+
+### 11.2 backendRef の `CORS`・`RequestRedirect`・`RequestMirror` のフィルタ
+
+- その backend の `servers[].middlewares` に、規則のフィルタと同じ形のミドルウェア（`cors`、`redirect_regex`、`mirror` とミラー先のサービス）を書く。rproxy v0.4.3 の `server_middleware_kinds` に `cors`・`redirect_regex`・`mirror` があるときだけ（ない rproxy ではルートが `UnsupportedValue`）。
+- `RequestRedirect` の ReplacePrefixMatch は `URLRewrite` と同じく、規則の path の接頭辞が 1 つのときだけ（転送先は規則のすべての match に使われる）。
+- ミラーはその backend に当たったリクエストだけを写す（rproxy が 1 つのリクエストで 1 回だけ写す）。ミラー先が見つからなければ規則のフィルタと同じく `ResolvedRefs: False` でミラーだけ外す。
+- backendRef の `ExtensionRef` は今までどおり断る（`RproxyMiddleware` の種類を転送先ごとに確かめる口がないため）。
+
+### 11.3 `ExternalAuth`（HTTP・gRPC）
+
+- `ExternalAuth` のフィルタを rproxy の `forward_auth`（v0.4.3 で足した `service`・`client_request`・`allow_status`・`response_headers: ["*"]`・`forward_body`・`protocol: grpc`）にする。宛先は backendRef の Service の Pod の IP のサービス（ほかの backend と同じく EndpointSlice から。BackendTLSPolicy も同じく効く）。
+- HTTP：Gateway API が必ず送るとする Host・メソッド・パス・Content-Length は `client_request` が送る。`Authorization` は `request_headers` に必ず入れる（Gateway API の「`allowedHeaders` が空なら決まったものだけ」。rproxy の `request_headers` は空だとすべてを送るため）。`allowedResponseHeaders` が空なら `["*"]`（応答そのものを表すヘッダは写さない）。200 だけが通す（`allow_status`）。
+- gRPC：`allowedHeaders` が空ならすべて（Gateway API と rproxy で同じ意味）。サービスは h2c（BackendTLSPolicy があれば h2 と `tls`）。
+- `forwardBody.maxSize`（0 は送らない）。大きい本文は 413（型の説明の「切って送る」ではなく、フィルタの説明と Envoy の既定の「断る」。rproxy-api の設計 7.3）。
+- 宛先が使えない（見つからない・ReferenceGrant がない・ready な Pod がない・BackendTLSPolicy に使える CA がない）ときは、確かめずに通すことのないよう、その規則は 500（`ResolvedRefs: False`）。backendRef の `ExternalAuth` なら、その backend の分だけ 500（`servers[].status`。ない rproxy ではその backend を外す）。
+- 名乗る機能：`HTTPRouteExternalAuth`・`HTTPRouteExternalAuthHTTP`・`HTTPRouteExternalAuthGRPC`・`HTTPRouteExternalAuthForwardBody`（GatewayClass の `supportedFeatures`）。Gateway API v1.6.3 の conformance にはこの機能の名前も試験もない（`pkg/features` にない）ので、試験は `tests/rproxy.rs`（本物の rproxy）・単体と rproxy-api の `tests/ext_authz.rs`。
+
+### 11.4 rproxy の CRD を `v1beta1` に
+
+- 4 つの CRD（`RproxyRule`・`RproxyMiddleware`・`RproxyPolicy`・`RproxyGatewayParameters`）は `v1beta1`（保存する版）と `v1alpha1`（`deprecated: true`、`deprecationWarning`）の両方を出す。形は同じなので、変換の webhook はなく `conversion.strategy: None`（API サーバが `apiVersion` を書き換えるだけ）。`rproxy-gateway crds` が `v1beta1` の型から `v1alpha1` の項を作る（単体の試験が形の一致を確かめる）。
+- コントローラは CRD を discovery の優先の版で watch する（今までどおり）。新しい CRD なら `v1beta1`、`helm upgrade` で CRD が古いまま（`v1alpha1` だけ）でも `v1alpha1` で動く。状態（`RproxyRule` の `status`）も同じ版で書く。
+- chart がクラスの既定の `RproxyGatewayParameters` を描くときは、クラスタが `v1beta1` を出していればそれ、なければ `v1alpha1`（Helm の `.Capabilities`。`helm install` は `crds/` を入れた後に調べる）。`config/`・例・e2e は `v1beta1`。e2e は `RproxyRule` を 1 つ `v1alpha1` で書き、`v1beta1` で読めること・保存の版が `v1beta1` であることを確かめる。受け入れテストは CRD の保存の版で書く（公開した古い chart でも動く）。
+- **v0.4.4 からの更新**：
+  1. `kubectl apply --server-side -f https://github.com/max3584/rproxy-gateway/releases/download/v0.4.5/rproxy.max3584.net.yaml`（`helm upgrade` は CRD を更新しない。Kustomize の `config/crd` は一緒に当たる）。
+  2. コントローラを更新する。今の `v1alpha1` のオブジェクトはそのまま `v1beta1` としても読める（書き直しは要らない）。CRD を当てる前にコントローラだけ更新しても `v1alpha1` で動く。
+  3. 手元のマニフェストの `apiVersion` は、時間のあるときに `rproxy.max3584.net/v1beta1` に変える（`v1alpha1` は警告が出るだけ）。
+- **保存の版**：etcd の中の今のオブジェクトは、次に書かれるまで `v1alpha1` のまま（CRD の `status.storedVersions` は `["v1alpha1", "v1beta1"]`）。形が同じなので動きは変わらない。将来 `v1alpha1` を出すのをやめる版（マイナー）の前には、すべてのオブジェクトを書き直して（`kubectl get rproxyrules,rproxymiddlewares,rproxypolicies,rproxygatewayparameters -A -o json | kubectl replace -f -`、または kube-storage-version-migrator）から `status.storedVersions` を `["v1beta1"]` にする（`kubectl patch crd <名前> --subresource=status --type=merge -p '{"status":{"storedVersions":["v1beta1"]}}'`）。v0.4.x のうちは `v1alpha1` を出し続ける（パッチで壊さない）。
+
+### 11.5 Mesh（GAMMA）の見立て（作らない）
+
+Gateway API の Mesh（GAMMA、conformance の `MESH-HTTP`・`MESH-GRPC`、機能 `Mesh` と `MeshClusterIPMatching`・`MeshConsumerRoute` など）は、HTTPRoute・GRPCRoute の `parentRefs` に **Service** を書き、クラスタの中の Pod から Service への通信（east-west）にルートを当てる。オーナーの依頼で、作らずに見立てだけ書く（2026-10-08）。
+
+**要るもの**
+
+| 部分 | 中身 | 今の rproxy-gateway / rproxy |
+|---|---|---|
+| 通信を取る | 各 Pod の外向きの通信を rproxy に向ける：Pod ごとのサイドカーを注入する（mutating webhook と、iptables / nftables を書く init コンテナか CNI のプラグイン）か、ノードごとのプロキシ（Istio ambient の ztunnel・Cilium の形。eBPF か TPROXY でノードの全 Pod を取る） | ない。fleet の hostNetwork の DaemonSet はあるが、Pod の通信を横取りしない |
+| 元の宛先で振り分ける | 取った接続の元の宛先（`SO_ORIGINAL_DST` か TPROXY の宛先）を読み、Service の ClusterIP:port ごとに「仮想の待ち受け」として L7 のルートを選ぶ（`MeshClusterIPMatching`）。ルートのない Service はそのまま kube-proxy の動きを真似る（Pod の IP に分ける） | rproxy のルールは待ち受けの (アドレス, ポート) がキー。元の宛先で選ぶ口は rproxy-api の大きな変更（新しい待ち受けの形、ルールの数がクラスタの Service の数になる） |
+| 全 Service の設定 | ルートのない Service も含め、クラスタのすべての Service・EndpointSlice をすべてのプロキシに配る（数千の Service、変化の多い EndpointSlice）。今の「Gateway 1 つ = ルールセット 1 つを PUT」は、毎回すべてを置き換えるので重い | ルールセットの PUT は全体の置き換え（etag 付き）。差分の配り方（xDS の増分のようなもの）がない |
+| 送り手のルート | `MeshConsumerRoute`：ルートの namespace の Pod が送るときだけ効くルート。送り手（どの Pod か）を知る必要がある | 接続元の IP から Pod・namespace を引く表が要る |
+| 識別と mTLS | メッシュは普通、ワークロードの証明書（SPIFFE）で相互 TLS をする（Gateway API の conformance は求めないが、メッシュとして使うなら要る）。CA・証明書の発行と回転・Pod ごとの鍵 | rproxy の TLS は終端・転送先への TLS・クライアント証明書の確認はあるが、Pod ごとの証明書の発行はない |
+| conformance の環境 | Mesh の試験（v1.6.3 で 22 本）は、`gateway-conformance-mesh` の namespace の echo の Pod に入って Service へ curl する。namespace のラベル（`--namespace-labels`）で注入を有効にする | 注入の仕組みがないと 1 本も動かない |
+
+**見積もり**：rproxy-api に「元の宛先で選ぶ待ち受け」と大きなルールセットの差分の反映、rproxy-gateway に注入の webhook と iptables の init（か CNI）、Service の全体の描画、送り手の表、（使うなら）mTLS の証明書。Gateway の機能の今までの追加（この 11. の全部）の数倍の量で、Pod の通信の道に入るため、障害の影響がクラスタ全体に広がる（今は Gateway の通信だけ）。受け入れテスト・セキュリティの線（「rproxy の Pod は Kubernetes の API を使わない」「テナントは自分の namespace だけ」）も作り直しになる。
+
+**勧め：作らない**。rproxy-gateway は north-south（Gateway）に絞る。クラスタの中の通信にポリシー・mTLS が要るなら、Istio（ambient）・Linkerd・Cilium のメッシュと並べて使う（rproxy-gateway は入口のまま、メッシュは Pod の間。Gateway の rproxy の Pod をメッシュに入れるかはメッシュの側の設定）。需要がはっきりしたら、v0.4.x のパッチではなく次のマイナー（形が大きく変わる）で、ノードごとのプロキシの形（ambient に近い。fleet の DaemonSet を使える）から考える。docs/CONFORMANCE.md の「名乗っていないもの」には Mesh を残す。
+
+## 13. ノードの喪失とバックエンド（v0.4.5）
 
 ノードが止まると、そのノードのバックエンドの Pod は、ノードが NotReady になって EndpointSlice の `ready` が false になるまで（node-monitor-grace-period、40〜60 秒）宛先に残り、rproxy はそこへ送り続ける。止まったノードの Pod は SYN に答えないので、接続は rproxy の接続の時間（L7 は 5 秒、L4 は宛先が複数なら 5 秒、1 つなら OS の再送で約 2 分）まで待ってから失敗する。ノードの喪失を見つけること自体（CNI・ロードバランサ・ノードの監視の時間）は扱わない（記録だけ。8.）。rproxy-gateway で決められるのは次の 3 つ。
 

@@ -20,7 +20,12 @@ spec:
 # the GatewayClass's defaults for every managed Gateway's rproxy (docs/DESIGN-v0.4.x.md, A).
 # Its CRD must be installed first when upgrading from a chart without it (helm upgrade does not
 # install new CRDs): kubectl apply --server-side -f crds/rproxy.max3584.net.yaml
+# v1beta1 since 0.4.5; v1alpha1 where the cluster still has the CRDs of an older chart
+{{- if .Capabilities.APIVersions.Has "rproxy.max3584.net/v1beta1/RproxyGatewayParameters" }}
+apiVersion: rproxy.max3584.net/v1beta1
+{{- else }}
 apiVersion: rproxy.max3584.net/v1alpha1
+{{- end }}
 kind: RproxyGatewayParameters
 metadata:
   name: rproxy-default

@@ -166,6 +166,9 @@ YAML
 retry 60 sh -c "test \"\$(kubectl -n e2e get gateway steal-dns -o jsonpath='{.status.conditions[?(@.type==\"Programmed\")].reason}')\" = AddressNotUsable"
 test -z "$(kubectl -n e2e get svc -l gateway.networking.k8s.io/gateway-name=steal-dns -o jsonpath='{.items[*].spec.externalIPs}')"
 retry 60 sh -c "test \"\$(kubectl -n e2e get rproxyrule steal-key -o jsonpath='{.status.conditions[?(@.type==\"Accepted\")].reason}')\" = Invalid"
+# written as v1alpha1 (deprecated, still served: objects of 0.4.4 and earlier), read as v1beta1 (stored)
+test "$(kubectl get crd rproxyrules.rproxy.max3584.net -o jsonpath='{.spec.versions[?(@.storage==true)].name}')" = v1beta1
+test "$(kubectl -n e2e get rproxyrules.v1beta1.rproxy.max3584.net steal-key -o jsonpath='{.apiVersion}')" = rproxy.max3584.net/v1beta1
 kubectl -n e2e delete gateway steal-dns > /dev/null
 kubectl -n e2e delete rproxyrule steal-key > /dev/null
 test "$(kubectl -n e2e get networkpolicy -l gateway.networking.k8s.io/gateway-name=e2e -o name | wc -l)" = 1
@@ -198,7 +201,7 @@ retry 60 sh -c "curl -sf -H 'Host: e2e.example.com' http://$addr/two > /dev/null
 
 echo "== RproxyGatewayParameters: the Gateway's own replicas, resources, labels and topology spread"
 cat <<YAML | kubectl apply -f - > /dev/null
-apiVersion: rproxy.max3584.net/v1alpha1
+apiVersion: rproxy.max3584.net/v1beta1
 kind: RproxyGatewayParameters
 metadata: {name: e2e, namespace: e2e}
 spec:
@@ -225,7 +228,7 @@ kubectl -n e2e create rolebinding tenant-admin --clusterrole=admin --serviceacco
 retry 60 sh -c "kubectl auth can-i update rproxygatewayparameters.rproxy.max3584.net -n e2e --as=system:serviceaccount:e2e:tenant | grep -qx yes"
 generation=$(kubectl -n e2e get deploy "$deploy" -o jsonpath='{.metadata.generation}')
 cat <<YAML | kubectl --as=system:serviceaccount:e2e:tenant apply -f - > /dev/null
-apiVersion: rproxy.max3584.net/v1alpha1
+apiVersion: rproxy.max3584.net/v1beta1
 kind: RproxyGatewayParameters
 metadata: {name: e2e, namespace: e2e}
 spec:
@@ -244,7 +247,7 @@ kubectl -n e2e patch httproute echo --type=json -p '[{"op":"add","path":"/spec/h
 retry 60 sh -c "curl -sf -H 'Host: kept.example.com' http://$addr/kept > /dev/null"
 echo "== parameters fixed: accepted, the new shape"
 cat <<YAML | kubectl --as=system:serviceaccount:e2e:tenant apply -f - > /dev/null
-apiVersion: rproxy.max3584.net/v1alpha1
+apiVersion: rproxy.max3584.net/v1beta1
 kind: RproxyGatewayParameters
 metadata: {name: e2e, namespace: e2e}
 spec:
@@ -301,7 +304,7 @@ test "$codes" = "200 403"
 kubectl -n rproxy-ui delete pod ui-probe --wait=false > /dev/null
 echo "== the UI: the Gateway hidden (parameters ui.visible: false): the Secret goes, the token goes (no rollout)"
 cat <<YAML | kubectl --as=system:serviceaccount:e2e:tenant apply -f - > /dev/null
-apiVersion: rproxy.max3584.net/v1alpha1
+apiVersion: rproxy.max3584.net/v1beta1
 kind: RproxyGatewayParameters
 metadata: {name: e2e, namespace: e2e}
 spec:

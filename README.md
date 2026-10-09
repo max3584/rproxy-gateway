@@ -26,7 +26,7 @@ English: [README.en.md](README.en.md)
 | `ReferenceGrant` | ほかの namespace の Service・Secret |
 | backend | EndpointSlice の Pod の IP（rproxy が振り分けとヘルスチェックをする） |
 | 状態 | Gateway・リスナー・ルートの `Accepted`・`Programmed`・`ResolvedRefs`（rproxy のルールの `conditions` から） |
-| `RproxyMiddleware`・`RproxyPolicy`・`RproxyRule`（`rproxy.max3584.net/v1alpha1`） | Gateway API にない設定（ミドルウェア、L4 の制限・帯域・GeoIP・受け身のヘルスチェック、ルールそのもの） |
+| `RproxyMiddleware`・`RproxyPolicy`・`RproxyRule`（`rproxy.max3584.net/v1beta1`。v0.4.4 までの `v1alpha1` も同じ形で使える（非推奨）） | Gateway API にない設定（ミドルウェア、L4 の制限・帯域・GeoIP・受け身のヘルスチェック、ルールそのもの） |
 | `RproxyGatewayParameters`（GatewayClass・Gateway の `parametersRef`） | managed の rproxy の形を Gateway ごとに（replicas、PDB、resources、Pod・Service の設定、rproxy の性能の設定） |
 | 移行（`--migrate-to`） | Ingress と Traefik の IngressRoute・IngressRouteTCP・IngressRouteUDP・Middleware・TLSOption を読む（[docs/MIGRATION.md](docs/MIGRATION.md)） |
 
@@ -61,10 +61,10 @@ spec:
 ```
 
 - 既定（managed）では、Gateway ごとに rproxy の Deployment と `LoadBalancer` の Service を Gateway の namespace に作る（`managed.serviceType`、`managed.replicas`）。Gateway の `spec.infrastructure` のラベル・注釈と `spec.addresses`（Service の `externalIPs`）を使う。
-- Gateway ごとの rproxy の形（replicas・resources・PDB・Service の設定など）は `RproxyGatewayParameters` を Gateway の namespace に書き、`spec.infrastructure.parametersRef` で指す。全 Gateway の既定と、Gateway に許す項目（`policy`）は chart の `managed.parameters`（GatewayClass の参照）。v0.4.1 から `helm upgrade` するときは、先に CRD を入れる（`helm upgrade` は新しい CRD を入れない）：`kubectl apply --server-side -f https://github.com/max3584/rproxy-gateway/releases/download/v<版>/rproxy.max3584.net.yaml`。
+- Gateway ごとの rproxy の形（replicas・resources・PDB・Service の設定など）は `RproxyGatewayParameters` を Gateway の namespace に書き、`spec.infrastructure.parametersRef` で指す。全 Gateway の既定と、Gateway に許す項目（`policy`）は chart の `managed.parameters`（GatewayClass の参照）。v0.4.1 から `helm upgrade` するときは、先に CRD を入れる（`helm upgrade` は新しい CRD を入れない）：`kubectl apply --server-side -f https://github.com/max3584/rproxy-gateway/releases/download/v<版>/rproxy.max3584.net.yaml`。v0.4.4 からは、CRD を当てると `v1beta1` が使えるようになる（当てなくても `v1alpha1` のまま動く。[docs/DESIGN-v0.4.x.md](docs/DESIGN-v0.4.x.md) の 11.4）。
 
 ```yaml
-apiVersion: rproxy.max3584.net/v1alpha1
+apiVersion: rproxy.max3584.net/v1beta1
 kind: RproxyGatewayParameters
 metadata: {name: web, namespace: default}
 spec:
@@ -126,7 +126,7 @@ rproxy の Pod は、コントローラがルールセットを反映してか�
 - **`Cluster`** は Pod の入れ替えではほぼ途切れない（どのノードも ready な Pod に送る）が、クライアントの IP は届かず、ノードが止まると、そのノードの Pod が endpoint から外れるまで（ノードが NotReady になるまで、40〜50 秒）一部の接続が落ち続ける。
 - **BGP + ECMP**：`Local` では、MetalLB が終了中の Pod のあるノードの経路を Pod が消えてから取り下げる（FRR モードで 3〜4 秒かかる）ので、その間の分が落ちる（3〜4 秒）。計画した入れ替えでほぼ 0 にしたいなら `Cluster`（ノードが止まったときの尾は上と同じ）。BFD でノードの死は 1 秒ほどで経路から外れる。BGP の収束はネットワークの側の設定（BFD、タイマー）で決まるので、受け入れテストの `bgp` は測って記録するだけ（途切れで失敗にしない）。
 - **NodePort と自前の L4 のロードバランサ**：`Local` では、ロードバランサは rproxy が止まってからでないとノードを外せない（NodePort には `healthCheckNodePort` がない）ので、止まる瞬間の接続が落ちる（2 秒ほど）。ロードバランサが Service の `healthCheckNodePort` を見られるなら `LoadBalancer` 型にするとよい（終了中の Pod だけのノードは失敗を返すので、rproxy が受け付けを続けている間に外れる）。
-- ノードが止まったとき、そのノードの **backend** の Pod も、ノードが NotReady になるまで EndpointSlice に残る（どの形でも、表の値の後ろに 40〜60 秒の一部の失敗が続くことがある）。v0.4.5 からコントローラはすべての backend に rproxy の受け身のヘルスチェック（`outlier_detection`）と短い接続の時間を付けるので、その Pod は数回の失敗で外れる（chart の `backends`。Gateway・リスナー・Service ごとには RproxyPolicy の `outlierDetection` が勝つ。[docs/DESIGN-v0.4.x.md](docs/DESIGN-v0.4.x.md) の 11.）。backend 自身も preStop で止まるようにする（受け入れテストの backend は 5 秒。ないと drain ごとに 1〜3 秒落ちる）。
+- ノードが止まったとき、そのノードの **backend** の Pod も、ノードが NotReady になるまで EndpointSlice に残る（どの形でも、表の値の後ろに 40〜60 秒の一部の失敗が続くことがある）。v0.4.5 からコントローラはすべての backend に rproxy の受け身のヘルスチェック（`outlier_detection`）と短い接続の時間を付けるので、その Pod は数回の失敗で外れる（chart の `backends`。Gateway・リスナー・Service ごとには RproxyPolicy の `outlierDetection` が勝つ。[docs/DESIGN-v0.4.x.md](docs/DESIGN-v0.4.x.md) の 13.）。backend 自身も preStop で止まるようにする（受け入れテストの backend は 5 秒。ないと drain ごとに 1〜3 秒落ちる）。
 
 ## コマンド
 

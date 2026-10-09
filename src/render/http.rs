@@ -118,10 +118,12 @@ impl Output {
 		self.middlewares = std::mem::take(&mut self.middlewares)
 			.into_iter()
 			.map(|(k, mut v)| {
-				// a mirror names its service
-				if let Some(svc) = v.pointer_mut("/mirror/service") {
-					if let Some(s) = svc.as_str() {
-						*svc = Value::String(p(s));
+				// a mirror and an external auth name their service
+				for at in ["/mirror/service", "/forward_auth/service"] {
+					if let Some(svc) = v.pointer_mut(at) {
+						if let Some(s) = svc.as_str() {
+							*svc = Value::String(p(s));
+						}
 					}
 				}
 				(p(&k), v)
@@ -372,6 +374,121 @@ enum Filtered {
 	Middlewares(Vec<Value>),
 	/// An ExtensionRef that does not resolve (the rule answers 500).
 	Missing,
+	/// An ExternalAuth whose backend cannot be used (the rule answers 500, `out.resolved` says why):
+	/// requests must not go on unchecked.
+	Unresolved,
+}
+
+/// rproxy's `forward_auth` for an ExternalAuth filter (Envoy's ext_authz), asking a service of
+/// the backend's pods (`{base}/extauth`). `Ok(None)`: the backend cannot be used (`out.resolved`).
+fn external_auth(
+	ctx: &Ctx,
+	ns: &str,
+	ea: &crate::k8s::gateway::ExternalAuth,
+	base: &str,
+	out: &mut Output,
+) -> Result<Option<Value>, String> {
+	let grpc = match ea.protocol.as_str() {
+		"GRPC" => true,
+		"HTTP" => false,
+		other => return Err(format!("ExternalAuth protocol {other:?} is not supported")),
+	};
+	if grpc {
+		crate::render::needs(ctx.features.ext_auth_grpc, "the ExternalAuth filter over gRPC", "forward_auth service, grpc")?;
+	} else {
+		crate::render::needs(
+			ctx.features.ext_auth_http,
+			"the ExternalAuth filter over HTTP",
+			"forward_auth service, client_request, allow_status, all_response_headers",
+		)?;
+	}
+	let body = ea.forward_body.as_ref().and_then(|b| b.max_size).filter(|n| *n > 0);
+	if body.is_some() {
+		crate::render::needs(ctx.features.ext_auth_body, "ExternalAuth forwardBody", "forward_auth forward_body")?;
+	}
+	let b = &ea.backend_ref;
+	let eps = match backends::resolve(ctx.world, ctx.kind, ns, b) {
+		Ok(eps) if eps.is_empty() => {
+			let svc_ns = b.namespace.clone().unwrap_or_else(|| ns.to_string());
+			out.resolved.get_or_insert(Cond::new(
+				"ResolvedRefs",
+				false,
+				"BackendNotFound",
+				format!("the ExternalAuth filter's Service {svc_ns}/{} has no ready endpoint", b.name),
+			));
+			return Ok(None);
+		}
+		Ok(eps) => eps,
+		Err(e) => {
+			out.resolved.get_or_insert(e);
+			return Ok(None);
+		}
+	};
+	// TLS to the auth server (BackendTLSPolicy), as for backends
+	let svc_ns = b.namespace.clone().unwrap_or_else(|| ns.to_string());
+	let policy = backends::port_name(ctx.world, ns, b)
+		.and_then(|port| ctx.backend_tls.and_then(|i| i.get(&svc_ns, &b.name, port.as_deref())).cloned());
+	if let Some(i) = ctx.backend_tls {
+		out.tls_policies.extend(i.naming(&svc_ns, &b.name).cloned());
+	}
+	let tls = match policy {
+		Some((key, crate::render::backend_tls::Tls::Use(tls))) => {
+			out.tls_policies.insert(key);
+			crate::render::needs(ctx.features.service_tls, "TLS to the ExternalAuth backend (BackendTLSPolicy)", "services tls")?;
+			Some(tls)
+		}
+		Some((key, crate::render::backend_tls::Tls::Invalid)) => {
+			out.tls_policies.insert(key);
+			return Ok(None);
+		}
+		None => None,
+	};
+	let scheme = if tls.is_some() { "https" } else { "http" };
+	let servers = backends::spread(&[(1, eps)])
+		.into_iter()
+		.map(|(ep, weight)| rp::Server { url: format!("{scheme}://{}", ep.authority()), weight, ..Default::default() })
+		.collect();
+	let protocol = match (grpc, tls.is_some()) {
+		(true, true) => Some("h2"),
+		(true, false) => Some("h2c"),
+		_ => None,
+	};
+	let name = format!("{base}/extauth");
+	out.services.insert(name.clone(), rp::Service { servers, protocol, tls, ..Default::default() });
+	let lower = |names: &[String]| -> Vec<String> {
+		let mut v: Vec<String> = names.iter().map(|n| n.to_ascii_lowercase()).collect();
+		v.dedup();
+		v
+	};
+	let mut v = json!({ "service": name });
+	if grpc {
+		v["protocol"] = json!("grpc");
+		// none listed: all headers
+		let allowed = lower(&ea.grpc.as_ref().map(|g| g.allowed_headers.clone()).unwrap_or_default());
+		if !allowed.is_empty() {
+			v["request_headers"] = json!(allowed);
+		}
+	} else {
+		let http = ea.http.clone().unwrap_or_default();
+		let path = http.path.unwrap_or_default();
+		v["path"] = json!(if path.starts_with('/') { path } else { format!("/{path}") });
+		v["client_request"] = json!(true);
+		v["allow_status"] = json!(["200"]);
+		// Host, method, path and Content-Length go anyway; Authorization and the ones listed
+		let mut headers = vec!["authorization".to_string()];
+		for h in lower(&http.allowed_headers) {
+			if !headers.contains(&h) {
+				headers.push(h);
+			}
+		}
+		v["request_headers"] = json!(headers);
+		let resp = lower(&http.allowed_response_headers);
+		v["response_headers"] = if resp.is_empty() { json!(["*"]) } else { json!(resp) };
+	}
+	if let Some(n) = body {
+		v["forward_body"] = json!({ "max_size": n });
+	}
+	Ok(Some(json!({ "forward_auth": v })))
 }
 
 /// The middlewares of one filter, or why it cannot be used. `base`: names for
@@ -419,6 +536,10 @@ fn filter(ctx: &Ctx, ns: &str, f: &HttpRouteFilter, m: &HttpRouteMatch, base: &s
 			}
 			vec![json!({ "mirror": v })]
 		}
+		"ExternalAuth" => match external_auth(ctx, ns, f.external_auth.as_ref().ok_or("externalAuth is missing")?, base, out)? {
+			Some(mw) => vec![mw],
+			None => return Ok(Filtered::Unresolved),
+		},
 		"ExtensionRef" => {
 			let r = f.extension_ref.as_ref().ok_or("extensionRef is missing")?;
 			if r.group != RPROXY_GROUP || r.kind != "RproxyMiddleware" {
@@ -441,31 +562,66 @@ fn filter(ctx: &Ctx, ns: &str, f: &HttpRouteFilter, m: &HttpRouteMatch, base: &s
 	}))
 }
 
-/// The middlewares of a backendRef's filters (rproxy's per-server middlewares:
-/// header changes, the host and the full path).
-fn backend_filter(ctx: &Ctx, f: &HttpRouteFilter, matches: &[HttpRouteMatch]) -> Result<Vec<Value>, String> {
+/// The middlewares of a backendRef's filters (rproxy's per-server middlewares: header changes,
+/// the host and the full path; CORS, redirects and mirrors with rproxy v0.4.3's
+/// `server_middleware_kinds`). `base`: names for what a filter adds (a mirror's service).
+fn backend_filter(
+	ctx: &Ctx,
+	ns: &str,
+	f: &HttpRouteFilter,
+	matches: &[HttpRouteMatch],
+	base: &str,
+	out: &mut Output,
+) -> Result<Vec<Value>, String> {
 	crate::render::needs(ctx.features.server_middlewares, "filters on backendRefs", "http_options server_middlewares")?;
+	let kind = |have: bool, what: &str, rproxy: &str| {
+		crate::render::needs(have, &format!("the {what} filter on a backendRef"), &format!("server_middleware_kinds {rproxy}"))
+	};
+	// a prefix replacement depends on the match; a server serves all of the rule's matches
+	let one_prefix = |what: &str| {
+		let distinct: std::collections::BTreeSet<String> = matches.iter().map(matched_prefix).collect();
+		if distinct.len() > 1 {
+			return Err(format!("{what} ReplacePrefixMatch on a backendRef of a rule with several path prefixes is not supported"));
+		}
+		Ok(())
+	};
+	let first = matches.first().cloned().unwrap_or_default();
 	match f.kind.as_str() {
-		"RequestHeaderModifier" | "ResponseHeaderModifier" => {
-			let mut dummy = Output::default();
-			match filter(ctx, "", f, &HttpRouteMatch::default(), "", &mut dummy)? {
+		"RequestHeaderModifier" | "ResponseHeaderModifier" | "CORS" | "RequestMirror" | "ExternalAuth" => {
+			match f.kind.as_str() {
+				"CORS" => kind(ctx.features.server_cors, "CORS", "cors")?,
+				"RequestMirror" => kind(ctx.features.server_mirror, "RequestMirror", "mirror")?,
+				"ExternalAuth" => kind(ctx.features.server_forward_auth, "ExternalAuth", "forward_auth")?,
+				_ => {}
+			}
+			match filter(ctx, ns, f, &first, base, out)? {
 				Filtered::Middlewares(m) => Ok(m),
+				// an auth server that cannot be asked: nothing may reach this backend (its share gets 500)
+				Filtered::Unresolved => Err(UNRESOLVED.into()),
 				Filtered::Missing => Err("unreachable".into()),
 			}
 		}
 		"URLRewrite" => {
 			let r = f.url_rewrite.as_ref().ok_or("urlRewrite is missing")?;
-			let prefix = r.path.as_ref().is_some_and(|p| p.kind == "ReplacePrefixMatch");
-			// a prefix replacement depends on the match; a server serves all of the rule's matches
-			let distinct: std::collections::BTreeSet<String> = matches.iter().map(matched_prefix).collect();
-			if prefix && distinct.len() > 1 {
-				return Err("URLRewrite ReplacePrefixMatch on a backendRef of a rule with several path prefixes is not supported".into());
+			if r.path.as_ref().is_some_and(|p| p.kind == "ReplacePrefixMatch") {
+				one_prefix("URLRewrite")?;
 			}
-			rewrite(ctx, r, matches.first().unwrap_or(&HttpRouteMatch::default()))
+			rewrite(ctx, r, &first)
+		}
+		"RequestRedirect" => {
+			kind(ctx.features.server_redirect, "RequestRedirect", "redirect_regex")?;
+			let r = f.request_redirect.as_ref().ok_or("requestRedirect is missing")?;
+			if r.path.as_ref().is_some_and(|p| p.kind == "ReplacePrefixMatch") {
+				one_prefix("RequestRedirect")?;
+			}
+			redirect(ctx, r, &first)
 		}
 		other => Err(format!("filter {other} on a backendRef is not supported")),
 	}
 }
+
+/// `backend_filter`'s error for a backend that must not be sent to (an ExternalAuth that cannot be asked).
+const UNRESOLVED: &str = "\0unresolved";
 
 /// rproxy's `retry` middleware for a rule's `retry`.
 fn retry(ctx: &Ctx, r: &crate::k8s::gateway::HttpRouteRetry) -> Result<Option<Value>, String> {
@@ -581,8 +737,10 @@ pub fn build(ctx: &Ctx, route: &HttpRoute, hosts: Option<&[String]>, exclusions:
 					let svc = (b.backend.namespace.clone().unwrap_or_else(|| ns.clone()), b.backend.name.clone());
 					out.backends.entry(base.clone()).or_default().push(svc);
 					let mut names = vec![];
+					let mut closed = false;
 					for (k, f) in b.filters.iter().enumerate() {
-						match backend_filter(ctx, f, matches) {
+						match backend_filter(ctx, &ns, f, matches, &format!("{base}/b{bi}/f{k}"), &mut out) {
+							Err(e) if e == UNRESOLVED => closed = true,
 							Ok(mws) => {
 								for (x, mw) in mws.into_iter().enumerate() {
 									let n = format!("{base}/b{bi}/f{k}.{x}");
@@ -594,6 +752,16 @@ pub fn build(ctx: &Ctx, route: &HttpRoute, hosts: Option<&[String]>, exclusions:
 								out.unsupported.get_or_insert(format!("rule {i}: {e}"));
 							}
 						}
+					}
+					if closed {
+						// its ExternalAuth cannot be asked: its share is answered 500 (or it is left out)
+						if ctx.features.server_status && weight > 0 {
+							weighted.push((weight, vec![Endpoint { addr: String::new(), port: 0 }]));
+							server_mws.push(vec![]);
+							fixed_500.push(true);
+							schemes.push("http");
+						}
+						continue;
 					}
 					protocols.push(backends::app_protocol(ctx.world, &ns, &b.backend));
 					schemes.push(scheme);
@@ -687,6 +855,7 @@ pub fn build(ctx: &Ctx, route: &HttpRoute, hosts: Option<&[String]>, exclusions:
 							chain.push(n);
 						}
 					}
+					Ok(Filtered::Unresolved) => broken = true,
 					Ok(Filtered::Missing) => {
 						broken = true;
 						out.resolved.get_or_insert(Cond::new(

@@ -122,8 +122,9 @@ rproxy runs with `RPROXY_API_ADDR=0.0.0.0`, `RPROXY_API_PORT=9443`, `RPROXY_TOKE
 | `URLRewrite` | hostname: `replace_host`; path: `replace_path` (ReplaceFullPath), `replace_path_regex` (ReplacePrefixMatch) |
 | `CORS` | `cors` (`allow_origins`, `allow_methods`, `allow_headers`, `expose_headers`, `allow_credentials`, `max_age`; `maxAge` defaults to 5) |
 | `RequestMirror` | `mirror` (a service of the mirror backend's pod IPs; `percent` / `fraction`). A mirror backend that does not resolve: `ResolvedRefs: False`, and only the mirror is left out |
-| `filters` of a backendRef | that backend's `servers[].middlewares` (`RequestHeaderModifier`, `ResponseHeaderModifier`, `URLRewrite`; ReplacePrefixMatch only when the rule has one path prefix) |
+| `filters` of a backendRef | that backend's `servers[].middlewares` (`RequestHeaderModifier`, `ResponseHeaderModifier`, `URLRewrite`, and `CORS`, `RequestRedirect` and `RequestMirror` with rproxy v0.4.3's `server_middleware_kinds`; ReplacePrefixMatch of URLRewrite and RequestRedirect only when the rule has one path prefix; a mirror copies only the requests sent to that backend) |
 | `retry` | `retry` (`attempts` is Gateway API's count + 1, `codes` become `status`, `backoff` `initial_interval`), the last middleware |
+| `ExternalAuth` (experimental) | `forward_auth` (rproxy v0.4.3's `features.forward_auth`). Its `service` is a service of the backendRef's Service pod IPs (`<rule>/f<n>/extauth`; `https://` and `tls` under a BackendTLSPolicy). HTTP: `client_request` (the client's method, its path after `http.path`, Host, Content-Length), `allow_status: ["200"]`, `request_headers` are `authorization` and `allowedHeaders`, `response_headers` are `allowedResponseHeaders` (`["*"]` when empty). gRPC: `protocol: grpc` (the service is h2c, h2 with TLS), `request_headers` are `allowedHeaders` (all when empty). `forwardBody.maxSize` is `forward_body`. When the backend is not found, has no ready pod or no usable CA, the rule answers 500 (`ResolvedRefs: False`) rather than letting requests through unchecked. `ExternalAuth` on a backendRef goes to that backend's `servers[].middlewares` |
 | `ExtensionRef` (`RproxyMiddleware`) | that middleware (`spec` as it is) |
 | `timeouts.request` / `timeouts.backendRequest` | the route's `timeouts.request` / `timeouts.backend_request` |
 | GRPCRoute | Into the same `http` rule as HTTPRoutes on the port. A method match becomes a path match (`service` and `method`: `Path(/<service>/<method>)`; `service` only: `PathPrefix(/<service>/)`; `method` only or `RegularExpression`: `PathRegexp`). Header matches, filters (`RequestHeaderModifier`, `ResponseHeaderModifier`, `RequestMirror`, `ExtensionRef`) and backendRef filters as for HTTPRoute. h2c to the backends (the service's `protocol: h2c`). rproxy names start with `grpc:` |
@@ -131,6 +132,7 @@ rproxy runs with `RPROXY_API_ADDR=0.0.0.0`, `RPROXY_API_PORT=9443`, `RPROXY_TOKE
 | The Gateway's `spec.tls.backend.clientCertificateRef` | `cert_file` / `key_file` of the BackendTLSPolicy services' `tls`; the Gateway's `ResolvedRefs` (`InvalidClientCertificateRef`, `RefNotPermitted`) |
 | Listener `TLS` (`tls.mode: Passthrough`) | a tcp rule, `tls.mode: sni`, `unmatched: reject`; `tls.routes` by TLSRoute host name |
 | `HTTPS` and `TLS` (Passthrough) on the same port | `tls.routes` (`passthrough: true`) of the `http` rule: only those names are not decrypted |
+| Several `HTTPS` listeners on one port (HTTP/2 connection reuse) | `tls.misdirected`: one group per listener (its host name, `*` without one). A request for another listener's host name than the one chosen by SNI gets 421 (`GatewayHTTPSListenerDetectMisdirectedRequests`, `misdirected` in rproxy v0.4.3's `http_options`; left out for rproxies without it) |
 | Listener `TLS` (`tls.mode: Terminate`) | a tcp rule, `tls.mode: terminate`, `tls.routes` by TLSRoute host name (those of Passthrough listeners on the same port with `passthrough: true`) |
 | TLSRoute destination | `tls.routes[].targets`: the pod IPs of all backends (weights spread over the pods) |
 | Listener `TCP` / `UDP` | a tcp / udp rule, `targets` (the pod IPs of all backends of the TCPRoutes / UDPRoutes, weights spread over the pods) |
@@ -141,7 +143,7 @@ rproxy runs with `RPROXY_API_ADDR=0.0.0.0`, `RPROXY_API_PORT=9443`, `RPROXY_TOKE
 | The Gateway's `spec.tls.frontend` (client certificate validation) | `tls.client_auth` of the port's rule (`mode: required`, `ca_file` a file of the `ca.crt` of the `caCertificateRefs` ConfigMaps). `perPort` for the port, else `default`. Kinds other than ConfigMap: `InvalidCACertificateKind`; missing or without `ca.crt`: `InvalidCACertificateRef`; another namespace needs a ReferenceGrant (to `ConfigMap`, else `RefNotPermitted`). With no usable one the listener is `Accepted: False` (`NoValidCACertificate`). `AllowInsecureFallback` becomes `mode: optional_no_verify` (certificates are asked for and checked, connections are accepted without one or with one that fails; the result reaches the backend in `X-Client-Verify: SUCCESS / FAILED / NONE` and `X-Forwarded-Client-Cert`), and the Gateway gets `InsecureFrontendValidationMode: True`. An rproxy without that mode (`features.client_auth_modes`) does not ask for certificates |
 | An `HTTPS` listener without a usable certificate | routes attach (counted in `attachedRoutes`), no rule is made (`ResolvedRefs: False`, `Programmed: False`) |
 
-### rproxy's CRDs (`rproxy.max3584.net/v1alpha1`)
+### rproxy's CRDs (`rproxy.max3584.net/v1beta1`; `v1alpha1` still works with the same shape, deprecated; [DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) 11.4)
 
 | CRD | Use |
 |---|---|
@@ -150,7 +152,7 @@ rproxy runs with `RPROXY_API_ADDR=0.0.0.0`, `RPROXY_API_PORT=9443`, `RPROXY_TOKE
 | `RproxyGatewayParameters` | how a managed Gateway's rproxy is made (replicas, PDB; pod labels, annotations, resources, topology spread, nodeSelector, tolerations, affinity, priorityClass; the Service's type, externalTrafficPolicy, loadBalancerClass, source ranges, ipFamilyPolicy, labels, annotations; rproxy's image, logLevel, performance, extra environment variables). Named by the GatewayClass's `parametersRef` (in the controller's namespace; its `policy` decides what Gateways may set) and the Gateway's `infrastructure.parametersRef` (same namespace). Merging, validation and who decides what: [DESIGN-v0.4.x.md](DESIGN-v0.4.x.md), 2. |
 | `RproxyRule` | `spec.rule` is a rule verbatim (the body of `POST /rules`), added to the rule set of the `spec.parentRef` Gateway. A Gateway in another namespace needs a ReferenceGrant there (from `rproxy.max3584.net/RproxyRule`, to `Gateway`). When a rule with the same key exists: `Accepted: False` (`Conflicted`). Status copies the rproxy rule's `conditions` |
 
-Not supported (the route gets `Accepted: False`, reason `UnsupportedValue`): `RequestMirror`, `CORS` and `RequestRedirect` filters on a backendRef, `ExternalAuth`.
+Not supported (the route gets `Accepted: False`, reason `UnsupportedValue`): `ExtensionRef` filters on a backendRef, and what the rproxy lacks ("rproxy features" below).
 
 ### rproxy features (`features`)
 
