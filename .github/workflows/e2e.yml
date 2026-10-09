@@ -6,6 +6,13 @@ name: e2e
 #   cluster's nodes as Docker containers (the Alpine job container has no Docker
 #   daemon; docker-in-docker would need a privileged nested daemon). There, nothing is
 #   built from Rust: the binaries come from the Alpine jobs.
+# - by hand with report_version: only "conformance report (published)", the report for submission to
+#   kubernetes-sigs/gateway-api from the published chart and images of a release (nothing built), e.g.
+#     gh workflow run e2e.yml -f report_version=0.4.5
+#   The artifact conformance-report-v<version> has the report as the suite wrote it
+#   (<channel>-v<version>-default-report.yaml), the suite's and the controller's logs and the
+#   environment (versions, image digests). It fails unless every profile is core and extended success
+#   with nothing skipped.
 on:
   pull_request:
   push:
@@ -15,6 +22,16 @@ on:
       rproxy_ref:
         description: "rproxy-api ref to build rproxy from"
         required: false
+      report_version:
+        description: "only the conformance report for submission upstream, from the PUBLISHED chart and images of this released version (e.g. 0.4.5; scripts/conformance-report.sh). Empty: the usual jobs"
+        required: false
+        default: ""
+      report_channel:
+        description: "report_version: the Gateway API channel of the CRDs (experimental: the claimed HTTPRouteRetry* use experimental fields)"
+        required: false
+        default: experimental
+        type: choice
+        options: [experimental, standard]
 
 permissions:
   contents: read
@@ -32,6 +49,7 @@ env:
 jobs:
   build:
     name: build (musl)
+    if: ${{ !inputs.report_version }}
     runs-on: ubuntu-latest
     container: alpine:3.24
     steps:
@@ -49,6 +67,7 @@ jobs:
 
   rproxy:
     name: rproxy (rproxy-api)
+    if: ${{ !inputs.report_version }}
     runs-on: ubuntu-latest
     container: alpine:3.24
     steps:
@@ -80,6 +99,7 @@ jobs:
 
   real:
     name: real rproxy (rule sets)
+    if: ${{ !inputs.report_version }}
     needs: rproxy
     runs-on: ubuntu-latest
     container: alpine:3.24
@@ -102,6 +122,7 @@ jobs:
 
   kind:
     name: e2e (kind)
+    if: ${{ !inputs.report_version }}
     needs: [build, rproxy]
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -122,6 +143,7 @@ jobs:
 
   conformance:
     name: Gateway API conformance
+    if: ${{ !inputs.report_version }}
     needs: [build, rproxy]
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -157,3 +179,30 @@ jobs:
       - name: extended
         continue-on-error: true
         run: exit "$(cat "$RUNNER_TEMP/rproxy-gateway-conformance/status")"
+
+  report:
+    name: conformance report (published)
+    if: ${{ inputs.report_version != '' && inputs.report_version != null }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - name: kind
+        run: |
+          curl -sLo "$RUNNER_TEMP/kind" https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+          sudo install -m 755 "$RUNNER_TEMP/kind" /usr/local/bin/kind
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - name: scripts/conformance-report.sh
+        env:
+          VERSION: ${{ inputs.report_version }}
+          GATEWAY_API_CHANNEL: ${{ inputs.report_channel }}
+          OUT_DIR: ${{ github.workspace }}/conformance-report
+        run: scripts/conformance-report.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: conformance-report-v${{ inputs.report_version }}
+          path: conformance-report/

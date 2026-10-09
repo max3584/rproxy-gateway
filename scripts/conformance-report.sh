@@ -6,7 +6,7 @@
 # (ghcr.io/max3584/rproxy-gateway:<appVersion>, ghcr.io/max3584/rproxy-gateway/rproxy:<the chart's tag>).
 # The suite infers the supported features from the GatewayClass status (no --supported-features),
 # so the report shows what the released controller itself declares. Runs on a Linux host with
-# Docker, kind, kubectl, helm, go and git (the manual conformance-report workflow; the same steps
+# Docker, kind, kubectl, helm, go and git (the e2e workflow run by hand with report_version; the same steps
 # are in docs/conformance/submission/.../README.md for anyone to reproduce).
 #   VERSION=0.4.5 scripts/conformance-report.sh
 # Writes $OUT_DIR/<channel>-v<VERSION>-default-report.yaml (the upstream file name), the suite's log,
