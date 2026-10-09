@@ -41,7 +41,7 @@ controller:
 rproxy:
   image:
     repository: ghcr.io/max3584/rproxy-gateway/rproxy
-    tag: "0.4.2"
+    tag: "0.4.3"
     digest: ""
     pullPolicy: IfNotPresent
   # addresses rules listen on (the first is listen_addr, the rest extra_listen_addrs); add "::" for IPv6
