@@ -1764,7 +1764,7 @@ spec:
 	let svc = &rule(&rules, 80)["http"]["services"]["default/web/r0"];
 	assert_eq!(svc["outlier_detection"]["consecutive_gateway_failures"], 3);
 	assert_eq!(svc["outlier_detection"]["max_ejected_percent"], 50);
-	assert_eq!(svc["timeouts"], json!({"connect": "1s"}));
+	assert_eq!(svc["timeouts"], json!({"connect": "1s", "response": "30s"}));
 	assert!(rule(&rules, 80).get("outlier_detection").is_none() && rule(&rules, 80).get("connect_timeout").is_none(), "not on http rules");
 	// an rproxy without connect_timeout (before v0.4.3)
 	let old = Options { features: Features { connect_timeout: false, ..Features::default() }, ..opts.clone() };
@@ -1863,4 +1863,91 @@ spec:
 	// the default (wildcard) does not send it
 	let p = render_gateway(&w, &w.gateways[0], &Options::default());
 	assert!(serde_json::to_value(&p.rules[0]).unwrap().get("listen_freebind").is_none());
+}
+
+/// v0.4.5: the default response timeout goes on HTTPRoute services without their own `timeouts`,
+/// not on GRPCRoute services; an RproxyPolicy's `connectTimeout` / `responseTimeout` replace the
+/// defaults (an HTTPRoute rule's own timeouts still win); a wrong duration makes the policy invalid.
+#[test]
+fn route_and_policy_timeouts() {
+	let routes = r#"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: web, namespace: default}
+spec:
+  parentRefs: [{name: gw, sectionName: http}]
+  rules:
+    - backendRefs: [{name: web, port: 80}]
+    - matches: [{path: {type: PathPrefix, value: /slow}}]
+      timeouts: {backendRequest: 5m}
+      backendRefs: [{name: web, port: 80}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata: {name: rpc, namespace: default}
+spec:
+  parentRefs: [{name: gw, sectionName: grpc}]
+  rules: [{backendRefs: [{name: web, port: 80}]}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata: {name: pg, namespace: default}
+spec:
+  parentRefs: [{name: gw, sectionName: pg}]
+  rules: [{backendRefs: [{name: db, port: 5432}]}]
+"#;
+	let listeners =
+		"  - {name: http, port: 80, protocol: HTTP}\n  - {name: grpc, port: 81, protocol: HTTP}\n  - {name: pg, port: 5432, protocol: TCP}";
+	let yaml = format!("{BASE}{L4_BASE}{}{routes}", gw(listeners));
+	let opts = Options { backends: BackendDefaults::standard(), ..Options::default() };
+	let services = |extra: &str| {
+		let w = world(&format!("{yaml}{extra}"));
+		let p = render_gateway(&w, &w.gateways[0], &opts);
+		let rules = p.rules_json();
+		let rule = |port: u16| rules.iter().find(|r| r["listen_port"] == port).unwrap().clone();
+		(rule(80)["http"]["services"].clone(), rule(81)["http"]["services"].clone(), rule(5432), p.policies)
+	};
+	let (web, rpc, pg, _) = services("");
+	assert_eq!(web["default/web/r0"]["timeouts"], json!({"connect": "1s", "response": "30s"}), "{web}");
+	assert!(web["default/web/r1"]["timeouts"].get("response").is_none(), "the rule's backendRequest wins: {web}");
+	let rpc_svc = rpc.as_object().unwrap().values().next().unwrap().clone();
+	assert_eq!(rpc_svc["timeouts"], json!({"connect": "1s"}), "no default response timeout for gRPC: {rpc}");
+	assert_eq!(pg["connect_timeout"], "1s");
+	let policy = r#"
+---
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyPolicy
+metadata: {name: slow, namespace: default}
+spec:
+  targetRefs: [{group: gateway.networking.k8s.io, kind: Gateway, name: gw}]
+  connectTimeout: 3s
+  responseTimeout: 2m
+"#;
+	let (web, rpc, pg, st) = services(policy);
+	assert_eq!(web["default/web/r0"]["timeouts"], json!({"connect": "3s", "response": "2m"}), "{web}");
+	assert!(web["default/web/r1"]["timeouts"].get("response").is_none(), "{web}");
+	let rpc_svc = rpc.as_object().unwrap().values().next().unwrap().clone();
+	assert_eq!(rpc_svc["timeouts"], json!({"connect": "3s", "response": "2m"}), "an explicit policy applies to gRPC too");
+	assert_eq!(pg["connect_timeout"], "3s");
+	assert!(cond(&st[0].conds, "Accepted").status);
+	// on a Service: only what sends to it
+	let on_db = r#"
+---
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyPolicy
+metadata: {name: db, namespace: default}
+spec:
+  targetRefs: [{group: "", kind: Service, name: db}]
+  connectTimeout: 250ms
+"#;
+	let (web, _, pg, _) = services(on_db);
+	assert_eq!(pg["connect_timeout"], "250ms");
+	assert_eq!(web["default/web/r0"]["timeouts"]["connect"], "1s");
+	let wrong = policy.replace("responseTimeout: 2m", "responseTimeout: soon");
+	let (web, _, _, st) = services(&wrong);
+	let c = cond(&st[0].conds, "Accepted");
+	assert_eq!((c.status, c.reason.as_str()), (false, "Invalid"));
+	assert!(c.message.contains("responseTimeout"), "{}", c.message);
+	assert_eq!(web["default/web/r0"]["timeouts"]["connect"], "1s", "an invalid policy is not used");
 }

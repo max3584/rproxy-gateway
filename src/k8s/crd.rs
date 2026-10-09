@@ -69,7 +69,7 @@ pub struct PolicyTargetRef {
 #[kube(group = "rproxy.max3584.net", version = "v1beta1", kind = "RproxyPolicy", namespaced, shortname = "rppol")]
 #[kube(status = "PolicyStatus")]
 #[kube(
-	doc = "rproxy rule settings (limits, bandwidth, geoip, outlier_detection, allow_from, crowdsec) attached to Gateways, listeners or Services"
+	doc = "rproxy rule settings (limits, bandwidth, geoip, outlier_detection, allow_from, crowdsec, connect and response timeouts) attached to Gateways, listeners or Services"
 )]
 #[serde(rename_all = "camelCase")]
 pub struct RproxyPolicySpec {
@@ -92,6 +92,16 @@ pub struct RproxyPolicySpec {
 	/// A rule's `crowdsec`.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub crowdsec: Option<bool>,
+	/// How long rproxy may take to connect to a backend pod (`10s`, `500ms`; 100ms-10m): an L4 tcp
+	/// rule's `connect_timeout` (rproxy v0.4.3), an `http` service's `timeouts.connect`. Replaces the
+	/// controller's default (`--backend-connect-timeout-*`).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub connect_timeout: Option<String>,
+	/// How long rproxy waits for a backend's response headers after sending the request (an `http`
+	/// service's `timeouts.response`; HTTPRoute and GRPCRoute backends). Replaces the controller's
+	/// default (`--backend-response-timeout`); an HTTPRoute rule's own `timeouts` still win.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub response_timeout: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, JsonSchema)]

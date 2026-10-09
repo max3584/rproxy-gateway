@@ -77,6 +77,7 @@ RPROXY_GATEWAY_BACKEND_OUTLIER_HTTP: {{ include "rproxy-gateway.kv" (.Values.bac
 RPROXY_GATEWAY_BACKEND_OUTLIER_L4: {{ include "rproxy-gateway.kv" (.Values.backends.outlierDetection.l4 | default dict) | quote }}
 RPROXY_GATEWAY_BACKEND_CONNECT_TIMEOUT_HTTP: {{ .Values.backends.connectTimeout.http | default "" | toString | quote }}
 RPROXY_GATEWAY_BACKEND_CONNECT_TIMEOUT_L4: {{ .Values.backends.connectTimeout.l4 | default "" | toString | quote }}
+RPROXY_GATEWAY_BACKEND_RESPONSE_TIMEOUT: {{ .Values.backends.responseTimeout | default "" | toString | quote }}
 {{- if .Values.fleet.enabled }}
 RPROXY_GATEWAY_MODE: "fleet"
 RPROXY_GATEWAY_FLEET_SELECTOR: "app.kubernetes.io/name=rproxy,app.kubernetes.io/component=fleet"

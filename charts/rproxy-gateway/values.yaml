@@ -138,6 +138,11 @@ backends:
   # and l4 (connect_timeout, then the next pod is tried; rproxy v0.4.3). "": rproxy's own (5 s; L4
   # with one pod: the OS's, about 2 minutes)
   connectTimeout: {http: 1s, l4: 1s}
+  # how long rproxy waits for the response headers of an HTTPRoute backend after sending the request
+  # (timeouts.response; a timeout is a 504 and a gateway failure for outlierDetection). Not for rules
+  # with their own timeouts (request, backendRequest) nor GRPCRoutes (streams may hold their headers
+  # back); response bodies (downloads, SSE, WebSocket after its 101) are not cut. "": rproxy's 60 s
+  responseTimeout: 30s
 
 # a GatewayClass for this controller
 gatewayClass:

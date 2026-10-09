@@ -76,7 +76,8 @@ spec:
       openAPIV3Schema:
         description: >-
           rproxy rule settings (limits, bandwidth, geoip, outlier_detection, allow_from,
-          crowdsec) attached to Gateways, listeners or Services
+          crowdsec, connect and response timeouts) attached to Gateways, listeners or
+          Services
         properties:
           spec:
             description: A rule's settings attached to Gateways, listeners or Services.
@@ -92,6 +93,13 @@ spec:
                 nullable: true
                 type: object
                 x-kubernetes-preserve-unknown-fields: true
+              connectTimeout:
+                description: |-
+                  How long rproxy may take to connect to a backend pod (`10s`, `500ms`; 100ms-10m): an L4 tcp
+                  rule's `connect_timeout` (rproxy v0.4.3), an `http` service's `timeouts.connect`. Replaces the
+                  controller's default (`--backend-connect-timeout-*`).
+                nullable: true
+                type: string
               crowdsec:
                 description: A rule's `crowdsec`.
                 nullable: true
@@ -111,6 +119,13 @@ spec:
                 nullable: true
                 type: object
                 x-kubernetes-preserve-unknown-fields: true
+              responseTimeout:
+                description: |-
+                  How long rproxy waits for a backend's response headers after sending the request (an `http`
+                  service's `timeouts.response`; HTTPRoute and GRPCRoute backends). Replaces the controller's
+                  default (`--backend-response-timeout`); an HTTPRoute rule's own `timeouts` still win.
+                nullable: true
+                type: string
               targetRefs:
                 items:
                   description: What a policy attaches to (GEP-713).
@@ -163,7 +178,8 @@ spec:
       openAPIV3Schema:
         description: >-
           rproxy rule settings (limits, bandwidth, geoip, outlier_detection, allow_from,
-          crowdsec) attached to Gateways, listeners or Services
+          crowdsec, connect and response timeouts) attached to Gateways, listeners or
+          Services
         properties:
           spec:
             description: A rule's settings attached to Gateways, listeners or Services.
@@ -179,6 +195,13 @@ spec:
                 nullable: true
                 type: object
                 x-kubernetes-preserve-unknown-fields: true
+              connectTimeout:
+                description: |-
+                  How long rproxy may take to connect to a backend pod (`10s`, `500ms`; 100ms-10m): an L4 tcp
+                  rule's `connect_timeout` (rproxy v0.4.3), an `http` service's `timeouts.connect`. Replaces the
+                  controller's default (`--backend-connect-timeout-*`).
+                nullable: true
+                type: string
               crowdsec:
                 description: A rule's `crowdsec`.
                 nullable: true
@@ -198,6 +221,13 @@ spec:
                 nullable: true
                 type: object
                 x-kubernetes-preserve-unknown-fields: true
+              responseTimeout:
+                description: |-
+                  How long rproxy waits for a backend's response headers after sending the request (an `http`
+                  service's `timeouts.response`; HTTPRoute and GRPCRoute backends). Replaces the controller's
+                  default (`--backend-response-timeout`); an HTTPRoute rule's own `timeouts` still win.
+                nullable: true
+                type: string
               targetRefs:
                 items:
                   description: What a policy attaches to (GEP-713).

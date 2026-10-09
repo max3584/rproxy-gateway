@@ -206,6 +206,14 @@ pub struct Service {
 	pub timeouts: Option<Value>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub outlier_detection: Option<Value>,
+	/// Not sent: the route rule set `timeouts` (HTTPRoute), so no RproxyPolicy or default response
+	/// timeout replaces them.
+	#[serde(skip)]
+	pub route_timeouts: bool,
+	/// Not sent: the controller's default response timeout applies (an HTTPRoute rule's main service
+	/// without `timeouts`; not GRPCRoute, whose streams may hold their headers back).
+	#[serde(skip)]
+	pub default_response: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]

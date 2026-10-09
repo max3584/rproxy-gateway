@@ -125,6 +125,10 @@ struct ControllerArgs {
 	/// rproxy v0.4.3). "": rproxy's (5 s with other backends, else the OS's).
 	#[arg(long, env = "RPROXY_GATEWAY_BACKEND_CONNECT_TIMEOUT_L4", default_value = "1s", value_parser = duration_opt)]
 	backend_connect_timeout_l4: String,
+	/// How long rproxy waits for an HTTPRoute backend's response headers after sending the request
+	/// (`timeouts.response`; rules without their own `timeouts`; not GRPCRoute). "": rproxy's 60 s.
+	#[arg(long, env = "RPROXY_GATEWAY_BACKEND_RESPONSE_TIMEOUT", default_value = "30s", value_parser = response_duration)]
+	backend_response_timeout: String,
 	/// Addresses rproxy rules listen on (the first is listen_addr, the rest extra_listen_addrs).
 	#[arg(long, env = "RPROXY_GATEWAY_LISTEN_ADDR", value_delimiter = ',', default_value = "0.0.0.0")]
 	listen_addr: Vec<String>,
@@ -253,6 +257,16 @@ fn duration_opt(s: &str) -> Result<String, String> {
 	}
 }
 
+/// `--backend-response-timeout`: a duration up to 1 h, or "" for rproxy's own.
+fn response_duration(s: &str) -> Result<String, String> {
+	let s = s.trim();
+	match rproxy_gateway::render::duration_ms(s) {
+		_ if s.is_empty() => Ok(String::new()),
+		Some(ms) if (1..=3_600_000).contains(&ms) => Ok(s.to_string()),
+		_ => Err(format!("{s:?}: a duration up to 1h, or empty")),
+	}
+}
+
 /// The `--backend-*` flags as what every backend gets.
 fn backend_defaults(a: &ControllerArgs) -> rproxy_gateway::render::BackendDefaults {
 	let object = |v: &serde_json::Value| Some(v.clone()).filter(|v| v.as_object().is_some_and(|o| !o.is_empty()));
@@ -262,6 +276,7 @@ fn backend_defaults(a: &ControllerArgs) -> rproxy_gateway::render::BackendDefaul
 		l4_outlier: object(&a.backend_outlier_l4),
 		http_connect_timeout: duration(&a.backend_connect_timeout_http),
 		l4_connect_timeout: duration(&a.backend_connect_timeout_l4),
+		http_response_timeout: duration(&a.backend_response_timeout),
 	}
 }
 

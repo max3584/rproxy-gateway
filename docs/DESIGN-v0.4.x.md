@@ -437,7 +437,7 @@ fleet のルールは `0.0.0.0`（`--listen-addr`）で待ち受けるので、2
 | b. 受け身のヘルスチェック | rproxy の `outlier_detection` を、コントローラが描くすべてのバックエンドに付ける。HTTP（HTTPRoute・GRPCRoute のサービス）：`consecutive_gateway_failures: 3`（502・503・504・接続できない・応答の時間切れ）、`consecutive_5xx: 0`（アプリの 5xx では外さない）、`ejection_time: 10s`、`max_ejection_time: 1m`、`max_ejected_percent: 50`。L4（TCP・TLS・UDP のルール）：`consecutive_failures: 1`、`ejection_time: 10s`、`max_ejection_time: 1m`（rproxy の既定の 1 回・10 秒に、続けて外れたら倍にする上限を足したもの） | 有効（chart の `backends.outlierDetection`。`null` で外す） |
 | c. 接続の時間 | HTTP のサービスの `timeouts.connect: 1s`、L4 の tcp のルールの `connect_timeout: 1s`（rproxy v0.4.3。過ぎたら次の宛先へ。宛先が 1 つならクライアントの接続を閉じる） | 有効（chart の `backends.connectTimeout`。`""` で rproxy の既定） |
 
-- 上書き：RproxyPolicy の `outlierDetection`（Gateway・リスナー・Service）があればそれを使い、既定は足さない。外すには `outlierDetection: {max_ejected_percent: 0}`。接続の時間はコントローラ全体の値だけ（RproxyPolicy に項目を足すのは CRD の変更なので、要るなら別に決める）。
+- 上書き：RproxyPolicy の `outlierDetection`（Gateway・リスナー・Service）があればそれを使い、既定は足さない。外すには `outlierDetection: {max_ejected_percent: 0}`。接続の時間・応答の時間は RproxyPolicy の `connectTimeout`・`responseTimeout`（v0.4.5 で足した。下の d.）。
 - コントローラの引数：`--backend-outlier-http`・`--backend-outlier-l4`（`key=value,...`、空で外す）、`--backend-connect-timeout-http`・`--backend-connect-timeout-l4`（空で rproxy の既定）。`RPROXY_GATEWAY_BACKEND_*`。
 - rproxy の版：`connect_timeout` は `features.connect_timeout` のある rproxy（v0.4.3）にだけ送る。`outlier_detection` と `timeouts.connect` は v0.4.0 からある。
 - 既定を変えたこと：今までの Gateway のルールにも付く（オーナーの依頼。ルールはその場で変わり、接続は切れない）。
@@ -458,3 +458,17 @@ fleet のルールは `0.0.0.0`（`--listen-addr`）で待ち受けるので、2
 - `docker kill`（電源が落ちたノード：何も答えない）：前は死んだ Pod に送った接続が rproxy の接続の時間（5 秒）より先にクライアント（2 秒）に諦められるので、rproxy は失敗として数えず外さない。NotReady まで約 4 回に 1 回が落ち続けた。後は 1 秒で接続を諦めて外し（L7 は 3 回、L4 は 1 回）、外す時間（10 秒 → 20 秒）が過ぎて試し直すときだけ数回落ちる。TCP は次の宛先に移るので失敗 0。
 - HTTP の接続を 2 秒にした回は、HTTPS（TLS の分だけクライアントの残り時間が短い）が rproxy の 2 秒より先に諦められて外れなかった。既定を 1 秒にしたのはこのため（クラスタの中の Pod は数ミリ秒で答える）。
 - `docker pause`（カーネルは動くので、止めた Pod への TCP の接続は成り立ち、応答だけ来ない：止まりかけのノード・固まったアプリ）：接続の時間は効かず、応答の時間切れ（`timeouts.response`）がないと gateway の失敗にならないので、どちらも NotReady まで落ち続ける。応答の時間はアプリごとに違うので既定にはしない（HTTPRoute の `timeouts.backendRequest` で決める）。
+
+### 13.1 決めたことの後に足したもの（オーナーの決定、2026-10-09）
+
+- 接続の時間の既定は HTTP・L4 とも 1 秒のまま。既定で有効にすること（今の Gateway にも付くこと）もそのまま。retry は既定で付けない。
+- **d. RproxyPolicy の `connectTimeout`・`responseTimeout`**（`v1beta1`・`v1alpha1` の両方に同じ形）：
+  - `connectTimeout`（100ms〜10m）：L4 の tcp のルールの `connect_timeout`、`http` のサービスの `timeouts.connect`。
+  - `responseTimeout`（1h まで）：`http` のサービスの `timeouts.response`。
+  - targetRefs の範囲（Gateway・`sectionName` のリスナー・Service）でコントローラの既定を置き換える。古いポリシーが勝つのは他の項目と同じ。HTTPRoute の規則の `timeouts`（`request`・`backendRequest`）があるサービスには `responseTimeout` を付けない（ルートが勝つ）。
+  - 時間の形が誤っていれば、そのポリシーを使わず `Accepted: False`（`Invalid`）にする。
+- **e. 既定の応答の時間 30 秒**（`--backend-response-timeout`、chart の `backends.responseTimeout`、`""` で rproxy の 60 秒）：HTTPRoute の規則のうち `timeouts` のないもののサービスに `timeouts.response: 30s`。
+  - rproxy の `timeouts.response` は、リクエストの本文を送り終えてから応答ヘッダが届くまでの時間。応答の本文（大きなダウンロード・SSE・ロングポーリングの本文）や、101 の後の WebSocket は切らない。本文を送り続けているリクエスト（アップロード・ストリーム）は送り終わるまで数え始めない。
+  - 時間切れは 504 で、`outlier_detection` の gateway の失敗に数える（3 回で外れる）。
+  - GRPCRoute には付けない：サーバのストリームは最初のメッセージまで応答ヘッダを送らないことがある（grpc-go の既定）。そのため、イベントのない watch が 30 秒で切れてしまう。gRPC の期限は `grpc-timeout` で決まる。要るなら RproxyPolicy の `responseTimeout` で付ける。
+  - 応答ヘッダを 30 秒より長く待たせるもの（ヘッダの前で待つロングポーリング、重い処理）は、HTTPRoute の `timeouts.backendRequest` か RproxyPolicy の `responseTimeout` で延ばす。
