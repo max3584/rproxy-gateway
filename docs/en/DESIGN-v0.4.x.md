@@ -10,7 +10,7 @@ The current decisions: [DESIGN.md](DESIGN.md); the tenant boundaries: [SECURITY.
 
 | Item | Decision |
 |---|---|
-| Goal | managed rproxy cannot be set per Gateway, installing without Helm is awkward, the UI cannot run on Kubernetes, rproxy stops at once on SIGTERM, there is no VIP without a Service |
+| Goal | managed rproxy cannot be set per Gateway, installing without Helm is awkward, the UI cannot run on Kubernetes, rproxy stops at once on SIGTERM, there is no VIP without a Service (F was dropped: 7.) |
 | Versions | **There is no v0.5.0.** Everything ships as patches of the v0.4 line (v0.4.2, v0.4.3, ...). Patches may add CRDs and values, but must not break existing installs (chart values, flags, Gateways) |
 | Compatibility | Everything added can be left out; left out, the pods and Services are those of v0.4.1 |
 | Boundaries | The lines drawn in the v0.4.0 security review (tenants stay in their namespace, the allow list of load balancer annotations, rproxy pods do not use the Kubernetes API, keys never cross the control API) hold. An item that crosses one is opened explicitly by the administrator |
@@ -24,7 +24,7 @@ The current decisions: [DESIGN.md](DESIGN.md); the tenant boundaries: [SECURITY.
 | B. Install with Kustomize | the chart's controller settings in a ConfigMap, `config/`, `install.yaml` on releases, CI | v0.4.2 |
 | C. The UI on Kubernetes | read-only tokens for the UI and a discovery Secret (the UI's chart is in the UI's repository) | v0.4.3 |
 | E. Stopping on SIGTERM | passing rproxy's `RPROXY_SHUTDOWN_*`, the grace period | v0.4.2 (rproxy v0.4.1) |
-| F. VIPs held by pods | the fleet's `vip` sidecar, Leases, status | v0.4.4 |
+| F. VIPs held by pods | the fleet's `vip` sidecar, Leases, status | added in v0.4.4, dropped in v0.4.5 (7.) |
 
 ### Done in v0.4.1
 
@@ -305,121 +305,13 @@ rproxy v0.4.1, 2 replicas, l2-local (MetalLB L2 + `Local`) and l2-cluster (Metal
 - e2e: `rproxy:e2e` (rproxy-api's master) is not the shipped image, so its pods roll to the new shape (no preStop, `/readyz`, `RPROXY_SHUTDOWN_*`, a 45 s grace period) once they answer `graceful_shutdown`.
 - Acceptance: failed requests have been in the summary already. Input `strict` (false by default): the scenarios `GAP_LIMIT` applies to (b, c, d, h, i) fail on any failed request (bgp stays record-only). With `source=checkout`, if the chart's rproxy image is not published yet, it is built from rproxy-api's release binary of the same version.
 
-## 7. F. VIPs held by rproxy pods
+## 7. F. VIPs held by rproxy pods (dropped)
 
-rproxy pods hold VIPs without a Service or LoadBalancer, failing over within seconds. Today managed relies on the Service (MetalLB, ...) to fail over, and fleet only writes node IPs (`--fleet-address`) with no way to move a VIP.
+v0.4.4 added the fleet's `vip` sidecar (`rproxy-gateway vip`, the chart's `fleet.vip`: a Lease per VIP picks the holder, which adds the VIP to its node's interface and sends gratuitous ARP / unsolicited NA); v0.4.5 removed it.
 
-### 7.1 Options
-
-| Option | What | Good | Bad |
-|---|---|---|---|
-| 1. fleet + a VIP sidecar (Lease) | a `vip` container in the fleet DaemonSet's pods. The pod holding a VIP's Lease adds the VIP to the node's interface and sends gratuitous ARP (unsolicited NA for IPv6); stopping, it releases the Lease and removes the VIP | planned moves (rollout, drain) under 1 s. One Lease in the API server decides the holder. Tied to rproxy's readiness | depends on the API server (7.4). Losing a node takes until the Lease expires (3 s by default) |
-| 1a. kube-vip inside it | kube-vip as a DaemonSet sidecar | a widely used implementation with ARP, NDP, BGP | cannot decide holding by rproxy's readiness (rule sets applied). More images and permissions; one more thing to track |
-| 1b. our own `rproxy-gateway vip` (Rust) | a new subcommand of the same image. netlink to add and remove addresses, a packet socket for ARP, an ICMPv6 raw socket for NA | can require rproxy's `/readyz` and the controller's "applied". Lease permissions narrowed by name. Status on the Gateway | code (about 1,000 lines) and dependencies (`rtnetlink`, ...; `cargo deny`) |
-| 2. VRRP (keepalived) among fleet pods | the VM's act / stb shape | no API server | both MASTER in a partition; multicast or `unicast_peer` (DaemonSet pod IPs change); VRID clashes; config generation |
-| 3. CNI BGP advertising pod or LB IPs (Calico, Cilium) | managed as is, the CNI advertises /32s | no hostNetwork; ECMP active-active | depends on the CNI; nothing for us to build |
-| 4. hostNetwork for managed, with a VIP sidecar | per-Gateway pods on the node network | a VIP per Gateway | hostNetwork in tenant namespaces (PodSecurity privileged); port clashes between Gateways on a node; breaks "managed separates tenants" |
-
-**Chosen: 1b (fleet + our own `vip` sidecar, Leases).** 3 is documentation only ("to fail over fast with managed and no Service"). 2 and 4 are not built.
-
-### 7.2 Shape
-
-```yaml
-fleet:
-  enabled: true
-  hostNetwork: true
-  vip:
-    enabled: false
-    addresses: [192.0.2.10, 192.0.2.11, "2001:db8::10"]   # set by the administrator; the fleet's addresses (Gateway status)
-    interface: ""                 # empty: the interface with a route to the VIP's subnet
-    leaseDuration: 3s
-    renewInterval: 1s
-    retryInterval: 500ms
-    garp: {count: 3, interval: 200ms}   # sent right after taking a VIP (NA for IPv6)
-    onApiUnreachable: hold        # hold | release (7.4)
-```
-
-- Holder: a Lease per VIP `rproxy-vip-<hash of the VIP>` (in the controller's namespace; the chart makes them, and the `vip` container gets get, update and watch narrowed with `resourceNames`). Expired Leases go first to pods holding fewer VIPs (they wait "VIPs held × 200 ms" before trying).
-- Condition to hold: the same pod's rproxy `/readyz` is ready, and the controller has told it "every Gateway's rule set is applied to this pod" (received on the pod IP like certsync, with a token derived from the master token). When either fails (E's `draining` included), the VIP is released at once.
-- Release: clear the Lease's `holderIdentity`, then remove the VIP from the interface. Other pods watch the Lease, take it at once, add the VIP and send gratuitous ARP / NA.
-- Addresses: `/32` for IPv4, `/128` for IPv6, added with `nodad`.
-- rproxy does not change: fleet rules listen on `0.0.0.0` (`--listen-addr`), so an added VIP reaches them. UDP answers from the address it arrived on (`IP_PKTINFO` / `IPV6_RECVPKTINFO`). Using one port for different Gateways per VIP needs `IP_FREEBIND`, an rproxy-api change (10. Q19).
-- Status: the Gateway's `status.addresses` are the VIPs. With no holder, the Gateway is `Programmed: False` (`AddressNotUsable`, "no pod holds VIP 192.0.2.10"). `/metrics` (the `vip` container, port 9445 on the pod IP): `rproxy_vip_held{vip}`, `rproxy_vip_transitions_total{vip,reason}`. Logs: `vip.acquire`, `vip.release` (`shutdown`, `not_ready`, `lease_lost`, `conflict`).
-
-### 7.3 The Gateway's `spec.addresses` and boundaries
-
-- In fleet mode, `spec.addresses` must already be one of the fleet's addresses (else `AddressNotUsable`). With VIPs, the VIPs are the fleet's addresses. A Gateway can choose among them but not create new ones (the administrator lists them in the chart).
-- At start, the controller checks the VIPs are within `--address-cidr` (the chart passes `managed.addressCIDRs` in fleet mode too) and overlap no Service ClusterIP, externalIP, load balancer IP or node IP; VIPs that fail are not used. With `addressCIDRs` empty, no VIPs (the same "off by default").
-- Rules listen on `0.0.0.0`, so traffic to any VIP reaches the Gateway owning the port. fleet is one trust domain ([SECURITY.md](SECURITY.md)), so this is allowed.
-- managed keeps Services. To use both in one cluster, use two GatewayClasses (two controllers).
-
-### 7.4 When the API server is unreachable
-
-- `hold` (default): keep the VIP while rproxy is ready. Other pods cannot take the Lease without the API server either, so there are no two holders. For the case where only the holder lost the API server and another took the Lease, the `vip` container listens to ARP / NA and **releases at once when another MAC announces the VIP**.
-- `release`: let go when the Lease expires (as kube-vip). A control plane outage takes the data plane down.
-
-### 7.5 Permissions and PodSecurity
-
-- The `vip` container: root, `capabilities: {drop: [ALL], add: [NET_ADMIN, NET_RAW]}`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation: false`.
-- Only the `vip` container has Kubernetes API credentials: the pod keeps `automountServiceAccountToken: false` and a `projected` `serviceAccountToken` volume is mounted into the `vip` container only. ServiceAccount `rproxy-gateway-vip`; a Role with get, update, patch, watch on `leases` (the VIP Leases by `resourceNames`).
-- fleet is already hostNetwork, so its namespace is PodSecurity `privileged` (as today).
-
-### 7.6 Failover times (expected)
-
-| Event | Option 1b | MetalLB L2 | MetalLB BGP |
-|---|---|---|---|
-| Planned move (rollout, drain, pod deletion) | under 1 s | seconds (v0.4.1 measured 0.2-1.2 s with the preStop) | route withdrawal (seconds; under 1 s with BFD) |
-| Node lost | `leaseDuration` (3 s by default) + about 0.5 s | memberlist detection (5-8 s) | the BGP hold timer (about 1 s with BFD) |
-| rproxy alone fails | as soon as `/readyz` fails | once it leaves the Service's endpoints | the same |
-
-- Whatever the method, TCP connections open when a VIP moves break (the new node does not know them). UDP sessions start over on the new node. E's `drain` does not help a VIP move.
-- active-active: several VIPs spread over nodes, handed out with DNS round robin. To split one VIP across nodes, use BGP (MetalLB, the CNI).
-
-### 7.7 IPv6
-
-- `/128` with `nodad`; an unsolicited NA (Override) sent 3 times right after taking it (`garp.count`).
-- Fleet rproxy takes IPv6 VIPs only with `::` in `--listen-addr`; an IPv6 VIP without `::` is an error at start.
-
-### 7.8 Tests
-
-- Unit: taking Leases (expiry, waiting by VIPs held, release), conditions (`/readyz`, the applied notice), `hold` and releasing on another MAC, VIP checks (`addressCIDRs`, overlaps), ARP and NA packet bytes.
-- Acceptance: an input `mode: managed | fleet-vip`. `fleet-vip` picks VIPs from kind's docker network and measures HTTP, TCP and UDP from the runner to the VIPs. Scenarios j. delete the holder pod, k. `kubectl rollout restart ds/rproxy`, l. drain the holder's node, m. `docker stop <holder node>`, n. `docker pause <holder node>` (no two holders when it comes back), o. `docker pause` the control plane container (`hold` keeps traffic flowing). The summary compares with MetalLB L2.
-
-### 7.9 As built in v0.4.4
-
-As in 7.2-7.8. What changed from the design, and details:
-
-- Values: an entry of `fleet.vip.addresses` is an address (canonical: `2001:db8::10`, not `2001:0db8::10`) or `{address, interface, nodeSelector}`. An empty `interface` means `fleet.vip.interface`, and if that is empty too, the interface with an address whose subnet holds the VIP. `nodeSelector` is the labels of the nodes that may hold that VIP. Also `fleet.vip.garp`, `onApiUnreachable`, `metricsPort` (9445 by default) and `resources`. The chart refuses VIPs without `fleet.enabled`, `hostNetwork` or `managed.addressCIDRs` (empty: VIPs cannot be used), and an IPv6 VIP without a `::` listen address. The controller gets `RPROXY_GATEWAY_FLEET_VIPS` and `RPROXY_GATEWAY_ADDRESS_CIDR` (only with VIPs; fleet without VIPs is unchanged).
-- The "applied" notice of the hold condition is the readiness gate `rproxy.max3584.net/ruleset-applied` rather than a new endpoint: `True` for rproxy's current restart count means applied (the same test the controller uses to turn it `False` after an rproxy restart). `vip` watches its own pod.
-- Release order: remove the VIP, then clear the Lease's holder (the reverse of the design, so no two nodes have it; a few milliseconds apart).
-- Drains: `kubectl drain` does not evict DaemonSet pods, so a pod lets its VIPs go when its node is cordoned (reason `cordoned`). A pod on a cordoned node takes a VIP only when no other pod has for twice the Lease duration, and does not let such a VIP go for the cordon (VIPs do not vanish when every node is cordoned). `vip` watches its node (labels, cordon).
-- Expiry: counted from when this pod last saw the Lease change, not from its `renewTime` (the holder's clock), like client-go's leader election: nodes' clocks are not compared.
-- Right after the API server comes back: a pod that is not the holder does not take an expired Lease until a Lease duration after the API server last failed it (the holder renews first). A failed watch starts again every second, not with kube's backoff (up to 30 s).
-- Another MAC: `vip` hears ARP (sender address = VIP), NS (source = VIP) and NA (target = VIP). A holder that renewed its Lease in time announces again (the other MAC is stale); one that could not (`hold`, API server unreachable) lets go and does not take it for a Lease duration. ARP and NA answers other nodes send unicast are not heard (broadcast and multicast only).
-- Permissions: a projected ServiceAccount token can only be the pod's ServiceAccount's, so with VIPs the fleet's pods run as `rproxy-gateway-vip` (still `automountServiceAccountToken: false`) and the `projected` token is mounted into the `vip` container only. Role: `leases` get, list, watch, update (`resourceNames`: the VIPs' Leases; list and watch with a `metadata.name` field selector), `pods` get, list, watch (its readiness gate). ClusterRole: `nodes` get, list, watch. The chart makes the Leases; `vip` gets no create.
-- `vip` reads rproxy's `/readyz` on the pod's IP, port 9443, every 0.5 s (`retryInterval`), verified with `ca.crt` of `rproxy-gateway-api-tls` (only that key is mounted).
-- Status: with VIPs, a fleet Gateway's `status.addresses` are the VIPs (those picked in `spec.addresses`, else every usable VIP). A Gateway that picked a VIP nobody has held for over 10 s is `Programmed: False` (`AddressNotUsable`); one that picked none, only when none of the usable VIPs is held.
-- Kustomize: `config/samples/fleet-vip` (the example VIP 192.0.2.10; the Lease's name and the Role's `resourceNames` are a hash of the address, so render the chart for other VIPs).
-- Acceptance: `mode=fleet-vip`. HTTP, HTTPS and TCP every 0.1 s throughout; UDP (a `UDPRoute` to agnhost's netexec) is checked to answer from the VIP at the start and after each scenario (not continuously). m is `docker kill` rather than the design's `docker stop` (see the numbers below). Scenarios run in the order j, k, l, o, n, m (a node after `docker kill` may come back with another address, so last). j, k, l and o fail over `GAP_LIMIT`; m and n are recorded only (n checks the VIP is on one node again once it comes back). MetalLB L2 is compared with the managed acceptance runs (l2-local, l2-cluster, 6.2).
-
-#### Acceptance test numbers
-
-`mode=fleet-vip`, kind (3 workers), one VIP, default values (duration 3 s, renew 1 s, retry 0.5 s, `hold`), run 37805425584. "Longest gap" is the longest time some probe got no 200; "Lease" is when the Lease's holder changed (from the start of the scenario).
-
-| Scenario | Failed (HTTP/HTTPS/TCP) | Longest gap | Lease | Result |
-|---|---|---|---|---|
-| j. the holder's pod deleted | 1/0/0 (of 883) | 0.2 s | +0.09 s | PASS |
-| k. `rollout restart ds/rproxy` | 0/0/0 (1090) | 0.1 s | +7.35 s (when the holder's pod's turn came) | PASS |
-| l. the holder's node drained (cordon) | 0/1/0 (345) | 1.2 s | +0.47 s | PASS |
-| o. the control plane `docker pause`d for 20 s (`hold`) | 0/0/0 (971) | 0.2 s | does not move | PASS |
-| n. the holder's node `docker pause`d (record only) | 26/27/26 (316) | 6.4 s | +2.36 s | once unpaused, the VIP is on one node 1.2 s later |
-| m. the holder's node `docker kill`ed (record only) | 27/27/14 (416) | 5.7 s | +3.15 s | — |
-
-- Planned moves (j, k, l): the Lease moves in 0.1-0.5 s and at most one request fails (managed behind MetalLB L2 + `Local`, 6.2's D: b2, c, d 0.2-1.2 s).
-- n and m moved at the Lease's expiry (3 s). Most failures are requests rproxy sent to the backend (echo) pod on the stopped node (until the node is NotReady and leaves the EndpointSlice: not the VIP's, as in managed's g).
-- The first run (run 37803895238) had m as `docker stop`: a stopping kind node stops its pods with SIGTERM, so the VIP moved at +0.06 s like a drain, with no failures. m became `docker kill` to measure a lost node.
-- UDP answered from the VIP at the start and after each scenario (rproxy answers from it with `IP_PKTINFO`).
-- Empty `vip` lines in the summary's timelines are the runner failing to read a node with `docker exec` (the probes succeed meanwhile).
+- Why: providing addresses (VIPs) and moving them is the platform's job (MetalLB, kube-vip, Cilium LB IPAM, cloud load balancers, keepalived on the nodes), and each has a well-used implementation. Owning it in rproxy-gateway meant a NET_ADMIN / NET_RAW container, Lease RBAC, ARP / NDP handling and network failure tests. rproxy can listen on several addresses (`--listen-addr`, a Gateway's `spec.addresses`), so rproxy-gateway only makes rproxy listen on the right addresses, and [PLATFORM.md](PLATFORM.md) describes how to provide them.
+- `fleet.vip` existed in v0.4.4 for one day and was off by default (opt-in), so it was removed in a patch. `helm upgrade` with `fleet.vip` still in the values fails (the chart's `fail`). Cleaning up the leftover Leases, RBAC and node addresses: "Moving off v0.4.4's `fleet.vip`" in [PLATFORM.md](PLATFORM.md).
+- v0.4.4's acceptance values (kind, one VIP, 3 s Lease): planned moves (deleting the holder pod, rollout restart, drain) 0.1-1.2 s, losing the node (`docker pause`, `docker kill`) 5.7-6.4 s. kube-vip (ARP, Leases) and keepalived (VRRP) give the same shape; their settings decide the numbers.
 
 ## 8. Changes to the acceptance test (`acceptance.yml`)
 
@@ -429,7 +321,6 @@ As in 7.2-7.8. What changed from the design, and details:
 | `install` | `helm` | `kustomize` installs `config/default` with an overlay | after B |
 | `ui` | `false` | also installs the UI's chart and checks 4.3 | C |
 | `strict` | `false` | fails if E's checks see any failed request | E |
-| `mode` | `managed` | `fleet-vip` runs 7.8's scenarios j-o | F |
 
 The gap limit (`GAP_LIMIT`) fails a run only for what rproxy-gateway controls: pod deletions, drains, rollouts and parameters changes measured in l2-local, l2-cluster and nodeport-lb. `bgp` gaps (route withdrawal, BFD) and lost nodes are the CNI's, the load balancer's or the network's time, so they are recorded only (`info (network-dependent)`).
 
@@ -445,7 +336,7 @@ Scenarios added (A), run after today's a-g; SKIP when the `RproxyGatewayParamete
 3. B: the chart's ConfigMap, `config/`, `install.yaml` on releases (v0.4.2). A and B both change the chart; whichever goes in second renders `config/` again with `scripts/render-config.sh`.
 4. E: wire rproxy-api v0.4.1's `RPROXY_SHUTDOWN_*` (6.).
 5. C: after the UI's chart, the discovery Secret and the UI token.
-6. F: the fleet VIP; large, so a patch of its own.
+6. F: the fleet VIP; large, so a patch of its own (v0.4.4). Dropped in v0.4.5 (7.).
 7. Acceptance (8.) is run by hand on each PR's branch to check nothing regresses from v0.4.1.
 
 ## 10. Decisions
@@ -461,12 +352,7 @@ Scenarios added (A), run after today's a-g; SKIP when the `RproxyGatewayParamete
 | Q7 | The UI's chart as a subchart of rproxy-gateway's | **No** (separate chart and versions). rproxy-gateway's chart only gets values such as `ui.namespace` |
 | Q8 | How the UI watches rproxy on Kubernetes | **The controller writes read-only tokens and a discovery Secret into the UI's namespace** (the administrator's `ui.namespace` and the Gateway's `ui.visible`) |
 | Q9 | Show Kubernetes rules to UI users who are not administrators | **Administrators only**; mapping namespaces to Keycloak groups later |
-| Q17 | F's approach | **1b: fleet + our own `rproxy-gateway vip` (Leases, gratuitous ARP / NA)** |
-| Q18 | VIPs while the API server is unreachable | **`hold`** (released at once when another MAC announces the VIP) |
-| Q19 | Separate listeners per VIP | **No** (`0.0.0.0` as is); if needed, an rproxy-api issue for `IP_FREEBIND` |
-| Q20 | Can a Gateway ask for a new VIP | **Only the administrator's list** (Gateways choose from it) |
-| Q21 | Lease defaults | **3 s expiry, 1 s renewal, 0.5 s retry** |
-| Q22 | When F ships | a separate patch of the v0.4 line (does not hold A-E back) |
+| Q17 | F's approach | v0.4.4: 1b (fleet + our own `rproxy-gateway vip`; Leases, gratuitous ARP / NA). **Dropped in v0.4.5; addresses are left to the platform** (7., [PLATFORM.md](PLATFORM.md)) |
 | — | Versions | **No v0.5.0**; patches from v0.4.2 on |
 | — | The class's default parameters in the chart | **Rendered only when `managed.parameters` is not empty** (`helm upgrade` does not install new CRDs; 2.7) |
 
@@ -486,11 +372,11 @@ When a node stops, its backend pods stay among the destinations until the node t
 - Controller flags: `--backend-outlier-http`, `--backend-outlier-l4` (`key=value,...`, empty for none), `--backend-connect-timeout-http`, `--backend-connect-timeout-l4` (empty for rproxy's own); `RPROXY_GATEWAY_BACKEND_*`.
 - rproxy version: `connect_timeout` is sent only to rproxy with `features.connect_timeout` (v0.4.3). `outlier_detection` and `timeouts.connect` exist since v0.4.0.
 - A changed default: existing Gateways' rules get them too (the owner's request; the rules change in place, connections are not cut).
-- Acceptance: scenario p (record-only, managed or fleet-vip): a node with an echo pod and no rproxy in the path is `docker kill`ed (`P_HOW=pause`: `docker pause`d); measured are how long requests keep failing (the last failure), when the EndpointSlice says NotReady, and when 10 s pass without a failure. The input `rproxy_ref` builds rproxy from an rproxy-api branch.
+- Acceptance: scenario p (record-only, managed): a node with an echo pod and no rproxy in the path is `docker kill`ed (`P_HOW=pause`: `docker pause`d); measured are how long requests keep failing (the last failure), when the EndpointSlice says NotReady, and when 10 s pass without a failure. The input `rproxy_ref` builds rproxy from an rproxy-api branch.
 
 #### Values from the acceptance test
 
-`mode=fleet-vip`, scenario p: of the nodes with an echo pod (3, one per worker), one that holds neither the VIP nor the controller's leader is stopped. Probes: HTTP, HTTPS and TCP every 0.1 s, a new connection each (`--max-time 2`). Recorded only.
+Measured with v0.4.4's `mode=fleet-vip` (the VIP sidecar is gone in v0.4.5; the VIP plays no part in backend failures), scenario p: of the nodes with an echo pod (3, one per worker), one that holds neither the VIP nor the controller's leader is stopped. Probes: HTTP, HTTPS and TCP every 0.1 s, a new connection each (`--max-time 2`). Recorded only.
 
 | How | Version | Failed (HTTP/HTTPS/TCP) | Longest gap | Failing for (last failure) | NotReady |
 |---|---|---|---|---|---|

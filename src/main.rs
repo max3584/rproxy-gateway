@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use rproxy_gateway::controller::provision::{Fleet, Managed, Mode, ProbeTiming};
-use rproxy_gateway::{certsync, controller, k8s, render, vip};
+use rproxy_gateway::{certsync, controller, k8s, render};
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -28,8 +28,6 @@ enum Command {
 	Controller(Box<ControllerArgs>),
 	/// Write certificate Secrets into rproxy's certificate directory (runs next to rproxy).
 	Certsync(certsync::Args),
-	/// Hold VIPs on the node for the fleet's rproxy (a sidecar with hostNetwork, NET_ADMIN and NET_RAW).
-	Vip(Box<vip::Args>),
 	/// Print rproxy-gateway's CRDs (RproxyMiddleware, RproxyPolicy, RproxyRule, RproxyGatewayParameters) as YAML.
 	Crds,
 	/// Render manifests (YAML files) into rule sets without a cluster: what the controller would PUT.
@@ -108,10 +106,6 @@ struct ControllerArgs {
 	/// fleet: addresses written to Gateway status (default: the pods' host IPs).
 	#[arg(long, env = "RPROXY_GATEWAY_FLEET_ADDRESS", value_delimiter = ',')]
 	fleet_address: Vec<String>,
-	/// fleet: VIPs the fleet pods' `vip` sidecars hold (one Lease each): the fleet's addresses instead
-	/// (inside `--address-cidr`; a Gateway picks some with `spec.addresses`).
-	#[arg(long, env = "RPROXY_GATEWAY_FLEET_VIPS", value_delimiter = ',', value_parser = |s: &str| vip::parse_vip(s.trim()).map(|_| s.trim().to_string()))]
-	fleet_vip: Vec<String>,
 	/// rproxy's passive health checks (`outlier_detection` of `http` services, rproxy's L7 keys as
 	/// `key=value,...`) every HTTPRoute / GRPCRoute backend gets unless an RproxyPolicy sets them. "": none.
 	#[arg(long, env = "RPROXY_GATEWAY_BACKEND_OUTLIER_HTTP", default_value = "consecutive_gateway_failures=3,consecutive_5xx=0,ejection_time=10s,max_ejection_time=1m,max_ejected_percent=50", value_parser = key_values)]
@@ -335,15 +329,11 @@ fn main() -> anyhow::Result<()> {
 			init_logging(&cli.log_format);
 			tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(certsync::run(args))
 		}
-		Command::Vip(args) => {
-			init_logging(&cli.log_format);
-			tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(vip::run(*args))
-		}
 		Command::Controller(a) => {
 			init_logging(&cli.log_format);
 			let backends = backend_defaults(&a);
 			let mode = match a.mode.as_str() {
-				"fleet" => Mode::Fleet(Fleet { selector: a.fleet_selector, addresses: a.fleet_address, vips: a.fleet_vip }),
+				"fleet" => Mode::Fleet(Fleet { selector: a.fleet_selector, addresses: a.fleet_address }),
 				_ => Mode::Managed(Managed {
 					rproxy_image: a.rproxy_image,
 					controller_image: a.controller_image,

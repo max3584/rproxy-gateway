@@ -113,37 +113,6 @@ fleet:
   shutdown: {delay: 5s, drain: 25s}
   # RproxyRules (off: the fleet's pods are shared by every Gateway; fleet is for one trust domain)
   rproxyRules: false
-  # VIPs held by the fleet's pods directly, without a Service or load balancer (docs/DESIGN-v0.4.x.md 7.):
-  # a `vip` sidecar (rproxy-gateway vip; NET_ADMIN and NET_RAW in that container only) per pod. One
-  # Lease per VIP (rproxy-vip-<hash>, made by the chart) decides which pod has it; the holder adds it to
-  # its node's interface and announces it (gratuitous ARP, unsolicited NA for IPv6). A pod holds VIPs
-  # only while its rproxy is ready (/readyz) and the controller has applied the rule sets to it; it lets
-  # them go first when rproxy drains (SIGTERM), the pod stops or the node is cordoned (a planned move
-  # takes well under a second; a lost node the Lease's duration). The VIPs become the fleet's addresses
-  # (instead of `addresses` above); Gateways pick some with spec.addresses (none: all). Needs hostNetwork,
-  # VIPs inside managed.addressCIDRs, and the namespace's PodSecurity at privileged (docs/SECURITY.md)
-  vip:
-    enabled: false
-    # canonical addresses ("192.0.2.10", "2001:db8::10"; IPv6 needs "::" in rproxy.listenAddresses),
-    # or {address, interface, nodeSelector} (the nodes that may hold it, by labels)
-    addresses: []
-    # the interface of VIPs that name none; empty: the one whose subnet holds the VIP
-    interface: ""
-    # the Lease: held this long without a renewal (whole seconds), renewed this often, a failed write
-    # tried again this soon (also how often rproxy's /readyz is read)
-    leaseDuration: 3s
-    renewInterval: 1s
-    retryInterval: 500ms
-    # gratuitous ARPs (IPv6: unsolicited NAs) sent after taking a VIP
-    garp: {count: 3, interval: 200ms}
-    # the API server cannot be reached: hold (keep the VIP while rproxy is ready; another MAC announcing
-    # it makes the pod let go) or release (drop it when the Lease would have expired)
-    onApiUnreachable: hold
-    # /metrics (rproxy_vip_held, rproxy_vip_transitions_total) and /healthz on the node's IP
-    metricsPort: 9445
-    resources:
-      requests: {cpu: 10m, memory: 16Mi}
-      limits: {memory: 64Mi}
 
 # what every backend the controller renders gets (the pods of the Services behind HTTPRoutes,
 # GRPCRoutes, TLSRoutes, TCPRoutes, UDPRoutes), unless an RproxyPolicy sets outlierDetection

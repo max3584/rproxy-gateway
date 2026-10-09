@@ -86,10 +86,6 @@ RPROXY_GATEWAY_FLEET_RPROXY_RULES: "true"
 {{- with .Values.fleet.addresses }}
 RPROXY_GATEWAY_FLEET_ADDRESS: {{ join "," . | quote }}
 {{- end }}
-{{- if .Values.fleet.vip.enabled }}
-RPROXY_GATEWAY_FLEET_VIPS: {{ include "rproxy-gateway.vips" . | quote }}
-RPROXY_GATEWAY_ADDRESS_CIDR: {{ join "," .Values.managed.addressCIDRs | quote }}
-{{- end }}
 {{- else }}
 RPROXY_GATEWAY_MODE: "managed"
 RPROXY_GATEWAY_RPROXY_IMAGE: {{ include "rproxy-gateway.rproxyImage" . | quote }}
@@ -138,22 +134,4 @@ RPROXY_GATEWAY_MIGRATION_ALLOW_CROSS_NAMESPACE: "true"
 {{- $out = append $out (printf "%s=%s" $k $v) -}}
 {{- end -}}
 {{- join "," $out -}}
-{{- end -}}
-
-{{/* fleet.vip: the VIPs' addresses, comma-separated (an entry is an address or {address, ...}) */}}
-{{- define "rproxy-gateway.vips" -}}
-{{- $out := list -}}
-{{- range .Values.fleet.vip.addresses -}}
-{{- if kindIs "string" . -}}
-{{- $out = append $out . -}}
-{{- else -}}
-{{- $out = append $out (required "fleet.vip.addresses: an entry without address" .address) -}}
-{{- end -}}
-{{- end -}}
-{{- join "," $out -}}
-{{- end -}}
-
-{{/* fleet.vip: the Lease of a VIP (rproxy-gateway vip: rproxy-vip- and the first 10 hex digits of the SHA-256 of the address) */}}
-{{- define "rproxy-gateway.vipLease" -}}
-{{- printf "rproxy-vip-%s" (sha256sum . | trunc 10) -}}
 {{- end -}}
