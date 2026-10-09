@@ -143,7 +143,7 @@ rproxy runs with `RPROXY_API_ADDR=0.0.0.0`, `RPROXY_API_PORT=9443`, `RPROXY_TOKE
 | The Gateway's `spec.tls.frontend` (client certificate validation) | `tls.client_auth` of the port's rule (`mode: required`, `ca_file` a file of the `ca.crt` of the `caCertificateRefs` ConfigMaps). `perPort` for the port, else `default`. Kinds other than ConfigMap: `InvalidCACertificateKind`; missing or without `ca.crt`: `InvalidCACertificateRef`; another namespace needs a ReferenceGrant (to `ConfigMap`, else `RefNotPermitted`). With no usable one the listener is `Accepted: False` (`NoValidCACertificate`). `AllowInsecureFallback` becomes `mode: optional_no_verify` (certificates are asked for and checked, connections are accepted without one or with one that fails; the result reaches the backend in `X-Client-Verify: SUCCESS / FAILED / NONE` and `X-Forwarded-Client-Cert`), and the Gateway gets `InsecureFrontendValidationMode: True`. An rproxy without that mode (`features.client_auth_modes`) does not ask for certificates |
 | An `HTTPS` listener without a usable certificate | routes attach (counted in `attachedRoutes`), no rule is made (`ResolvedRefs: False`, `Programmed: False`) |
 
-### rproxy's CRDs (`rproxy.max3584.net/v1alpha1`)
+### rproxy's CRDs (`rproxy.max3584.net/v1beta1`; `v1alpha1` still works with the same shape, deprecated; [DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) 11.4)
 
 | CRD | Use |
 |---|---|

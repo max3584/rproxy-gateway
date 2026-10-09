@@ -44,7 +44,7 @@ managed の Deployment・Service はコントローラが実行時に作るの�
 
 ### 2.1 形
 
-CRD `RproxyGatewayParameters`（`rproxy.max3584.net/v1alpha1`、namespaced、shortname `rpgwp`）。GatewayClass の `spec.parametersRef`（クラスの既定）と、Gateway の `spec.infrastructure.parametersRef`（その Gateway の上書き）の両方から指す。
+CRD `RproxyGatewayParameters`（`rproxy.max3584.net/v1alpha1`（v0.4.5 から `v1beta1`、11.4）、namespaced、shortname `rpgwp`）。GatewayClass の `spec.parametersRef`（クラスの既定）と、Gateway の `spec.infrastructure.parametersRef`（その Gateway の上書き）の両方から指す。
 
 ```yaml
 apiVersion: rproxy.max3584.net/v1alpha1
@@ -497,4 +497,15 @@ docs/CONFORMANCE.md の「名乗っていないもの」を埋める（オーナ
 - `forwardBody.maxSize`（0 は送らない）。大きい本文は 413（型の説明の「切って送る」ではなく、フィルタの説明と Envoy の既定の「断る」。rproxy-api の設計 7.3）。
 - 宛先が使えない（見つからない・ReferenceGrant がない・ready な Pod がない・BackendTLSPolicy に使える CA がない）ときは、確かめずに通すことのないよう、その規則は 500（`ResolvedRefs: False`）。backendRef の `ExternalAuth` なら、その backend の分だけ 500（`servers[].status`。ない rproxy ではその backend を外す）。
 - 名乗る機能：`HTTPRouteExternalAuth`・`HTTPRouteExternalAuthHTTP`・`HTTPRouteExternalAuthGRPC`・`HTTPRouteExternalAuthForwardBody`（GatewayClass の `supportedFeatures`）。Gateway API v1.6.3 の conformance にはこの機能の名前も試験もない（`pkg/features` にない）ので、試験は `tests/rproxy.rs`（本物の rproxy）・単体と rproxy-api の `tests/ext_authz.rs`。
+
+### 11.4 rproxy の CRD を `v1beta1` に
+
+- 4 つの CRD（`RproxyRule`・`RproxyMiddleware`・`RproxyPolicy`・`RproxyGatewayParameters`）は `v1beta1`（保存する版）と `v1alpha1`（`deprecated: true`、`deprecationWarning`）の両方を出す。形は同じなので、変換の webhook はなく `conversion.strategy: None`（API サーバが `apiVersion` を書き換えるだけ）。`rproxy-gateway crds` が `v1beta1` の型から `v1alpha1` の項を作る（単体の試験が形の一致を確かめる）。
+- コントローラは CRD を discovery の優先の版で watch する（今までどおり）。新しい CRD なら `v1beta1`、`helm upgrade` で CRD が古いまま（`v1alpha1` だけ）でも `v1alpha1` で動く。状態（`RproxyRule` の `status`）も同じ版で書く。
+- chart がクラスの既定の `RproxyGatewayParameters` を描くときは、クラスタが `v1beta1` を出していればそれ、なければ `v1alpha1`（Helm の `.Capabilities`。`helm install` は `crds/` を入れた後に調べる）。`config/`・例・e2e は `v1beta1`。e2e は `RproxyRule` を 1 つ `v1alpha1` で書き、`v1beta1` で読めること・保存の版が `v1beta1` であることを確かめる。受け入れテストは CRD の保存の版で書く（公開した古い chart でも動く）。
+- **v0.4.4 からの更新**：
+  1. `kubectl apply --server-side -f https://github.com/max3584/rproxy-gateway/releases/download/v0.4.5/rproxy.max3584.net.yaml`（`helm upgrade` は CRD を更新しない。Kustomize の `config/crd` は一緒に当たる）。
+  2. コントローラを更新する。今の `v1alpha1` のオブジェクトはそのまま `v1beta1` としても読める（書き直しは要らない）。CRD を当てる前にコントローラだけ更新しても `v1alpha1` で動く。
+  3. 手元のマニフェストの `apiVersion` は、時間のあるときに `rproxy.max3584.net/v1beta1` に変える（`v1alpha1` は警告が出るだけ）。
+- **保存の版**：etcd の中の今のオブジェクトは、次に書かれるまで `v1alpha1` のまま（CRD の `status.storedVersions` は `["v1alpha1", "v1beta1"]`）。形が同じなので動きは変わらない。将来 `v1alpha1` を出すのをやめる版（マイナー）の前には、すべてのオブジェクトを書き直して（`kubectl get rproxyrules,rproxymiddlewares,rproxypolicies,rproxygatewayparameters -A -o json | kubectl replace -f -`、または kube-storage-version-migrator）から `status.storedVersions` を `["v1beta1"]` にする（`kubectl patch crd <名前> --subresource=status --type=merge -p '{"status":{"storedVersions":["v1beta1"]}}'`）。v0.4.x のうちは `v1alpha1` を出し続ける（パッチで壊さない）。
 
