@@ -106,6 +106,12 @@ for i in $(seq 60); do
   [ "$i" = 60 ] && { echo "the stress Gateway does not answer"; exit 1; }
 done
 
+# every TCP request is a new connection (tens of thousands a minute): give the client the whole
+# ephemeral port range and let it reuse TIME_WAIT ports, or connect() fails with EADDRNOTAVAIL
+if [ -n "${CI:-}" ]; then
+  sudo sysctl -q -w net.ipv4.ip_local_port_range="1024 65535" net.ipv4.tcp_tw_reuse=1
+fi
+
 echo "== stress load: $TOTAL requests, $CONCURRENCY in flight, seed $SEED"
 (cd test/stress && CGO_ENABLED=0 go build -o "$work/stress" .)
 status=0
@@ -122,6 +128,20 @@ for node in $(kind get nodes --name "$CLUSTER"); do
   mem+=$(docker exec "$node" crictl stats -o json 2>/dev/null | jq -r --arg ns stress \
     '.stats[] | select(.attributes.labels["io.kubernetes.pod.namespace"] == $ns and .attributes.labels["io.kubernetes.container.name"] == "rproxy")
      | "\(.attributes.labels["io.kubernetes.pod.name"]): \((.memory.workingSetBytes.value | tonumber) / 1048576 | floor) MiB\n"' || true)
+done
+# what the memory is: the process (VmRSS) and the container's cgroup (anon, file cache, socket buffers)
+for pod in $(kubectl -n stress get pods -l gateway.networking.k8s.io/gateway-name=stress -o name); do
+  # shellcheck disable=SC2016 # expanded in the pod
+  mem+="${pod#pod/}: $(kubectl -n stress exec "$pod" -c rproxy -- sh -c \
+    'grep VmRSS /proc/1/status | tr -s " "; grep -E "^(anon|file|sock|kernel) " /sys/fs/cgroup/memory.stat | while read -r k v; do echo "$k $((v / 1048576)) MiB"; done' \
+    2>/dev/null | paste -sd, -)
+"
+done
+# sockets left in rproxy's network namespace after the load (UDP sessions keep one socket each until idle)
+for pod in $(kubectl -n stress get pods -l gateway.networking.k8s.io/gateway-name=stress -o name); do
+  # shellcheck disable=SC2016 # expanded in the pod
+  mem+="${pod#pod/}: $(kubectl -n stress exec "$pod" -c rproxy -- sh -c 'echo "udp sockets $(($(wc -l < /proc/net/udp) - 1)), tcp sockets $(($(wc -l < /proc/net/tcp) - 1))"' 2>/dev/null)
+"
 done
 printf '%s' "$mem" | tee "$work/memory.txt"
 if [ "$restarts" != 0 ]; then echo "::error::rproxy restarted $restarts times during the load"; status=1; fi
