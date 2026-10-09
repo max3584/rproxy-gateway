@@ -15,11 +15,6 @@
 #               (network-dependent)")
 #   nodeport-lb NodePort Services (externalTrafficPolicy Local; Cluster through HELM_ARGS) behind an HAProxy container that
 #               health-checks every node and sends to all healthy ones (a user's own L4 balancer)
-# MODE=fleet-vip (instead of a TOPOLOGY): fleet mode with VIPs held by the fleet's pods (fleet.vip,
-# docs/DESIGN-v0.4.x.md 7.): a VIP from kind's docker network, no Service or load balancer; the runner
-# sends to the VIP. Scenarios j-o (the VIP holder's pod deleted, rollout restart, drain; its node killed
-# or paused, the control plane paused); the pod deletion, rollout restart, drain and the paused control
-# plane (hold) fail over GAP_LIMIT, a lost node is recorded only.
 # Outages are measured and reported. With MANAGED_REPLICAS >= 2, a pod deletion, a node drain, a
 # rollout restart and a parameters change fail the run when the longest gap without a 200 exceeds
 # GAP_LIMIT seconds (l2-local, l2-cluster, nodeport-lb: what rproxy-gateway controls; bgp and a lost
@@ -32,13 +27,6 @@ cd "$(dirname "$0")/.."
 
 SOURCE=${SOURCE:-published}
 TOPOLOGY=${TOPOLOGY:-l2-local}
-# managed (TOPOLOGY decides how traffic reaches the Gateway) or fleet-vip
-MODE=${MODE:-managed}
-case "$MODE" in
-  managed) ;;
-  fleet-vip) TOPOLOGY=fleet-vip ;;
-  *) echo "MODE: managed or fleet-vip"; exit 1 ;;
-esac
 if [ "$SOURCE" = checkout ]; then
   CHART=${CHART:-charts/rproxy-gateway}
 else
@@ -53,13 +41,8 @@ GAP_LIMIT=${GAP_LIMIT:-3}
 # true: a pod deletion, drain, rollout or parameters change also fails on any failed request (not only
 # on a gap over GAP_LIMIT)
 STRICT=${STRICT:-false}
-# the scenarios to run (a b1 b2 c d e f g h i; u is added with UI=true; MODE=fleet-vip: j k l o n m, the
-# node killed (m) last: a kind node started again may come back with another address)
-if [ "$MODE" = fleet-vip ]; then
-  SCENARIOS=${SCENARIOS:-j k l o n m}
-else
-  SCENARIOS=${SCENARIOS:-a b1 b2 c d e f g h i}
-fi
+# the scenarios to run (a b1 b2 c d e f g h i; u is added with UI=true)
+SCENARIOS=${SCENARIOS:-a b1 b2 c d e f g h i}
 # true: also the UI chart of UI_DIR (a checkout of TCP-UDP-rproxy-ui) with the bundled MariaDB, the
 # controller's ui.namespace, and scenario u
 UI=${UI:-false}
@@ -68,7 +51,7 @@ UI_DIR=${UI_DIR:-../TCP-UDP-rproxy-ui}
 UI_USAGE_SECS=${UI_USAGE_SECS:-15}
 FRR_IMAGE=${FRR_IMAGE:-quay.io/frrouting/frr:9.1.0}
 HAPROXY_IMAGE=${HAPROXY_IMAGE:-haproxy:3.0-alpine}
-case "$TOPOLOGY" in l2-local | l2-cluster | bgp | nodeport-lb | fleet-vip) ;; *) echo "TOPOLOGY: l2-local, l2-cluster, bgp or nodeport-lb"; exit 1 ;; esac
+case "$TOPOLOGY" in l2-local | l2-cluster | bgp | nodeport-lb) ;; *) echo "TOPOLOGY: l2-local, l2-cluster, bgp or nodeport-lb"; exit 1 ;; esac
 CLUSTER=${CLUSTER:-rproxy-gateway-acc}
 GATEWAY_API_VERSION=${GATEWAY_API_VERSION:-v1.6.3}
 METALLB_VERSION=${METALLB_VERSION:-v0.15.2}
@@ -81,12 +64,6 @@ APPLY_TIMEOUT=${APPLY_TIMEOUT:-120}
 ROTATE_TIMEOUT=${ROTATE_TIMEOUT:-300}
 NS=rproxy-gateway-system
 APP=acc
-# the rproxy pods: the Gateway's (managed) or the fleet's
-if [ "$MODE" = fleet-vip ]; then
-  RP_NS=$NS RP_SEL=app.kubernetes.io/name=rproxy,app.kubernetes.io/component=fleet
-else
-  RP_NS=$APP RP_SEL=app.kubernetes.io/name=rproxy
-fi
 work=${RUNNER_TEMP:-/tmp}/rproxy-gateway-acceptance
 mkdir -p "$work"
 results=$work/results.tsv
@@ -114,12 +91,7 @@ dump() {
   kubectl get events -A --sort-by=.lastTimestamp > "$d/events.txt" 2>&1 || true
   kubectl -n "$NS" logs -l app.kubernetes.io/name=rproxy-gateway --prefix --tail=-1 > "$d/controller.log" 2>&1 || true
   kubectl -n "$NS" get lease rproxy-gateway -o yaml > "$d/lease.yaml" 2>&1 || true
-  kubectl -n "$RP_NS" logs -l "$RP_SEL" --prefix --all-containers --tail=-1 > "$d/rproxy.log" 2>&1 || true
-  if [ "$MODE" = fleet-vip ]; then
-    kubectl -n "$NS" logs -l "$RP_SEL" -c vip --prefix --tail=-1 --previous > "$d/vip-previous.log" 2>&1 || true
-    kubectl -n "$NS" get lease -o yaml > "$d/leases.yaml" 2>&1 || true
-    for n in $(kind get nodes --name "$CLUSTER" 2> /dev/null); do echo "$n: $(docker exec "$n" ip -o addr show 2> /dev/null | grep -c " ${VIP:-none}/")"; done > "$d/vip-addresses.txt" 2>&1 || true
-  fi
+  kubectl -n "$APP" logs -l app.kubernetes.io/name=rproxy --prefix --all-containers --tail=-1 > "$d/rproxy.log" 2>&1 || true
   kubectl get gateways,httproutes,tcproutes,certificates -A -o yaml > "$d/objects.yaml" 2>&1 || true
   kubectl -n "$APP" get deploy,svc,networkpolicy,pdb,secret -o wide > "$d/managed.txt" 2>&1 || true
   docker logs "$CLUSTER-frr" > "$d/frr.log" 2>&1 || true
@@ -278,14 +250,6 @@ spec: {ipAddressPools: [kind]}" || { cat "$work/apply.log"; exit 1; }
     ;;
   nodeport-lb)
     HELM_ARGS="--set managed.serviceType=NodePort --set managed.externalTrafficPolicy=Local $HELM_ARGS"
-    ;;
-  fleet-vip)
-    # a VIP from kind's docker network (docker allocates from the start of the subnet); the fleet's pods
-    # hold it (hostNetwork, the vip sidecar), the runner reaches it on the docker bridge
-    VIP=${VIP:-$prefix.255.100}
-    LEASE=rproxy-vip-$(printf '%s' "$VIP" | sha256sum | cut -c1-10)
-    echo "kind network $subnet, VIP $VIP (Lease $LEASE)"
-    HELM_ARGS="--set fleet.enabled=true --set fleet.vip.enabled=true --set fleet.vip.addresses={$VIP} --set managed.addressCIDRs={$VIP/32} $HELM_ARGS"
     ;;
 esac
 case "$TOPOLOGY" in
@@ -462,17 +426,9 @@ kubectl -n "$APP" rollout status deploy/echo --timeout=300s
 kubectl -n "$APP" wait --for=condition=Ready certificate/secure-cert --timeout=180s
 kubectl -n "$APP" wait --for=condition=Programmed gateway/acc --timeout=300s
 LB=$(kubectl -n "$APP" get gateway acc -o jsonpath='{.status.addresses[0].value}')
-if [ "$MODE" = fleet-vip ]; then
-  # every worker runs a fleet pod; the Gateway's address is the VIP
-  DEPLOY=-
-  MANAGED_REPLICAS=$(echo "$WORKERS" | wc -w)
-  kubectl -n "$NS" rollout status ds/rproxy --timeout=300s
-  [ "$LB" = "$VIP" ] || { echo "the Gateway's address is $LB, not the VIP $VIP"; exit 1; }
-else
-  DEPLOY=$(kubectl -n "$APP" get deploy -l gateway.networking.k8s.io/gateway-name=acc -o jsonpath='{.items[0].metadata.name}')
-  log "managed rproxy Deployment: $DEPLOY"
-  kubectl -n "$APP" rollout status "deploy/$DEPLOY" --timeout=300s
-fi
+DEPLOY=$(kubectl -n "$APP" get deploy -l gateway.networking.k8s.io/gateway-name=acc -o jsonpath='{.items[0].metadata.name}')
+log "managed rproxy Deployment: $DEPLOY"
+kubectl -n "$APP" rollout status "deploy/$DEPLOY" --timeout=300s
 if [ "$TOPOLOGY" = nodeport-lb ]; then
   # HAProxy (TCP) in front of every worker's node ports: health checks every 500 ms (down after 2
   # failures); a connection that fails marks the node down at once and is tried again on another
@@ -495,20 +451,6 @@ fi
 log "Gateway address ($TOPOLOGY): $LB"
 
 # ---------------------------------------------------------------- checks
-# fleet-vip: the nodes with the VIP on an interface (a paused or stopped node is not listed)
-vip_nodes() {
-  local n
-  for n in $WORKERS; do
-    if docker exec "$n" ip -o addr show 2> /dev/null | grep -q " $VIP/"; then echo "$n"; fi
-  done
-}
-vip_once() { [ "$(vip_nodes | wc -l)" -eq 1 ]; }
-# vip_moved <node>: exactly one node other than <node> has the VIP
-vip_moved() { local n; n=$(vip_nodes); [ -n "$n" ] && [ "$n" != "$1" ] && [ "$(echo "$n" | wc -l)" -eq 1 ]; }
-vip_holder() { kubectl -n "$NS" get lease "$LEASE" -o jsonpath='{.spec.holderIdentity}' 2> /dev/null; }
-pod_node() { kubectl -n "$RP_NS" get pod "$1" -o jsonpath='{.spec.nodeName}' 2> /dev/null; }
-# fleet-vip: a UDP datagram to the VIP is answered (from the VIP: the client only takes answers from where it sent)
-udp_ok() { [ "$(echo 'echo vip-udp' | timeout 3 nc -u -w 1 "$LB" 9001 2> /dev/null | head -c 7)" = vip-udp ]; }
 http_code() { curl -s -o /dev/null -w '%{http_code}' --connect-timeout 1 --max-time 2 "$@" || true; }
 lb_host_ok() { [ "$(http_code -H "Host: $1" "http://$LB/")" = 200 ]; }
 # a pod's rule set: HTTP, HTTPS (verified against the CA) and TCP straight to the pod IP
@@ -519,7 +461,7 @@ pod_serves() {
 }
 # live rproxy pods: name ip ready(true/false)
 rproxy_pods() {
-  kubectl -n "$RP_NS" get pods -l "$RP_SEL" -o json |
+  kubectl -n "$APP" get pods -l app.kubernetes.io/name=rproxy -o json |
     jq -r '.items[] | select(.metadata.deletionTimestamp == null and .status.phase == "Running" and .status.podIP != null)
       | "\(.metadata.name) \(.status.podIP) \(([.status.conditions[]? | select(.type == "Ready")][0].status // "False") == "True")"'
 }
@@ -535,15 +477,9 @@ all_pods_serve() {
 cond() {  # cond <kind/name> <jsonpath filter>
   kubectl -n "$APP" get "$1" -o jsonpath="$2"
 }
-# every listener Programmed (3; fleet-vip: 4 with the UDP one)
-listeners_programmed() {
-  local l
-  l=$(cond gateway/acc '{.status.listeners[*].conditions[?(@.type=="Programmed")].status}')
-  [ -n "$l" ] && ! tr ' ' '\n' <<< "$l" | grep -qvx True && [ "$(wc -w <<< "$l")" -ge 3 ]
-}
 statuses_ok() {
   [ "$(cond gateway/acc '{.status.conditions[?(@.type=="Programmed")].status}')" = True ] &&
-    listeners_programmed &&
+    [ "$(cond gateway/acc '{.status.listeners[*].conditions[?(@.type=="Programmed")].status}')" = "True True True" ] &&
     [ "$(cond httproute/echo '{.status.parents[*].conditions[?(@.type=="Accepted")].status}')" = "True True" ] &&
     [ "$(cond httproute/echo '{.status.parents[*].conditions[?(@.type=="ResolvedRefs")].status}')" = "True True" ] &&
     [ "$(cond tcproute/echo '{.status.parents[*].conditions[?(@.type=="Accepted")].status}')" = True ]
@@ -559,45 +495,6 @@ secret_serial() {
 }
 secret_changed() { local s; s=$(secret_serial); [ -n "$s" ] && [ "$s" != "$1" ]; }
 
-if [ "$MODE" = fleet-vip ]; then
-  # UDP through the VIP (rproxy answers from the address the datagram came to): a UDP listener and an
-  # echo backend (agnhost netexec answers "echo <text>" with <text>)
-  cat << YAML | kubectl apply -f - > /dev/null
-apiVersion: apps/v1
-kind: Deployment
-metadata: {name: udp-echo, namespace: $APP}
-spec:
-  replicas: 2
-  selector: {matchLabels: {app: udp-echo}}
-  template:
-    metadata: {labels: {app: udp-echo}}
-    spec:
-      containers:
-        - name: echo
-          image: registry.k8s.io/e2e-test-images/agnhost:2.53
-          args: [netexec, --http-port=8080, --udp-port=8081]
-          readinessProbe: {httpGet: {path: /healthz, port: 8080}, periodSeconds: 2}
----
-apiVersion: v1
-kind: Service
-metadata: {name: udp-echo, namespace: $APP}
-spec:
-  selector: {app: udp-echo}
-  ports: [{name: udp, port: 8081, protocol: UDP}]
----
-apiVersion: gateway.networking.k8s.io/v1alpha2
-kind: UDPRoute
-metadata: {name: udp-echo, namespace: $APP}
-spec:
-  parentRefs: [{name: acc, sectionName: udp}]
-  rules: [{backendRefs: [{name: udp-echo, port: 8081}]}]
-YAML
-  kubectl -n "$APP" patch gateway acc --type=json -p '[{"op":"add","path":"/spec/listeners/-","value":{"name":"udp","port":9001,"protocol":"UDP"}}]' > /dev/null
-  kubectl -n "$APP" rollout status deploy/udp-echo --timeout=300s
-  wait_for 120 udp_ok || { echo "UDP through the VIP never answered"; exit 1; }
-  log "UDP through the VIP answers"
-fi
-
 log "== baseline"
 wait_for 180 all_pods_serve || { echo "the rproxy pods never served"; exit 1; }
 wait_for 60 lb_host_ok echo.example.com || { echo "the Gateway address never served"; exit 1; }
@@ -606,7 +503,7 @@ kubectl -n "$APP" get pods -o wide
 kubectl -n "$NS" get pods -o wide
 {
   echo "controller: $(kubectl -n "$NS" get pods -l app.kubernetes.io/name=rproxy-gateway -o jsonpath='{.items[0].status.containerStatuses[0].imageID}')"
-  echo "rproxy: $(kubectl -n "$RP_NS" get pods -l "$RP_SEL" -o jsonpath='{.items[0].status.containerStatuses[?(@.name=="rproxy")].imageID}')"
+  echo "rproxy: $(kubectl -n "$APP" get pods -l app.kubernetes.io/name=rproxy -o jsonpath='{.items[0].status.containerStatuses[?(@.name=="rproxy")].imageID}')"
 } > "$work/images.txt"
 cat "$work/images.txt"
 
@@ -642,7 +539,7 @@ w_slices() {
       + (if .conditions.terminating then "/terminating" else "" end)] | sort | join(" "))'
 }
 w_pods() {
-  kubectl -n "$RP_NS" get pods -l "$RP_SEL" -w --output-watch-events -o json |
+  kubectl -n "$APP" get pods -l app.kubernetes.io/name=rproxy -w --output-watch-events -o json |
     jq -r --unbuffered '"pod " + (.object.metadata.name | split("-") | last) + " @" + (.object.spec.nodeName // "-")
       + " Ready=" + ([.object.status.conditions[]? | select(.type == "Ready") | .status][0] // "-")
       + " gate=" + ([.object.status.conditions[]? | select(.type == "rproxy.max3584.net/ruleset-applied") | .status][0] // "-")
@@ -655,16 +552,10 @@ w_l2() {
 w_route() {
   docker exec "$CLUSTER-frr" sh -c "while :; do echo \"route \$(ip route show $LB/32 | grep -o 'via [0-9.]*' | sort | tr '\n' ' ')\"; sleep 0.2; done"
 }
-# fleet-vip: the VIP's Lease holder, and the nodes that have the VIP on an interface
-w_lease() {
-  kubectl -n "$NS" get lease "$LEASE" -w -o json | jq -r --unbuffered '"lease holder=" + ((.spec.holderIdentity // "-") | split("-") | last)'
-}
-w_vip() { while :; do echo "vip on $(vip_nodes | tr '\n' ' ')"; sleep 0.2; done; }
 w_lb() { docker logs -f --since 1s "$CLUSTER-lb" 2>&1 | grep --line-buffered -E ' is (UP|DOWN)' | sed -u 's/^/lb /'; }
-[ "$MODE" = fleet-vip ] || watch_bg slices w_slices
+watch_bg slices w_slices
 watch_bg pods w_pods
 case "$TOPOLOGY" in
-  fleet-vip) watch_bg lease w_lease && watch_bg vip w_vip ;;
   l2-*) watch_bg l2 w_l2 ;;
   bgp) watch_bg route w_route ;;
   nodeport-lb) watch_bg lb w_lb ;;
@@ -792,10 +683,6 @@ settle() {
   wait_for "$RECOVERY_TIMEOUT" probes_ok_since "$t" || return 1
   # pods being deleted are gone (the next scenario starts from a clean placement)
   wait_for 120 none_terminating || true
-  if [ "$MODE" = fleet-vip ]; then
-    wait_for 60 vip_once || return 1
-    wait_for 60 udp_ok || return 1
-  fi
   sleep 5
 }
 none_terminating() {
@@ -816,7 +703,7 @@ announcer() {
 }
 # live rproxy pods with their nodes: name node
 rproxy_nodes() {
-  kubectl -n "$RP_NS" get pods -l "$RP_SEL" -o json |
+  kubectl -n "$APP" get pods -l app.kubernetes.io/name=rproxy -o json |
     jq -r '.items[] | select(.metadata.deletionTimestamp == null) | "\(.metadata.name) \(.spec.nodeName)"'
 }
 placement() {
@@ -1089,144 +976,6 @@ scenario_i() {
   record "$label" "$t0" "$(now_ms)" "$(secs $((t_fixed - t0)))s" "$ok" "${notes}accepted again $(secs $((t_fixed - t_bad)))s after the fix" limit
 }
 
-# ---------------------------------------------------------------- j-o. fleet-vip (MODE=fleet-vip)
-# The VIP's holder: the pod named in its Lease and that pod's node; a scenario first waits for the VIP
-# to be on exactly one node (moved: on another one)
-vip_where() {
-  HOLDER=$(vip_holder)
-  HOLDER_NODE=$(pod_node "$HOLDER")
-}
-only_fleet() {  # only_fleet <label>: SKIP outside MODE=fleet-vip
-  [ "$MODE" = fleet-vip ] && return 0
-  printf '%s\t–\t–\t–\tSKIP\tMODE=fleet-vip only\n' "$1" >> "$results"
-  return 1
-}
-# moved <from node> <since ms>: waits for the VIP on one other node; MOVED_AT (ms), MOVED_TO
-moved() {
-  if wait_for 60 vip_moved "$1"; then MOVED_AT=$(now_ms); else MOVED_AT=$(now_ms) MOVED_TO="(not moved)"; return 1; fi
-  MOVED_TO=$(vip_nodes | tr '\n' ' ')
-}
-scenario_j() {
-  local label="j. VIP holder pod deleted" t0 old ok=PASS
-  only_fleet "$label" || return 0
-  old=$(rproxy_pods | awk '{print $1}' | tr '\n' ' ')
-  vip_where
-  log "== $label: $HOLDER on $HOLDER_NODE"
-  t0=$(now_ms)
-  kubectl -n "$NS" delete pod "$HOLDER" --wait=false > /dev/null
-  moved "$HOLDER_NODE" || ok=FAIL
-  new_pods_serve "$old" "$RECOVERY_TIMEOUT" || ok=FAIL
-  settle || ok=FAIL
-  record "$label" "$t0" "$(now_ms)" "$(secs $((MOVED_AT - t0)))s" "$ok" \
-    "VIP $HOLDER_NODE → ${MOVED_TO}after $(secs $((MOVED_AT - t0)))s (seen by polling the nodes every ~0.5 s); holder now $(vip_holder); ${NEW_GAPS}" limit
-}
-scenario_k() {
-  local label="k. rollout restart (fleet DaemonSet)" t0 old ok=PASS t_rolled
-  only_fleet "$label" || return 0
-  old=$(rproxy_pods | awk '{print $1}' | tr '\n' ' ')
-  vip_where
-  log "== $label; VIP on $HOLDER_NODE"
-  t0=$(now_ms)
-  kubectl -n "$NS" rollout restart ds/rproxy > /dev/null
-  kubectl -n "$NS" rollout status ds/rproxy --timeout="${RECOVERY_TIMEOUT}s" > /dev/null || ok=FAIL
-  t_rolled=$(now_ms)
-  new_pods_serve "$old" "$RECOVERY_TIMEOUT" || ok=FAIL
-  settle || ok=FAIL
-  record "$label" "$t0" "$(now_ms)" "$(secs $((t_rolled - t0)))s" "$ok" \
-    "rollout complete after $(secs $((t_rolled - t0)))s; VIP $HOLDER_NODE → $(vip_nodes | tr '\n' ' ')(holder $(vip_holder)); ${NEW_GAPS}" limit
-}
-scenario_l() {
-  local label="l. VIP holder's node drained (cordoned: the VIP moves)" t0 ok=PASS t_drained
-  only_fleet "$label" || return 0
-  vip_where
-  log "== $label: $HOLDER_NODE; placement: $(placement)"
-  t0=$(now_ms)
-  # the VIP moves when the node is cordoned, while the drain evicts the other pods
-  kubectl drain "$HOLDER_NODE" --ignore-daemonsets --delete-emptydir-data --timeout=300s > "$work/drain.log" 2>&1 &
-  local drain=$!
-  moved "$HOLDER_NODE" || ok=FAIL
-  wait "$drain" || ok=FAIL
-  t_drained=$(now_ms)
-  settle || ok=FAIL
-  record "$label" "$t0" "$(now_ms)" "$(secs $((MOVED_AT - t0)))s" "$ok" \
-    "VIP $HOLDER_NODE → ${MOVED_TO}after $(secs $((MOVED_AT - t0)))s; kubectl drain took $(secs $((t_drained - t0)))s (the fleet's pods stay: a DaemonSet)" limit
-  kubectl uncordon "$HOLDER_NODE" > /dev/null
-}
-# first_ok <from ms>: seconds from <from> to the first 200 after the first failure (any probe)
-first_ok() {
-  local p t best=""
-  for p in http https tcp; do
-    t=$(awk -v s="$1" '$1 >= s { if ($2 != "200") bad = 1; else if (bad) { print $1; exit } }' "$work/probe-$p.log")
-    if [ -n "$t" ] && { [ -z "$best" ] || [ "$t" -lt "$best" ]; }; then best=$t; fi
-  done
-  if [ -n "$best" ]; then secs $((best - $1)); else echo "–"; fi
-}
-# node_lost <kill|pause> <label>: the VIP holder's node killed or paused (the Lease expires: record only)
-node_lost() {
-  local how=$1 label=$2 t0 ok=PASS t_ok t_end notes node
-  vip_where
-  node=$HOLDER_NODE
-  log "== $label: $node ($HOLDER); placement: $(placement)"
-  t0=$(now_ms)
-  docker "$how" "$node" > /dev/null
-  moved "$node" || ok=FAIL
-  sleep 3
-  if wait_for "$RECOVERY_TIMEOUT" probes_stable 5; then t_ok=$(($(now_ms) - 5000)); else t_ok=$(now_ms) ok=FAIL; fi
-  t_end=$(now_ms)
-  notes="VIP $node → ${MOVED_TO}after $(secs $((MOVED_AT - t0)))s; first 200 again after $(first_ok "$t0")s; steady again (5 s without a failure) by $(secs $((t_ok - t0)))s (requests rproxy sends to the echo pod on that node fail until the node is NotReady)"
-  if [ "$how" = pause ]; then
-    sleep 15
-    docker unpause "$node" > /dev/null
-    # the paused holder comes back believing it holds the VIP: it must let go (its Lease is another's)
-    local t_back
-    t_back=$(now_ms)
-    sleep 1
-    if wait_for 30 vip_once; then
-      notes+="; unpaused after $(secs $((t_back - t0)))s: on one node again $(secs $(($(now_ms) - t_back)))s later ($(vip_nodes | tr '\n' ' '))"
-    else
-      ok=FAIL notes+="; unpaused: the VIP stayed on $(vip_nodes | tr '\n' ' ')"
-    fi
-  else
-    docker start "$node" > /dev/null
-    # the address the node comes back with (docker may give it another one)
-    notes+="; started again as $(kind_ip "$node")"
-  fi
-  wait_for 300 node_ready "$node" || ok=FAIL
-  settle || ok=FAIL
-  record "$label" "$t0" "$t_end" "$(secs $((t_ok - t0)))s" "$ok" "$notes"
-}
-scenario_m() {
-  # docker kill: lost at once (docker stop shuts the node down cleanly: its pods stop and the VIP is
-  # handed over like a drain)
-  local label="m. VIP holder's node lost (docker kill)"
-  only_fleet "$label" || return 0
-  node_lost kill "$label"
-}
-scenario_n() {
-  local label="n. VIP holder's node paused (docker pause, then unpause)"
-  only_fleet "$label" || return 0
-  node_lost pause "$label"
-}
-scenario_o() {
-  local label="o. control plane paused (hold: the VIP stays)" t0 ok=PASS cp t_back notes before
-  only_fleet "$label" || return 0
-  cp=$(kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[0].metadata.name}')
-  vip_where
-  before=$(vip_nodes | tr '\n' ' ')
-  log "== $label: $cp for 20 s; VIP on $before"
-  t0=$(now_ms)
-  docker pause "$cp" > /dev/null
-  sleep 20
-  notes="during the pause the VIP was on $(vip_nodes | tr '\n' ' ')"
-  docker unpause "$cp" > /dev/null
-  t_back=$(now_ms)
-  wait_for 120 kubectl get --raw /readyz || ok=FAIL
-  sleep 10
-  settle || ok=FAIL
-  notes+="; API server back $(secs $(($(now_ms) - t_back)))s after the unpause; VIP $before→ $(vip_nodes | tr '\n' ' ')(holder $(vip_holder))"
-  record "$label" "$t0" "$(now_ms)" "–" "$ok" "$notes" limit
-}
-
 # ---------------------------------------------------------------- u. the UI (UI=true)
 # The UI chart of UI_DIR (a checkout of TCP-UDP-rproxy-ui; its image built from it) with the bundled
 # MariaDB, reading the Gateway's rproxy pods through the controller's discovery Secret (ui.namespace).
@@ -1391,7 +1140,6 @@ stop_probes
     l2-cluster) echo "MetalLB $METALLB_VERSION L2, externalTrafficPolicy Cluster." ;;
     bgp) echo "MetalLB $METALLB_VERSION BGP (FRR mode, BFD 300 ms x 3) to an FRR router ($FRR_IMAGE) with ECMP over the announcing nodes (externalTrafficPolicy $ETP)." ;;
     nodeport-lb) echo "NodePort Services (externalTrafficPolicy $ETP) behind HAProxy ($HAPROXY_IMAGE, TCP, checks every 500 ms, a failed connection marks the node down and goes to another)." ;;
-    fleet-vip) echo "fleet mode (a DaemonSet with hostNetwork on every worker) with the VIP $VIP held by the fleet's pods directly (the vip sidecar, Lease $LEASE; no Service or load balancer). MetalLB L2 for comparison: the managed runs (l2-local, l2-cluster; docs/DESIGN-v0.4.x.md 6.2)." ;;
   esac
   echo "kind 1 control plane + 3 workers, cert-manager $CERT_MANAGER_VERSION, Gateway API $GATEWAY_API_VERSION experimental."
   echo "Controller replicas 2, managed.replicas $MANAGED_REPLICAS. Extra helm flags: \`${HELM_ARGS:-none}\`. Probes: HTTP, HTTPS, TCP through the Gateway's address every 100 ms, a new connection each."
@@ -1404,7 +1152,7 @@ stop_probes
   echo "|---|---|---|---|---|---|"
   awk -F'\t' '{ printf "| %s | %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5, $6 }' "$results"
   echo
-  echo "PASS (outage): requests failed but everything recovered (recorded, not a failure). info (network-dependent): over the gap limit in the bgp topology, whose gaps are the network's convergence (recorded, not a failure); a lost node (g, m, n) is recorded only in every topology. SKIP: the placement or topology did not allow the scenario. FAIL: routes never recovered, the certificate never rotated or the state was not restored (timeouts: recovery ${RECOVERY_TIMEOUT}s, leader ${LEADER_TIMEOUT}s, route change ${APPLY_TIMEOUT}s, rotation ${ROTATE_TIMEOUT}s)$([ "$MANAGED_REPLICAS" -ge 2 ] && [ "$TOPOLOGY" != bgp ] && echo ", or a pod deletion, drain, rollout restart or parameters change left a gap over ${GAP_LIMIT}s$([ "$STRICT" = true ] && echo " or any failed request (STRICT)")")."
+  echo "PASS (outage): requests failed but everything recovered (recorded, not a failure). info (network-dependent): over the gap limit in the bgp topology, whose gaps are the network's convergence (recorded, not a failure); a lost node (g) is recorded only in every topology. SKIP: the placement or topology did not allow the scenario. FAIL: routes never recovered, the certificate never rotated or the state was not restored (timeouts: recovery ${RECOVERY_TIMEOUT}s, leader ${LEADER_TIMEOUT}s, route change ${APPLY_TIMEOUT}s, rotation ${ROTATE_TIMEOUT}s)$([ "$MANAGED_REPLICAS" -ge 2 ] && [ "$TOPOLOGY" != bgp ] && echo ", or a pod deletion, drain, rollout restart or parameters change left a gap over ${GAP_LIMIT}s$([ "$STRICT" = true ] && echo " or any failed request (STRICT)")")."
   echo
   echo "Nodes: $(tr '\n' ' ' < "$work/nodes.txt")"
   for f in "$work"/timeline-*.txt; do
