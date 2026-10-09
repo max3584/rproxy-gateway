@@ -421,6 +421,18 @@ fleet:
 - UDP は最初と各シナリオの後に VIP から答えが返った（`IP_PKTINFO` で VIP から返す）。
 - 要約の `vip` の行が空になるところは、ランナーから `docker exec` でノードを読めなかったとき（プローブは成功している）。
 
+### 7.10 v0.4.5 で足した形：VIP ごとの待ち受け（10. Q19 の見直し）
+
+v0.4.4 では fleet のルールは `0.0.0.0` で待ち受けるので、2 つ目の Gateway が同じポートを使うと rproxy が `409` で断る（VIP が違っても）。rproxy-api v0.4.3 の `listen_freebind`（まだノードにないアドレスで待ち受ける、`IP_FREEBIND`）を使い、Gateway ごとに自分の VIP で待ち受けられるようにした。
+
+- 値：`fleet.vip.listen: wildcard | vip`（既定 `wildcard` で v0.4.4 と同じ）。`vip` でコントローラに `RPROXY_GATEWAY_FLEET_VIP_LISTEN=vip`。
+- 待ち受けるアドレス：Gateway の `spec.addresses` のうち使える VIP、なければ使える VIP すべて（IPv4 が `listen_addr`、残りは `extra_listen_addrs`）。持ち主がいるかどうかでは変えない（`listen_freebind` で、VIP を持っていないノードの rproxy も同じルールで待ち受け、VIP が来たらそのまま届く。VIP が動いてもルールは変わらない）。ルールのキーは `tcp/<VIP>:443` になる。
+- rproxy の版：fleet の Pod の rproxy がすべて `features.listen_freebind` を持つときだけ（答えた Pod のどれかが持たなければ `wildcard` に戻してログ。まだ答えていない新しい Pod では戻さない）。fleet の Pod を作り直す必要はない（ルールごとの印）。
+- 取り合い：fleet ではすべての Gateway のルールが同じ rproxy に入る。同じアドレス（か、それを含むワイルドカード）の同じポートを 2 つの Gateway が使うと、**古い Gateway**（作られた時刻、次に namespace・名前）が持ち、後の Gateway のそのルールは組から外してリスナーを `Accepted: False`（`PortUnavailable`、「tcp/192.0.2.10:443 is used by Gateway ns/name」）にする。今までは先に反映された方が勝ち、後の方は rproxy の `409` の文が `Programmed: False` に出ていた（`wildcard` でも同じ判定を使うので、2 つの Gateway が同じポートを使うときの勝ち負けが決まる）。rproxy の `409` は残る（判定のずれの守り）。
+- UDP：特定のアドレスで待ち受けるので、返信は VIP から出る（`IP_PKTINFO` は要らない）。
+- 守り：`vip` では、ある VIP に来たものはその VIP の Gateway にだけ届き、ノードの IP では受けない（[SECURITY.md](SECURITY.md)）。
+- 受け入れ：入力 `vip_listen: vip`（VIP 2 つ、Gateway `acc` は 1 つ目だけ）と `rproxy_ref`（rproxy を rproxy-api のブランチ・タグから作る）。シナリオ q：2 つ目の VIP に別の namespace の Gateway を 80・443・UDP 9001 で作り、両方が Programmed で VIP ごとにそれぞれのバックエンドに届くこと、1 つ目の VIP の 80 を求めた 3 つ目の Gateway が `PortUnavailable` になり 1 つ目が乱れないこと（`GAP_LIMIT`）。`vip` では Pod ごとの確認（`pod_serves`）は、その Pod のノードが VIP の 80・443・9000 で待ち受けていること（`ss`）で見る。
+
 ## 8. 受け入れテスト（`acceptance.yml`）の変更
 
 | 入力 | 既定 | 中身 | 入れる PR |
@@ -463,7 +475,7 @@ fleet:
 | Q9 | Kubernetes のルールを UI の利用者に見せるか | **管理者だけ**。namespace と Keycloak のグループの対応は後で |
 | Q17 | F の方式 | **案 1b：fleet + 自前の `rproxy-gateway vip`（Lease、gratuitous ARP / NA）** |
 | Q18 | API サーバに届かないときの VIP | **`hold`**（ほかの MAC が同じ VIP を告げたらすぐ手放す） |
-| Q19 | VIP ごとに待ち受けを分けるか | **分けない**（`0.0.0.0` のまま）。要るなら rproxy-api に `IP_FREEBIND` の issue |
+| Q19 | VIP ごとに待ち受けを分けるか | v0.4.4 は**分けない**（`0.0.0.0` のまま）。v0.4.5 で `fleet.vip.listen: vip` を足した（rproxy-api v0.4.3 の `listen_freebind`。既定は `wildcard` のまま。7.10） |
 | Q20 | VIP を Gateway が新しく求められるか | **管理者の一覧だけ**（Gateway は一覧から選ぶ） |
 | Q21 | Lease の既定 | **期限 3 秒・更新 1 秒・やり直し 0.5 秒** |
 | Q22 | F をいつ出すか | v0.4 の系列の別のパッチ（A〜E を待たせない） |

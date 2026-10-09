@@ -72,6 +72,11 @@ RPROXY_GATEWAY_FLEET_ADDRESS: {{ join "," . | quote }}
 {{- if .Values.fleet.vip.enabled }}
 RPROXY_GATEWAY_FLEET_VIPS: {{ include "rproxy-gateway.vips" . | quote }}
 RPROXY_GATEWAY_ADDRESS_CIDR: {{ join "," .Values.managed.addressCIDRs | quote }}
+{{- if eq (.Values.fleet.vip.listen | default "wildcard") "vip" }}
+RPROXY_GATEWAY_FLEET_VIP_LISTEN: "vip"
+{{- else if ne (.Values.fleet.vip.listen | default "wildcard") "wildcard" }}
+{{- fail "fleet.vip.listen: wildcard or vip" }}
+{{- end }}
 {{- end }}
 {{- else }}
 RPROXY_GATEWAY_MODE: "managed"

@@ -198,6 +198,9 @@ pub struct Fleet {
 	pub addresses: Vec<String>,
 	/// VIPs the fleet's `vip` sidecars hold (canonical addresses): the fleet's addresses instead.
 	pub vips: Vec<String>,
+	/// With VIPs: each Gateway's rules listen on its VIPs (`listen_freebind`) instead of the
+	/// wildcard, so Gateways on different VIPs can use the same port (`--fleet-vip-listen vip`).
+	pub listen_on_vips: bool,
 }
 
 /// A short, DNS-safe id of a Gateway: `<namespace>-<name>` (cut) and a hash of

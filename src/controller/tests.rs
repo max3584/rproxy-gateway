@@ -389,6 +389,55 @@ async fn a_refused_rule_does_not_stop_the_others() {
 	assert_eq!(fake.lock().unwrap().puts.len(), 2);
 }
 
+/// fleet: two Gateways on the same port on two VIPs both keep it; a third on one of those VIPs (or a
+/// wildcard next to them) loses to the older one and says so on its listener.
+#[test]
+fn fleet_gateways_share_a_port_on_different_addresses() {
+	use crate::render::ListenerPlan;
+	use crate::render::status::{Cond, get};
+	let gw = |name: &str, created: &str| -> crate::k8s::gateway::Gateway {
+		serde_json::from_value(json!({
+			"apiVersion": "gateway.networking.k8s.io/v1", "kind": "Gateway",
+			"metadata": {"name": name, "namespace": "default", "creationTimestamp": created},
+			"spec": {"gatewayClassName": "rproxy", "listeners": []}
+		}))
+		.unwrap()
+	};
+	let on = |name: &str, addr: &str| {
+		let mut p = plan(443, &[]);
+		p.name = name.into();
+		p.ruleset = format!("k8s/default/{name}");
+		p.rules[0].listen_addr = addr.into();
+		p.rules[0].listen_freebind = addr != "0.0.0.0";
+		let key = p.rules[0].key();
+		p.listeners = vec![ListenerPlan {
+			name: "https".into(),
+			supported_kinds: vec![],
+			attached: 1,
+			conds: vec![Cond::ok("Accepted", "Accepted")],
+			rule_key: Some(key),
+			servable: true,
+		}];
+		p
+	};
+	let (a, b, c) = (gw("a", "2026-01-01T00:00:00Z"), gw("b", "2026-01-02T00:00:00Z"), gw("c", "2026-01-03T00:00:00Z"));
+	// listed newest first: the order does not decide, the age does
+	let mut rendered = vec![(&c, on("c", "192.0.2.10")), (&b, on("b", "192.0.2.11")), (&a, on("a", "192.0.2.10"))];
+	fleet_conflicts(&mut rendered);
+	let (pc, pb, pa) = (&rendered[0].1, &rendered[1].1, &rendered[2].1);
+	assert_eq!((pa.rules.len(), pb.rules.len(), pc.rules.len()), (1, 1, 0), "a and b keep 443 on their VIPs; c loses");
+	assert_eq!(pb.rules[0].key(), "tcp/192.0.2.11:443");
+	let acc = get(&pc.listeners[0].conds, "Accepted").unwrap();
+	assert_eq!((acc.status, acc.reason.as_str()), (false, "PortUnavailable"));
+	assert!(acc.message.contains("Gateway default/a") && acc.message.contains("tcp/192.0.2.10:443"), "{}", acc.message);
+	assert!(pc.listeners[0].rule_key.is_none() && !pc.listeners[0].servable);
+	assert!(get(&pa.listeners[0].conds, "Accepted").unwrap().status);
+	// a wildcard takes the port on every address
+	let mut rendered = vec![(&b, on("b", "192.0.2.11")), (&a, on("a", "0.0.0.0"))];
+	fleet_conflicts(&mut rendered);
+	assert_eq!((rendered[1].1.rules.len(), rendered[0].1.rules.len()), (1, 0), "the older wildcard keeps the port");
+}
+
 #[test]
 fn supported_features_match_the_conformance_script() {
 	let script = include_str!("../../scripts/conformance.sh");

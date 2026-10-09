@@ -363,6 +363,7 @@ async fn reconcile_all(
 	let mut pod_done: Vec<(String, bool)> = vec![];
 	let opts = render::Options {
 		listen_addrs: cfg.listen_addrs.clone(),
+		listen_freebind: false,
 		cert_dir: provision::CERT_DIR.into(),
 		labels: true,
 		migration: cfg.migration.clone(),
@@ -371,6 +372,34 @@ async fn reconcile_all(
 		raw_rules: !matches!(cfg.mode, Mode::Fleet(_)) || cfg.fleet_rproxy_rules,
 		cross_namespace_secrets: cfg.cross_namespace_secrets,
 		params: params_opts.clone(),
+	};
+	// fleet: the pods (every Gateway's)
+	let fleet_eps = match &cfg.mode {
+		Mode::Fleet(f) => provision::pods(&pods_now, &cfg.namespace, &provision::parse_selector(&f.selector)),
+		Mode::Managed(_) => vec![],
+	};
+	// fleet with VIPs: which can be used, who holds them
+	let vips = match &cfg.mode {
+		Mode::Fleet(f) if !f.vips.is_empty() => {
+			let host_ips: Vec<String> = fleet_eps.iter().filter_map(|e| e.host_ip.clone()).collect();
+			let unusable: BTreeMap<String, String> = f
+				.vips
+				.iter()
+				.filter_map(|v| fleet_vip::unusable(&world, v, &cfg.address_cidrs, &host_ips).map(|why| (v.clone(), why)))
+				.collect();
+			{
+				let mut seen = VIPS_SEEN.lock().unwrap();
+				for why in unusable.values() {
+					if seen.insert(why.clone()) {
+						warn!(reason = %why, "a VIP is not used");
+					}
+				}
+			}
+			let holders = fleet_vip::holders(client, &cfg.namespace, &f.vips).await;
+			soon |= holders.values().any(|h| matches!(h, fleet_vip::Holder::Unheld(_)));
+			Some(VipState { unusable, holders })
+		}
+		_ => None,
 	};
 	let mut rendered: Vec<(&crate::k8s::gateway::Gateway, GatewayPlan)> = vec![];
 	for gw in world.gateways.iter().filter(|g| classes.contains(&g.spec.gateway_class_name)) {
@@ -384,13 +413,28 @@ async fn reconcile_all(
 			Mode::Fleet(f) => provision::pods(&pods_now, &cfg.namespace, &provision::parse_selector(&f.selector)),
 		};
 		let features = pod_features(rp, &eps, &mut state.caps).await;
-		let opts = render::Options { features, ..opts.clone() };
+		let mut opts = render::Options { features, ..opts.clone() };
+		// fleet listening on VIPs: the Gateway's own VIPs (rproxy that has listen_freebind)
+		if let (Mode::Fleet(f), Some(v)) = (&cfg.mode, vips.as_ref()) {
+			if f.listen_on_vips && fleet_freebind(&eps, &state.caps) {
+				let requested = render::gateway_addresses(gw).map(|(a, _)| a).unwrap_or_default();
+				let addrs = fleet_vip::listen_vips(&requested, &f.vips, &v.unusable);
+				if !addrs.is_empty() {
+					opts.listen_addrs = addrs;
+					opts.listen_freebind = true;
+				}
+			}
+		}
 		rendered.push((gw, render::render_gateway(&world, gw, &opts)));
+	}
+	// fleet: the same port on the same address in two Gateways: the older Gateway keeps it
+	if matches!(cfg.mode, Mode::Fleet(_)) {
+		fleet_conflicts(&mut rendered);
 	}
 	// fleet: one certificate Secret with every Gateway's files, mounted into every pod
 	let fleet_pods = match &cfg.mode {
-		Mode::Fleet(f) => {
-			let eps = provision::pods(&pods_now, &cfg.namespace, &provision::parse_selector(&f.selector));
+		Mode::Fleet(_) => {
+			let eps = fleet_eps.clone();
 			let mut files = BTreeMap::new();
 			for (_, plan) in rendered.iter().filter(|(_, p)| p.accepted()) {
 				files.extend(plan.files.iter().map(|(k, v)| (k.clone(), v.clone())));
@@ -411,29 +455,6 @@ async fn reconcile_all(
 			eps
 		}
 		Mode::Managed(_) => vec![],
-	};
-	// fleet with VIPs: which can be used, who holds them
-	let vips = match &cfg.mode {
-		Mode::Fleet(f) if !f.vips.is_empty() => {
-			let host_ips: Vec<String> = fleet_pods.iter().filter_map(|e| e.host_ip.clone()).collect();
-			let unusable: BTreeMap<String, String> = f
-				.vips
-				.iter()
-				.filter_map(|v| fleet_vip::unusable(&world, v, &cfg.address_cidrs, &host_ips).map(|why| (v.clone(), why)))
-				.collect();
-			{
-				let mut seen = VIPS_SEEN.lock().unwrap();
-				for why in unusable.values() {
-					if seen.insert(why.clone()) {
-						warn!(reason = %why, "a VIP is not used");
-					}
-				}
-			}
-			let holders = fleet_vip::holders(client, &cfg.namespace, &f.vips).await;
-			soon |= holders.values().any(|h| matches!(h, fleet_vip::Holder::Unheld(_)));
-			Some(VipState { unusable, holders })
-		}
-		_ => None,
 	};
 	let pass = Pass {
 		client,
@@ -991,6 +1012,61 @@ async fn write_crd_status(
 		if let Some(api) = dyn_api(client, cache, "RproxyRule", Some(&ns)) {
 			if let Err(e) = patch_status(&api, &name, new).await {
 				warn!(rule = format!("{ns}/{name}"), error = %e, "cannot write RproxyRule status");
+			}
+		}
+	}
+}
+
+/// Whether the fleet's rproxy has `listen_freebind` (rproxy v0.4.3): every pod that answered says so.
+/// Kept while pods are not asked yet (a new pod does not move every Gateway back to the wildcard for a
+/// pass); a pod that says it has not turns it off.
+static FLEET_FREEBIND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn fleet_freebind(eps: &[Endpoint], caps: &HashMap<String, Capabilities>) -> bool {
+	use std::sync::atomic::Ordering;
+	let known: Vec<bool> = eps.iter().filter_map(|ep| caps.get(&ep.uid).map(|c| c.feature("listen_freebind"))).collect();
+	if known.iter().any(|k| !k) {
+		if FLEET_FREEBIND.swap(false, Ordering::Relaxed) {
+			warn!("a fleet pod's rproxy has no listen_freebind (rproxy v0.4.3): Gateways listen on the wildcard again");
+		}
+		return false;
+	}
+	if !known.is_empty() && !FLEET_FREEBIND.swap(true, Ordering::Relaxed) {
+		info!("the fleet's rproxy has listen_freebind: Gateways listen on their VIPs");
+	}
+	FLEET_FREEBIND.load(Ordering::Relaxed)
+}
+
+/// fleet: every Gateway's rules go to the same rproxy, which refuses a rule that takes a port another
+/// set holds on the same address (or a wildcard covering it). The older Gateway (then by namespace and
+/// name) keeps it; the other's rule is left out and its listeners say why (`Accepted: False`,
+/// `PortUnavailable`), instead of whichever was applied first winning.
+fn fleet_conflicts(rendered: &mut [(&crate::k8s::gateway::Gateway, GatewayPlan)]) {
+	let mut order: Vec<usize> = (0..rendered.len()).filter(|i| rendered[*i].1.accepted()).collect();
+	order.sort_by_key(|i| {
+		let m = &rendered[*i].0.metadata;
+		(m.creation_timestamp.as_ref().map(|t| t.0), m.namespace.clone(), m.name.clone())
+	});
+	let mut taken: Vec<(crate::rproxy::model::Rule, String)> = vec![];
+	for i in order {
+		let plan = &mut rendered[i].1;
+		let owner = format!("{}/{}", plan.namespace, plan.name);
+		let mut lost: Vec<(String, String)> = vec![];
+		plan.rules.retain(|r| match taken.iter().find(|(t, _)| t.overlaps(r)) {
+			Some((t, other)) => {
+				lost.push((r.key(), format!("{} is used by Gateway {other} ({}): pick another port or address", r.key(), t.key())));
+				false
+			}
+			None => true,
+		});
+		taken.extend(plan.rules.iter().map(|r| (r.clone(), owner.clone())));
+		for (key, why) in lost {
+			warn!(gateway = owner, rule = key, reason = why, "listener port taken by another Gateway");
+			let listeners = plan.listeners.iter_mut().chain(plan.listener_sets.iter_mut().flat_map(|s| s.listeners.iter_mut()));
+			for l in listeners.filter(|l| l.rule_key.as_deref() == Some(key.as_str())) {
+				render::status::set(&mut l.conds, render::status::Cond::new("Accepted", false, "PortUnavailable", why.clone()));
+				l.rule_key = None;
+				l.servable = false;
 			}
 		}
 	}

@@ -14,6 +14,9 @@ pub struct Rule {
 	pub listen_port: u16,
 	#[serde(skip_serializing_if = "Vec::is_empty")]
 	pub extra_listen_addrs: Vec<String>,
+	/// Listen while the addresses are not on the node yet (fleet VIPs; rproxy v0.4.3).
+	#[serde(skip_serializing_if = "std::ops::Not::not")]
+	pub listen_freebind: bool,
 	#[serde(skip_serializing_if = "Vec::is_empty")]
 	pub targets: Vec<Target>,
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -31,6 +34,31 @@ impl Rule {
 	/// rproxy's name of the rule: `tcp/0.0.0.0:443`.
 	pub fn key(&self) -> String {
 		rule_key(self.protocol, &self.listen_addr, self.listen_port)
+	}
+
+	/// Whether rproxy would refuse the two side by side (`409 already_exists`): the same protocol,
+	/// overlapping ports, and an address of one equal to, or covered by a wildcard of, the other's
+	/// (rproxy-api `net::listen::clash`: `::` without other addresses also takes IPv4).
+	pub fn overlaps(&self, other: &Rule) -> bool {
+		let ports = |r: &Rule| {
+			let end = r.extra.get("listen_port_end").and_then(Value::as_u64).and_then(|p| u16::try_from(p).ok()).unwrap_or(r.listen_port);
+			(r.listen_port, end.max(r.listen_port))
+		};
+		let ((a0, a1), (b0, b1)) = (ports(self), ports(other));
+		if self.protocol != other.protocol || a0 > b1 || b0 > a1 {
+			return false;
+		}
+		let ips = |r: &Rule| -> Vec<std::net::IpAddr> {
+			std::iter::once(&r.listen_addr).chain(&r.extra_listen_addrs).filter_map(|a| a.trim_matches(['[', ']']).parse().ok()).collect()
+		};
+		let covers = |wild: std::net::IpAddr, v6only: bool, ip: std::net::IpAddr| match wild {
+			std::net::IpAddr::V4(w) if w.is_unspecified() => ip.is_ipv4(),
+			std::net::IpAddr::V6(w) if w.is_unspecified() => !v6only || ip.is_ipv6(),
+			_ => false,
+		};
+		let (av, bv) = (!self.extra_listen_addrs.is_empty(), !other.extra_listen_addrs.is_empty());
+		let bs = ips(other);
+		ips(self).into_iter().any(|x| bs.iter().any(|y| x == *y || covers(x, av, *y) || covers(*y, bv, x)))
 	}
 }
 
@@ -336,5 +364,27 @@ mod tests {
 		let p = v.condition("Programmed");
 		assert_eq!((p.status.as_str(), p.reason.as_str(), p.message.as_str()), ("False", "Failed", "bind: in use"));
 		assert_eq!(v.condition("Accepted").status, "True");
+	}
+
+	#[test]
+	fn rules_overlap_like_rproxy() {
+		let r = |p: Protocol, addr: &str, extra: &[&str], port: u16| Rule {
+			protocol: p,
+			listen_addr: addr.into(),
+			listen_port: port,
+			extra_listen_addrs: extra.iter().map(|s| s.to_string()).collect(),
+			..Default::default()
+		};
+		let t = Protocol::Tcp;
+		assert!(!r(t, "192.0.2.10", &[], 443).overlaps(&r(t, "192.0.2.11", &[], 443)), "two VIPs share a port");
+		assert!(r(t, "192.0.2.10", &[], 443).overlaps(&r(t, "192.0.2.10", &[], 443)));
+		assert!(!r(t, "192.0.2.10", &[], 443).overlaps(&r(Protocol::Udp, "192.0.2.10", &[], 443)), "tcp and udp");
+		assert!(!r(t, "192.0.2.10", &[], 443).overlaps(&r(t, "192.0.2.10", &[], 80)));
+		assert!(r(t, "0.0.0.0", &[], 443).overlaps(&r(t, "192.0.2.10", &[], 443)), "a wildcard takes every address");
+		assert!(r(t, "192.0.2.10", &[], 443).overlaps(&r(t, "0.0.0.0", &[], 443)));
+		assert!(r(t, "::", &[], 443).overlaps(&r(t, "192.0.2.10", &[], 443)), "a dual-stack :: takes IPv4");
+		assert!(!r(t, "0.0.0.0", &["::"], 443).overlaps(&r(t, "2001:db8::10", &["192.0.2.10"], 80)));
+		assert!(r(t, "192.0.2.11", &["2001:db8::10"], 443).overlaps(&r(t, "192.0.2.10", &["2001:db8::10"], 443)), "an extra address");
+		assert!(r(t, "192.0.2.10", &["2001:db8::10"], 443).overlaps(&r(t, "0.0.0.0", &[], 443)));
 	}
 }

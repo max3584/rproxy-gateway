@@ -8,6 +8,8 @@ name: acceptance
 #   gh workflow run acceptance.yml --ref <branch> -f source=checkout -f topology=bgp
 # fleet with a VIP held by the fleet's pods (the vip sidecar), e.g.
 #   gh workflow run acceptance.yml --ref <branch> -f source=checkout -f mode=fleet-vip
+# fleet listening on each Gateway's VIPs (fleet.vip.listen=vip; rproxy built from an rproxy-api ref), e.g.
+#   gh workflow run acceptance.yml --ref <branch> -f source=checkout -f mode=fleet-vip -f vip_listen=vip -f rproxy_ref=master
 # The UI (TCP-UDP-rproxy-ui's chart and image from ui_ref, bundled MariaDB) only, e.g.
 #   gh workflow run acceptance.yml --ref <branch> -f source=checkout -f ui=true -f ui_ref=main -f scenarios=u
 on:
@@ -65,6 +67,16 @@ on:
         description: "TCP-UDP-rproxy-ui branch, tag or SHA (ui)"
         required: false
         default: main
+      rproxy_ref:
+        description: "rproxy-api branch, tag or SHA to build the rproxy image from (empty: the chart's image)"
+        required: false
+        default: ""
+      vip_listen:
+        description: "mode fleet-vip: fleet.vip.listen (vip: two VIPs, scenario q puts a second Gateway on the same ports; needs rproxy v0.4.3, e.g. rproxy_ref)"
+        required: false
+        default: wildcard
+        type: choice
+        options: [wildcard, vip]
 
 permissions:
   contents: read
@@ -91,10 +103,28 @@ jobs:
           name: rproxy-gateway
           path: dist/amd64/rproxy-gateway
 
+  rproxy:
+    name: rproxy (rproxy-api)
+    if: inputs.rproxy_ref != ''
+    runs-on: ubuntu-latest
+    container: alpine:3.24
+    steps:
+      - name: packages
+        run: apk add --no-cache bash git tar zstd curl gcc musl-dev
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build
+        shell: bash
+        run: scripts/build-rproxy.sh "${{ inputs.rproxy_ref }}" dist/amd64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rproxy-api
+          path: dist/amd64/rproxy-api
+
   acceptance:
     name: acceptance (${{ inputs.source || 'published' }}, ${{ inputs.mode == 'fleet-vip' && 'fleet-vip' || inputs.topology || 'l2-local' }})
-    needs: build
-    if: ${{ !cancelled() && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    needs: [build, rproxy]
+    if: ${{ !cancelled() && (needs.build.result == 'success' || needs.build.result == 'skipped') && (needs.rproxy.result == 'success' || needs.rproxy.result == 'skipped') }}
     # kind runs the nodes as Docker containers: on the runner VM (like e2e)
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -104,6 +134,11 @@ jobs:
         if: inputs.source == 'checkout'
         with:
           name: rproxy-gateway
+          path: dist/amd64
+      - uses: actions/download-artifact@v4
+        if: inputs.rproxy_ref != ''
+        with:
+          name: rproxy-api
           path: dist/amd64
       - uses: actions/checkout@v4
         if: inputs.ui
@@ -125,9 +160,11 @@ jobs:
           HELM_ARGS: ${{ inputs.helm_args }}
           GAP_LIMIT: ${{ inputs.gap_limit || '3' }}
           STRICT: ${{ inputs.strict && 'true' || 'false' }}
-          # fleet-vip: its own default (j k l o n m) unless scenarios are given
-          SCENARIOS: ${{ (inputs.mode == 'fleet-vip' && inputs.scenarios == 'a b1 b2 c d e f g h i') && 'j k l o n m' || inputs.scenarios || 'a b1 b2 c d e f g h i' }}
+          # fleet-vip: its own default (j k l o n m; q first with vip_listen vip) unless scenarios are given
+          SCENARIOS: ${{ (inputs.mode == 'fleet-vip' && inputs.scenarios == 'a b1 b2 c d e f g h i') && (inputs.vip_listen == 'vip' && 'q j k l o n m' || 'j k l o n m') || inputs.scenarios || 'a b1 b2 c d e f g h i' }}
           UI: ${{ inputs.ui && 'true' || 'false' }}
+          VIP_LISTEN: ${{ inputs.vip_listen || 'wildcard' }}
+          RPROXY_IMAGE_FROM: ${{ inputs.rproxy_ref != '' && 'dist' || 'chart' }}
           UI_DIR: ${{ github.workspace }}/ui-src
         run: scripts/acceptance.sh
       - uses: actions/upload-artifact@v4

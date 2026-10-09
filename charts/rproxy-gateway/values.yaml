@@ -139,6 +139,12 @@ fleet:
     # the API server cannot be reached: hold (keep the VIP while rproxy is ready; another MAC announcing
     # it makes the pod let go) or release (drop it when the Lease would have expired)
     onApiUnreachable: hold
+    # where Gateways' listeners listen: wildcard (rproxy.listenAddresses: every Gateway's port on every
+    # address, so two Gateways cannot use the same port) or vip (each Gateway on its own VIPs, those of
+    # spec.addresses, else every VIP: Gateways on different VIPs can use the same port, and traffic to
+    # one VIP reaches only its Gateways). vip needs rproxy v0.4.3 (listen_freebind); with an older
+    # rproxy the controller keeps the wildcard
+    listen: wildcard
     # /metrics (rproxy_vip_held, rproxy_vip_transitions_total) and /healthz on the node's IP
     metricsPort: 9445
     resources:
