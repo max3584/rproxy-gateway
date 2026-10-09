@@ -30,7 +30,7 @@ A Kubernetes controller for [rproxy](https://github.com/max3584/rproxy-api). It 
 | `RproxyGatewayParameters` (GatewayClass and Gateway `parametersRef`) | managed rproxy per Gateway (replicas, PDB, resources, pod and Service settings, rproxy's performance settings) |
 | Migration (`--migrate-to`) | reads Ingress and Traefik's IngressRoute, IngressRouteTCP, IngressRouteUDP, Middleware, TLSOption ([docs/en/MIGRATION.md](docs/en/MIGRATION.md)) |
 
-Decisions and the mapping tables: [docs/en/DESIGN.md](docs/en/DESIGN.md). Gateway API conformance results: [docs/en/CONFORMANCE.md](docs/en/CONFORMANCE.md). Tenant separation, what is off by default, and permissions: [docs/en/SECURITY.md](docs/en/SECURITY.md). The design of what the v0.4 patches add for running on Kubernetes (rproxy settings per Gateway, Kustomize, the UI, VIPs): [docs/en/DESIGN-v0.4.x.md](docs/en/DESIGN-v0.4.x.md).
+Decisions and the mapping tables: [docs/en/DESIGN.md](docs/en/DESIGN.md). Gateway API conformance results: [docs/en/CONFORMANCE.md](docs/en/CONFORMANCE.md). Tenant separation, what is off by default, and permissions: [docs/en/SECURITY.md](docs/en/SECURITY.md). The design of what the v0.4 patches add for running on Kubernetes (rproxy settings per Gateway, Kustomize, the UI): [docs/en/DESIGN-v0.4.x.md](docs/en/DESIGN-v0.4.x.md). Providing Gateways' addresses on the platform (MetalLB, kube-vip, Cilium, cloud load balancers, NodePort + your own L4, keepalived for fleet): [docs/en/PLATFORM.md](docs/en/PLATFORM.md).
 
 ## Installing
 
@@ -76,16 +76,7 @@ spec:
 ```
 - To show Gateways' rproxy, read only, in the management UI ([TCP-UDP-rproxy-ui](https://github.com/max3584/TCP-UDP-rproxy-ui)'s chart, installed apart), set the chart's `ui.namespace` to the UI's namespace. The controller writes the Secret `rproxy-ui-discovery` there (rproxy pods, the CA certificate, read-only tokens). rproxy v0.4.2 reads a changed token file again, so setting `ui.namespace` and showing or hiding a Gateway do not roll the pods (pods show in the UI once they take its token, within a minute or two; older rproxy images roll the pods once). Hide a Gateway with `ui: {visible: false}` in its parameters ([docs/en/SECURITY.md](docs/en/SECURITY.md), "Showing Gateways to the UI").
 - The controller runs 2 replicas by default; they elect a leader with a Lease and only it applies rule sets (docs/en/DESIGN.md, "High availability").
-- With `fleet.enabled=true`, the chart's DaemonSet (`hostNetwork: true`) runs rproxy, which serves every Gateway. When it stops it keeps accepting for `fleet.shutdown.delay` (5 s by default) and waits for open connections up to `fleet.shutdown.drain` (25 s by default). Point the health check of the load balancer or VIP in front at `https://<node>:9443/readyz` (503 once it starts stopping), and make the delay longer than it takes to take the node out.
-- To have the fleet's pods hold VIPs directly, use `fleet.vip` (no Service or load balancer; [docs/en/DESIGN-v0.4.x.md](docs/en/DESIGN-v0.4.x.md) 7.). The `vip` sidecar (`NET_ADMIN` and `NET_RAW` in that container only) of the pod that takes a VIP's Lease adds the VIP to its node's interface and sends gratuitous ARP (unsolicited NA for IPv6). Only pods whose rproxy is ready and has its rule sets hold VIPs, and they let them go first when rproxy drains, the pod stops or the node is cordoned (a drain), so a planned move takes under a second (a lost node: the Lease's duration, 3 s by default). Keep the VIPs inside `managed.addressCIDRs`; Gateways pick VIPs with `spec.addresses` (none: all). The namespace's PodSecurity is `privileged` ([docs/en/SECURITY.md](docs/en/SECURITY.md), "fleet VIPs").
-  ```yaml
-  fleet:
-    enabled: true
-    vip:
-      enabled: true
-      addresses: ["192.0.2.10", {address: "192.0.2.11", interface: eth1, nodeSelector: {zone: a}}]
-  managed: {addressCIDRs: [192.0.2.0/24]}
-  ```
+- With `fleet.enabled=true`, the chart's DaemonSet (`hostNetwork: true`) runs rproxy, which serves every Gateway. When it stops it keeps accepting for `fleet.shutdown.delay` (5 s by default) and waits for open connections up to `fleet.shutdown.drain` (25 s by default). Point the health check of the load balancer or VIP in front at `https://<node>:9443/readyz` (503 once it starts stopping), and make the delay longer than it takes to take the node out. rproxy-gateway does not hold addresses (VIPs) itself (v0.4.4's `fleet.vip` was removed in v0.4.5): keepalived, your own L4, or a Service selecting the fleet's pods are in [docs/en/PLATFORM.md](docs/en/PLATFORM.md), "fleet".
 - Chart values: [charts/rproxy-gateway/values.yaml](charts/rproxy-gateway/values.yaml). The controller's settings are passed in a ConfigMap `rproxy-gateway-config` (`RPROXY_GATEWAY_*` environment variables); `controller.extraArgs` stay arguments and win over it.
 
 ### Installing without Helm (kubectl, Kustomize)
@@ -96,7 +87,7 @@ Releases carry manifests rendered from the chart: `install.yaml` (managed), `ins
 kubectl apply --server-side -f https://github.com/max3584/rproxy-gateway/releases/download/v<version>/install.yaml
 ```
 
-With Kustomize, use [config/default](config/default) (fleet: [config/fleet](config/fleet)) as the base. The controller's settings are the `RPROXY_GATEWAY_*` of `rproxy-gateway controller --help`, changed with a `configMapGenerator` and `behavior: merge` (the ConfigMap's name gets a hash, so a change rolls the controller). Examples: [config/samples](config/samples) (image digests, managed replicas, one controller replica, the class's default `RproxyGatewayParameters` (the chart's `managed.parameters`), fleet VIPs (the chart's `fleet.vip`, rendered for an example VIP)).
+With Kustomize, use [config/default](config/default) (fleet: [config/fleet](config/fleet)) as the base. The controller's settings are the `RPROXY_GATEWAY_*` of `rproxy-gateway controller --help`, changed with a `configMapGenerator` and `behavior: merge` (the ConfigMap's name gets a hash, so a change rolls the controller). Examples: [config/samples](config/samples) (image digests, managed replicas, one controller replica, the class's default `RproxyGatewayParameters` (the chart's `managed.parameters`)).
 
 ```yaml
 apiVersion: kustomize.config.k8s.io/v1beta1
@@ -116,6 +107,8 @@ configMapGenerator:
 ## Availability (`managed.replicas` 2 or more)
 
 rproxy pods become Ready only once the controller has applied their rule set (a readiness gate), and when they stop they keep accepting for 15 s after SIGTERM (`managed.shutdown.delay`) while `/readyz` takes them out of the Service, then close their listeners and let open connections end for up to 25 s (`managed.shutdown.drain`) (rproxy v0.4.1; older rproxy images: a 15 s preStop). `managed.preStopSeconds` is unset by default from 0.4.2; if you set it for 0.4.1, that preStop stays on every pod and the delay and drain follow it (remove the value if you do not need it). Each Gateway gets a PodDisruptionBudget and its pods spread over nodes (docs/en/DESIGN.md, "rproxy availability").
+
+Platform setup per shape (MetalLB L2, BGP + BFD, kube-vip, Cilium, cloud, NodePort + HAProxy, ClusterIP): [docs/en/PLATFORM.md](docs/en/PLATFORM.md).
 
 The acceptance test (kind 1+3 nodes, `managed.replicas=2`, HTTP, HTTPS and TCP every 100 ms on new connections), longest time without an answer (s):
 
