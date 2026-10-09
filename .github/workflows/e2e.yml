@@ -27,7 +27,7 @@ env:
   CARGO_TERM_COLOR: always
   # rproxy-api master has the rule sets (#28) and the Gateway API settings (#237); another ref
   # (a release tag, a branch) by hand
-  RPROXY_REF: ${{ inputs.rproxy_ref || 'feat/forward-auth-ext-authz' }}
+  RPROXY_REF: ${{ inputs.rproxy_ref || 'master' }}
 
 jobs:
   build:
