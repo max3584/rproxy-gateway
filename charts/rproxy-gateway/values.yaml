@@ -113,6 +113,13 @@ fleet:
   shutdown: {delay: 5s, drain: 25s}
   # RproxyRules (off: the fleet's pods are shared by every Gateway; fleet is for one trust domain)
   rproxyRules: false
+  # where Gateways' listeners listen: wildcard (rproxy.listenAddresses on every node: one Gateway per
+  # port) or addresses (a Gateway with spec.addresses listens on those only, inside
+  # managed.addressCIDRs, whether a node has them yet or not: Gateways on different addresses can use
+  # the same port, and traffic to an address reaches only its Gateways; the platform puts the
+  # addresses on the nodes: MetalLB, kube-vip, keepalived... Gateways without spec.addresses keep the
+  # wildcard). addresses needs rproxy v0.4.3 (listen_freebind); with an older rproxy the wildcard is kept
+  listen: wildcard
 
 # what every backend the controller renders gets (the pods of the Services behind HTTPRoutes,
 # GRPCRoutes, TLSRoutes, TCPRoutes, UDPRoutes), unless an RproxyPolicy sets outlierDetection

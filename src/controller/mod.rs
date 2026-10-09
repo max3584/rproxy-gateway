@@ -369,6 +369,7 @@ async fn reconcile_all(
 	let mut pod_done: Vec<(String, bool)> = vec![];
 	let opts = render::Options {
 		listen_addrs: cfg.listen_addrs.clone(),
+		listen_freebind: false,
 		cert_dir: provision::CERT_DIR.into(),
 		labels: true,
 		migration: cfg.migration.clone(),
@@ -391,8 +392,22 @@ async fn reconcile_all(
 			Mode::Fleet(f) => provision::pods(&pods_now, &cfg.namespace, &provision::parse_selector(&f.selector)),
 		};
 		let features = pod_features(rp, &eps, &mut state.caps).await;
-		let opts = render::Options { features, ..opts.clone() };
+		let mut opts = render::Options { features, ..opts.clone() };
+		// fleet listening on Gateways' addresses: a Gateway with spec.addresses (allowed by --address-cidr)
+		// listens on them (rproxy with listen_freebind: whether a node has them yet or not)
+		if let Mode::Fleet(f) = &cfg.mode {
+			if f.listen_on_addresses && fleet_freebind(&eps, &state.caps) {
+				if let Some(addrs) = listen_addresses(gw, &cfg.address_cidrs) {
+					opts.listen_addrs = addrs;
+					opts.listen_freebind = true;
+				}
+			}
+		}
 		rendered.push((gw, render::render_gateway(&world, gw, &opts)));
+	}
+	// fleet: the same port on the same address in two Gateways: the older Gateway keeps it
+	if matches!(cfg.mode, Mode::Fleet(_)) {
+		fleet_conflicts(&mut rendered);
 	}
 	// fleet: one certificate Secret with every Gateway's files, mounted into every pod
 	let fleet_pods = match &cfg.mode {
@@ -831,6 +846,9 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 			};
 			let addrs = if plan.addresses.is_empty() {
 				addrs
+			} else if f.listen_on_addresses {
+				// fleet.listen=addresses: its own addresses (checked against --address-cidr by the render)
+				plan.addresses.clone()
 			} else {
 				// the fleet's addresses are fixed: an address asked for must be one of them
 				if let Some(a) = plan.addresses.iter().find(|a| !addrs.contains(a)) {
@@ -952,6 +970,78 @@ async fn write_crd_status(
 		if let Some(api) = dyn_api(client, cache, "RproxyRule", Some(&ns)) {
 			if let Err(e) = patch_status(&api, &name, new).await {
 				warn!(rule = format!("{ns}/{name}"), error = %e, "cannot write RproxyRule status");
+			}
+		}
+	}
+}
+
+/// Whether the fleet's rproxy has `listen_freebind` (rproxy v0.4.3): every pod that answered says so.
+/// Kept while pods are not asked yet (a new pod does not move every Gateway back to the wildcard for a
+/// pass); a pod that says it has not turns it off.
+static FLEET_FREEBIND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn fleet_freebind(eps: &[Endpoint], caps: &HashMap<String, Capabilities>) -> bool {
+	use std::sync::atomic::Ordering;
+	let known: Vec<bool> = eps.iter().filter_map(|ep| caps.get(&ep.uid).map(|c| c.feature("listen_freebind"))).collect();
+	if known.iter().any(|k| !k) {
+		if FLEET_FREEBIND.swap(false, Ordering::Relaxed) {
+			warn!("a fleet pod's rproxy has no listen_freebind (rproxy v0.4.3): Gateways listen on the wildcard again");
+		}
+		return false;
+	}
+	if !known.is_empty() && !FLEET_FREEBIND.swap(true, Ordering::Relaxed) {
+		info!("the fleet's rproxy has listen_freebind: Gateways with spec.addresses listen on them");
+	}
+	FLEET_FREEBIND.load(Ordering::Relaxed)
+}
+
+/// fleet.listen=addresses: where a Gateway's rules listen: its `spec.addresses` when every one is inside
+/// `--address-cidr` (IPv4 first: the first is `listen_addr`, the rest `extra_listen_addrs`); `None`: the
+/// wildcard (no addresses, or one the render refuses: `AddressNotUsable`).
+fn listen_addresses(gw: &crate::k8s::gateway::Gateway, cidrs: &[render::Cidr]) -> Option<Vec<String>> {
+	let (mut ips, unusable) = render::gateway_addresses(gw).ok()?;
+	if ips.is_empty() || unusable.is_some() {
+		return None;
+	}
+	let allowed = |a: &String| a.parse::<std::net::IpAddr>().is_ok_and(|ip| cidrs.iter().any(|c| c.contains(ip)));
+	if !ips.iter().all(allowed) {
+		return None;
+	}
+	ips.dedup();
+	ips.sort_by_key(|a| a.contains(':'));
+	Some(ips)
+}
+
+/// fleet: every Gateway's rules go to the same rproxy, which refuses a rule that takes a port another
+/// set holds on the same address (or a wildcard covering it). The older Gateway (then by namespace and
+/// name) keeps it; the other's rule is left out and its listeners say why (`Accepted: False`,
+/// `PortUnavailable`), instead of whichever was applied first winning.
+fn fleet_conflicts(rendered: &mut [(&crate::k8s::gateway::Gateway, GatewayPlan)]) {
+	let mut order: Vec<usize> = (0..rendered.len()).filter(|i| rendered[*i].1.accepted()).collect();
+	order.sort_by_key(|i| {
+		let m = &rendered[*i].0.metadata;
+		(m.creation_timestamp.as_ref().map(|t| t.0), m.namespace.clone(), m.name.clone())
+	});
+	let mut taken: Vec<(crate::rproxy::model::Rule, String)> = vec![];
+	for i in order {
+		let plan = &mut rendered[i].1;
+		let owner = format!("{}/{}", plan.namespace, plan.name);
+		let mut lost: Vec<(String, String)> = vec![];
+		plan.rules.retain(|r| match taken.iter().find(|(t, _)| t.overlaps(r)) {
+			Some((t, other)) => {
+				lost.push((r.key(), format!("{} is used by Gateway {other} ({}): pick another port or address", r.key(), t.key())));
+				false
+			}
+			None => true,
+		});
+		taken.extend(plan.rules.iter().map(|r| (r.clone(), owner.clone())));
+		for (key, why) in lost {
+			warn!(gateway = owner, rule = key, reason = why, "listener port taken by another Gateway");
+			let listeners = plan.listeners.iter_mut().chain(plan.listener_sets.iter_mut().flat_map(|s| s.listeners.iter_mut()));
+			for l in listeners.filter(|l| l.rule_key.as_deref() == Some(key.as_str())) {
+				render::status::set(&mut l.conds, render::status::Cond::new("Accepted", false, "PortUnavailable", why.clone()));
+				l.rule_key = None;
+				l.servable = false;
 			}
 		}
 	}

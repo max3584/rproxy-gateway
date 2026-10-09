@@ -404,8 +404,24 @@ fleet:
 
 ### Gateways' `spec.addresses` and `addressCIDRs`
 
-- Today: a fleet Gateway's `spec.addresses` must be one of `fleet.addresses` (others: `Programmed: False`, `AddressNotUsable`). rproxy listens on `0.0.0.0`, so even with several VIPs listed in `fleet.addresses` the same port cannot go to different Gateways per VIP (any VIP with a matching port is taken).
-- Coming (a PR in progress): fleet's rproxy listens per Gateway on its `spec.addresses` (rproxy's `listen_freebind`, rproxy-api #257). The addresses must be inside `managed.addressCIDRs`, and rproxy can listen before the VIP reaches that node, so the keepalived or Service VIPs above can be split per Gateway as they are. This section will be updated once it is merged.
+- `fleet.listen: wildcard` (the default): a fleet Gateway's `spec.addresses` must be one of `fleet.addresses` (others: `Programmed: False`, `AddressNotUsable`). rproxy listens on `0.0.0.0`, so even with several VIPs listed in `fleet.addresses` the same port cannot go to different Gateways per VIP (any VIP with a matching port is taken).
+- `fleet.listen: addresses` (v0.4.5, rproxy v0.4.3's `listen_freebind`): the rules of a Gateway with `spec.addresses` listen on those addresses only ([DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) 12.). The addresses must be inside `managed.addressCIDRs` (the chart passes them as `--address-cidr`). Every fleet pod listens even before the VIP reaches its node, so the keepalived or Service VIPs above can be split per Gateway as they are (different VIPs can use the same port; traffic to an address reaches only its Gateway). Gateways without `spec.addresses` stay on `0.0.0.0`. The same port on the same address (or `0.0.0.0`) belongs to the older Gateway; the newer one's listener is `Accepted: False` (`PortUnavailable`). The Gateway's `status.addresses` are its `spec.addresses`.
+
+```yaml
+fleet:
+  enabled: true
+  listen: addresses
+managed:
+  addressCIDRs: [192.0.2.10/32, 192.0.2.11/32]   # VIPs keepalived, MetalLB... put on the nodes
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {name: web-a, namespace: team-a}
+spec:
+  gatewayClassName: rproxy
+  addresses: [{type: IPAddress, value: 192.0.2.10}]
+  listeners: [{name: https, port: 443, protocol: HTTPS, tls: {certificateRefs: [{name: web-a}]}}]
+```
 
 ## ClusterIP (in-cluster only)
 

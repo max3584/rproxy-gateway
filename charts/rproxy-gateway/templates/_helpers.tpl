@@ -86,6 +86,13 @@ RPROXY_GATEWAY_FLEET_RPROXY_RULES: "true"
 {{- with .Values.fleet.addresses }}
 RPROXY_GATEWAY_FLEET_ADDRESS: {{ join "," . | quote }}
 {{- end }}
+{{- $listen := .Values.fleet.listen | default "wildcard" }}
+{{- if eq $listen "addresses" }}
+RPROXY_GATEWAY_FLEET_LISTEN: "addresses"
+RPROXY_GATEWAY_ADDRESS_CIDR: {{ join "," .Values.managed.addressCIDRs | quote }}
+{{- else if ne $listen "wildcard" }}
+{{- fail "fleet.listen: wildcard or addresses" }}
+{{- end }}
 {{- else }}
 RPROXY_GATEWAY_MODE: "managed"
 RPROXY_GATEWAY_RPROXY_IMAGE: {{ include "rproxy-gateway.rproxyImage" . | quote }}

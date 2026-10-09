@@ -469,3 +469,88 @@ spec:
 	drop(rp);
 	let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// fleet listening on addresses (rproxy v0.4.3 `listen_freebind`): two Gateways' sets on the same port on
+/// two addresses not on the host both run; a third set on one of them is refused for that rule.
+#[tokio::test]
+async fn two_gateways_on_one_port_on_two_addresses() {
+	let Some(bin) = rproxy_bin() else { return };
+	let _ = rustls::crypto::ring::default_provider().install_default();
+	let dir = std::env::temp_dir().join(format!("rproxy-gateway-vips-{}", std::process::id()));
+	let _ = std::fs::remove_dir_all(&dir);
+	std::fs::create_dir_all(&dir).unwrap();
+	let backend = echo_backend().await;
+	let [port, api] = free_ports();
+	let rp = Rproxy::start(&bin, &dir, api);
+	rp.wait().await;
+	let client = Client::new(None, TOKEN).unwrap();
+	let caps = client.capabilities(SocketAddr::from(([127, 0, 0, 1], api))).await.unwrap();
+	if !caps.feature("listen_freebind") {
+		eprintln!("rproxy {} has no listen_freebind (v0.4.3); skipped", caps.version);
+		return;
+	}
+	let gateways: String = ["a", "b", "c"]
+		.iter()
+		.map(|n| {
+			format!(
+				r#"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {{name: {n}, namespace: default, generation: 1}}
+spec:
+  gatewayClassName: rproxy
+  listeners: [{{name: tcp, port: {port}, protocol: TCP}}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata: {{name: {n}, namespace: default}}
+spec:
+  parentRefs: [{{name: {n}}}]
+  rules: [{{backendRefs: [{{name: echo, port: 80}}]}}]
+"#
+			)
+		})
+		.collect();
+	let yaml = format!(
+		r#"
+apiVersion: v1
+kind: Service
+metadata: {{name: echo, namespace: default}}
+spec: {{ports: [{{name: http, port: 80}}]}}
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata: {{name: echo-1, namespace: default, labels: {{kubernetes.io/service-name: echo}}}}
+addressType: IPv4
+ports: [{{name: http, port: {backend}}}]
+endpoints: [{{addresses: [127.0.0.1]}}]
+{gateways}"#
+	);
+	let mut world = World::default();
+	world.read_manifests(&yaml).unwrap();
+	let ep = Endpoint { pod: "rproxy".into(), uid: "1".into(), ip: "127.0.0.1".into(), api_port: api, ..Default::default() };
+	let mut applied = Applied::new();
+	let mut caps_cache = HashMap::new();
+	// TEST-NET-3 addresses: on no interface of the test host
+	for (i, vip) in ["203.0.113.20", "203.0.113.21", "203.0.113.20"].iter().enumerate() {
+		let opts = render::Options {
+			listen_addrs: vec![vip.to_string()],
+			listen_freebind: true,
+			features: render::Features::of(&caps),
+			..Default::default()
+		};
+		let plan = render::render_gateway(&world, &world.gateways[i], &opts);
+		let (r, _) = sync_pod(&client, &ep, &plan, &mut applied, &mut caps_cache).await;
+		let PodSync::Synced(views) = r else { panic!("{r:?}") };
+		let key = format!("tcp/{vip}:{port}");
+		let v = views.iter().find(|v| v.key() == key).unwrap_or_else(|| panic!("{key}: {views:?}"));
+		if i < 2 {
+			assert_eq!(v.state, "running", "{key}: {:?}", v.error);
+		} else {
+			// the controller leaves it out first (fleet_conflicts); rproxy refuses it too
+			assert_eq!(v.state, "failed", "{key}");
+			assert!(v.error.as_deref().unwrap_or("").contains("k8s/default/a"), "{:?}", v.error);
+		}
+	}
+}

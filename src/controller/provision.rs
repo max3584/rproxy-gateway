@@ -196,6 +196,9 @@ pub struct Fleet {
 	pub selector: String,
 	/// Addresses written to Gateway status (else the pods' host IPs).
 	pub addresses: Vec<String>,
+	/// A Gateway with `spec.addresses` listens on them (`listen_freebind`) instead of the wildcard, so
+	/// Gateways on different addresses can use the same port (`--fleet-listen addresses`).
+	pub listen_on_addresses: bool,
 }
 
 /// A short, DNS-safe id of a Gateway: `<namespace>-<name>` (cut) and a hash of

@@ -34,6 +34,8 @@ use world::World;
 pub struct Options {
 	/// The listen addresses: the first is `listen_addr`, the rest `extra_listen_addrs`.
 	pub listen_addrs: Vec<String>,
+	/// Rules listen with `listen_freebind` (fleet VIPs not on every node).
+	pub listen_freebind: bool,
 	/// Where certsync writes certificate files on the rproxy host.
 	pub cert_dir: String,
 	/// Whether rproxy takes `labels` (`features.labels`).
@@ -167,6 +169,7 @@ impl Default for Options {
 	fn default() -> Self {
 		Options {
 			listen_addrs: vec!["0.0.0.0".into()],
+			listen_freebind: false,
 			cert_dir: "/var/run/rproxy-gateway/certs".into(),
 			labels: true,
 			migration: None,
@@ -1586,6 +1589,7 @@ fn new_rule(protocol: rp::Protocol, port: u16, opts: &Options) -> rp::Rule {
 		listen_addr: opts.listen_addrs[0].clone(),
 		listen_port: port,
 		extra_listen_addrs: opts.listen_addrs[1..].to_vec(),
+		listen_freebind: opts.listen_freebind,
 		..Default::default()
 	}
 }

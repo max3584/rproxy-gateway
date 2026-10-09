@@ -16,7 +16,7 @@ English: [en/SECURITY.md](en/SECURITY.md)
 ## managed と fleet
 
 - **managed（既定）**：Gateway ごとに、Gateway の namespace に rproxy を置く。制御 API の証明書とトークンは Gateway ごと（CA が `<id>.rproxy-api.rproxy-gateway.internal` に出したもの、マスタートークンから HMAC で導いたもの）。テナントを分けるのはこちら。
-- **fleet**：すべての Gateway が同じ rproxy の Pod（hostNetwork の DaemonSet）を使う。**1 つの信頼の範囲（1 人の管理者）のためのもの**で、テナントを分けない。すべての Gateway の証明書を 1 つの Secret（`rproxy-fleet-certs`）にまとめて全 Pod に渡し、ノードのポートは先に取った Gateway のもの（後から来たものは `Programmed: False`）。fleet では RproxyRule を既定で読まない（`fleet.rproxyRules` / `--fleet-rproxy-rules`）。
+- **fleet**：すべての Gateway が同じ rproxy の Pod（hostNetwork の DaemonSet）を使う。**1 つの信頼の範囲（1 人の管理者）のためのもの**で、テナントを分けない。すべての Gateway の証明書を 1 つの Secret（`rproxy-fleet-certs`）にまとめて全 Pod に渡し、ノードのポートは古い Gateway のもの（後の Gateway のリスナーは `Accepted: False`・`PortUnavailable`、v0.4.5）。`fleet.listen: addresses`（v0.4.5、rproxy v0.4.3）では `spec.addresses` を持つ Gateway が自分のアドレス（`managed.addressCIDRs` の内）でだけ待ち受けるので、アドレスが違えば同じポートを使え、あるアドレスに来たものはその Gateway にだけ届く（アドレスをノードに置くのは MetalLB・kube-vip・keepalived などプラットフォームの側）。fleet では RproxyRule を既定で読まない（`fleet.rproxyRules` / `--fleet-rproxy-rules`）。
 
 ## テナントの入力への制限
 

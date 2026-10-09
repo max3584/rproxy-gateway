@@ -106,6 +106,11 @@ struct ControllerArgs {
 	/// fleet: addresses written to Gateway status (default: the pods' host IPs).
 	#[arg(long, env = "RPROXY_GATEWAY_FLEET_ADDRESS", value_delimiter = ',')]
 	fleet_address: Vec<String>,
+	/// fleet: where Gateways' rules listen. `wildcard` (--listen-addr: every Gateway's port on every
+	/// address) or `addresses` (a Gateway with spec.addresses, inside --address-cidr, on those only, so
+	/// Gateways on different addresses can use the same port; rproxy with features.listen_freebind, v0.4.3).
+	#[arg(long, env = "RPROXY_GATEWAY_FLEET_LISTEN", default_value = "wildcard", value_parser = ["wildcard", "addresses"])]
+	fleet_listen: String,
 	/// rproxy's passive health checks (`outlier_detection` of `http` services, rproxy's L7 keys as
 	/// `key=value,...`) every HTTPRoute / GRPCRoute backend gets unless an RproxyPolicy sets them. "": none.
 	#[arg(long, env = "RPROXY_GATEWAY_BACKEND_OUTLIER_HTTP", default_value = "consecutive_gateway_failures=3,consecutive_5xx=0,ejection_time=10s,max_ejection_time=1m,max_ejected_percent=50", value_parser = key_values)]
@@ -333,7 +338,11 @@ fn main() -> anyhow::Result<()> {
 			init_logging(&cli.log_format);
 			let backends = backend_defaults(&a);
 			let mode = match a.mode.as_str() {
-				"fleet" => Mode::Fleet(Fleet { selector: a.fleet_selector, addresses: a.fleet_address }),
+				"fleet" => Mode::Fleet(Fleet {
+					selector: a.fleet_selector,
+					addresses: a.fleet_address,
+					listen_on_addresses: a.fleet_listen == "addresses",
+				}),
 				_ => Mode::Managed(Managed {
 					rproxy_image: a.rproxy_image,
 					controller_image: a.controller_image,
