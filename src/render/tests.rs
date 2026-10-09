@@ -293,6 +293,14 @@ stringData: {{tls.crt: nope, tls.key: nope}}
 	let tls = &rules.iter().find(|r| r["listen_port"] == 443).unwrap()["tls"];
 	assert_eq!(tls["mode"], "terminate");
 	assert_eq!(tls["certificates"].as_array().unwrap().len(), 1);
+	// a request for b.example.com on a connection made for another name (and the reverse) gets 421
+	assert_eq!(tls["misdirected"], json!({"groups": [["*"], ["b.example.com"]]}));
+	let w = world(&yaml);
+	let old = Options { features: Features { misdirected: false, ..Default::default() }, ..Default::default() };
+	let rules = render_gateway(&w, &w.gateways[0], &old).rules_json();
+	assert!(rules.iter().find(|r| r["listen_port"] == 443).unwrap()["tls"].get("misdirected").is_none(), "an older rproxy");
+	let rules = p.rules_json();
+	let tls = &rules.iter().find(|r| r["listen_port"] == 443).unwrap()["tls"];
 	let file = tls["certificates"][0]["cert_file"].as_str().unwrap();
 	let name = file.rsplit('/').next().unwrap();
 	assert_eq!(p.files[name], crt.as_bytes());
@@ -378,6 +386,158 @@ spec:
 	);
 	assert_eq!(route("default/f/r2/m0/h0")["middlewares"], json!([http::RESPOND_500]));
 	assert_eq!(cond(&p.parents[0].conds, "ResolvedRefs").reason, "BackendNotFound");
+}
+
+#[test]
+fn filters_on_backend_refs() {
+	let yaml = format!(
+		"{BASE}{}{}",
+		gw("  - {name: http, port: 8080, protocol: HTTP}"),
+		r#"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: b, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  rules:
+    - matches: [{path: {value: /b}}]
+      backendRefs:
+        - name: web
+          port: 80
+          filters:
+            - type: CORS
+              cors: {allowOrigins: ["https://www.foo.com"], allowMethods: [GET]}
+            - type: RequestMirror
+              requestMirror: {backendRef: {name: api, namespace: other, port: 8000}, percent: 50}
+        - name: web
+          port: 80
+          filters:
+            - type: RequestRedirect
+              requestRedirect: {scheme: https, statusCode: 302}
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata: {name: g, namespace: other}
+spec:
+  from: [{group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: default}]
+  to: [{group: "", kind: Service}]
+"#
+	);
+	let p = plan(&yaml);
+	assert!(cond(&p.parents[0].conds, "Accepted").status, "{:?}", p.parents[0].conds);
+	let http = &p.rules_json()[0]["http"];
+	let servers = http["services"]["default/b/r0"]["servers"].as_array().unwrap().clone();
+	let mws = |s: &serde_json::Value| -> Vec<serde_json::Value> {
+		s["middlewares"].as_array().unwrap().iter().map(|n| http["middlewares"][n.as_str().unwrap()].clone()).collect()
+	};
+	let first = mws(&servers[0]);
+	assert_eq!(first[0]["cors"]["allow_origins"], json!(["https://www.foo.com"]));
+	let mirror = first[1]["mirror"].clone();
+	assert_eq!(mirror["percent"], 50);
+	assert_eq!(http["services"][mirror["service"].as_str().unwrap()]["servers"], json!([{"url": "http://10.1.0.1:9000"}]));
+	let last = mws(servers.last().unwrap());
+	assert_eq!(last[0]["redirect_regex"]["replacement"], "https://${1}${2}${3}");
+	assert_eq!(last[0]["redirect_regex"]["status"], 302);
+	// an rproxy that runs only rewrites per server
+	let w = world(&yaml);
+	for features in [
+		Features { server_cors: false, ..Default::default() },
+		Features { server_mirror: false, ..Default::default() },
+		Features { server_redirect: false, ..Default::default() },
+	] {
+		let p = render_gateway(&w, &w.gateways[0], &Options { features, ..Default::default() });
+		let c = cond(&p.parents[0].conds, "Accepted");
+		assert_eq!((c.status, c.reason.as_str()), (false, "UnsupportedValue"));
+		assert!(c.message.contains("server_middleware_kinds"), "{}", c.message);
+	}
+}
+
+#[test]
+fn external_auth() {
+	let yaml = format!(
+		"{BASE}{}{}",
+		gw("  - {name: http, port: 8080, protocol: HTTP}"),
+		r#"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: ea, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  rules:
+    - matches: [{path: {value: /http}}]
+      filters:
+        - type: ExternalAuth
+          externalAuth:
+            protocol: HTTP
+            backendRef: {name: api, namespace: other, port: 8000}
+            http: {path: auth, allowedHeaders: [X-Tenant, authorization]}
+            forwardBody: {maxSize: 1024}
+      backendRefs: [{name: web, port: 80}]
+    - matches: [{path: {value: /grpc}}]
+      filters:
+        - type: ExternalAuth
+          externalAuth: {protocol: GRPC, backendRef: {name: api, namespace: other, port: 8000}, grpc: {}}
+      backendRefs: [{name: web, port: 80}]
+    - matches: [{path: {value: /gone}}]
+      filters:
+        - type: ExternalAuth
+          externalAuth: {protocol: HTTP, backendRef: {name: nothing, port: 80}}
+      backendRefs: [{name: web, port: 80}]
+    - matches: [{path: {value: /per-backend}}]
+      backendRefs:
+        - name: web
+          port: 80
+          filters:
+            - type: ExternalAuth
+              externalAuth: {protocol: GRPC, backendRef: {name: api, namespace: other, port: 8000}, grpc: {allowedHeaders: [Authorization]}}
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata: {name: g, namespace: other}
+spec:
+  from: [{group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: default}]
+  to: [{group: "", kind: Service}]
+"#
+	);
+	let p = plan(&yaml);
+	assert!(cond(&p.parents[0].conds, "Accepted").status, "{:?}", p.parents[0].conds);
+	assert_eq!(cond(&p.parents[0].conds, "ResolvedRefs").reason, "BackendNotFound", "the /gone auth server");
+	let http = &p.rules_json()[0]["http"];
+	let route = |n: &str| http["routes"].as_array().unwrap().iter().find(|r| r["name"] == n).unwrap().clone();
+	let mw = |r: &serde_json::Value, i: usize| http["middlewares"][r["middlewares"][i].as_str().unwrap()].clone();
+	let fa = mw(&route("default/ea/r0/m0/h0"), 0)["forward_auth"].clone();
+	assert_eq!(
+		fa,
+		json!({"service": "default/ea/r0/f0/extauth", "path": "/auth", "client_request": true, "allow_status": ["200"],
+			"request_headers": ["authorization", "x-tenant"], "response_headers": ["*"], "forward_body": {"max_size": 1024}})
+	);
+	assert_eq!(http["services"]["default/ea/r0/f0/extauth"]["servers"], json!([{"url": "http://10.1.0.1:9000"}]));
+	let g = mw(&route("default/ea/r1/m0/h0"), 0)["forward_auth"].clone();
+	assert_eq!(g, json!({"service": "default/ea/r1/f0/extauth", "protocol": "grpc"}), "no headers listed: all");
+	assert_eq!(http["services"]["default/ea/r1/f0/extauth"]["protocol"], "h2c");
+	// an auth server that cannot be asked: the rule answers 500 instead of letting requests through
+	let gone = route("default/ea/r2/m0/h0");
+	assert!(gone.get("service").is_none());
+	assert_eq!(gone["middlewares"], json!([http::RESPOND_500]));
+	// on a backendRef: that server's middlewares
+	let server = &http["services"]["default/ea/r3"]["servers"][0];
+	let per = &http["middlewares"][server["middlewares"][0].as_str().unwrap()]["forward_auth"];
+	assert_eq!((per["protocol"].as_str(), per["request_headers"].clone()), (Some("grpc"), json!(["authorization"])));
+	// an rproxy without these
+	let w = world(&yaml);
+	for features in [
+		Features { ext_auth_http: false, ..Default::default() },
+		Features { ext_auth_grpc: false, ..Default::default() },
+		Features { ext_auth_body: false, ..Default::default() },
+		Features { server_forward_auth: false, ..Default::default() },
+	] {
+		let p = render_gateway(&w, &w.gateways[0], &Options { features: features.clone(), ..Default::default() });
+		let c = cond(&p.parents[0].conds, "Accepted");
+		assert_eq!((c.status, c.reason.as_str()), (false, "UnsupportedValue"), "{features:?}");
+		assert!(c.message.contains("forward_auth"), "{}", c.message);
+	}
 }
 
 #[test]

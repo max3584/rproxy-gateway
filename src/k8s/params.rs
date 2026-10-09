@@ -48,7 +48,7 @@ impl JsonSchema for IntOrStr {
 #[derive(CustomResource, Clone, Debug, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[kube(
 	group = "rproxy.max3584.net",
-	version = "v1alpha1",
+	version = "v1beta1",
 	kind = "RproxyGatewayParameters",
 	plural = "rproxygatewayparameters",
 	namespaced,

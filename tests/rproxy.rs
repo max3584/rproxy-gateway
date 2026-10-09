@@ -104,6 +104,31 @@ async fn echo_backend() -> u16 {
 	port
 }
 
+/// An HTTP auth server (Envoy's ext_authz over HTTP): 200 with `x-test: <path>` for
+/// `authorization: allow`, 403 for anything else.
+async fn auth_backend() -> u16 {
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let port = listener.local_addr().unwrap().port();
+	tokio::spawn(async move {
+		loop {
+			let Ok((tcp, _)) = listener.accept().await else { continue };
+			tokio::spawn(async move {
+				let svc = hyper::service::service_fn(|req: hyper::Request<hyper::body::Incoming>| async move {
+					let allowed = req.headers().get("authorization").is_some_and(|v| v == "allow");
+					let resp = hyper::Response::builder()
+						.status(if allowed { 200 } else { 403 })
+						.header("x-test", format!("checked {}", req.uri().path()))
+						.body(http_body_util::Full::new(hyper::body::Bytes::from("auth")))
+						.unwrap();
+					Ok::<_, std::convert::Infallible>(resp)
+				});
+				let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(tcp), svc).await;
+			});
+		}
+	});
+	port
+}
+
 /// A UDP echo.
 async fn udp_echo() -> u16 {
 	let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -121,8 +146,13 @@ async fn udp_echo() -> u16 {
 
 /// One HTTP/1.1 request over a plain connection: (status, headers + body text).
 async fn get(port: u16, host: &str, path: &str) -> (u16, String) {
+	get_with(port, host, path, "").await
+}
+
+/// `get` with more header lines (`extra`, each ending in CRLF).
+async fn get_with(port: u16, host: &str, path: &str, extra: &str) -> (u16, String) {
 	let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-	tcp.write_all(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+	tcp.write_all(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{extra}Connection: close\r\n\r\n").as_bytes()).await.unwrap();
 	let mut out = vec![];
 	tcp.read_to_end(&mut out).await.unwrap();
 	let text = String::from_utf8_lossy(&out).to_string();
@@ -157,6 +187,7 @@ async fn rule_sets_on_a_real_rproxy() {
 	std::fs::create_dir_all(&certs).unwrap();
 
 	let backend = echo_backend().await;
+	let auth = auth_backend().await;
 	let udp = udp_echo().await;
 	let [http_port, https_port, tcp_port, udp_port, api] = free_ports();
 	let key = rcgen::KeyPair::generate().unwrap();
@@ -173,6 +204,18 @@ kind: EndpointSlice
 metadata: {{name: echo-1, namespace: default, labels: {{kubernetes.io/service-name: echo}}}}
 addressType: IPv4
 ports: [{{name: http, port: {backend}}}]
+endpoints: [{{addresses: [127.0.0.1]}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {{name: auth, namespace: default}}
+spec: {{ports: [{{name: http, port: 80}}]}}
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata: {{name: auth-1, namespace: default, labels: {{kubernetes.io/service-name: auth}}}}
+addressType: IPv4
+ports: [{{name: http, port: {auth}}}]
 endpoints: [{{addresses: [127.0.0.1]}}]
 ---
 apiVersion: v1
@@ -244,6 +287,16 @@ spec:
       backendRefs: [{{name: echo, port: 80}}]
     - matches: [{{path: {{type: PathPrefix, value: /partial}}}}]
       backendRefs: [{{name: echo, port: 80}}, {{name: missing, port: 80}}]
+    - matches: [{{path: {{type: PathPrefix, value: /guarded}}}}]
+      filters:
+        - type: ExternalAuth
+          externalAuth: {{protocol: HTTP, backendRef: {{name: auth, port: 80}}, http: {{path: /check, allowedResponseHeaders: [x-test]}}}}
+      backendRefs: [{{name: echo, port: 80}}]
+    - matches: [{{path: {{type: PathPrefix, value: /per-backend}}}}]
+      backendRefs:
+        - name: echo
+          port: 80
+          filters: [{{type: RequestRedirect, requestRedirect: {{hostname: elsewhere.example.com, statusCode: 302}}}}]
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: TCPRoute
@@ -356,6 +409,22 @@ spec:
 		assert_eq!(codes, [200, 500].into());
 	} else {
 		eprintln!("this rproxy lacks the newer settings ({features:?}); not tested");
+	}
+	// rproxy v0.4.3: ExternalAuth (Envoy's HTTP ext_authz) and filters on a backendRef
+	if features.ext_auth_http && features.server_redirect {
+		let (s, body) = get(http_port, "newer.example.com", "/guarded/x").await;
+		assert_eq!(s, 403, "{body}");
+		let (s, body) = get_with(http_port, "newer.example.com", "/guarded/x?q=1", "Authorization: allow\r\n").await;
+		assert_eq!(s, 200, "{body}");
+		assert!(
+			body.ends_with("/guarded/x|newer.example.com|checked /check/guarded/x"),
+			"the auth server's header, asked at the prefixed path: {body}"
+		);
+		let (s, body) = get(http_port, "newer.example.com", "/per-backend").await;
+		assert_eq!(s, 302, "{body}");
+		assert!(body.to_ascii_lowercase().contains("location: http://elsewhere.example.com"), "{body}");
+	} else {
+		eprintln!("this rproxy lacks the v0.4.3 settings ({features:?}); not tested");
 	}
 
 	// HTTPS with SNI

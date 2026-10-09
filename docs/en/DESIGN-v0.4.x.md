@@ -44,7 +44,7 @@ The controller creates the managed Deployments and Services at run time, so neit
 
 ### 2.1 Shape
 
-A CRD `RproxyGatewayParameters` (`rproxy.max3584.net/v1alpha1`, namespaced, shortname `rpgwp`), named both by a GatewayClass's `spec.parametersRef` (the class's defaults) and by a Gateway's `spec.infrastructure.parametersRef` (that Gateway's overrides).
+A CRD `RproxyGatewayParameters` (`rproxy.max3584.net/v1alpha1`, `v1beta1` from v0.4.5 (11.4), namespaced, shortname `rpgwp`), named both by a GatewayClass's `spec.parametersRef` (the class's defaults) and by a Gateway's `spec.infrastructure.parametersRef` (that Gateway's overrides).
 
 ```yaml
 apiVersion: rproxy.max3584.net/v1alpha1
@@ -358,6 +358,62 @@ Scenarios added (A), run after today's a-g; SKIP when the `RproxyGatewayParamete
 | — | The class's default parameters in the chart | **Rendered only when `managed.parameters` is not empty** (`helm upgrade` does not install new CRDs; 2.7) |
 
 Q10-Q16 (the UI's migrations and MariaDB, rproxy-api #240 and #241, usage) are in the UI's and rproxy-api's designs.
+
+## 11. The rest of the Gateway API (v0.4.5, rproxy v0.4.3)
+
+Closing "Not claimed" of docs/en/CONFORMANCE.md (requested by the owner, 2026-10-08). What rproxy needs is in rproxy-api's docs/en/DESIGN-v0.4.x.md, 7. Each is told by rproxy's `features`; with an rproxy without it things stay as before (routes using the feature are `UnsupportedValue`, no 421).
+
+### 11.1 421 Misdirected Request (`GatewayHTTPSListenerDetectMisdirectedRequests`)
+
+- With two or more `HTTPS` listeners on a port, the rule's `tls.misdirected.groups` gets one group per listener (the host name in rproxy's form, `*.example.com` → `**.example.com`; `*` for a listener without a host name). rproxy answers 421 when the SNI and the Host fall in different groups. A Host of no listener (no `*` listener) is routed as before: 404.
+- With one listener there is nothing to tell apart, so none is written. `TLS` (Terminate) listeners do not speak HTTP and are left out.
+- Not written for rproxies without `misdirected` in `http_options` (rproxy v0.4.3): requests reach another listener's routes, as before.
+
+### 11.2 `CORS`, `RequestRedirect` and `RequestMirror` filters on a backendRef
+
+- That backend's `servers[].middlewares` get middlewares shaped as for the rule's filters (`cors`, `redirect_regex`, `mirror` with the mirror's service). Only when rproxy v0.4.3's `server_middleware_kinds` has `cors`, `redirect_regex` and `mirror` (with other rproxies the route is `UnsupportedValue`).
+- ReplacePrefixMatch of `RequestRedirect`, as of `URLRewrite`, only when the rule has one path prefix (a server serves all of the rule's matches).
+- A mirror copies only the requests that land on that backend (rproxy copies once per request). A mirror whose backend is not found is dropped with `ResolvedRefs: False`, as for the rule's filter.
+- `ExtensionRef` on a backendRef is still refused (there is no check of the `RproxyMiddleware`'s kind per server).
+
+### 11.3 `ExternalAuth` (HTTP and gRPC)
+
+- The `ExternalAuth` filter becomes rproxy's `forward_auth` (with `service`, `client_request`, `allow_status`, `response_headers: ["*"]`, `forward_body` and `protocol: grpc` added in v0.4.3). It asks a service of the backendRef's Service pod IPs (from EndpointSlices, as other backends; BackendTLSPolicy applies the same way).
+- HTTP: Host, method, path and Content-Length, which the Gateway API says are always sent, go with `client_request`. `Authorization` is always in `request_headers` (the Gateway API's "only the fixed ones when `allowedHeaders` is empty"; rproxy's `request_headers` sends all when empty). An empty `allowedResponseHeaders` is `["*"]` (headers describing the answer itself are not copied). Only 200 allows (`allow_status`).
+- gRPC: an empty `allowedHeaders` is all headers (the same meaning in the Gateway API and rproxy). The service is h2c (h2 and `tls` under a BackendTLSPolicy).
+- `forwardBody.maxSize` (0 sends no body). Larger bodies get 413 (the filter's description and Envoy's default, "reject", rather than the type's "truncate"; rproxy-api's design 7.3).
+- When the auth backend cannot be used (not found, no ReferenceGrant, no ready pod, no usable CA in its BackendTLSPolicy), the rule answers 500 (`ResolvedRefs: False`) so that nothing goes through unchecked. For `ExternalAuth` on a backendRef, only that backend's share gets 500 (`servers[].status`; with rproxies without it the backend is left out).
+- Claimed features: `HTTPRouteExternalAuth`, `HTTPRouteExternalAuthHTTP`, `HTTPRouteExternalAuthGRPC`, `HTTPRouteExternalAuthForwardBody` (GatewayClass `supportedFeatures`). Gateway API v1.6.3's conformance has neither these feature names nor tests (not in `pkg/features`), so the tests are `tests/rproxy.rs` (a real rproxy), unit tests, and rproxy-api's `tests/ext_authz.rs`.
+
+### 11.4 rproxy's CRDs to `v1beta1`
+
+- The four CRDs (`RproxyRule`, `RproxyMiddleware`, `RproxyPolicy`, `RproxyGatewayParameters`) serve `v1beta1` (the stored version) and `v1alpha1` (`deprecated: true`, with a `deprecationWarning`). The schema is the same, so there is no conversion webhook: `conversion.strategy: None` (the API server only rewrites `apiVersion`). `rproxy-gateway crds` makes the `v1alpha1` entry from the `v1beta1` types (a unit test checks the schemas are equal).
+- The controller watches the CRDs at discovery's preferred version (as before): `v1beta1` with the new CRDs, and `v1alpha1` when `helm upgrade` left the old CRDs (`v1alpha1` only). Status (`RproxyRule`'s `status`) is written at the same version.
+- When the chart renders the class's default `RproxyGatewayParameters`, it uses `v1beta1` if the cluster serves it, else `v1alpha1` (Helm's `.Capabilities`; `helm install` looks after installing `crds/`). `config/`, examples and e2e use `v1beta1`. e2e writes one `RproxyRule` as `v1alpha1` and checks it reads as `v1beta1` and that the stored version is `v1beta1`. The acceptance test writes the CRDs' stored version (it works with an older published chart too).
+- **Upgrading from v0.4.4**:
+  1. `kubectl apply --server-side -f https://github.com/max3584/rproxy-gateway/releases/download/v0.4.5/rproxy.max3584.net.yaml` (`helm upgrade` does not update CRDs; Kustomize's `config/crd` is applied along).
+  2. Upgrade the controller. Existing `v1alpha1` objects read as `v1beta1` as they are (nothing to rewrite). A controller upgraded before the CRDs keeps working on `v1alpha1`.
+  3. Change your manifests' `apiVersion` to `rproxy.max3584.net/v1beta1` when convenient (`v1alpha1` only warns).
+- **Stored versions**: existing objects stay stored as `v1alpha1` in etcd until they are next written (the CRDs' `status.storedVersions` is `["v1alpha1", "v1beta1"]`); with one schema nothing behaves differently. Before a future (minor) version stops serving `v1alpha1`, rewrite every object (`kubectl get rproxyrules,rproxymiddlewares,rproxypolicies,rproxygatewayparameters -A -o json | kubectl replace -f -`, or kube-storage-version-migrator) and then set `status.storedVersions` to `["v1beta1"]` (`kubectl patch crd <name> --subresource=status --type=merge -p '{"status":{"storedVersions":["v1beta1"]}}'`). v0.4.x keeps serving `v1alpha1` (patches do not break).
+
+### 11.5 Mesh (GAMMA): an assessment (not built)
+
+The Gateway API's Mesh support (GAMMA; conformance profiles `MESH-HTTP` and `MESH-GRPC`, features `Mesh`, `MeshClusterIPMatching`, `MeshConsumerRoute` and others) puts a **Service** in the `parentRefs` of HTTPRoutes and GRPCRoutes, applying routes to traffic from pods to Services inside the cluster (east-west). As the owner asked, it is not built; this is the assessment (2026-10-08).
+
+**What it takes**
+
+| Part | What | rproxy-gateway / rproxy today |
+|---|---|---|
+| Capturing traffic | Send every pod's outgoing traffic to rproxy: inject a sidecar per pod (a mutating webhook plus an init container or CNI plugin writing iptables / nftables rules), or a proxy per node (Istio ambient's ztunnel, Cilium's way; eBPF or TPROXY catching all pods of the node) | None. The fleet's hostNetwork DaemonSet exists but does not intercept pod traffic |
+| Routing by the original destination | Read a captured connection's original destination (`SO_ORIGINAL_DST` or the TPROXY destination) and pick L7 routes per Service ClusterIP:port, as a "virtual listener" (`MeshClusterIPMatching`). Services without routes must behave like kube-proxy (spread over pod IPs) | rproxy's rules are keyed by the listening (address, port). Choosing by the original destination is a large rproxy-api change (a new kind of listener, as many rules as the cluster has Services) |
+| Every Service's settings | Every Service and EndpointSlice of the cluster, routed or not, goes to every proxy (thousands of Services, busy EndpointSlices). Today's "one Gateway = one rule set PUT" replaces everything each time and would be heavy | Rule set PUTs replace the whole set (with an etag); there is no incremental distribution (like incremental xDS) |
+| Consumer routes | `MeshConsumerRoute`: a route that applies only when pods of the route's namespace send. The sender (which pod) must be known | A table from source IP to pod and namespace would be needed |
+| Identity and mTLS | Meshes usually do mutual TLS with workload certificates (SPIFFE) (the Gateway API conformance does not ask for it, but a mesh is used for it): a CA, issuing and rotating certificates, a key per pod | rproxy terminates TLS, does TLS to backends and checks client certificates, but issues no per-pod certificates |
+| The conformance setup | The mesh tests (22 in v1.6.3) exec into echo pods of the `gateway-conformance-mesh` namespace and curl Services; namespace labels (`--namespace-labels`) turn injection on | Without injection not a single test can run |
+
+**Estimate**: in rproxy-api, listeners choosing by the original destination and incremental application of large rule sets; in rproxy-gateway, an injection webhook and an iptables init (or CNI), rendering all Services, the sender table, and (if used) mTLS certificates. Several times all of this section 11, and it sits in the path of all pod traffic, so a failure spreads over the whole cluster (today: Gateway traffic only). The acceptance tests and the security lines ("rproxy pods do not use the Kubernetes API", "tenants stay in their namespace") would need redoing too.
+
+**Recommendation: do not build it.** rproxy-gateway stays north-south (Gateway). Where in-cluster traffic needs policies or mTLS, run a mesh (Istio ambient, Linkerd, Cilium) next to it (rproxy-gateway is the entrance, the mesh is between pods; whether the Gateway's rproxy pods join the mesh is the mesh's setting). If demand becomes clear, consider it in the next minor (a big change of shape), not a v0.4.x patch, starting from a per-node proxy (close to ambient; the fleet DaemonSet could carry it). docs/en/CONFORMANCE.md keeps Mesh under "Not claimed".
 
 ## 12. Listening on each Gateway's addresses in fleet (v0.4.5)
 

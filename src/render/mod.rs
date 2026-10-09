@@ -130,6 +130,22 @@ pub struct Features {
 	pub tls_route_targets: bool,
 	/// `tls.client_auth` mode `optional_no_verify` (`features.client_auth_modes`).
 	pub client_auth_no_verify: bool,
+	/// `tls.misdirected` (`http_options` `misdirected`, rproxy v0.4.3).
+	pub misdirected: bool,
+	/// `cors`, `redirect_regex` and `mirror` in `servers[].middlewares`
+	/// (`server_middleware_kinds`, rproxy v0.4.3).
+	pub server_cors: bool,
+	pub server_redirect: bool,
+	pub server_mirror: bool,
+	/// `forward_auth` per server (`server_middleware_kinds`, rproxy v0.4.3).
+	pub server_forward_auth: bool,
+	/// The ExternalAuth filter over HTTP: `forward_auth` with `service`, `client_request`,
+	/// `allow_status`, `all_response_headers` (`features.forward_auth`, rproxy v0.4.3).
+	pub ext_auth_http: bool,
+	/// ... over gRPC: `forward_auth` with `service`, `grpc`.
+	pub ext_auth_grpc: bool,
+	/// ... with the body: `forward_body`.
+	pub ext_auth_body: bool,
 }
 
 impl Default for Features {
@@ -149,6 +165,14 @@ impl Default for Features {
 			service_tls: true,
 			tls_route_targets: true,
 			client_auth_no_verify: true,
+			misdirected: true,
+			server_cors: true,
+			server_redirect: true,
+			server_mirror: true,
+			server_forward_auth: true,
+			ext_auth_http: true,
+			ext_auth_grpc: true,
+			ext_auth_body: true,
 		}
 	}
 }
@@ -170,6 +194,14 @@ impl Features {
 			service_tls: c.lists("services", "tls"),
 			tls_route_targets: c.feature("tls_route_targets"),
 			client_auth_no_verify: c.lists("client_auth_modes", "optional_no_verify"),
+			misdirected: opt("misdirected"),
+			server_cors: c.lists("server_middleware_kinds", "cors"),
+			server_redirect: c.lists("server_middleware_kinds", "redirect_regex"),
+			server_mirror: c.lists("server_middleware_kinds", "mirror"),
+			server_forward_auth: c.lists("server_middleware_kinds", "forward_auth"),
+			ext_auth_http: ["service", "client_request", "allow_status", "all_response_headers"].iter().all(|n| c.lists("forward_auth", n)),
+			ext_auth_grpc: ["service", "grpc"].iter().all(|n| c.lists("forward_auth", n)),
+			ext_auth_body: c.lists("forward_auth", "forward_body"),
 		}
 	}
 
@@ -189,6 +221,14 @@ impl Features {
 			service_tls: self.service_tls && o.service_tls,
 			tls_route_targets: self.tls_route_targets && o.tls_route_targets,
 			client_auth_no_verify: self.client_auth_no_verify && o.client_auth_no_verify,
+			misdirected: self.misdirected && o.misdirected,
+			server_cors: self.server_cors && o.server_cors,
+			server_redirect: self.server_redirect && o.server_redirect,
+			server_mirror: self.server_mirror && o.server_mirror,
+			server_forward_auth: self.server_forward_auth && o.server_forward_auth,
+			ext_auth_http: self.ext_auth_http && o.ext_auth_http,
+			ext_auth_grpc: self.ext_auth_grpc && o.ext_auth_grpc,
+			ext_auth_body: self.ext_auth_body && o.ext_auth_body,
 		}
 	}
 }
@@ -910,6 +950,28 @@ fn exclusions(listeners: &[ListenerState], i: usize) -> Vec<String> {
 		.collect()
 }
 
+/// `tls.misdirected` of an HTTPS port (GatewayHTTPSListenerDetectMisdirectedRequests): one group of
+/// names per HTTPS listener (`*` for one without a host name), so that a request on a connection
+/// made for one listener's name (SNI) for another listener's host name gets 421. None with fewer
+/// than two listeners (nothing to tell apart).
+fn misdirected_groups(listeners: &[ListenerState], members: &[usize]) -> Option<rp::Misdirected> {
+	let mut groups: Vec<Vec<String>> = vec![];
+	for i in members {
+		let l = &listeners[*i];
+		if l.family != Some(Family::Https) {
+			continue;
+		}
+		let pattern = match l.l.hostname.as_deref() {
+			Some(h) => hostname::to_rproxy(h).to_ascii_lowercase(),
+			None => "*".to_string(),
+		};
+		if !groups.iter().any(|g| g[0] == pattern) {
+			groups.push(vec![pattern]);
+		}
+	}
+	(groups.len() > 1).then_some(rp::Misdirected { groups })
+}
+
 /// One route attached to a listener.
 struct Attachment {
 	kind: RouteKind,
@@ -1169,7 +1231,9 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 			rule.http = Some(rp::Http { routes, default: None, services, middlewares });
 			if https {
 				let passthrough: Vec<rp::TlsRoute> = tls_routes.into_iter().filter(|r| r.passthrough).collect();
-				rule.tls = Some(rp::Tls { mode: "terminate", certificates, routes: passthrough, client_auth, ..Default::default() });
+				let misdirected = if opts.features.misdirected { misdirected_groups(&listeners, members) } else { None };
+				rule.tls =
+					Some(rp::Tls { mode: "terminate", certificates, routes: passthrough, client_auth, misdirected, ..Default::default() });
 			}
 		} else if has(Family::TlsPassthrough) || has(Family::TlsTerminate) {
 			if tls_routes.is_empty() {
