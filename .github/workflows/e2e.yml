@@ -13,6 +13,11 @@ name: e2e
 #   (<channel>-v<version>-default-report.yaml), the suite's and the controller's logs and the
 #   environment (versions, image digests). It fails unless every profile is core and extended success
 #   with nothing skipped.
+# - by hand with compat: only "compat", the e2e and the conformance suite on older (and the next)
+#   Kubernetes and Gateway API versions (see the matrix), e.g.
+#     gh workflow run e2e.yml -f compat=true
+#   e2e must pass on every pair (rproxy-gateway works there); conformance is recorded only (older
+#   suites do not know the newer features; the artifact compat-<k8s>-<gateway api> has the report).
 on:
   pull_request:
   push:
@@ -26,6 +31,11 @@ on:
         description: "only the conformance report for submission upstream, from the PUBLISHED chart and images of this released version (e.g. 0.4.5; scripts/conformance-report.sh). Empty: the usual jobs"
         required: false
         default: ""
+      compat:
+        description: "only the compatibility matrix: e2e (must pass) and conformance (recorded) on older and next Kubernetes / Gateway API versions"
+        required: false
+        default: false
+        type: boolean
       report_channel:
         description: "report_version: the Gateway API channel of the CRDs (experimental: the claimed HTTPRouteRetry* use experimental fields)"
         required: false
@@ -99,7 +109,7 @@ jobs:
 
   real:
     name: real rproxy (rule sets)
-    if: ${{ !inputs.report_version }}
+    if: ${{ !inputs.report_version && !inputs.compat }}
     needs: rproxy
     runs-on: ubuntu-latest
     container: alpine:3.24
@@ -122,7 +132,7 @@ jobs:
 
   kind:
     name: e2e (kind)
-    if: ${{ !inputs.report_version }}
+    if: ${{ !inputs.report_version && !inputs.compat }}
     needs: [build, rproxy]
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -143,7 +153,7 @@ jobs:
 
   conformance:
     name: Gateway API conformance
-    if: ${{ !inputs.report_version }}
+    if: ${{ !inputs.report_version && !inputs.compat }}
     needs: [build, rproxy]
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -179,6 +189,65 @@ jobs:
       - name: extended
         continue-on-error: true
         run: exit "$(cat "$RUNNER_TEMP/rproxy-gateway-conformance/status")"
+
+  compat:
+    name: compat (k8s ${{ matrix.k8s }}, Gateway API ${{ matrix.gwapi }})
+    if: ${{ inputs.compat }}
+    needs: [build, rproxy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # the oldest Kubernetes the chart allows (kubeVersion >=1.29) with an older Gateway API
+          - { k8s: v1.29.14, gwapi: v1.4.1 }
+          - { k8s: v1.31.14, gwapi: v1.5.1 }
+          - { k8s: v1.33.12, gwapi: v1.6.3 }
+          - { k8s: v1.37.0, gwapi: v1.6.3 }
+          # the next Gateway API (release candidate), to be ready when it ships
+          - { k8s: v1.37.0, gwapi: v1.7.0-rc.1 }
+    env:
+      KIND_NODE_IMAGE: kindest/node:${{ matrix.k8s }}
+      GATEWAY_API_VERSION: ${{ matrix.gwapi }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/amd64
+          merge-multiple: true
+      - name: kind
+        run: |
+          curl -sLo "$RUNNER_TEMP/kind" https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+          sudo install -m 755 "$RUNNER_TEMP/kind" /usr/local/bin/kind
+      # rproxy-gateway works here: the same e2e as on every PR, against this Kubernetes and these CRDs
+      - name: scripts/e2e.sh
+        env:
+          MIGRATE: e2e/e2e
+          GATEWAY_API_CHANNEL: experimental
+        run: scripts/e2e.sh
+      - name: controller log
+        if: always()
+        run: kubectl -n rproxy-gateway-system logs deploy/rproxy-gateway --tail=200 || true
+      - name: delete the e2e cluster
+        if: always()
+        run: kind delete cluster --name rproxy-gateway || true
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      # recorded only: an older suite does not know the newer features
+      - name: scripts/conformance.sh (recorded)
+        continue-on-error: true
+        run: scripts/conformance.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compat-${{ matrix.k8s }}-${{ matrix.gwapi }}
+          path: |
+            conformance-report.yaml
+            ${{ runner.temp }}/rproxy-gateway-conformance/conformance.log
+            ${{ runner.temp }}/rproxy-gateway-conformance/controller.log
 
   report:
     name: conformance report (published)

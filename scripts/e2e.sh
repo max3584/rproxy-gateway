@@ -3,6 +3,7 @@
 # binaries the Alpine jobs built: dist/amd64/rproxy-gateway and dist/amd64/rproxy-api.
 #   scripts/e2e.sh            # create the cluster, install, test
 #   SETUP_ONLY=1 scripts/e2e.sh   # stop after installing (conformance.sh uses this)
+#   KIND_NODE_IMAGE=kindest/node:v1.29.14 scripts/e2e.sh   # another Kubernetes version (the compat run)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 CLUSTER=${CLUSTER:-rproxy-gateway}
@@ -41,7 +42,7 @@ docker build -q -t rproxy-gateway:e2e --build-arg TARGETARCH=amd64 -f Dockerfile
 docker build -q -t rproxy:e2e --build-arg TARGETARCH=amd64 -f Dockerfile.rproxy .
 
 echo "== cluster"
-kind get clusters | grep -qx "$CLUSTER" || kind create cluster --name "$CLUSTER" --wait 180s
+kind get clusters | grep -qx "$CLUSTER" || kind create cluster --name "$CLUSTER" ${KIND_NODE_IMAGE:+--image "$KIND_NODE_IMAGE"} --wait 180s
 kind load docker-image --name "$CLUSTER" rproxy-gateway:e2e rproxy:e2e
 kubectl apply --server-side -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/$GATEWAY_API_VERSION/$GATEWAY_API_CHANNEL-install.yaml" > /dev/null
 # the runner reaches ClusterIPs (Gateway addresses) through the kind node (kube-proxy there)
