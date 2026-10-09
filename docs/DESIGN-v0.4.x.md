@@ -509,3 +509,22 @@ docs/CONFORMANCE.md の「名乗っていないもの」を埋める（オーナ
   3. 手元のマニフェストの `apiVersion` は、時間のあるときに `rproxy.max3584.net/v1beta1` に変える（`v1alpha1` は警告が出るだけ）。
 - **保存の版**：etcd の中の今のオブジェクトは、次に書かれるまで `v1alpha1` のまま（CRD の `status.storedVersions` は `["v1alpha1", "v1beta1"]`）。形が同じなので動きは変わらない。将来 `v1alpha1` を出すのをやめる版（マイナー）の前には、すべてのオブジェクトを書き直して（`kubectl get rproxyrules,rproxymiddlewares,rproxypolicies,rproxygatewayparameters -A -o json | kubectl replace -f -`、または kube-storage-version-migrator）から `status.storedVersions` を `["v1beta1"]` にする（`kubectl patch crd <名前> --subresource=status --type=merge -p '{"status":{"storedVersions":["v1beta1"]}}'`）。v0.4.x のうちは `v1alpha1` を出し続ける（パッチで壊さない）。
 
+### 11.5 Mesh（GAMMA）の見立て（作らない）
+
+Gateway API の Mesh（GAMMA、conformance の `MESH-HTTP`・`MESH-GRPC`、機能 `Mesh` と `MeshClusterIPMatching`・`MeshConsumerRoute` など）は、HTTPRoute・GRPCRoute の `parentRefs` に **Service** を書き、クラスタの中の Pod から Service への通信（east-west）にルートを当てる。オーナーの依頼で、作らずに見立てだけ書く（2026-10-08）。
+
+**要るもの**
+
+| 部分 | 中身 | 今の rproxy-gateway / rproxy |
+|---|---|---|
+| 通信を取る | 各 Pod の外向きの通信を rproxy に向ける：Pod ごとのサイドカーを注入する（mutating webhook と、iptables / nftables を書く init コンテナか CNI のプラグイン）か、ノードごとのプロキシ（Istio ambient の ztunnel・Cilium の形。eBPF か TPROXY でノードの全 Pod を取る） | ない。fleet の hostNetwork の DaemonSet はあるが、Pod の通信を横取りしない |
+| 元の宛先で振り分ける | 取った接続の元の宛先（`SO_ORIGINAL_DST` か TPROXY の宛先）を読み、Service の ClusterIP:port ごとに「仮想の待ち受け」として L7 のルートを選ぶ（`MeshClusterIPMatching`）。ルートのない Service はそのまま kube-proxy の動きを真似る（Pod の IP に分ける） | rproxy のルールは待ち受けの (アドレス, ポート) がキー。元の宛先で選ぶ口は rproxy-api の大きな変更（新しい待ち受けの形、ルールの数がクラスタの Service の数になる） |
+| 全 Service の設定 | ルートのない Service も含め、クラスタのすべての Service・EndpointSlice をすべてのプロキシに配る（数千の Service、変化の多い EndpointSlice）。今の「Gateway 1 つ = ルールセット 1 つを PUT」は、毎回すべてを置き換えるので重い | ルールセットの PUT は全体の置き換え（etag 付き）。差分の配り方（xDS の増分のようなもの）がない |
+| 送り手のルート | `MeshConsumerRoute`：ルートの namespace の Pod が送るときだけ効くルート。送り手（どの Pod か）を知る必要がある | 接続元の IP から Pod・namespace を引く表が要る |
+| 識別と mTLS | メッシュは普通、ワークロードの証明書（SPIFFE）で相互 TLS をする（Gateway API の conformance は求めないが、メッシュとして使うなら要る）。CA・証明書の発行と回転・Pod ごとの鍵 | rproxy の TLS は終端・転送先への TLS・クライアント証明書の確認はあるが、Pod ごとの証明書の発行はない |
+| conformance の環境 | Mesh の試験（v1.6.3 で 22 本）は、`gateway-conformance-mesh` の namespace の echo の Pod に入って Service へ curl する。namespace のラベル（`--namespace-labels`）で注入を有効にする | 注入の仕組みがないと 1 本も動かない |
+
+**見積もり**：rproxy-api に「元の宛先で選ぶ待ち受け」と大きなルールセットの差分の反映、rproxy-gateway に注入の webhook と iptables の init（か CNI）、Service の全体の描画、送り手の表、（使うなら）mTLS の証明書。Gateway の機能の今までの追加（この 11. の全部）の数倍の量で、Pod の通信の道に入るため、障害の影響がクラスタ全体に広がる（今は Gateway の通信だけ）。受け入れテスト・セキュリティの線（「rproxy の Pod は Kubernetes の API を使わない」「テナントは自分の namespace だけ」）も作り直しになる。
+
+**勧め：作らない**。rproxy-gateway は north-south（Gateway）に絞る。クラスタの中の通信にポリシー・mTLS が要るなら、Istio（ambient）・Linkerd・Cilium のメッシュと並べて使う（rproxy-gateway は入口のまま、メッシュは Pod の間。Gateway の rproxy の Pod をメッシュに入れるかはメッシュの側の設定）。需要がはっきりしたら、v0.4.x のパッチではなく次のマイナー（形が大きく変わる）で、ノードごとのプロキシの形（ambient に近い。fleet の DaemonSet を使える）から考える。docs/CONFORMANCE.md の「名乗っていないもの」には Mesh を残す。
+
