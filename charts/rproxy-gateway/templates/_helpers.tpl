@@ -45,6 +45,19 @@ helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
 {{- join "," $out -}}
 {{- end -}}
 
+{{/* key=value,... of a map whose values are numbers or strings (backends.outlierDetection) */}}
+{{- define "rproxy-gateway.kv" -}}
+{{- $out := list -}}
+{{- range $k, $v := . -}}
+{{- if or (kindIs "float64" $v) (kindIs "int" $v) (kindIs "int64" $v) -}}
+{{- $out = append $out (printf "%s=%d" $k (int64 $v)) -}}
+{{- else -}}
+{{- $out = append $out (printf "%s=%v" $k $v) -}}
+{{- end -}}
+{{- end -}}
+{{- join "," $out -}}
+{{- end -}}
+
 {{/* the controller's settings: the data of the ConfigMap rproxy-gateway-config (RPROXY_GATEWAY_* of
 `rproxy-gateway controller`; what used to be its arguments) */}}
 {{- define "rproxy-gateway.config" -}}
@@ -60,6 +73,10 @@ RPROXY_GATEWAY_ALLOW_EXTERNAL_NAME_SERVICES: "true"
 {{- with .Values.controller.watchNamespaces }}
 RPROXY_GATEWAY_WATCH_NAMESPACES: {{ join "," . | quote }}
 {{- end }}
+RPROXY_GATEWAY_BACKEND_OUTLIER_HTTP: {{ include "rproxy-gateway.kv" (.Values.backends.outlierDetection.http | default dict) | quote }}
+RPROXY_GATEWAY_BACKEND_OUTLIER_L4: {{ include "rproxy-gateway.kv" (.Values.backends.outlierDetection.l4 | default dict) | quote }}
+RPROXY_GATEWAY_BACKEND_CONNECT_TIMEOUT_HTTP: {{ .Values.backends.connectTimeout.http | default "" | toString | quote }}
+RPROXY_GATEWAY_BACKEND_CONNECT_TIMEOUT_L4: {{ .Values.backends.connectTimeout.l4 | default "" | toString | quote }}
 {{- if .Values.fleet.enabled }}
 RPROXY_GATEWAY_MODE: "fleet"
 RPROXY_GATEWAY_FLEET_SELECTOR: "app.kubernetes.io/name=rproxy,app.kubernetes.io/component=fleet"

@@ -35,7 +35,7 @@ base() {
         if (doc ~ /# Source: [^\n]*\/templates\/config\.yaml/) {
           n = split(doc, lines, "\n")
           for (i = 1; i <= n; i++) {
-            if (match(lines[i], /^  RPROXY_GATEWAY_[A-Z_]+: "/)) {
+            if (match(lines[i], /^  RPROXY_GATEWAY_[A-Z0-9_]+: "/)) {
               kv = lines[i]
               sub(/^  /, "", kv)
               sub(/: "/, "=", kv)

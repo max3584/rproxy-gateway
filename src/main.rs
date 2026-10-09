@@ -111,6 +111,20 @@ struct ControllerArgs {
 	/// Gateways on different addresses can use the same port; rproxy with features.listen_freebind, v0.4.3).
 	#[arg(long, env = "RPROXY_GATEWAY_FLEET_LISTEN", default_value = "wildcard", value_parser = ["wildcard", "addresses"])]
 	fleet_listen: String,
+	/// rproxy's passive health checks (`outlier_detection` of `http` services, rproxy's L7 keys as
+	/// `key=value,...`) every HTTPRoute / GRPCRoute backend gets unless an RproxyPolicy sets them. "": none.
+	#[arg(long, env = "RPROXY_GATEWAY_BACKEND_OUTLIER_HTTP", default_value = "consecutive_gateway_failures=3,consecutive_5xx=0,ejection_time=10s,max_ejection_time=1m,max_ejected_percent=50", value_parser = key_values)]
+	backend_outlier_http: serde_json::Value,
+	/// The same for L4 rules (TCP, TLS, UDP routes; rproxy's L4 shape).
+	#[arg(long, env = "RPROXY_GATEWAY_BACKEND_OUTLIER_L4", default_value = "consecutive_failures=1,ejection_time=10s,max_ejection_time=1m", value_parser = key_values)]
+	backend_outlier_l4: serde_json::Value,
+	/// How long rproxy may take to connect to an `http` backend (`timeouts.connect`). "": rproxy's 5 s.
+	#[arg(long, env = "RPROXY_GATEWAY_BACKEND_CONNECT_TIMEOUT_HTTP", default_value = "1s", value_parser = duration_opt)]
+	backend_connect_timeout_http: String,
+	/// How long rproxy may take to connect to an L4 tcp backend before trying the next (`connect_timeout`,
+	/// rproxy v0.4.3). "": rproxy's (5 s with other backends, else the OS's).
+	#[arg(long, env = "RPROXY_GATEWAY_BACKEND_CONNECT_TIMEOUT_L4", default_value = "1s", value_parser = duration_opt)]
+	backend_connect_timeout_l4: String,
 	/// Addresses rproxy rules listen on (the first is listen_addr, the rest extra_listen_addrs).
 	#[arg(long, env = "RPROXY_GATEWAY_LISTEN_ADDR", value_delimiter = ',', default_value = "0.0.0.0")]
 	listen_addr: Vec<String>,
@@ -213,6 +227,44 @@ struct RenderArgs {
 }
 
 /// `--shutdown-delay`, `--shutdown-drain`: like the parameters' `rproxy.shutdown` (0s to 10m).
+/// `--backend-outlier-*`: `key=value,...` (a number or a word each: `consecutive_failures=3,ejection_time=10s`)
+/// as a JSON object; "" for none.
+fn key_values(s: &str) -> Result<serde_json::Value, String> {
+	let mut out = serde_json::Map::new();
+	for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+		let (k, v) = part.split_once('=').ok_or_else(|| format!("{part:?}: key=value"))?;
+		let (k, v) = (k.trim(), v.trim());
+		if k.is_empty() || !k.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_') {
+			return Err(format!("{k:?}: rproxy's outlier_detection keys are lowercase words"));
+		}
+		let value = v.parse::<u64>().map(serde_json::Value::from).unwrap_or_else(|_| serde_json::Value::String(v.to_string()));
+		out.insert(k.to_string(), value);
+	}
+	Ok(serde_json::Value::Object(out))
+}
+
+/// `--backend-connect-timeout-*`: a duration (`500ms`, `2s`), or "" for rproxy's own.
+fn duration_opt(s: &str) -> Result<String, String> {
+	let s = s.trim();
+	match rproxy_gateway::render::duration_ms(s) {
+		_ if s.is_empty() => Ok(String::new()),
+		Some(ms) if (100..=600_000).contains(&ms) => Ok(s.to_string()),
+		_ => Err(format!("{s:?}: a duration from 100ms to 10m (rproxy's range), or empty")),
+	}
+}
+
+/// The `--backend-*` flags as what every backend gets.
+fn backend_defaults(a: &ControllerArgs) -> rproxy_gateway::render::BackendDefaults {
+	let object = |v: &serde_json::Value| Some(v.clone()).filter(|v| v.as_object().is_some_and(|o| !o.is_empty()));
+	let duration = |s: &str| (!s.is_empty()).then(|| s.to_string());
+	rproxy_gateway::render::BackendDefaults {
+		http_outlier: object(&a.backend_outlier_http),
+		l4_outlier: object(&a.backend_outlier_l4),
+		http_connect_timeout: duration(&a.backend_connect_timeout_http),
+		l4_connect_timeout: duration(&a.backend_connect_timeout_l4),
+	}
+}
+
 fn shutdown_duration(s: &str) -> Result<Duration, String> {
 	let d = render::params::duration(s).ok_or_else(|| format!("{s:?} is not a duration (5s, 250ms, 1m)"))?;
 	if d > Duration::from_secs(600) {
@@ -284,6 +336,7 @@ fn main() -> anyhow::Result<()> {
 		}
 		Command::Controller(a) => {
 			init_logging(&cli.log_format);
+			let backends = backend_defaults(&a);
 			let mode = match a.mode.as_str() {
 				"fleet" => Mode::Fleet(Fleet {
 					selector: a.fleet_selector,
@@ -323,6 +376,7 @@ fn main() -> anyhow::Result<()> {
 				fleet_rproxy_rules: a.fleet_rproxy_rules,
 				cross_namespace_secrets: a.cross_namespace_secrets,
 				watch_namespaces: a.watch_namespaces.clone(),
+				backends,
 				ui: (!a.ui_namespace.trim().is_empty()).then(|| rproxy_gateway::controller::provision::UiAccess {
 					namespace: a.ui_namespace.trim().to_string(),
 					pod_selector: rproxy_gateway::controller::provision::parse_selector(&a.ui_pod_selector),
@@ -340,5 +394,27 @@ fn main() -> anyhow::Result<()> {
 			};
 			tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(controller::run(cfg))
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn backend_flags() {
+		assert_eq!(
+			key_values("consecutive_failures=3, ejection_time=10s").unwrap(),
+			serde_json::json!({"consecutive_failures": 3, "ejection_time": "10s"})
+		);
+		assert_eq!(key_values("").unwrap(), serde_json::json!({}));
+		assert!(key_values("consecutive_failures").is_err());
+		assert!(key_values("Bad-Key=1").is_err());
+		assert_eq!(duration_opt("1s").unwrap(), "1s");
+		assert_eq!(duration_opt("").unwrap(), "");
+		assert!(duration_opt("10ms").is_err() && duration_opt("soon").is_err());
+		let a = Cli::try_parse_from(["rproxy-gateway", "controller"]).unwrap();
+		let Command::Controller(a) = a.command else { panic!() };
+		assert_eq!(backend_defaults(&a), rproxy_gateway::render::BackendDefaults::standard(), "the flags' defaults are the standard ones");
 	}
 }

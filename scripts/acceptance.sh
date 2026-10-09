@@ -22,6 +22,12 @@
 # address, and a third asking for a port taken on one of them (PortUnavailable).
 # RPROXY_IMAGE_FROM=dist: the rproxy image from dist/amd64/rproxy-api (the workflow's rproxy_ref) instead
 # of the chart's.
+# Scenario p (record-only): a node that runs a backend (echo) pod but no rproxy pod that
+# traffic goes through is lost (P_HOW=kill, the default: docker kill, nothing answers any more, as a
+# node that lost power; P_HOW=pause: docker pause, whose kernel still completes TCP handshakes for the
+# frozen pods, as a hung node): how long requests keep failing (rproxy sends some to the pod there
+# until its EndpointSlice says NotReady, unless its passive health checks leave it out first).
+P_HOW=${P_HOW:-kill}
 # Outages are measured and reported. With MANAGED_REPLICAS >= 2, a pod deletion, a node drain, a
 # rollout restart and a parameters change fail the run when the longest gap without a 200 exceeds
 # GAP_LIMIT seconds (l2-local, l2-cluster, nodeport-lb: what rproxy-gateway controls; bgp and a lost
@@ -975,6 +981,63 @@ gw_cond() { cond gateway/acc "{.status.conditions[?(@.type==\"$1\")].$2}"; }
 gw_reason_is() { [ "$(gw_cond Accepted reason)" = "$1" ]; }
 skip_params() {
   printf '%s\t–\t–\t–\tSKIP\tno RproxyGatewayParameters CRD (a chart before 0.4.2)\n' "$1" >> "$results"
+}
+# p. a backend's node lost: see the header. Record-only (the node's detection is the cluster's)
+echo_nodes() { kubectl -n "$APP" get pods -l app=echo -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' | sort -u; }
+# whether an echo endpoint on node $1 is ready in the EndpointSlices (ready unset: ready; jq's // would
+# take false for unset)
+echo_ep_ready() {
+  kubectl -n "$APP" get endpointslices -l kubernetes.io/service-name=echo -o json |
+    jq -e --arg n "$1" '[.items[].endpoints[]? | select(.nodeName == $n and (.conditions.ready | if . == null then true else . end))] | length > 0' > /dev/null
+}
+# last_fail <from ms> <to ms>: the last request that did not get a 200 (ms, 0: none)
+last_fail() {
+  local p t last=0
+  for p in http https tcp; do
+    t=$(awk -v s="$1" -v e="$2" '$1 >= s && $1 <= e && $2 != "200" { l = $1 } END { print l + 0 }' "$work/probe-$p.log")
+    [ "$t" -gt "$last" ] && last=$t
+  done
+  echo "$last"
+}
+scenario_p() {
+  local label="p. a backend's node lost (docker $P_HOW; no rproxy there that traffic goes through)" t0 ok=PASS node="" n skip ld_node t_nr=0 t_ok t_end lf notes
+  ld_node=$(kubectl -n "$NS" get pod "$(leader)" -o jsonpath='{.spec.nodeName}' 2> /dev/null || true)
+  # not an rproxy pod's or the announcing node; not the controller leader's when possible
+  skip=" $ld_node $(announcer) $(rproxy_nodes | awk '{print $2}' | tr '\n' ' ') "
+  for n in $(echo_nodes); do [[ $skip == *" $n "* ]] || { node=$n; break; }; done
+  if [ -z "$node" ]; then
+    for n in $(echo_nodes); do [ "$n" = "$(announcer)" ] && continue; node=$n; break; done
+  fi
+  if [ -z "$node" ]; then
+    printf '%s\t–\t–\t–\tSKIP\tno node with an echo pod and no rproxy pod in the path (%s)\n' "$label" "$(placement)" >> "$results"
+    return 0
+  fi
+  log "== $label: $node (echo pods on $(echo_nodes | tr '\n' ' ')); placement: $(placement)"
+  t0=$(now_ms)
+  docker "$P_HOW" "$node" > /dev/null
+  sleep 3
+  # until the probes have been steady for 10 s (passive health checks re-try an ejected pod after
+  # 10 s, 20 s, ...), noting when the endpoint there turns not ready
+  local end=$((t0 + RECOVERY_TIMEOUT * 1000))
+  while [ "$(now_ms)" -lt "$end" ]; do
+    if [ "$t_nr" = 0 ] && ! echo_ep_ready "$node"; then t_nr=$(now_ms); fi
+    if [ "$t_nr" != 0 ] && probes_stable 10; then break; fi
+    sleep 0.5
+  done
+  t_end=$(now_ms)
+  [ "$t_nr" != 0 ] || ok=FAIL
+  lf=$(last_fail "$t0" "$t_end")
+  t_ok=$t_end
+  notes="docker $P_HOW $node; the echo endpoint there not ready in the EndpointSlice after $([ "$t_nr" != 0 ] && secs $((t_nr - t0)) || echo never)s; last failed request $([ "$lf" -gt 0 ] && echo "at $(secs $((lf - t0)))s" || echo "none")"
+  if [ "$P_HOW" = pause ]; then
+    docker unpause "$node" > /dev/null
+  else
+    docker start "$node" > /dev/null
+    notes+="; started again as $(kind_ip "$node")"
+  fi
+  wait_for 300 node_ready "$node" || ok=FAIL
+  settle || ok=FAIL
+  record "$label" "$t0" "$t_ok" "$([ "$lf" -gt 0 ] && secs $((lf - t0)) || echo 0)s" "$ok" "$notes"
 }
 scenario_h() {
   local label="h. Gateway parameters changed (replicas +1, resources)" t0 old ok=PASS want served

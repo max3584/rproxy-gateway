@@ -426,3 +426,35 @@ fleet のルールは `0.0.0.0`（`--listen-addr`）で待ち受けるので、2
 - UDP：特定のアドレスで待ち受けるので、返信はそのアドレスから出る（`IP_PKTINFO` は要らない）。
 - 守り：あるアドレスに来たものはそのアドレスの Gateway にだけ届く。アドレスは管理者の `managed.addressCIDRs` の内だけ（今までの `spec.addresses` の守りと同じ、[SECURITY.md](SECURITY.md)）。
 - 受け入れ：`mode=fleet`（VIP なし、`fleet.listen=addresses`）と入力 `rproxy_ref`（rproxy を rproxy-api のブランチ・タグから作る）。シナリオ q：kind の docker ネットワークのアドレス 2 つを、プラットフォームの代わりに 1 つのワーカーに `ip addr add` で置き（ネットワークの側は記録だけ）、同じポート 8080・8443・UDP 9002 の Gateway を 2 つ（アドレスごと）作る。両方が Programmed（アドレスを置く前から）、アドレスごとにそれぞれのバックエンドに届くこと、1 つ目のアドレスの 8080 を求めた 3 つ目が `PortUnavailable` になり、ワイルドカードの `acc`（80・443・9000）と 1 つ目が乱れないこと（`GAP_LIMIT`）。
+
+## 13. ノードの喪失とバックエンド（v0.4.5）
+
+ノードが止まると、そのノードのバックエンドの Pod は、ノードが NotReady になって EndpointSlice の `ready` が false になるまで（node-monitor-grace-period、40〜60 秒）宛先に残り、rproxy はそこへ送り続ける。止まったノードの Pod は SYN に答えないので、接続は rproxy の接続の時間（L7 は 5 秒、L4 は宛先が複数なら 5 秒、1 つなら OS の再送で約 2 分）まで待ってから失敗する。ノードの喪失を見つけること自体（CNI・ロードバランサ・ノードの監視の時間）は扱わない（記録だけ。8.）。rproxy-gateway で決められるのは次の 3 つ。
+
+| 項目 | 形 | 既定 |
+|---|---|---|
+| a. EndpointSlice の条件 | `ready`（なしは true）の endpoint だけを使う。`terminating` のものは使わず、ready な endpoint が 1 つもないときだけ `serving` で終了中のものを使う（KEP-1669、kube-proxy と同じ：全部の Pod が止まりかけでも drain の間は答える）。`ready: true` でも `terminating: true` なら ready とみなさない | 常に（今までは `ready` だけを見て、終了中で serving のものも捨てていた） |
+| b. 受け身のヘルスチェック | rproxy の `outlier_detection` を、コントローラが描くすべてのバックエンドに付ける。HTTP（HTTPRoute・GRPCRoute のサービス）：`consecutive_gateway_failures: 3`（502・503・504・接続できない・応答の時間切れ）、`consecutive_5xx: 0`（アプリの 5xx では外さない）、`ejection_time: 10s`、`max_ejection_time: 1m`、`max_ejected_percent: 50`。L4（TCP・TLS・UDP のルール）：`consecutive_failures: 1`、`ejection_time: 10s`、`max_ejection_time: 1m`（rproxy の既定の 1 回・10 秒に、続けて外れたら倍にする上限を足したもの） | 有効（chart の `backends.outlierDetection`。`null` で外す） |
+| c. 接続の時間 | HTTP のサービスの `timeouts.connect: 1s`、L4 の tcp のルールの `connect_timeout: 1s`（rproxy v0.4.3。過ぎたら次の宛先へ。宛先が 1 つならクライアントの接続を閉じる） | 有効（chart の `backends.connectTimeout`。`""` で rproxy の既定） |
+
+- 上書き：RproxyPolicy の `outlierDetection`（Gateway・リスナー・Service）があればそれを使い、既定は足さない。外すには `outlierDetection: {max_ejected_percent: 0}`。接続の時間はコントローラ全体の値だけ（RproxyPolicy に項目を足すのは CRD の変更なので、要るなら別に決める）。
+- コントローラの引数：`--backend-outlier-http`・`--backend-outlier-l4`（`key=value,...`、空で外す）、`--backend-connect-timeout-http`・`--backend-connect-timeout-l4`（空で rproxy の既定）。`RPROXY_GATEWAY_BACKEND_*`。
+- rproxy の版：`connect_timeout` は `features.connect_timeout` のある rproxy（v0.4.3）にだけ送る。`outlier_detection` と `timeouts.connect` は v0.4.0 からある。
+- 既定を変えたこと：今までの Gateway のルールにも付く（オーナーの依頼。ルールはその場で変わり、接続は切れない）。
+- 受け入れ：シナリオ p（記録だけ。managed）：rproxy が通らないノードのうち echo の Pod があるものを `docker kill`（`P_HOW=pause` で `docker pause`）し、失敗が続いた時間（最後の失敗）、EndpointSlice で NotReady になった時刻、10 秒失敗のない状態に戻るまでを測る。入力 `rproxy_ref` で rproxy を rproxy-api のブランチから作る。
+
+#### 受け入れテストでの値
+
+測ったときは v0.4.4 の `mode=fleet-vip`（VIP のサイドカーは v0.4.5 で外した。VIP はバックエンドの失敗と関係しない）、シナリオ p、echo（3 つ、ワーカーごとに 1 つ）のあるノードのうち VIP の持ち主でもコントローラのリーダーでもないものを止めた。プローブは HTTP・HTTPS・TCP を 0.1 秒おきに新しい接続で（`--max-time 2`）。記録だけ。
+
+| 止め方 | 版 | 失敗（HTTP/HTTPS/TCP） | 最長の途切れ | 失敗が続いた時間（最後の失敗） | NotReady |
+|---|---|---|---|---|---|
+| `docker kill` | 前（chart 0.4.4・rproxy 0.4.2、run 37881266745） | 29/30/4（781） | 2.3 秒 | 47.1 秒（NotReady まで続く） | 47.0 秒 |
+| `docker kill` | 後（この版・rproxy v0.4.3、HTTP の接続 1 秒、run 37882953598） | 9/9/0（1146） | 1.2 秒 | 37.5 秒（0〜1 秒・11〜14 秒・35〜37 秒の 3 回だけ） | 44.9 秒 |
+| `docker kill` | 後（HTTP の接続 2 秒、run 37881273245） | 10/18/0（1055） | 2.2 秒 | 44.9 秒 | 44.9 秒 |
+| `docker pause` | 前（run 37878937573） | 30/30/30 | 2.3 秒 | 68.4 秒 | 49.2 秒 |
+| `docker pause` | 後（HTTP の接続 2 秒、run 37880239529） | 21/21/21（411） | 2.2 秒 | 46.9 秒 | 46.5 秒 |
+
+- `docker kill`（電源が落ちたノード：何も答えない）：前は死んだ Pod に送った接続が rproxy の接続の時間（5 秒）より先にクライアント（2 秒）に諦められるので、rproxy は失敗として数えず外さない。NotReady まで約 4 回に 1 回が落ち続けた。後は 1 秒で接続を諦めて外し（L7 は 3 回、L4 は 1 回）、外す時間（10 秒 → 20 秒）が過ぎて試し直すときだけ数回落ちる。TCP は次の宛先に移るので失敗 0。
+- HTTP の接続を 2 秒にした回は、HTTPS（TLS の分だけクライアントの残り時間が短い）が rproxy の 2 秒より先に諦められて外れなかった。既定を 1 秒にしたのはこのため（クラスタの中の Pod は数ミリ秒で答える）。
+- `docker pause`（カーネルは動くので、止めた Pod への TCP の接続は成り立ち、応答だけ来ない：止まりかけのノード・固まったアプリ）：接続の時間は効かず、応答の時間切れ（`timeouts.response`）がないと gateway の失敗にならないので、どちらも NotReady まで落ち続ける。応答の時間はアプリごとに違うので既定にはしない（HTTPRoute の `timeouts.backendRequest` で決める）。

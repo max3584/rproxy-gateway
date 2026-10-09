@@ -54,6 +54,78 @@ pub struct Options {
 	pub cross_namespace_secrets: bool,
 	/// How GatewayClasses' and Gateways' RproxyGatewayParameters are found and checked.
 	pub params: params::ParamsOptions,
+	/// What every backend gets unless an RproxyPolicy sets it (passive health checks, connect timeouts).
+	pub backends: BackendDefaults,
+}
+
+/// What the controller gives every backend it renders unless an RproxyPolicy sets it (v0.4.5,
+/// docs/DESIGN-v0.4.x.md 13.): rproxy's passive health checks (`outlier_detection`), so a pod on
+/// a node that died is left out after a few failed connections instead of until its EndpointSlice
+/// says NotReady (40-60 s), and connect timeouts short enough to notice it. `None`: rproxy's own.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BackendDefaults {
+	/// `outlier_detection` of `http` services (rproxy's L7 shape).
+	pub http_outlier: Option<Value>,
+	/// `outlier_detection` of L4 rules (TCP, TLS passthrough, UDP).
+	pub l4_outlier: Option<Value>,
+	/// `timeouts.connect` of `http` services.
+	pub http_connect_timeout: Option<String>,
+	/// `connect_timeout` of L4 tcp rules (rproxy v0.4.3).
+	pub l4_connect_timeout: Option<String>,
+}
+
+impl BackendDefaults {
+	/// The controller's defaults (`--backend-*`): eject a server after 3 gateway failures in a row
+	/// (502/503/504, no connection, `timeouts.response`; not the app's own 5xx) for 10 s, doubling
+	/// up to 1 m, at most half of a service's servers; an L4 target after a failed connection (as
+	/// rproxy does), doubling up to 1 m; connect within 1 s (a pod in the cluster answers in
+	/// milliseconds; a client that gives up first is not counted as the backend's failure).
+	pub fn standard() -> BackendDefaults {
+		BackendDefaults {
+			http_outlier: Some(serde_json::json!({
+				"consecutive_gateway_failures": 3, "consecutive_5xx": 0, "ejection_time": "10s", "max_ejection_time": "1m",
+				"max_ejected_percent": 50
+			})),
+			l4_outlier: Some(serde_json::json!({"consecutive_failures": 1, "ejection_time": "10s", "max_ejection_time": "1m"})),
+			http_connect_timeout: Some("1s".into()),
+			l4_connect_timeout: Some("1s".into()),
+		}
+	}
+
+	/// Fills in what the rules do not have (an RproxyPolicy's `outlierDetection` wins).
+	pub fn apply(&self, rules: &mut [rp::Rule], features: &Features) {
+		for r in rules {
+			match r.http.as_mut() {
+				Some(http) => {
+					for svc in http.services.values_mut() {
+						// a service of fixed statuses only has nothing to check
+						if svc.servers.iter().all(|s| s.url.is_empty()) {
+							continue;
+						}
+						if svc.outlier_detection.is_none() {
+							svc.outlier_detection = self.http_outlier.clone();
+						}
+						if let Some(t) = &self.http_connect_timeout {
+							match svc.timeouts.as_mut().and_then(Value::as_object_mut) {
+								Some(o) => {
+									o.entry("connect").or_insert_with(|| Value::String(t.clone()));
+								}
+								None => svc.timeouts = Some(serde_json::json!({ "connect": t })),
+							}
+						}
+					}
+				}
+				None => {
+					if let Some(o) = &self.l4_outlier {
+						r.extra.entry("outlier_detection").or_insert_with(|| o.clone());
+					}
+					if let (rp::Protocol::Tcp, true, Some(t)) = (r.protocol, features.connect_timeout, &self.l4_connect_timeout) {
+						r.extra.entry("connect_timeout").or_insert_with(|| Value::String(t.clone()));
+					}
+				}
+			}
+		}
+	}
 }
 
 /// An IP range (`10.0.0.0/24`).
@@ -106,6 +178,7 @@ impl Default for Options {
 			raw_rules: true,
 			cross_namespace_secrets: true,
 			params: params::ParamsOptions::default(),
+			backends: BackendDefaults::default(),
 		}
 	}
 }
@@ -146,6 +219,8 @@ pub struct Features {
 	pub ext_auth_grpc: bool,
 	/// ... with the body: `forward_body`.
 	pub ext_auth_body: bool,
+	/// `connect_timeout` of L4 tcp rules (rproxy v0.4.3, `features.connect_timeout`).
+	pub connect_timeout: bool,
 }
 
 impl Default for Features {
@@ -173,6 +248,7 @@ impl Default for Features {
 			ext_auth_http: true,
 			ext_auth_grpc: true,
 			ext_auth_body: true,
+			connect_timeout: true,
 		}
 	}
 }
@@ -202,6 +278,7 @@ impl Features {
 			ext_auth_http: ["service", "client_request", "allow_status", "all_response_headers"].iter().all(|n| c.lists("forward_auth", n)),
 			ext_auth_grpc: ["service", "grpc"].iter().all(|n| c.lists("forward_auth", n)),
 			ext_auth_body: c.lists("forward_auth", "forward_body"),
+			connect_timeout: c.feature("connect_timeout"),
 		}
 	}
 
@@ -229,6 +306,7 @@ impl Features {
 			ext_auth_http: self.ext_auth_http && o.ext_auth_http,
 			ext_auth_grpc: self.ext_auth_grpc && o.ext_auth_grpc,
 			ext_auth_body: self.ext_auth_body && o.ext_auth_body,
+			connect_timeout: self.connect_timeout && o.connect_timeout,
 		}
 	}
 }
@@ -1377,6 +1455,7 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 		&mut plan.rules,
 		&policy::Targets { listeners: &by_name, l4_services: &l4_services, http_services: &http_services },
 	);
+	opts.backends.apply(&mut plan.rules, &opts.features);
 	let taken: Vec<String> = plan.rules.iter().map(|r| r.key()).collect();
 	let file_names: BTreeSet<String> = files.keys().cloned().collect();
 	let limits = policy::RawLimits { enabled: opts.raw_rules, cert_dir: &opts.cert_dir, files: &file_names };

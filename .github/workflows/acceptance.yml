@@ -8,6 +8,8 @@ name: acceptance
 #   gh workflow run acceptance.yml --ref <branch> -f source=checkout -f topology=bgp
 # fleet listening on each Gateway's addresses (fleet.listen=addresses; rproxy built from an rproxy-api ref), e.g.
 #   gh workflow run acceptance.yml --ref <branch> -f source=checkout -f mode=fleet -f rproxy_ref=master
+# A backend's node lost (scenario p, record-only) with rproxy built from an rproxy-api ref, e.g.
+#   gh workflow run acceptance.yml --ref <branch> -f source=checkout -f scenarios=p -f rproxy_ref=master
 # The UI (TCP-UDP-rproxy-ui's chart and image from ui_ref, bundled MariaDB) only, e.g.
 #   gh workflow run acceptance.yml --ref <branch> -f source=checkout -f ui=true -f ui_ref=main -f scenarios=u
 on:
