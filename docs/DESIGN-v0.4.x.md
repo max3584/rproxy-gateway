@@ -471,3 +471,14 @@ fleet:
 | — | chart のクラスの既定の parameters | **`managed.parameters` が空でないときだけ描く**（`helm upgrade` は新しい CRD を入れないため。2.7） |
 
 Q10〜Q16（UI の migration・MariaDB、rproxy-api の #240・#241、利用量）は UI・rproxy-api の設計にある。
+
+## 11. Gateway API の残り（v0.4.5、rproxy v0.4.3）
+
+docs/CONFORMANCE.md の「名乗っていないもの」を埋める（オーナーの依頼、2026-10-08）。rproxy に要る口は rproxy-api の docs/DESIGN-v0.4.x.md の 7.。どれも rproxy の `features` で見分け、ない rproxy では前のとおり（名乗る機能のルートは `UnsupportedValue`、421 は付けない）。
+
+### 11.1 421 Misdirected Request（`GatewayHTTPSListenerDetectMisdirectedRequests`）
+
+- 同じポートの `HTTPS` のリスナーが 2 つ以上なら、ルールの `tls.misdirected.groups` にリスナーごとのグループを書く（ホスト名は rproxy の形（`*.example.com` → `**.example.com`）、ホスト名のないリスナーは `*`）。rproxy は SNI と Host が違うグループなら 421 を返す。Host がどのリスナーにも当たらなければ（`*` のリスナーがないとき）ルートで選ばれて 404。
+- 1 つしかなければ付けない（分けるものがない）。`TLS`（Terminate）のリスナーは HTTP を話さないので入れない。
+- rproxy v0.4.3 の `http_options` の `misdirected` がない rproxy には付けない（今までどおり、ほかのリスナーのルートに届く）。
+

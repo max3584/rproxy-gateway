@@ -82,6 +82,7 @@ pub const SUPPORTED_FEATURES: &[&str] = &[
 	"BackendTLSPolicy",
 	"BackendTLSPolicySANValidation",
 	"GatewayBackendClientCertificate",
+	"GatewayHTTPSListenerDetectMisdirectedRequests",
 ];
 
 #[derive(Clone, Debug)]

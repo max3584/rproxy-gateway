@@ -87,6 +87,15 @@ pub struct Tls {
 	pub client_auth: Option<Value>,
 	#[serde(skip_serializing_if = "Vec::is_empty")]
 	pub alpn: Vec<String>,
+	/// 421 for a request whose Host is another listener's than the SNI's (rproxy v0.4.3).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub misdirected: Option<Misdirected>,
+}
+
+/// `tls.misdirected`: groups of server name patterns.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct Misdirected {
+	pub groups: Vec<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]

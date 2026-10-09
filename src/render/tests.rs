@@ -293,6 +293,14 @@ stringData: {{tls.crt: nope, tls.key: nope}}
 	let tls = &rules.iter().find(|r| r["listen_port"] == 443).unwrap()["tls"];
 	assert_eq!(tls["mode"], "terminate");
 	assert_eq!(tls["certificates"].as_array().unwrap().len(), 1);
+	// a request for b.example.com on a connection made for another name (and the reverse) gets 421
+	assert_eq!(tls["misdirected"], json!({"groups": [["*"], ["b.example.com"]]}));
+	let w = world(&yaml);
+	let old = Options { features: Features { misdirected: false, ..Default::default() }, ..Default::default() };
+	let rules = render_gateway(&w, &w.gateways[0], &old).rules_json();
+	assert!(rules.iter().find(|r| r["listen_port"] == 443).unwrap()["tls"].get("misdirected").is_none(), "an older rproxy");
+	let rules = p.rules_json();
+	let tls = &rules.iter().find(|r| r["listen_port"] == 443).unwrap()["tls"];
 	let file = tls["certificates"][0]["cert_file"].as_str().unwrap();
 	let name = file.rsplit('/').next().unwrap();
 	assert_eq!(p.files[name], crt.as_bytes());
