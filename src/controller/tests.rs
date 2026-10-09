@@ -438,6 +438,25 @@ fn fleet_gateways_share_a_port_on_different_addresses() {
 	assert_eq!((rendered[1].1.rules.len(), rendered[0].1.rules.len()), (1, 0), "the older wildcard keeps the port");
 }
 
+/// fleet.listen=addresses: a Gateway's spec.addresses inside --address-cidr (IPv4 first), else the wildcard.
+#[test]
+fn fleet_listen_addresses() {
+	let gw = |addrs: &[&str]| -> crate::k8s::gateway::Gateway {
+		let a: Vec<Value> = addrs.iter().map(|v| json!({"type": "IPAddress", "value": v})).collect();
+		serde_json::from_value(json!({
+			"apiVersion": "gateway.networking.k8s.io/v1", "kind": "Gateway",
+			"metadata": {"name": "g", "namespace": "default"},
+			"spec": {"gatewayClassName": "rproxy", "addresses": a, "listeners": []}
+		}))
+		.unwrap()
+	};
+	let cidrs: Vec<render::Cidr> = vec!["192.0.2.0/24".parse().unwrap(), "2001:db8::/64".parse().unwrap()];
+	assert_eq!(listen_addresses(&gw(&["2001:db8::10", "192.0.2.10"]), &cidrs), Some(vec!["192.0.2.10".into(), "2001:db8::10".into()]));
+	assert_eq!(listen_addresses(&gw(&[]), &cidrs), None, "no addresses: the wildcard");
+	assert_eq!(listen_addresses(&gw(&["192.0.2.10", "198.51.100.1"]), &cidrs), None, "one outside the ranges");
+	assert_eq!(listen_addresses(&gw(&["192.0.2.10"]), &[]), None, "static addresses off");
+}
+
 #[test]
 fn supported_features_match_the_conformance_script() {
 	let script = include_str!("../../scripts/conformance.sh");

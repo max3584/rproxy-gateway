@@ -1571,10 +1571,10 @@ fn cross_namespace_secrets_can_be_turned_off() {
 	assert!(off.files.is_empty(), "no key copied");
 }
 
-/// fleet listening on VIPs: the rules listen on the Gateway's VIPs (IPv4 first, IPv6 as an extra
+/// fleet listening on addresses: the rules listen on the Gateway's addresses (IPv4 first, IPv6 as an extra
 /// address) with `listen_freebind`, and their keys carry the VIP.
 #[test]
-fn rules_listen_on_the_vips_given() {
+fn rules_listen_on_the_addresses_given() {
 	let yaml = format!(
 		"{BASE}{}{}",
 		gw("    - {name: tcp, port: 9000, protocol: TCP}\n    - {name: udp, port: 5353, protocol: UDP}"),

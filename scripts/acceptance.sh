@@ -20,9 +20,11 @@
 # sends to the VIP. Scenarios j-o (the VIP holder's pod deleted, rollout restart, drain; its node killed
 # or paused, the control plane paused); the pod deletion, rollout restart, drain and the paused control
 # plane (hold) fail over GAP_LIMIT, a lost node is recorded only.
-# VIP_LISTEN=vip (MODE=fleet-vip): fleet.vip.listen=vip, two VIPs; the Gateway listens on the first
-# only (spec.addresses), and scenario q puts a second Gateway on the same ports on the second VIP
-# (needs rproxy v0.4.3: RPROXY_IMAGE_FROM=dist, an rproxy built from rproxy-api into dist/amd64/rproxy-api).
+# MODE=fleet: fleet mode (hostNetwork DaemonSet) without VIPs, fleet.listen=addresses: a Gateway with
+# spec.addresses listens on those addresses only (listen_freebind; rproxy v0.4.3). The Gateway acc has
+# none (the wildcard, the nodes' addresses). Scenario q: two addresses put on one worker by hand (ip
+# addr: what MetalLB, kube-vip, keepalived... do; record-only), two Gateways on the same ports, one per
+# address, and a third asking for a port taken on one of them (PortUnavailable).
 # RPROXY_IMAGE_FROM=dist: the rproxy image from dist/amd64/rproxy-api (the workflow's rproxy_ref) instead
 # of the chart's.
 # Outages are measured and reported. With MANAGED_REPLICAS >= 2, a pod deletion, a node drain, a
@@ -42,7 +44,8 @@ MODE=${MODE:-managed}
 case "$MODE" in
   managed) ;;
   fleet-vip) TOPOLOGY=fleet-vip ;;
-  *) echo "MODE: managed or fleet-vip"; exit 1 ;;
+  fleet) TOPOLOGY=fleet ;;
+  *) echo "MODE: managed, fleet or fleet-vip"; exit 1 ;;
 esac
 if [ "$SOURCE" = checkout ]; then
   CHART=${CHART:-charts/rproxy-gateway}
@@ -60,13 +63,10 @@ GAP_LIMIT=${GAP_LIMIT:-3}
 STRICT=${STRICT:-false}
 # the scenarios to run (a b1 b2 c d e f g h i; u is added with UI=true; MODE=fleet-vip: j k l o n m, the
 # node killed (m) last: a kind node started again may come back with another address)
-# fleet.vip.listen (MODE=fleet-vip): wildcard (the chart's default) or vip
-VIP_LISTEN=${VIP_LISTEN:-wildcard}
-RPROXY_IMAGE_FROM=${RPROXY_IMAGE_FROM:-chart}
-if [ "$MODE" = fleet-vip ] && [ "$VIP_LISTEN" = vip ]; then
-  SCENARIOS=${SCENARIOS:-q j k l o n m}
-elif [ "$MODE" = fleet-vip ]; then
+if [ "$MODE" = fleet-vip ]; then
   SCENARIOS=${SCENARIOS:-j k l o n m}
+elif [ "$MODE" = fleet ]; then
+  SCENARIOS=${SCENARIOS:-q}
 else
   SCENARIOS=${SCENARIOS:-a b1 b2 c d e f g h i}
 fi
@@ -78,7 +78,7 @@ UI_DIR=${UI_DIR:-../TCP-UDP-rproxy-ui}
 UI_USAGE_SECS=${UI_USAGE_SECS:-15}
 FRR_IMAGE=${FRR_IMAGE:-quay.io/frrouting/frr:9.1.0}
 HAPROXY_IMAGE=${HAPROXY_IMAGE:-haproxy:3.0-alpine}
-case "$TOPOLOGY" in l2-local | l2-cluster | bgp | nodeport-lb | fleet-vip) ;; *) echo "TOPOLOGY: l2-local, l2-cluster, bgp or nodeport-lb"; exit 1 ;; esac
+case "$TOPOLOGY" in l2-local | l2-cluster | bgp | nodeport-lb | fleet-vip | fleet) ;; *) echo "TOPOLOGY: l2-local, l2-cluster, bgp or nodeport-lb"; exit 1 ;; esac
 CLUSTER=${CLUSTER:-rproxy-gateway-acc}
 GATEWAY_API_VERSION=${GATEWAY_API_VERSION:-v1.6.3}
 METALLB_VERSION=${METALLB_VERSION:-v0.15.2}
@@ -92,7 +92,7 @@ ROTATE_TIMEOUT=${ROTATE_TIMEOUT:-300}
 NS=rproxy-gateway-system
 APP=acc
 # the rproxy pods: the Gateway's (managed) or the fleet's
-if [ "$MODE" = fleet-vip ]; then
+if [ "$MODE" != managed ]; then
   RP_NS=$NS RP_SEL=app.kubernetes.io/name=rproxy,app.kubernetes.io/component=fleet
 else
   RP_NS=$APP RP_SEL=app.kubernetes.io/name=rproxy
@@ -289,20 +289,19 @@ spec: {ipAddressPools: [kind]}" || { cat "$work/apply.log"; exit 1; }
   nodeport-lb)
     HELM_ARGS="--set managed.serviceType=NodePort --set managed.externalTrafficPolicy=Local $HELM_ARGS"
     ;;
+  fleet)
+    # two addresses from kind's docker network for scenario q (not on any node until it adds them)
+    ADDR1=${ADDR1:-$prefix.255.110} ADDR2=${ADDR2:-$prefix.255.111}
+    echo "kind network $subnet, scenario q's addresses $ADDR1 $ADDR2"
+    HELM_ARGS="--set fleet.enabled=true --set fleet.listen=addresses --set managed.addressCIDRs={$ADDR1/32,$ADDR2/32} $HELM_ARGS"
+    ;;
   fleet-vip)
     # a VIP from kind's docker network (docker allocates from the start of the subnet); the fleet's pods
     # hold it (hostNetwork, the vip sidecar), the runner reaches it on the docker bridge
     VIP=${VIP:-$prefix.255.100}
     LEASE=rproxy-vip-$(printf '%s' "$VIP" | sha256sum | cut -c1-10)
     echo "kind network $subnet, VIP $VIP (Lease $LEASE)"
-    if [ "$VIP_LISTEN" = vip ]; then
-      # a second VIP for scenario q's Gateway; every Gateway listens on its own VIPs
-      VIP2=${VIP2:-$prefix.255.101}
-      echo "fleet.vip.listen=vip, second VIP $VIP2"
-      HELM_ARGS="--set fleet.enabled=true --set fleet.vip.enabled=true --set fleet.vip.addresses={$VIP,$VIP2} --set managed.addressCIDRs={$VIP/32,$VIP2/32} --set fleet.vip.listen=vip $HELM_ARGS"
-    else
-      HELM_ARGS="--set fleet.enabled=true --set fleet.vip.enabled=true --set fleet.vip.addresses={$VIP} --set managed.addressCIDRs={$VIP/32} $HELM_ARGS"
-    fi
+    HELM_ARGS="--set fleet.enabled=true --set fleet.vip.enabled=true --set fleet.vip.addresses={$VIP} --set managed.addressCIDRs={$VIP/32} $HELM_ARGS"
     ;;
 esac
 case "$TOPOLOGY" in
@@ -346,6 +345,7 @@ if [ "$SOURCE" = checkout ]; then
 else
   image_args=(--version "$CHART_VERSION")
 fi
+RPROXY_IMAGE_FROM=${RPROXY_IMAGE_FROM:-chart}
 if [ "$RPROXY_IMAGE_FROM" = dist ]; then
   # rproxy built from rproxy-api (the workflow's rproxy_ref), e.g. a branch not released yet
   log "== rproxy image from dist/amd64/rproxy-api (sha256 $(sha256sum dist/amd64/rproxy-api | cut -c1-12))"
@@ -369,9 +369,6 @@ kubectl wait --for=condition=Accepted gatewayclass/rproxy --timeout=120s
 
 # ---------------------------------------------------------------- Gateway, routes, certificates
 log "== issuers, Gateway, routes"
-# fleet.vip.listen=vip: the Gateway on the first VIP only (scenario q's Gateway takes the second)
-ACC_ADDRESSES=""
-if [ "$MODE" = fleet-vip ] && [ "$VIP_LISTEN" = vip ]; then ACC_ADDRESSES="  addresses: [{type: IPAddress, value: $VIP}]"; fi
 kubectl create namespace $APP --dry-run=client -o yaml | kubectl apply -f - > /dev/null
 apply_issuers() {
   cat << 'YAML' | kubectl apply -f -
@@ -448,7 +445,6 @@ kind: Gateway
 metadata: {name: acc, namespace: $APP}
 spec:
   gatewayClassName: rproxy
-$ACC_ADDRESSES
   listeners:
     - {name: http, port: 80, protocol: HTTP}
     - name: https
@@ -491,7 +487,13 @@ kubectl -n "$APP" rollout status deploy/echo --timeout=300s
 kubectl -n "$APP" wait --for=condition=Ready certificate/secure-cert --timeout=180s
 kubectl -n "$APP" wait --for=condition=Programmed gateway/acc --timeout=300s
 LB=$(kubectl -n "$APP" get gateway acc -o jsonpath='{.status.addresses[0].value}')
-if [ "$MODE" = fleet-vip ]; then
+if [ "$MODE" = fleet ]; then
+  # every worker runs a fleet pod; the Gateway (no spec.addresses) listens on the wildcard: the nodes'
+  # addresses, the first in its status
+  DEPLOY=-
+  MANAGED_REPLICAS=$(echo "$WORKERS" | wc -w)
+  kubectl -n "$NS" rollout status ds/rproxy --timeout=300s
+elif [ "$MODE" = fleet-vip ]; then
   # every worker runs a fleet pod; the Gateway's address is the VIP
   DEPLOY=-
   MANAGED_REPLICAS=$(echo "$WORKERS" | wc -w)
@@ -540,20 +542,8 @@ pod_node() { kubectl -n "$RP_NS" get pod "$1" -o jsonpath='{.spec.nodeName}' 2> 
 udp_ok() { [ "$(echo 'echo vip-udp' | timeout 3 nc -u -w 1 "$LB" 9001 2> /dev/null | head -c 7)" = vip-udp ]; }
 http_code() { curl -s -o /dev/null -w '%{http_code}' --connect-timeout 1 --max-time 2 "$@" || true; }
 lb_host_ok() { [ "$(http_code -H "Host: $1" "http://$LB/")" = 200 ]; }
-# a pod's rule set: HTTP, HTTPS (verified against the CA) and TCP straight to the pod IP. With
-# fleet.vip.listen=vip the rules listen on the VIP only, which just one node has: the pod's node (the
-# fleet is hostNetwork) listens on the VIP's ports 80, 443 and 9000 then
+# a pod's rule set: HTTP, HTTPS (verified against the CA) and TCP straight to the pod IP
 pod_serves() {
-  if [ "$MODE" = fleet-vip ] && [ "$VIP_LISTEN" = vip ]; then
-    local n ports
-    for n in $WORKERS; do
-      [ "$(kind_ip "$n")" = "$1" ] || continue
-      ports=$(docker exec "$n" ss -Hltn 2> /dev/null | awk '{print $4}')
-      grep -qx "$VIP:80" <<< "$ports" && grep -qx "$VIP:443" <<< "$ports" && grep -qx "$VIP:9000" <<< "$ports"
-      return
-    done
-    return 1
-  fi
   [ "$(http_code -H 'Host: echo.example.com' "http://$1/")" = 200 ] &&
     [ "$(http_code --cacert "$work/ca.crt" --resolve "secure.example.com:443:$1" https://secure.example.com/)" = 200 ] &&
     [ "$(http_code "http://$1:9000/")" = 200 ]
@@ -702,7 +692,7 @@ w_lease() {
 }
 w_vip() { while :; do echo "vip on $(vip_nodes | tr '\n' ' ')"; sleep 0.2; done; }
 w_lb() { docker logs -f --since 1s "$CLUSTER-lb" 2>&1 | grep --line-buffered -E ' is (UP|DOWN)' | sed -u 's/^/lb /'; }
-[ "$MODE" = fleet-vip ] || watch_bg slices w_slices
+[ "$MODE" != managed ] || watch_bg slices w_slices
 watch_bg pods w_pods
 case "$TOPOLOGY" in
   fleet-vip) watch_bg lease w_lease && watch_bg vip w_vip ;;
@@ -1245,132 +1235,135 @@ scenario_n() {
   only_fleet "$label" || return 0
   node_lost pause "$label"
 }
-# q. fleet.vip.listen=vip: a second Gateway (namespace acc2) on the same ports 80, 443 and UDP 9001 on
-# the second VIP. Both Gateways are Programmed and each VIP reaches its own Gateway's backends (the
-# echo pod's namespace in the answer); a third Gateway asking for the first VIP's port 80 is refused on
-# that listener (PortUnavailable) while the first keeps serving. Traffic to the first Gateway must not
-# be disturbed (GAP_LIMIT).
-gw2_programmed() {
-  [ "$(kubectl -n acc2 get gateway acc2 -o jsonpath='{.status.conditions[?(@.type=="Programmed")].status}')" = True ] &&
-    [ "$(kubectl -n acc2 get gateway acc2 -o jsonpath='{.status.listeners[*].conditions[?(@.type=="Programmed")].status}')" = "True True True" ]
+# q. MODE=fleet, fleet.listen=addresses: see the header. Both Gateways must be Programmed and each
+# address must reach its own Gateway's backend (HTTP, HTTPS, UDP); the third Gateway gets
+# PortUnavailable; acc (the wildcard, other ports) is not disturbed (GAP_LIMIT)
+q_gateways_programmed() {
+  local g
+  for g in one two; do
+    [ "$(kubectl -n q get gateway "$g" -o jsonpath='{.status.conditions[?(@.type=="Programmed")].status}')" = True ] &&
+      [ "$(kubectl -n q get gateway "$g" -o jsonpath='{.status.listeners[*].conditions[?(@.type=="Programmed")].status}')" = "True True True" ] || return 1
+  done
 }
 ns_of() { curl -s --connect-timeout 1 --max-time 2 "$@" | jq -r '.namespace // empty' 2> /dev/null; }
-vip2_serves() {
-  [ "$(ns_of -H 'Host: echo.example.com' "http://$VIP2/")" = acc2 ] &&
-    [ "$(ns_of --cacert "$work/ca.crt" --resolve "secure2.example.com:443:$VIP2" https://secure2.example.com/)" = acc2 ] &&
-    [ "$(echo 'echo vip2-udp' | timeout 3 nc -u -w 1 "$VIP2" 9001 2> /dev/null | head -c 8)" = vip2-udp ]
+# q_serves <address> <tag>: HTTP, HTTPS and UDP on the address reach the echo pods tagged <tag>
+q_serves() {
+  [ "$(ns_of -H 'Host: echo.example.com' "http://$1:8080/")" = "$2" ] &&
+    [ "$(ns_of --cacert "$work/ca.crt" --resolve "q.example.com:8443:$1" https://q.example.com:8443/)" = "$2" ] &&
+    [ "$(echo "echo $2" | timeout 3 nc -u -w 1 "$1" 9002 2> /dev/null | head -c ${#2})" = "$2" ]
 }
-vip1_is_acc() {
-  [ "$(ns_of -H 'Host: echo.example.com' "http://$VIP/")" = "$APP" ] &&
-    [ "$(ns_of --cacert "$work/ca.crt" --resolve "secure.example.com:443:$VIP" https://secure.example.com/)" = "$APP" ]
-}
-port_refused() {
-  [ "$(kubectl -n acc2 get gateway acc3 -o jsonpath='{.status.listeners[0].conditions[?(@.type=="Accepted")].reason}')" = PortUnavailable ]
+q_port_refused() {
+  [ "$(kubectl -n q get gateway three -o jsonpath='{.status.listeners[0].conditions[?(@.type=="Accepted")].reason}')" = PortUnavailable ]
 }
 scenario_q() {
-  local label="q. a second Gateway on the same ports on the second VIP (fleet.vip.listen=vip)" t0 ok=PASS t_prog t_serve notes msg
-  only_fleet "$label" || return 0
-  if [ "$VIP_LISTEN" != vip ]; then
-    printf '%s\t–\t–\t–\tSKIP\tVIP_LISTEN=vip only\n' "$label" >> "$results"
+  local label="q. two Gateways on the same ports on two addresses (fleet.listen=addresses)" t0 ok=PASS t_prog t_serve notes msg node
+  if [ "$MODE" != fleet ]; then
+    printf '%s\t–\t–\t–\tSKIP\tMODE=fleet only\n' "$label" >> "$results"
     return 0
   fi
-  log "== $label: $VIP2"
+  node=$(echo "$WORKERS" | awk '{print $1}')
+  log "== $label: $ADDR1 and $ADDR2 on $node"
   t0=$(now_ms)
-  kubectl create namespace acc2 --dry-run=client -o yaml | kubectl apply -f - > /dev/null
-  cat << YAML | kubectl apply -f - > /dev/null
+  kubectl create namespace q --dry-run=client -o yaml | kubectl apply -f - > /dev/null
+  {
+    cat << YAML
 apiVersion: cert-manager.io/v1
 kind: Certificate
-metadata: {name: secure2-cert, namespace: acc2}
+metadata: {name: q-cert, namespace: q}
 spec:
-  secretName: secure2-cert
-  dnsNames: [secure2.example.com]
+  secretName: q-cert
+  dnsNames: [q.example.com]
   privateKey: {algorithm: ECDSA, size: 256}
   issuerRef: {name: acc-ca, kind: ClusterIssuer, group: cert-manager.io}
+YAML
+    local g addr
+    for g in one two; do
+      [ "$g" = one ] && addr=$ADDR1 || addr=$ADDR2
+      cat << YAML
 ---
 apiVersion: apps/v1
 kind: Deployment
-metadata: {name: echo, namespace: acc2}
+metadata: {name: echo-$g, namespace: q}
 spec:
   replicas: 2
-  selector: {matchLabels: {app: echo}}
+  selector: {matchLabels: {app: echo-$g}}
   template:
-    metadata: {labels: {app: echo}}
+    metadata: {labels: {app: echo-$g}}
     spec:
       containers:
         - name: echo
           image: registry.k8s.io/gateway-api/echo-basic:v1.5.1
           env:
             - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
-            - {name: NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}
+            - {name: NAMESPACE, value: $g}
           readinessProbe: {httpGet: {path: /, port: 3000}, periodSeconds: 2}
         - name: udp
           image: registry.k8s.io/e2e-test-images/agnhost:2.53
-          args: [netexec, --http-port=8080, --udp-port=8081]
+          args: [netexec, --http-port=8081, --udp-port=8082]
 ---
 apiVersion: v1
 kind: Service
-metadata: {name: echo, namespace: acc2}
+metadata: {name: echo-$g, namespace: q}
 spec:
-  selector: {app: echo}
-  ports: [{name: http, port: 8080, targetPort: 3000}]
----
-apiVersion: v1
-kind: Service
-metadata: {name: udp-echo, namespace: acc2}
-spec:
-  selector: {app: echo}
-  ports: [{name: udp, port: 8081, protocol: UDP}]
+  selector: {app: echo-$g}
+  ports: [{name: http, port: 8080, targetPort: 3000}, {name: udp, port: 8082, protocol: UDP}]
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
-metadata: {name: acc2, namespace: acc2}
+metadata: {name: $g, namespace: q}
 spec:
   gatewayClassName: rproxy
-  addresses: [{type: IPAddress, value: $VIP2}]
+  addresses: [{type: IPAddress, value: $addr}]
   listeners:
-    - {name: http, port: 80, protocol: HTTP}
-    - {name: https, port: 443, protocol: HTTPS, hostname: secure2.example.com, tls: {certificateRefs: [{name: secure2-cert}]}}
-    - {name: udp, port: 9001, protocol: UDP}
+    - {name: http, port: 8080, protocol: HTTP}
+    - {name: https, port: 8443, protocol: HTTPS, hostname: q.example.com, tls: {certificateRefs: [{name: q-cert}]}}
+    - {name: udp, port: 9002, protocol: UDP}
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
-metadata: {name: echo, namespace: acc2}
+metadata: {name: $g, namespace: q}
 spec:
-  parentRefs: [{name: acc2, sectionName: http}, {name: acc2, sectionName: https}]
-  hostnames: [echo.example.com, secure2.example.com]
-  rules: [{backendRefs: [{name: echo, port: 8080}]}]
+  parentRefs: [{name: $g, sectionName: http}, {name: $g, sectionName: https}]
+  hostnames: [echo.example.com, q.example.com]
+  rules: [{backendRefs: [{name: echo-$g, port: 8080}]}]
 ---
 apiVersion: gateway.networking.k8s.io/v1alpha2
 kind: UDPRoute
-metadata: {name: udp-echo, namespace: acc2}
+metadata: {name: $g, namespace: q}
 spec:
-  parentRefs: [{name: acc2, sectionName: udp}]
-  rules: [{backendRefs: [{name: udp-echo, port: 8081}]}]
+  parentRefs: [{name: $g, sectionName: udp}]
+  rules: [{backendRefs: [{name: echo-$g, port: 8082}]}]
 YAML
-  kubectl -n acc2 rollout status deploy/echo --timeout=300s > /dev/null || ok=FAIL
-  if wait_for "$APPLY_TIMEOUT" gw2_programmed; then t_prog=$(now_ms); else t_prog=$(now_ms) ok=FAIL; fi
-  if wait_for "$APPLY_TIMEOUT" vip2_serves; then t_serve=$(now_ms); else t_serve=$(now_ms) ok=FAIL; fi
-  vip1_is_acc || ok=FAIL
+    done
+  } | kubectl apply -f - > /dev/null
+  kubectl -n q rollout status deploy/echo-one deploy/echo-two --timeout=300s > /dev/null || ok=FAIL
+  if wait_for "$APPLY_TIMEOUT" q_gateways_programmed; then t_prog=$(now_ms); else t_prog=$(now_ms) ok=FAIL; fi
+  # the platform's part (MetalLB, kube-vip, keepalived...): the addresses on one node
+  docker exec "$node" ip addr add "$ADDR1/32" dev eth0
+  docker exec "$node" ip addr add "$ADDR2/32" dev eth0
+  if wait_for "$APPLY_TIMEOUT" q_serves "$ADDR1" one && wait_for 30 q_serves "$ADDR2" two; then t_serve=$(now_ms); else t_serve=$(now_ms) ok=FAIL; fi
   statuses_ok || ok=FAIL
-  notes="acc2 Programmed after $(secs $((t_prog - t0)))s, its VIP $VIP2 answering HTTP, HTTPS and UDP from acc2 after $(secs $((t_serve - t0)))s; $VIP still reaches acc ($(vip1_is_acc && echo yes || echo NO)); VIP2 on $(for n in $WORKERS; do docker exec "$n" ip -o addr show 2> /dev/null | grep -q " $VIP2/" && echo "$n"; done | tr '\n' ' ')"
-  # the same port on the first VIP: refused on that listener, the first Gateway unaffected
+  notes="both Gateways Programmed after $(secs $((t_prog - t0)))s (before the addresses were on any node); $ADDR1 → one, $ADDR2 → two (HTTP, HTTPS, UDP) $(secs $((t_serve - t0)))s after the start"
+  # the same port on the first address: refused on that listener
   cat << YAML | kubectl apply -f - > /dev/null
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
-metadata: {name: acc3, namespace: acc2}
+metadata: {name: three, namespace: q}
 spec:
   gatewayClassName: rproxy
-  addresses: [{type: IPAddress, value: $VIP}]
-  listeners: [{name: http, port: 80, protocol: HTTP}]
+  addresses: [{type: IPAddress, value: $ADDR1}]
+  listeners: [{name: http, port: 8080, protocol: HTTP}]
 YAML
-  if wait_for 60 port_refused; then
-    msg=$(kubectl -n acc2 get gateway acc3 -o jsonpath='{.status.listeners[0].conditions[?(@.type=="Accepted")].message}')
-    notes+="; acc3 on $VIP:80: PortUnavailable ($msg)"
+  if wait_for 60 q_port_refused; then
+    msg=$(kubectl -n q get gateway three -o jsonpath='{.status.listeners[0].conditions[?(@.type=="Accepted")].message}')
+    notes+="; three on $ADDR1:8080: PortUnavailable ($msg)"
   else
-    ok=FAIL notes+="; acc3 on $VIP:80 not refused: $(kubectl -n acc2 get gateway acc3 -o jsonpath='{.status.listeners[0].conditions}')"
+    ok=FAIL notes+="; three on $ADDR1:8080 not refused: $(kubectl -n q get gateway three -o jsonpath='{.status.listeners[0].conditions}')"
   fi
-  if ! statuses_ok || ! vip1_is_acc; then ok=FAIL notes+="; acc disturbed by acc3"; fi
-  kubectl delete namespace acc2 --wait=true --timeout=180s > /dev/null || true
+  if ! q_serves "$ADDR1" one || ! statuses_ok; then ok=FAIL notes+="; disturbed by three"; fi
+  kubectl delete namespace q --wait=true --timeout=180s > /dev/null || true
+  docker exec "$node" ip addr del "$ADDR1/32" dev eth0 || true
+  docker exec "$node" ip addr del "$ADDR2/32" dev eth0 || true
   settle || ok=FAIL
   record "$label" "$t0" "$(now_ms)" "$(secs $((t_serve - t0)))s" "$ok" "$notes" limit
 }
@@ -1558,7 +1551,8 @@ stop_probes
     l2-cluster) echo "MetalLB $METALLB_VERSION L2, externalTrafficPolicy Cluster." ;;
     bgp) echo "MetalLB $METALLB_VERSION BGP (FRR mode, BFD 300 ms x 3) to an FRR router ($FRR_IMAGE) with ECMP over the announcing nodes (externalTrafficPolicy $ETP)." ;;
     nodeport-lb) echo "NodePort Services (externalTrafficPolicy $ETP) behind HAProxy ($HAPROXY_IMAGE, TCP, checks every 500 ms, a failed connection marks the node down and goes to another)." ;;
-    fleet-vip) echo "fleet mode (a DaemonSet with hostNetwork on every worker) with the VIP $VIP held by the fleet's pods directly (the vip sidecar, Lease $LEASE; no Service or load balancer); fleet.vip.listen=$VIP_LISTEN$([ "$VIP_LISTEN" = vip ] && echo " (second VIP $VIP2)"); rproxy image: $RPROXY_IMAGE_FROM. MetalLB L2 for comparison: the managed runs (l2-local, l2-cluster; docs/DESIGN-v0.4.x.md 6.2)." ;;
+    fleet) echo "fleet mode (a DaemonSet with hostNetwork on every worker) without VIPs, fleet.listen=addresses; scenario q's addresses $ADDR1 $ADDR2 put on one worker by hand (ip addr); rproxy image: $RPROXY_IMAGE_FROM." ;;
+    fleet-vip) echo "fleet mode (a DaemonSet with hostNetwork on every worker) with the VIP $VIP held by the fleet's pods directly (the vip sidecar, Lease $LEASE; no Service or load balancer). MetalLB L2 for comparison: the managed runs (l2-local, l2-cluster; docs/DESIGN-v0.4.x.md 6.2)." ;;
   esac
   echo "kind 1 control plane + 3 workers, cert-manager $CERT_MANAGER_VERSION, Gateway API $GATEWAY_API_VERSION experimental."
   echo "Controller replicas 2, managed.replicas $MANAGED_REPLICAS. Extra helm flags: \`${HELM_ARGS:-none}\`. Probes: HTTP, HTTPS, TCP through the Gateway's address every 100 ms, a new connection each."

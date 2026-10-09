@@ -113,6 +113,13 @@ fleet:
   shutdown: {delay: 5s, drain: 25s}
   # RproxyRules (off: the fleet's pods are shared by every Gateway; fleet is for one trust domain)
   rproxyRules: false
+  # where Gateways' listeners listen: wildcard (rproxy.listenAddresses on every node: one Gateway per
+  # port) or addresses (a Gateway with spec.addresses listens on those only, inside
+  # managed.addressCIDRs, whether a node has them yet or not: Gateways on different addresses can use
+  # the same port, and traffic to an address reaches only its Gateways; the platform puts the
+  # addresses on the nodes: MetalLB, kube-vip, keepalived... Gateways without spec.addresses keep the
+  # wildcard). addresses needs rproxy v0.4.3 (listen_freebind); with an older rproxy the wildcard is kept
+  listen: wildcard
   # VIPs held by the fleet's pods directly, without a Service or load balancer (docs/DESIGN-v0.4.x.md 7.):
   # a `vip` sidecar (rproxy-gateway vip; NET_ADMIN and NET_RAW in that container only) per pod. One
   # Lease per VIP (rproxy-vip-<hash>, made by the chart) decides which pod has it; the holder adds it to
@@ -139,12 +146,6 @@ fleet:
     # the API server cannot be reached: hold (keep the VIP while rproxy is ready; another MAC announcing
     # it makes the pod let go) or release (drop it when the Lease would have expired)
     onApiUnreachable: hold
-    # where Gateways' listeners listen: wildcard (rproxy.listenAddresses: every Gateway's port on every
-    # address, so two Gateways cannot use the same port) or vip (each Gateway on its own VIPs, those of
-    # spec.addresses, else every VIP: Gateways on different VIPs can use the same port, and traffic to
-    # one VIP reaches only its Gateways). vip needs rproxy v0.4.3 (listen_freebind); with an older
-    # rproxy the controller keeps the wildcard
-    listen: wildcard
     # /metrics (rproxy_vip_held, rproxy_vip_transitions_total) and /healthz on the node's IP
     metricsPort: 9445
     resources:

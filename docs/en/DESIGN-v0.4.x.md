@@ -421,18 +421,6 @@ As in 7.2-7.8. What changed from the design, and details:
 - UDP answered from the VIP at the start and after each scenario (rproxy answers from it with `IP_PKTINFO`).
 - Empty `vip` lines in the summary's timelines are the runner failing to read a node with `docker exec` (the probes succeed meanwhile).
 
-### 7.10 Added in v0.4.5: listening per VIP (revisiting 10. Q19)
-
-In v0.4.4 the fleet's rules listen on `0.0.0.0`, so rproxy refuses (`409`) a second Gateway on the same port, even on another VIP. With rproxy-api v0.4.3's `listen_freebind` (listening on an address not on the node yet, `IP_FREEBIND`), each Gateway can listen on its own VIPs.
-
-- Value: `fleet.vip.listen: wildcard | vip` (default `wildcard`, as in v0.4.4). `vip` gives the controller `RPROXY_GATEWAY_FLEET_VIP_LISTEN=vip`.
-- Addresses listened on: the usable VIPs among the Gateway's `spec.addresses`, else every usable VIP (IPv4 as `listen_addr`, the rest `extra_listen_addrs`). Not changed by who holds them (with `listen_freebind` the rproxy of a node without the VIP listens with the same rule, and traffic arrives once the VIP comes; a moving VIP does not change the rules). Rule keys become `tcp/<VIP>:443`.
-- rproxy version: only while every fleet pod's rproxy has `features.listen_freebind` (if a pod that answered lacks it, back to `wildcard`, logged; a new pod that has not answered yet does not switch it back). The fleet's pods need not be re-created (a per-rule mark).
-- Conflicts: in fleet every Gateway's rules go to the same rproxy. When two Gateways use the same port on the same address (or a wildcard covering it), the **older Gateway** (creation time, then namespace and name) keeps it; the newer one's rule is left out of its set and its listener is `Accepted: False` (`PortUnavailable`, "tcp/192.0.2.10:443 is used by Gateway ns/name"). Before, whichever was applied first won and the other showed rproxy's `409` in `Programmed: False` (the same check applies with `wildcard`, so who wins is decided). rproxy's `409` stays as a backstop.
-- UDP: the rule listens on the address itself, so replies leave from the VIP (no `IP_PKTINFO` needed).
-- Guard: with `vip`, traffic to a VIP reaches only that VIP's Gateways, and the node's IPs are not listened on ([SECURITY.md](SECURITY.md)).
-- Acceptance: inputs `vip_listen: vip` (two VIPs; Gateway `acc` on the first only) and `rproxy_ref` (rproxy built from an rproxy-api branch or tag). Scenario q: a Gateway in another namespace on 80, 443 and UDP 9001 on the second VIP; both Programmed, each VIP reaching its own backends; a third Gateway asking for port 80 on the first VIP gets `PortUnavailable` and the first is undisturbed (`GAP_LIMIT`). With `vip`, the per-pod check (`pod_serves`) is that the pod's node listens on the VIP's 80, 443 and 9000 (`ss`).
-
 ## 8. Changes to the acceptance test (`acceptance.yml`)
 
 | Input | Default | What | PR |
@@ -475,7 +463,7 @@ Scenarios added (A), run after today's a-g; SKIP when the `RproxyGatewayParamete
 | Q9 | Show Kubernetes rules to UI users who are not administrators | **Administrators only**; mapping namespaces to Keycloak groups later |
 | Q17 | F's approach | **1b: fleet + our own `rproxy-gateway vip` (Leases, gratuitous ARP / NA)** |
 | Q18 | VIPs while the API server is unreachable | **`hold`** (released at once when another MAC announces the VIP) |
-| Q19 | Separate listeners per VIP | **No** in v0.4.4 (`0.0.0.0` as is). v0.4.5 adds `fleet.vip.listen: vip` (rproxy-api v0.4.3's `listen_freebind`; the default stays `wildcard`; 7.10) |
+| Q19 | Separate listeners per VIP | **No** in v0.4.4 (`0.0.0.0` as is). v0.4.5 adds `fleet.listen: addresses` (listening on the Gateway's `spec.addresses`; rproxy-api v0.4.3's `listen_freebind`; the default stays `wildcard`; 12.) |
 | Q20 | Can a Gateway ask for a new VIP | **Only the administrator's list** (Gateways choose from it) |
 | Q21 | Lease defaults | **3 s expiry, 1 s renewal, 0.5 s retry** |
 | Q22 | When F ships | a separate patch of the v0.4 line (does not hold A-E back) |
@@ -483,3 +471,15 @@ Scenarios added (A), run after today's a-g; SKIP when the `RproxyGatewayParamete
 | — | The class's default parameters in the chart | **Rendered only when `managed.parameters` is not empty** (`helm upgrade` does not install new CRDs; 2.7) |
 
 Q10-Q16 (the UI's migrations and MariaDB, rproxy-api #240 and #241, usage) are in the UI's and rproxy-api's designs.
+
+## 12. Listening on each Gateway's addresses in fleet (v0.4.5)
+
+The fleet's rules listen on `0.0.0.0` (`--listen-addr`), so rproxy refuses (`409`) a second Gateway on the same port, even on another address. With rproxy-api v0.4.3's `listen_freebind` (listening on an address not on the node yet, `IP_FREEBIND`), each Gateway can listen on its own addresses. Putting the addresses on the nodes (announcing, moving them) is the platform's job (MetalLB, kube-vip, Cilium LB IPAM, a cloud LB, keepalived on the hosts...); rproxy-gateway only listens (it does not rely on the VIP sidecar; the owner's decision). Revisits 10. Q19.
+
+- Value: the chart's `fleet.listen: wildcard | addresses` (default `wildcard`, as before). `addresses` gives the controller `RPROXY_GATEWAY_FLEET_LISTEN=addresses` and `RPROXY_GATEWAY_ADDRESS_CIDR` (`managed.addressCIDRs`).
+- Addresses listened on: the Gateway's `spec.addresses` (when every one is inside `--address-cidr`; IPv4 as `listen_addr`, the rest `extra_listen_addrs`). Not changed by which node has the address (with `listen_freebind` every fleet pod listens with the same rule, and traffic arrives on the node the address is on; a moving address does not change the rules). Rule keys become `tcp/<address>:443`. Gateways without `spec.addresses` keep the wildcard. The Gateway's `status.addresses` are its `spec.addresses`.
+- rproxy version: only while every fleet pod's rproxy has `features.listen_freebind` (if a pod that answered lacks it, back to the wildcard, logged; a new pod that has not answered yet does not switch it back). The fleet's pods need not be re-created (a per-rule mark).
+- Conflicts: in fleet every Gateway's rules go to the same rproxy. When two Gateways use the same port on the same address (or a wildcard covering it), the **older Gateway** (creation time, then namespace and name) keeps it; the newer one's rule is left out of its set and its listener is `Accepted: False` (`PortUnavailable`, "tcp/192.0.2.10:443 is used by Gateway ns/name"). The same with `wildcard` (before, whichever was applied first won and the other showed rproxy's `409` in `Programmed: False`). rproxy's `409` stays as a backstop.
+- UDP: the rule listens on the address itself, so replies leave from it (no `IP_PKTINFO` needed).
+- Guard: traffic to an address reaches only that address's Gateways. Addresses are limited to the administrator's `managed.addressCIDRs` (the same guard as `spec.addresses` before; [SECURITY.md](SECURITY.md)).
+- Acceptance: `mode=fleet` (no VIPs, `fleet.listen=addresses`) and the input `rproxy_ref` (rproxy built from an rproxy-api branch or tag). Scenario q: two addresses of kind's docker network are put on one worker with `ip addr add`, standing in for the platform (the network part is recorded only), and two Gateways (one per address) on the same ports 8080, 8443 and UDP 9002. Both Programmed (before the addresses are on a node), each address reaching its own backend; a third Gateway asking for 8080 on the first address gets `PortUnavailable`, and the wildcard `acc` (80, 443, 9000) and the first are undisturbed (`GAP_LIMIT`).

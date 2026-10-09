@@ -399,10 +399,10 @@ spec:
 	let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// fleet listening on VIPs (rproxy v0.4.3 `listen_freebind`): two Gateways' sets on the same port on
+/// fleet listening on addresses (rproxy v0.4.3 `listen_freebind`): two Gateways' sets on the same port on
 /// two addresses not on the host both run; a third set on one of them is refused for that rule.
 #[tokio::test]
-async fn two_gateways_on_one_port_on_two_vips() {
+async fn two_gateways_on_one_port_on_two_addresses() {
 	let Some(bin) = rproxy_bin() else { return };
 	let _ = rustls::crypto::ring::default_provider().install_default();
 	let dir = std::env::temp_dir().join(format!("rproxy-gateway-vips-{}", std::process::id()));

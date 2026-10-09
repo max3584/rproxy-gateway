@@ -373,34 +373,6 @@ async fn reconcile_all(
 		cross_namespace_secrets: cfg.cross_namespace_secrets,
 		params: params_opts.clone(),
 	};
-	// fleet: the pods (every Gateway's)
-	let fleet_eps = match &cfg.mode {
-		Mode::Fleet(f) => provision::pods(&pods_now, &cfg.namespace, &provision::parse_selector(&f.selector)),
-		Mode::Managed(_) => vec![],
-	};
-	// fleet with VIPs: which can be used, who holds them
-	let vips = match &cfg.mode {
-		Mode::Fleet(f) if !f.vips.is_empty() => {
-			let host_ips: Vec<String> = fleet_eps.iter().filter_map(|e| e.host_ip.clone()).collect();
-			let unusable: BTreeMap<String, String> = f
-				.vips
-				.iter()
-				.filter_map(|v| fleet_vip::unusable(&world, v, &cfg.address_cidrs, &host_ips).map(|why| (v.clone(), why)))
-				.collect();
-			{
-				let mut seen = VIPS_SEEN.lock().unwrap();
-				for why in unusable.values() {
-					if seen.insert(why.clone()) {
-						warn!(reason = %why, "a VIP is not used");
-					}
-				}
-			}
-			let holders = fleet_vip::holders(client, &cfg.namespace, &f.vips).await;
-			soon |= holders.values().any(|h| matches!(h, fleet_vip::Holder::Unheld(_)));
-			Some(VipState { unusable, holders })
-		}
-		_ => None,
-	};
 	let mut rendered: Vec<(&crate::k8s::gateway::Gateway, GatewayPlan)> = vec![];
 	for gw in world.gateways.iter().filter(|g| classes.contains(&g.spec.gateway_class_name)) {
 		// what the Gateway's rproxy pods take (all of rproxy v0.4.0 before they are asked)
@@ -414,12 +386,11 @@ async fn reconcile_all(
 		};
 		let features = pod_features(rp, &eps, &mut state.caps).await;
 		let mut opts = render::Options { features, ..opts.clone() };
-		// fleet listening on VIPs: the Gateway's own VIPs (rproxy that has listen_freebind)
-		if let (Mode::Fleet(f), Some(v)) = (&cfg.mode, vips.as_ref()) {
-			if f.listen_on_vips && fleet_freebind(&eps, &state.caps) {
-				let requested = render::gateway_addresses(gw).map(|(a, _)| a).unwrap_or_default();
-				let addrs = fleet_vip::listen_vips(&requested, &f.vips, &v.unusable);
-				if !addrs.is_empty() {
+		// fleet listening on Gateways' addresses: a Gateway with spec.addresses (allowed by --address-cidr)
+		// listens on them (rproxy with listen_freebind: whether a node has them yet or not)
+		if let Mode::Fleet(f) = &cfg.mode {
+			if f.listen_on_addresses && fleet_freebind(&eps, &state.caps) {
+				if let Some(addrs) = listen_addresses(gw, &cfg.address_cidrs) {
 					opts.listen_addrs = addrs;
 					opts.listen_freebind = true;
 				}
@@ -433,8 +404,8 @@ async fn reconcile_all(
 	}
 	// fleet: one certificate Secret with every Gateway's files, mounted into every pod
 	let fleet_pods = match &cfg.mode {
-		Mode::Fleet(_) => {
-			let eps = fleet_eps.clone();
+		Mode::Fleet(f) => {
+			let eps = provision::pods(&pods_now, &cfg.namespace, &provision::parse_selector(&f.selector));
 			let mut files = BTreeMap::new();
 			for (_, plan) in rendered.iter().filter(|(_, p)| p.accepted()) {
 				files.extend(plan.files.iter().map(|(k, v)| (k.clone(), v.clone())));
@@ -455,6 +426,29 @@ async fn reconcile_all(
 			eps
 		}
 		Mode::Managed(_) => vec![],
+	};
+	// fleet with VIPs: which can be used, who holds them
+	let vips = match &cfg.mode {
+		Mode::Fleet(f) if !f.vips.is_empty() => {
+			let host_ips: Vec<String> = fleet_pods.iter().filter_map(|e| e.host_ip.clone()).collect();
+			let unusable: BTreeMap<String, String> = f
+				.vips
+				.iter()
+				.filter_map(|v| fleet_vip::unusable(&world, v, &cfg.address_cidrs, &host_ips).map(|why| (v.clone(), why)))
+				.collect();
+			{
+				let mut seen = VIPS_SEEN.lock().unwrap();
+				for why in unusable.values() {
+					if seen.insert(why.clone()) {
+						warn!(reason = %why, "a VIP is not used");
+					}
+				}
+			}
+			let holders = fleet_vip::holders(client, &cfg.namespace, &f.vips).await;
+			soon |= holders.values().any(|h| matches!(h, fleet_vip::Holder::Unheld(_)));
+			Some(VipState { unusable, holders })
+		}
+		_ => None,
 	};
 	let pass = Pass {
 		client,
@@ -890,6 +884,9 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 				};
 				let addrs = if plan.addresses.is_empty() {
 					addrs
+				} else if f.listen_on_addresses {
+					// fleet.listen=addresses: its own addresses (checked against --address-cidr by the render)
+					plan.addresses.clone()
 				} else {
 					// the fleet's addresses are fixed: an address asked for must be one of them
 					if let Some(a) = plan.addresses.iter().find(|a| !addrs.contains(a)) {
@@ -1032,9 +1029,26 @@ fn fleet_freebind(eps: &[Endpoint], caps: &HashMap<String, Capabilities>) -> boo
 		return false;
 	}
 	if !known.is_empty() && !FLEET_FREEBIND.swap(true, Ordering::Relaxed) {
-		info!("the fleet's rproxy has listen_freebind: Gateways listen on their VIPs");
+		info!("the fleet's rproxy has listen_freebind: Gateways with spec.addresses listen on them");
 	}
 	FLEET_FREEBIND.load(Ordering::Relaxed)
+}
+
+/// fleet.listen=addresses: where a Gateway's rules listen: its `spec.addresses` when every one is inside
+/// `--address-cidr` (IPv4 first: the first is `listen_addr`, the rest `extra_listen_addrs`); `None`: the
+/// wildcard (no addresses, or one the render refuses: `AddressNotUsable`).
+fn listen_addresses(gw: &crate::k8s::gateway::Gateway, cidrs: &[render::Cidr]) -> Option<Vec<String>> {
+	let (mut ips, unusable) = render::gateway_addresses(gw).ok()?;
+	if ips.is_empty() || unusable.is_some() {
+		return None;
+	}
+	let allowed = |a: &String| a.parse::<std::net::IpAddr>().is_ok_and(|ip| cidrs.iter().any(|c| c.contains(ip)));
+	if !ips.iter().all(allowed) {
+		return None;
+	}
+	ips.dedup();
+	ips.sort_by_key(|a| a.contains(':'));
+	Some(ips)
 }
 
 /// fleet: every Gateway's rules go to the same rproxy, which refuses a rule that takes a port another

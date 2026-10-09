@@ -16,7 +16,7 @@ English: [en/SECURITY.md](en/SECURITY.md)
 ## managed と fleet
 
 - **managed（既定）**：Gateway ごとに、Gateway の namespace に rproxy を置く。制御 API の証明書とトークンは Gateway ごと（CA が `<id>.rproxy-api.rproxy-gateway.internal` に出したもの、マスタートークンから HMAC で導いたもの）。テナントを分けるのはこちら。
-- **fleet**：すべての Gateway が同じ rproxy の Pod（hostNetwork の DaemonSet）を使う。**1 つの信頼の範囲（1 人の管理者）のためのもの**で、テナントを分けない。すべての Gateway の証明書を 1 つの Secret（`rproxy-fleet-certs`）にまとめて全 Pod に渡し、ノードのポートは先に取った Gateway のもの（後から来たものは `Programmed: False`）。fleet では RproxyRule を既定で読まない（`fleet.rproxyRules` / `--fleet-rproxy-rules`）。
+- **fleet**：すべての Gateway が同じ rproxy の Pod（hostNetwork の DaemonSet）を使う。**1 つの信頼の範囲（1 人の管理者）のためのもの**で、テナントを分けない。すべての Gateway の証明書を 1 つの Secret（`rproxy-fleet-certs`）にまとめて全 Pod に渡し、ノードのポートは古い Gateway のもの（後の Gateway のリスナーは `Accepted: False`・`PortUnavailable`、v0.4.5）。`fleet.listen: addresses`（v0.4.5、rproxy v0.4.3）では `spec.addresses` を持つ Gateway が自分のアドレス（`managed.addressCIDRs` の内）でだけ待ち受けるので、アドレスが違えば同じポートを使え、あるアドレスに来たものはその Gateway にだけ届く（アドレスをノードに置くのは MetalLB・kube-vip・keepalived などプラットフォームの側）。fleet では RproxyRule を既定で読まない（`fleet.rproxyRules` / `--fleet-rproxy-rules`）。
 
 ## テナントの入力への制限
 
@@ -78,7 +78,7 @@ fleet の Pod が VIP を直接持つとき（[DESIGN-v0.4.x.md](DESIGN-v0.4.x.m
 - `vip` のコンテナだけが root で `NET_ADMIN`・`NET_RAW`（ほかは drop、`readOnlyRootFilesystem`、`allowPrivilegeEscalation: false`）。ノードのネットワーク（hostNetwork）でアドレスを足し外しし、ARP・NDP を送って聞く。fleet はもう hostNetwork なので、namespace の PodSecurity は今と同じ `privileged`（`baseline` は hostNetwork を許さない）。
 - Kubernetes の API の資格は `vip` のコンテナだけ：Pod は `automountServiceAccountToken: false` のまま、ServiceAccount `rproxy-gateway-vip` のトークンを `projected` で `vip` にだけつなぐ（rproxy・certsync は今どおり API を使わない）。権限は、VIP の Lease（`resourceNames` で名指し）の get・list・watch・update、コントローラの namespace の Pod の読み取り（自分の readiness gate）、ノードの読み取り（ラベル・cordon）。Lease は chart が作り、`vip` は作れない。乗っ取られた `vip` ができるのは、VIP をどのノードに置くかを変えることと、その namespace の Pod とノードを読むこと。
 - VIP は管理者が chart で決めるものだけで、`managed.addressCIDRs` の内にあり、ほかの Service やノードのアドレスと重ならないものだけを使う（コントローラが確かめる。`vip` も範囲の外の VIP は持たない）。Gateway は VIP を選べるが作れない。
-- 既定（`fleet.vip.listen: wildcard`）では fleet のルールは `0.0.0.0` で待ち受けるので、どの VIP に来てもポートが合えばその Gateway に届く（fleet は 1 つの信頼の範囲）。`fleet.vip.listen: vip`（rproxy v0.4.3）では各 Gateway のルールが自分の VIP だけで待ち受けるので、ある VIP に来たものはその VIP の Gateway にだけ届き、ノードの IP では受けない。
+- fleet のルールは `0.0.0.0` で待ち受けるので、どの VIP に来てもポートが合えばその Gateway に届く（fleet は 1 つの信頼の範囲）。
 - `/metrics`（9445）はノードの IP で認証なしに答える（VIP を持っているかと移った回数だけ）。ノードへの外からの通信はファイアウォールで絞る（上の「ネットワーク」）。
 
 ## rproxy のルールセットの持ち主

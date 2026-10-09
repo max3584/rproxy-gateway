@@ -112,11 +112,11 @@ struct ControllerArgs {
 	/// (inside `--address-cidr`; a Gateway picks some with `spec.addresses`).
 	#[arg(long, env = "RPROXY_GATEWAY_FLEET_VIPS", value_delimiter = ',', value_parser = |s: &str| vip::parse_vip(s.trim()).map(|_| s.trim().to_string()))]
 	fleet_vip: Vec<String>,
-	/// fleet with VIPs: where Gateways' rules listen. `wildcard` (--listen-addr, every Gateway's port
-	/// on every address) or `vip` (each Gateway's own VIPs, so Gateways on different VIPs can use the
-	/// same port; needs rproxy with features.listen_freebind, v0.4.3).
-	#[arg(long, env = "RPROXY_GATEWAY_FLEET_VIP_LISTEN", default_value = "wildcard", value_parser = ["wildcard", "vip"])]
-	fleet_vip_listen: String,
+	/// fleet: where Gateways' rules listen. `wildcard` (--listen-addr: every Gateway's port on every
+	/// address) or `addresses` (a Gateway with spec.addresses, inside --address-cidr, on those only, so
+	/// Gateways on different addresses can use the same port; rproxy with features.listen_freebind, v0.4.3).
+	#[arg(long, env = "RPROXY_GATEWAY_FLEET_LISTEN", default_value = "wildcard", value_parser = ["wildcard", "addresses"])]
+	fleet_listen: String,
 	/// Addresses rproxy rules listen on (the first is listen_addr, the rest extra_listen_addrs).
 	#[arg(long, env = "RPROXY_GATEWAY_LISTEN_ADDR", value_delimiter = ',', default_value = "0.0.0.0")]
 	listen_addr: Vec<String>,
@@ -298,7 +298,7 @@ fn main() -> anyhow::Result<()> {
 				"fleet" => Mode::Fleet(Fleet {
 					selector: a.fleet_selector,
 					addresses: a.fleet_address,
-					listen_on_vips: !a.fleet_vip.is_empty() && a.fleet_vip_listen == "vip",
+					listen_on_addresses: a.fleet_listen == "addresses",
 					vips: a.fleet_vip,
 				}),
 				_ => Mode::Managed(Managed {

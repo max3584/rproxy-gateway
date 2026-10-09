@@ -93,22 +93,6 @@ pub fn unusable(world: &World, vip: &str, cidrs: &[Cidr], host_ips: &[String]) -
 	None
 }
 
-/// Where a Gateway's rules listen when the fleet listens on VIPs (`--fleet-vip-listen vip`): the
-/// usable VIPs it asks for (`spec.addresses`), else every usable VIP; IPv4 first (the first is
-/// `listen_addr`, the rest `extra_listen_addrs`). Whether they are held does not matter (rproxy
-/// listens with `listen_freebind`). Empty: none to listen on (the wildcard is kept).
-pub fn listen_vips(requested: &[String], vips: &[String], unusable: &BTreeMap<String, String>) -> Vec<String> {
-	let usable = |v: &&String| vips.contains(*v) && !unusable.contains_key(*v);
-	let mut out: Vec<String> = if requested.is_empty() {
-		vips.iter().filter(usable).cloned().collect()
-	} else {
-		requested.iter().filter(usable).cloned().collect()
-	};
-	out.dedup();
-	out.sort_by_key(|v| v.contains(':'));
-	out
-}
-
 /// A Gateway's addresses: the VIPs it asks for (`spec.addresses`), else every usable
 /// VIP; `Err`: why they cannot be used (`AddressNotUsable`).
 pub fn gateway_vips(
@@ -177,15 +161,6 @@ mod tests {
 		assert!(matches!(holder("l", Some(&lease(Some("a"), ago(30))), now), Holder::Unheld(w) if w.contains("a stopped")));
 		assert!(matches!(holder("l", Some(&lease(None, None)), now), Holder::Unheld(_)), "never held");
 		assert!(matches!(holder("rproxy-vip-x", None, now), Holder::Unheld(w) if w.contains("rproxy-vip-x does not exist")));
-	}
-
-	#[test]
-	fn listen_addresses() {
-		let vips: Vec<String> = vec!["2001:db8::10".into(), "192.0.2.10".into(), "192.0.2.11".into(), "192.0.2.12".into()];
-		let unusable: BTreeMap<String, String> = [("192.0.2.12".to_string(), "off".to_string())].into();
-		assert_eq!(listen_vips(&[], &vips, &unusable), vec!["192.0.2.10", "192.0.2.11", "2001:db8::10"], "IPv4 first, usable only");
-		assert_eq!(listen_vips(&["192.0.2.11".into()], &vips, &unusable), vec!["192.0.2.11"]);
-		assert!(listen_vips(&["192.0.2.12".into(), "192.0.2.99".into()], &vips, &unusable).is_empty(), "not usable, not a VIP");
 	}
 
 	#[test]
