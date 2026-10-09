@@ -10,7 +10,7 @@ v0.4.0・v0.4.1 の受け入れテストで分かった、Kubernetes で運用�
 
 | 項目 | 決めたこと |
 |---|---|
-| 目的 | managed の rproxy を Gateway ごとに変えられない、Helm 以外で入れにくい、UI を Kubernetes に置けない、rproxy が SIGTERM ですぐ終わる、Service を通さない VIP がない |
+| 目的 | managed の rproxy を Gateway ごとに変えられない、Helm 以外で入れにくい、UI を Kubernetes に置けない、rproxy が SIGTERM ですぐ終わる、Service を通さない VIP がない（F はやめた。7.） |
 | 版 | **v0.5.0 は作らない**。すべて v0.4 の系列のパッチ（v0.4.2、v0.4.3、…）で出す。CRD・値などを足すのはパッチでよいが、今の入れ方（chart の値・フラグ・Gateway）を壊さない |
 | 互換 | 足すものはすべて省略でき、省略したときは v0.4.1 と同じ Pod・Service になる |
 | 守り | v0.4.0 のセキュリティレビューで決めた線（テナントは自分の namespace だけ、LB の注釈の許可リスト、rproxy の Pod は Kubernetes の API を使わない、鍵を制御 API に流さない）を崩さない。崩す項目は管理者が明示して開ける |
@@ -24,7 +24,7 @@ v0.4.0・v0.4.1 の受け入れテストで分かった、Kubernetes で運用�
 | B. Kustomize で入れる | chart のコントローラの設定を ConfigMap に、`config/`、リリースの `install.yaml`・CI | v0.4.2 |
 | C. UI を Kubernetes で | UI 用の読むだけのトークンと発見の Secret（UI の chart は UI のリポジトリ） | v0.4.3 |
 | E. SIGTERM での終わり方 | rproxy の `RPROXY_SHUTDOWN_*` を渡す、猶予の秒数 | v0.4.2（rproxy v0.4.1） |
-| F. Pod が直接持つ VIP | fleet の `vip` サイドカー・Lease・状態 | v0.4.4 |
+| F. Pod が直接持つ VIP | fleet の `vip` サイドカー・Lease・状態 | v0.4.4 で入れ、v0.4.5 でやめた（7.） |
 
 ### v0.4.1 で済んだもの
 
@@ -305,121 +305,13 @@ rproxy v0.4.1、replicas 2、l2-local（MetalLB L2 + `Local`）と l2-cluster（
 - e2e：`rproxy:e2e`（rproxy-api の master）は出荷するイメージではないので、Pod が `graceful_shutdown` を答えた後に新しい形（preStop なし、`/readyz`、`RPROXY_SHUTDOWN_*`、猶予 45 秒）に入れ替わること。
 - 受け入れ：失敗したリクエストは前から要約に出ている。入力 `strict`（既定 false）で、`GAP_LIMIT` を当てるシナリオ（b・c・d・h・i）に失敗したリクエストが 1 つでもあれば落とす（bgp は記録だけのまま）。`source=checkout` で chart の rproxy のイメージがまだ出ていなければ、rproxy-api の同じ版のリリースのバイナリから作る。
 
-## 7. F. rproxy の Pod が直接持つ VIP
+## 7. F. rproxy の Pod が直接持つ VIP（やめた）
 
-Service・LoadBalancer を通さず rproxy の Pod が VIP を持ち、冗長の切り替えを数秒以内にする。今の managed は Service（MetalLB など）の切り替えに任せ、fleet はノードの IP（`--fleet-address`）を書くだけで、VIP の移し方を持たない。
+v0.4.4 で fleet の `vip` サイドカー（`rproxy-gateway vip`、chart の `fleet.vip`。VIP ごとの Lease で持ち主を決め、ノードのインタフェースに VIP を足して gratuitous ARP / unsolicited NA を出す）を入れたが、v0.4.5 で外した。
 
-### 7.1 案
-
-| 案 | 中身 | 良いところ | 困るところ |
-|---|---|---|---|
-| 1. fleet + VIP のサイドカー（Lease） | fleet の DaemonSet の Pod に `vip` のコンテナ。VIP ごとの Lease を取った Pod がノードのインタフェースに VIP を足し、gratuitous ARP（IPv6 は unsolicited NA）を出す。止めるときは Lease を手放して VIP を外す | 予定の移動（rollout・drain）は 1 秒未満。持ち主は API サーバの Lease 1 つで決まる。rproxy の準備と結べる | API サーバに頼る（7.4）。予定外のノードの喪失は Lease の期限（既定 3 秒）まで |
-| 1a. その中身に kube-vip を使う | kube-vip を DaemonSet のサイドカーにする | 使われている実装。ARP・NDP・BGP がある | rproxy の準備（ルールセットが入ったか）で持つかを決められない。イメージと権限が増える。版を追う相手が増える |
-| 1b. 自前の `rproxy-gateway vip`（Rust） | 同じイメージの新しいサブコマンド。netlink でアドレスを足し外し、packet socket で ARP、ICMPv6 の raw socket で NA | rproxy の `/readyz` とコントローラの「反映した」を条件にできる。Lease の権限を名前で絞れる。状態を Gateway に書ける | 書く量（1,000 行ほど）と依存（`rtnetlink` など。`cargo deny`） |
-| 2. VRRP（keepalived）を fleet の Pod の間で | VM の act / stb と同じ形 | API サーバに頼らない | 分断で両方が MASTER。マルチキャストか `unicast_peer`（DaemonSet の Pod の IP は変わる）。VRID の衝突。設定の生成が要る |
-| 3. CNI の BGP で Pod・LB の IP を広告（Calico・Cilium） | managed のまま、CNI が /32 を広告 | hostNetwork が要らない。ECMP で active-active | CNI 次第。こちらで作るものがない |
-| 4. managed で hostNetwork を選べるようにして VIP のサイドカー | Gateway ごとの Pod をノードのネットワークに | Gateway ごとの VIP | テナントの namespace に hostNetwork（PodSecurity privileged）。同じノードの Gateway どうしのポートがぶつかる。「テナントを分けるのは managed」が崩れる |
-
-**採る案：1b（fleet + 自前の `vip` サイドカー、Lease）**。3 は文書だけ（「managed で Service を使わずに速く切り替えたいとき」）。2・4 は作らない。
-
-### 7.2 形
-
-```yaml
-fleet:
-  enabled: true
-  hostNetwork: true
-  vip:
-    enabled: false
-    addresses: [192.0.2.10, 192.0.2.11, "2001:db8::10"]   # 管理者が決める。fleet のアドレス（Gateway の status）になる
-    interface: ""                 # 空なら VIP と同じサブネットの経路を持つインタフェース
-    leaseDuration: 3s
-    renewInterval: 1s
-    retryInterval: 500ms
-    garp: {count: 3, interval: 200ms}   # 取った直後に出す数（IPv6 は NA）
-    onApiUnreachable: hold        # hold | release（7.4）
-```
-
-- 持ち主の決め方：VIP ごとの Lease `rproxy-vip-<VIP のハッシュ>`（コントローラの namespace。chart が先に作り、`vip` のコンテナは `resourceNames` で絞った get・update・watch だけ）。期限の切れた Lease は、持っている VIP の少ない Pod から先に取る（取りに行くまでの待ちを「持っている数 × 200ms」にする）。
-- 持つ条件：同じ Pod の rproxy の `/readyz` が ready、かつコントローラから「この Pod にすべての Gateway のルールセットを反映した」の知らせ（certsync と同じく Pod の IP で受け、マスタートークンから導いたトークン付き）を受けていること。どちらかが崩れたら（E の `draining` を含む）すぐ手放す。
-- 手放し方：Lease の `holderIdentity` を空にして更新 → VIP をインタフェースから外す。ほかの Pod は Lease を watch しているので、すぐ取って足し、gratuitous ARP / NA を出す。
-- アドレス：IPv4 は `/32`、IPv6 は `/128` を `nodad` で足す。
-- rproxy は変えない：fleet のルールは `0.0.0.0`（`--listen-addr`）で待ち受けるので、足した VIP にそのまま届く。UDP は `IP_PKTINFO` / `IPV6_RECVPKTINFO` で届いたアドレスから返す。VIP ごとに同じポートを別の Gateway に使うには `IP_FREEBIND` が要り、rproxy-api の変更になる（10. Q19）。
-- 状態：Gateway の `status.addresses` は VIP。VIP の持ち主がいなければ Gateway の `Programmed: False`（`AddressNotUsable`、「VIP 192.0.2.10 を持つ Pod がない」）。`/metrics`（`vip` のコンテナ、Pod の IP の 9445）：`rproxy_vip_held{vip}`、`rproxy_vip_transitions_total{vip,reason}`。ログ：`vip.acquire`・`vip.release`（`shutdown`・`not_ready`・`lease_lost`・`conflict`）。
-
-### 7.3 Gateway の `spec.addresses` と守り
-
-- fleet では今も `spec.addresses` は fleet のアドレスのどれかだけで、ほかは `AddressNotUsable`。VIP を使うときは VIP が fleet のアドレスになる。Gateway は VIP を選べるが、新しい VIP を作れない（VIP の一覧は管理者が chart で決めるだけ）。
-- コントローラは起動時に、VIP が `--address-cidr`（chart は fleet でも `managed.addressCIDRs` を渡す）の内にあること、Service の ClusterIP・externalIPs・LB の IP・ノードの IP と重ならないことを確かめ、外れた VIP は使わない。`addressCIDRs` が空なら VIP は使えない（「既定では使えない」と同じ）。
-- `0.0.0.0` で待ち受けるので、どの VIP に来てもポートが合えばその Gateway に届く。fleet は 1 つの信頼の範囲（[SECURITY.md](SECURITY.md)）なので許す。
-- managed は今のまま Service。同じクラスタで両方を使うなら GatewayClass を分ける（コントローラを 2 つ）。
-
-### 7.4 API サーバに届かないとき
-
-- `hold`（既定）：rproxy が ready のうちは VIP を持ち続ける。ほかの Pod も API サーバに届かなければ取れないので、二重にはならない。持ち主だけが API サーバから切れ、ほかが Lease を取った場合に備えて、`vip` のコンテナは ARP / NA を聞き、**ほかの MAC がその VIP を告げたらすぐ手放す**。
-- `release`：Lease の期限で手放す（kube-vip と同じ）。コントロールプレーンが落ちるとデータプレーンも落ちる。
-
-### 7.5 権限と PodSecurity
-
-- `vip` のコンテナ：root、`capabilities: {drop: [ALL], add: [NET_ADMIN, NET_RAW]}`、`readOnlyRootFilesystem`、`allowPrivilegeEscalation: false`。
-- Kubernetes の API の資格は `vip` のコンテナだけ：Pod の `automountServiceAccountToken: false` のまま、`projected` の `serviceAccountToken` のボリュームを `vip` のコンテナにだけつなぐ。ServiceAccount `rproxy-gateway-vip`、Role は `leases` の get・update・patch・watch（`resourceNames` で VIP の Lease だけ）。
-- fleet はもう hostNetwork なので namespace は PodSecurity の `privileged`（今と同じ）。
-
-### 7.6 切り替えの時間（見込み）
-
-| できごと | 案 1b | MetalLB L2 | MetalLB BGP |
-|---|---|---|---|
-| 予定の移動（rollout・drain・Pod の削除） | 1 秒未満 | 数秒（v0.4.1 の測定では preStop で 0.2〜1.2 秒） | 経路の取り下げ（数秒、BFD なら 1 秒未満） |
-| ノードの喪失 | `leaseDuration`（既定 3 秒）+ 0.5 秒ほど | memberlist の検知（5〜8 秒） | BGP の hold timer（BFD なら 1 秒ほど） |
-| rproxy だけが落ちた | `/readyz` が落ちてすぐ | Service の宛先から外れてから | 同じ |
-
-- どの方法でも、VIP が移るとそのとき張られていた TCP の接続は切れる。UDP のセッションも新しいノードで作り直し。E の `drain` は VIP の移動では効かない。
-- active-active：VIP を複数にしてノードに散らし、DNS のラウンドロビンで配る。1 つの VIP の上で複数ノードに分けたいなら BGP（MetalLB・CNI）。
-
-### 7.7 IPv6
-
-- `/128` を `nodad` で足し、unsolicited NA（Override）を取った直後に 3 回送る（`garp.count`）。
-- fleet の rproxy は `--listen-addr` に `::` があるときだけ IPv6 の VIP を受ける。IPv6 の VIP があって `::` がなければ起動時に誤り。
-
-### 7.8 試験
-
-- 単体：Lease の取り方（期限、持っている数の待ち、手放し）、条件（`/readyz`・反映の知らせ）、`hold` と他の MAC を見て手放すこと、VIP の確かめ（`addressCIDRs`・重なり）、ARP・NA のパケットの形。
-- 受け入れ：入力 `mode: managed | fleet-vip`。`fleet-vip` では kind の docker のネットワークから VIP を選び、ランナーから VIP へ HTTP・TCP・UDP を流し続けて測る。シナリオ j. 持ち主の Pod を消す、k. `kubectl rollout restart ds/rproxy`、l. 持ち主のノードを drain、m. `docker stop <持ち主のノード>`、n. `docker pause <持ち主のノード>`（戻ったときに二重にならないこと）、o. control-plane のコンテナを `docker pause`（`hold` で通信が続くこと）。要約に MetalLB L2 との比較を出す。
-
-### 7.9 v0.4.4 で入れた形
-
-7.2〜7.8 のとおり。設計から変えたところと細かいところ：
-
-- 値：`fleet.vip.addresses` の 1 つは、アドレス（正規の形。`2001:0db8::10` ではなく `2001:db8::10`）か `{address, interface, nodeSelector}`。`interface` が空なら `fleet.vip.interface`、それも空なら VIP を含むサブネットのアドレスを持つインタフェース。`nodeSelector` はその VIP を持てるノードのラベル。`fleet.vip.garp`・`onApiUnreachable`・`metricsPort`（既定 9445）・`resources`。chart は `fleet.enabled`・`hostNetwork`・`managed.addressCIDRs`（空なら VIP は使えない）、IPv6 の VIP に `::` の待ち受けがなければ誤りにする。コントローラには `RPROXY_GATEWAY_FLEET_VIPS` と `RPROXY_GATEWAY_ADDRESS_CIDR` を渡す（VIP を使うときだけ。使わない fleet は今までと同じ）。
-- 持つ条件の「反映の知らせ」は、新しい口を作らず readiness gate `rproxy.max3584.net/ruleset-applied` を使う：今の rproxy の再起動の回数で `True` なら反映済み（コントローラが rproxy の再起動で `False` に戻すのと同じ判断）。`vip` は自分の Pod を watch する。
-- 手放す順：VIP を外してから Lease の holder を空ける（設計の逆。二重に持つ時間をなくす。差は数ミリ秒）。
-- drain：`kubectl drain` は DaemonSet の Pod を追い出さないので、ノードが cordon されたら VIP を手放す（理由 `cordoned`）。cordon のノードの Pod は、ほかの Pod が取らないまま Lease の期限の 2 倍が過ぎたときだけ取り、取ったものは cordon では手放さない（すべてのノードが cordon でも VIP がなくならない）。`vip` は自分のノードを watch する（ラベル・cordon）。
-- 期限の数え方：Lease の `renewTime`（持ち主の時計）ではなく、自分が Lease の変化を最後に見てからの時間で数える（client-go の leader election と同じ。ノードの時計を比べない）。
-- API サーバが戻った直後：持ち主でない Pod は、API サーバに届かなかったときから期限の分は期限切れの Lease を取らない（持ち主が先に更新できる）。watch のやり直しは kube の既定（最大 30 秒）ではなく 1 秒おき。
-- ほかの MAC：ARP（送り主のアドレスが VIP）と NS（送り元が VIP）・NA（対象が VIP）を聞く。持ち主が期限内に Lease を更新できていればほかの MAC は古いので告げ直し、できていなければ（`hold` で API サーバに届かない）手放して期限の分は取らない。ほかのノードが unicast で答える ARP・NA は聞こえない（broadcast・multicast だけ）。
-- 権限：ServiceAccount のトークンの投影は Pod の ServiceAccount のものしか作れないので、VIP を使うときは fleet の Pod の ServiceAccount を `rproxy-gateway-vip` にし（`automountServiceAccountToken: false` のまま）、`projected` のトークンを `vip` のコンテナにだけつなぐ。Role：`leases` の get・list・watch・update（`resourceNames` で VIP の Lease だけ。list・watch は `metadata.name` の field selector）、`pods` の get・list・watch（自分の readiness gate）。ClusterRole：`nodes` の get・list・watch。Lease は chart が作り、`vip` に create は与えない。
-- `vip` は rproxy の `/readyz` を Pod の IP の 9443 で 0.5 秒（`retryInterval`）おきに読む（`rproxy-gateway-api-tls` の `ca.crt` だけをマウントして検証）。
-- 状態：VIP を使う fleet の Gateway の `status.addresses` は VIP（`spec.addresses` で選んだもの、なければ使える VIP すべて）。持ち主のいない時間が 10 秒を超えた VIP を選んだ Gateway は `Programmed: False`（`AddressNotUsable`）。選んでいない Gateway は、使える VIP のどれも持たれていないときだけ。
-- Kustomize：`config/samples/fleet-vip`（例の VIP 192.0.2.10。Lease の名前と Role の `resourceNames` がアドレスのハッシュなので、ほかの VIP は chart を描いて使う）。
-- 受け入れ：`mode=fleet-vip`。HTTP・HTTPS・TCP を 0.1 秒おきに流し続け、UDP（`UDPRoute`、agnhost の netexec）は VIP から答えが返ることを最初と各シナリオの後に確かめる（流し続けはしない）。m は設計の `docker stop` ではなく `docker kill`（下の値）。シナリオは j・k・l・o・n・m の順（`docker kill` したノードは別のアドレスで戻ることがあるので最後）。j・k・l・o は `GAP_LIMIT` で落とし、m・n は記録だけ（n は戻ったときに VIP が 1 つのノードだけになることを確かめる）。MetalLB L2 との比較は managed の受け入れ（l2-local・l2-cluster、6.2）の値と並べる。
-
-#### 受け入れテストでの値
-
-`mode=fleet-vip`、kind（ワーカー 3 台）、VIP 1 つ、既定の値（期限 3 秒・更新 1 秒・やり直し 0.5 秒、`hold`）で回した（run 37805425584）。「最長の途切れ」はどれかのプローブが 200 を返さなかった最長の時間、「Lease」は Lease の持ち主が変わった時刻（シナリオの始まりから）。
-
-| シナリオ | 失敗（HTTP/HTTPS/TCP） | 最長の途切れ | Lease | 結果 |
-|---|---|---|---|---|
-| j. 持ち主の Pod の削除 | 1/0/0（883 のうち） | 0.2 秒 | +0.09 秒 | PASS |
-| k. `rollout restart ds/rproxy` | 0/0/0（1090） | 0.1 秒 | +7.35 秒（持ち主の Pod の番が来たとき） | PASS |
-| l. 持ち主のノードの drain（cordon） | 0/1/0（345） | 1.2 秒 | +0.47 秒 | PASS |
-| o. control plane の `docker pause` 20 秒（`hold`） | 0/0/0（971） | 0.2 秒 | 移らない | PASS |
-| n. 持ち主のノードの `docker pause`（記録だけ） | 26/27/26（316） | 6.4 秒 | +2.36 秒 | 戻して 1.2 秒で VIP は 1 つのノードだけ |
-| m. 持ち主のノードの `docker kill`（記録だけ） | 27/27/14（416） | 5.7 秒 | +3.15 秒 | — |
-
-- 予定の移動（j・k・l）は Lease が 0.1〜0.5 秒で移り、途切れは 1 リクエストまで（MetalLB L2 + `Local` の managed（6.2 の D）の b2・c・d は 0.2〜1.2 秒）。
-- n・m は Lease の期限（3 秒）で移った。失敗の多くは、止めたノードにあるバックエンド（echo）の Pod に rproxy が送ったもの（ノードが NotReady になって EndpointSlice から外れるまで。VIP とは関係なく、managed の g と同じ）。
-- 最初の回（run 37803895238）では m を `docker stop` にした：kind のノードが止まるときに Pod が SIGTERM で止まるので、VIP は drain と同じく +0.06 秒で移り、失敗は 0。ノードの喪失を測るため `docker kill` にした。
-- UDP は最初と各シナリオの後に VIP から答えが返った（`IP_PKTINFO` で VIP から返す）。
-- 要約の `vip` の行が空になるところは、ランナーから `docker exec` でノードを読めなかったとき（プローブは成功している）。
+- 理由：アドレス（VIP）を用意して移すのはプラットフォーム（MetalLB・kube-vip・Cilium の LB IPAM・クラウドのロードバランサ・ノードの keepalived）の仕事で、どれにも使われてきた実装がある。rproxy-gateway が持つと、NET_ADMIN・NET_RAW のコンテナ、Lease の RBAC、ARP / NDP の扱い、ネットワークの障害の試験までを抱える。rproxy は複数のアドレスで待ち受けられる（`--listen-addr`、Gateway の `spec.addresses`）ので、rproxy-gateway は正しいアドレスで待ち受けることだけをし、アドレスの用意の仕方は [PLATFORM.md](PLATFORM.md) に書く。
+- `fleet.vip` は v0.4.4 の 1 日だけで、既定で切っていた（opt-in）ので、パッチで外した。`fleet.vip` を値に書いたままの `helm upgrade` は失敗する（chart の `fail`）。残る Lease・RBAC・ノードのアドレスの片付けは [PLATFORM.md](PLATFORM.md) の「v0.4.4 の `fleet.vip` から移る」。
+- v0.4.4 の受け入れテスト（kind、VIP 1 つ、Lease の期限 3 秒）の値：予定の移動（持ち主の Pod の削除・rollout restart・drain）の途切れは 0.1〜1.2 秒、ノードの喪失（`docker pause`・`docker kill`）は 5.7〜6.4 秒。同じ形は kube-vip（ARP、Lease）・keepalived（VRRP）でも作れ、値はそれぞれの設定で決まる。
 
 ## 8. 受け入れテスト（`acceptance.yml`）の変更
 
@@ -429,7 +321,6 @@ fleet:
 | `install` | `helm` | `kustomize` で `config/default` に overlay を当てて入れる | B の後 |
 | `ui` | `false` | UI の chart も入れ、4.3 の確認をする | C |
 | `strict` | `false` | E の確認で失敗のリクエストが 1 つでもあれば落とす | E |
-| `mode` | `managed` | `fleet-vip` で 7.8 のシナリオ j〜o | F |
 
 途切れの上限（`GAP_LIMIT`）で落とすのは、rproxy-gateway が決める Pod の削除・drain・rollout・parameters の変更を、l2-local・l2-cluster・nodeport-lb で測ったときだけ。`bgp` の途切れ（経路の取り下げ・BFD）とノードの喪失は CNI・ロードバランサ・ネットワークの側の時間なので記録だけ（`info (network-dependent)`）。
 
@@ -445,7 +336,7 @@ fleet:
 3. B：chart の ConfigMap、`config/`、リリースの `install.yaml`（v0.4.2）。A と B は chart を両方変えるので、後から入るほうが `scripts/render-config.sh` で `config/` を描き直す。
 4. E：rproxy-api v0.4.1 の `RPROXY_SHUTDOWN_*` をつなぐ（6.）。
 5. C：UI の chart の後、発見の Secret と UI のトークン。
-6. F：fleet の VIP。大きいので、ほかと別のパッチにする。
+6. F：fleet の VIP。大きいので、ほかと別のパッチにした（v0.4.4）。v0.4.5 でやめた（7.）。
 7. 受け入れ（8.）は各 PR のブランチで手で回し、v0.4.1 から下がっていないことを確かめる。
 
 ## 10. 決めたこと
@@ -461,12 +352,7 @@ fleet:
 | Q7 | UI の chart を gateway の chart の subchart にするか | **しない**（別の chart、版も別）。gateway の chart には `ui.namespace` などの値だけ |
 | Q8 | UI が Kubernetes の rproxy を見る方法 | **コントローラが読むだけのトークンと発見の Secret を UI の namespace に書く**（管理者の `ui.namespace` と Gateway の `ui.visible`） |
 | Q9 | Kubernetes のルールを UI の利用者に見せるか | **管理者だけ**。namespace と Keycloak のグループの対応は後で |
-| Q17 | F の方式 | **案 1b：fleet + 自前の `rproxy-gateway vip`（Lease、gratuitous ARP / NA）** |
-| Q18 | API サーバに届かないときの VIP | **`hold`**（ほかの MAC が同じ VIP を告げたらすぐ手放す） |
-| Q19 | VIP ごとに待ち受けを分けるか | **分けない**（`0.0.0.0` のまま）。要るなら rproxy-api に `IP_FREEBIND` の issue |
-| Q20 | VIP を Gateway が新しく求められるか | **管理者の一覧だけ**（Gateway は一覧から選ぶ） |
-| Q21 | Lease の既定 | **期限 3 秒・更新 1 秒・やり直し 0.5 秒** |
-| Q22 | F をいつ出すか | v0.4 の系列の別のパッチ（A〜E を待たせない） |
+| Q17 | F の方式 | v0.4.4 は案 1b（fleet + 自前の `rproxy-gateway vip`。Lease、gratuitous ARP / NA）。**v0.4.5 でやめ、アドレスはプラットフォームに任せる**（7.、[PLATFORM.md](PLATFORM.md)） |
 | — | 版 | **v0.5.0 は作らない**。v0.4.2 から順にパッチで出す |
 | — | chart のクラスの既定の parameters | **`managed.parameters` が空でないときだけ描く**（`helm upgrade` は新しい CRD を入れないため。2.7） |
 
