@@ -368,3 +368,10 @@ Closing "Not claimed" of docs/en/CONFORMANCE.md (requested by the owner, 2026-10
 - With one listener there is nothing to tell apart, so none is written. `TLS` (Terminate) listeners do not speak HTTP and are left out.
 - Not written for rproxies without `misdirected` in `http_options` (rproxy v0.4.3): requests reach another listener's routes, as before.
 
+### 11.2 `CORS`, `RequestRedirect` and `RequestMirror` filters on a backendRef
+
+- That backend's `servers[].middlewares` get middlewares shaped as for the rule's filters (`cors`, `redirect_regex`, `mirror` with the mirror's service). Only when rproxy v0.4.3's `server_middleware_kinds` has `cors`, `redirect_regex` and `mirror` (with other rproxies the route is `UnsupportedValue`).
+- ReplacePrefixMatch of `RequestRedirect`, as of `URLRewrite`, only when the rule has one path prefix (a server serves all of the rule's matches).
+- A mirror copies only the requests that land on that backend (rproxy copies once per request). A mirror whose backend is not found is dropped with `ResolvedRefs: False`, as for the rule's filter.
+- `ExtensionRef` on a backendRef is still refused (there is no check of the `RproxyMiddleware`'s kind per server).
+

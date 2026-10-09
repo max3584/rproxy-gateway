@@ -122,7 +122,7 @@ rproxy runs with `RPROXY_API_ADDR=0.0.0.0`, `RPROXY_API_PORT=9443`, `RPROXY_TOKE
 | `URLRewrite` | hostname: `replace_host`; path: `replace_path` (ReplaceFullPath), `replace_path_regex` (ReplacePrefixMatch) |
 | `CORS` | `cors` (`allow_origins`, `allow_methods`, `allow_headers`, `expose_headers`, `allow_credentials`, `max_age`; `maxAge` defaults to 5) |
 | `RequestMirror` | `mirror` (a service of the mirror backend's pod IPs; `percent` / `fraction`). A mirror backend that does not resolve: `ResolvedRefs: False`, and only the mirror is left out |
-| `filters` of a backendRef | that backend's `servers[].middlewares` (`RequestHeaderModifier`, `ResponseHeaderModifier`, `URLRewrite`; ReplacePrefixMatch only when the rule has one path prefix) |
+| `filters` of a backendRef | that backend's `servers[].middlewares` (`RequestHeaderModifier`, `ResponseHeaderModifier`, `URLRewrite`, and `CORS`, `RequestRedirect` and `RequestMirror` with rproxy v0.4.3's `server_middleware_kinds`; ReplacePrefixMatch of URLRewrite and RequestRedirect only when the rule has one path prefix; a mirror copies only the requests sent to that backend) |
 | `retry` | `retry` (`attempts` is Gateway API's count + 1, `codes` become `status`, `backoff` `initial_interval`), the last middleware |
 | `ExtensionRef` (`RproxyMiddleware`) | that middleware (`spec` as it is) |
 | `timeouts.request` / `timeouts.backendRequest` | the route's `timeouts.request` / `timeouts.backend_request` |
@@ -151,7 +151,7 @@ rproxy runs with `RPROXY_API_ADDR=0.0.0.0`, `RPROXY_API_PORT=9443`, `RPROXY_TOKE
 | `RproxyGatewayParameters` | how a managed Gateway's rproxy is made (replicas, PDB; pod labels, annotations, resources, topology spread, nodeSelector, tolerations, affinity, priorityClass; the Service's type, externalTrafficPolicy, loadBalancerClass, source ranges, ipFamilyPolicy, labels, annotations; rproxy's image, logLevel, performance, extra environment variables). Named by the GatewayClass's `parametersRef` (in the controller's namespace; its `policy` decides what Gateways may set) and the Gateway's `infrastructure.parametersRef` (same namespace). Merging, validation and who decides what: [DESIGN-v0.4.x.md](DESIGN-v0.4.x.md), 2. |
 | `RproxyRule` | `spec.rule` is a rule verbatim (the body of `POST /rules`), added to the rule set of the `spec.parentRef` Gateway. A Gateway in another namespace needs a ReferenceGrant there (from `rproxy.max3584.net/RproxyRule`, to `Gateway`). When a rule with the same key exists: `Accepted: False` (`Conflicted`). Status copies the rproxy rule's `conditions` |
 
-Not supported (the route gets `Accepted: False`, reason `UnsupportedValue`): `RequestMirror`, `CORS` and `RequestRedirect` filters on a backendRef, `ExternalAuth`.
+Not supported (the route gets `Accepted: False`, reason `UnsupportedValue`): `ExternalAuth`, `ExtensionRef` filters on a backendRef, and what the rproxy lacks ("rproxy features" below).
 
 ### rproxy features (`features`)
 
