@@ -1055,10 +1055,11 @@ skip_params() {
 }
 # p. a backend's node lost: see the header. Record-only (the node's detection is the cluster's)
 echo_nodes() { kubectl -n "$APP" get pods -l app=echo -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' | sort -u; }
-# the time (ms) the echo endpoint on node $1 is first seen not ready (or gone) in the EndpointSlices
+# whether an echo endpoint on node $1 is ready in the EndpointSlices (ready unset: ready; jq's // would
+# take false for unset)
 echo_ep_ready() {
   kubectl -n "$APP" get endpointslices -l kubernetes.io/service-name=echo -o json |
-    jq -e --arg n "$1" '[.items[].endpoints[]? | select(.nodeName == $n and (.conditions.ready // true))] | length > 0' > /dev/null
+    jq -e --arg n "$1" '[.items[].endpoints[]? | select(.nodeName == $n and (.conditions.ready | if . == null then true else . end))] | length > 0' > /dev/null
 }
 # last_fail <from ms> <to ms>: the last request that did not get a 200 (ms, 0: none)
 last_fail() {
