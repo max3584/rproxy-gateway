@@ -221,10 +221,12 @@ jobs:
           - { k8s: v1.37.0, gwapi: v1.5.1, strict: true }
           - { k8s: v1.37.0, gwapi: v1.6.3, strict: true }
           - { k8s: v1.37.0, gwapi: v1.7.0-rc.1 }
-          # every Kubernetes minor the chart allows (kubeVersion >=1.29) on the current Gateway API
-          - { k8s: v1.29.14, gwapi: v1.6.3, strict: true }
-          - { k8s: v1.30.13, gwapi: v1.6.3, strict: true }
-          - { k8s: v1.31.14, gwapi: v1.6.3, strict: true }
+          # every Kubernetes minor the chart allows (kubeVersion >=1.29), each with the newest Gateway API
+          # whose CRDs it accepts (v1.6 CRDs use CEL functions older API servers do not have: isIP,
+          # dns1123Label; k8s 1.29-1.31 refuse them)
+          - { k8s: v1.29.14, gwapi: v1.4.1 }
+          - { k8s: v1.30.13, gwapi: v1.5.1, strict: true }
+          - { k8s: v1.31.14, gwapi: v1.5.1, strict: true }
           - { k8s: v1.32.11, gwapi: v1.6.3, strict: true }
           - { k8s: v1.33.12, gwapi: v1.6.3, strict: true }
           - { k8s: v1.34.11, gwapi: v1.6.3, strict: true }
