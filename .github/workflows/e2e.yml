@@ -27,9 +27,7 @@ env:
   CARGO_TERM_COLOR: always
   # rproxy-api master has the rule sets (#28) and the Gateway API settings (#237); another ref
   # (a release tag, a branch) by hand
-  # until rproxy-api #257 (listen_freebind, connect_timeout) is merged: its branch (build-rproxy.sh falls
-  # back to master once the branch is gone)
-  RPROXY_REF: ${{ inputs.rproxy_ref || 'feat/freebind-connect-timeout' }}
+  RPROXY_REF: ${{ inputs.rproxy_ref || 'master' }}
 
 jobs:
   build:
