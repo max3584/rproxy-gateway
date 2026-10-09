@@ -112,6 +112,8 @@ pub struct Config {
 	pub leader: Option<leader::Settings>,
 	/// The UI's namespace and pods (`--ui-namespace`): it gets the discovery Secret (`ui`).
 	pub ui: Option<provision::UiAccess>,
+	/// Passive health checks and connect timeouts every backend gets (`--backend-*`).
+	pub backends: render::BackendDefaults,
 }
 
 impl Config {
@@ -371,6 +373,7 @@ async fn reconcile_all(
 		raw_rules: !matches!(cfg.mode, Mode::Fleet(_)) || cfg.fleet_rproxy_rules,
 		cross_namespace_secrets: cfg.cross_namespace_secrets,
 		params: params_opts.clone(),
+		backends: cfg.backends.clone(),
 	};
 	let mut rendered: Vec<(&crate::k8s::gateway::Gateway, GatewayPlan)> = vec![];
 	for gw in world.gateways.iter().filter(|g| classes.contains(&g.spec.gateway_class_name)) {

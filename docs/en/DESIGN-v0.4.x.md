@@ -471,3 +471,23 @@ Scenarios added (A), run after today's a-g; SKIP when the `RproxyGatewayParamete
 | — | The class's default parameters in the chart | **Rendered only when `managed.parameters` is not empty** (`helm upgrade` does not install new CRDs; 2.7) |
 
 Q10-Q16 (the UI's migrations and MariaDB, rproxy-api #240 and #241, usage) are in the UI's and rproxy-api's designs.
+
+## 11. Lost nodes and backends (v0.4.5)
+
+When a node stops, its backend pods stay among the destinations until the node turns NotReady and the EndpointSlice says `ready: false` (node-monitor-grace-period, 40–60 s), and rproxy keeps sending to them. A pod on a stopped node does not answer SYNs, so a connection fails only after rproxy's connect time (L7: 5 s; L4: 5 s with several destinations, else the OS's retries, about 2 minutes). Detecting the lost node itself (the CNI's, the load balancer's, node monitoring) is out of scope (recorded only; 8.). What rproxy-gateway decides:
+
+| Item | Shape | Default |
+|---|---|---|
+| a. EndpointSlice conditions | Only `ready` endpoints (unset: true). `terminating` ones are not used, except the `serving` terminating ones when no endpoint is ready (KEP-1669, as kube-proxy: a Service whose every pod is stopping still answers while they drain). `ready: true` with `terminating: true` is not taken as ready | Always (before, only `ready` was read, and serving terminating endpoints were dropped too) |
+| b. Passive health checks | rproxy's `outlier_detection` on every backend the controller renders. HTTP (services of HTTPRoutes, GRPCRoutes): `consecutive_gateway_failures: 3` (502, 503, 504, no connection, a response timeout), `consecutive_5xx: 0` (the app's own 5xx do not eject), `ejection_time: 10s`, `max_ejection_time: 1m`, `max_ejected_percent: 50`. L4 (TCP, TLS, UDP rules): `consecutive_failures: 1`, `ejection_time: 10s`, `max_ejection_time: 1m` (rproxy's default of 1 failure for 10 s, plus doubling up to a limit when it keeps failing) | On (the chart's `backends.outlierDetection`; `null` turns it off) |
+| c. Connect timeouts | `timeouts.connect: 2s` for HTTP services (a failure is a 502, so a little longer), `connect_timeout: 1s` for L4 tcp rules (rproxy v0.4.3; then the next destination; with one destination the client's connection is closed) | On (the chart's `backends.connectTimeout`; `""` for rproxy's own) |
+
+- Overrides: an RproxyPolicy's `outlierDetection` (Gateway, listener, Service) is used as it is and the default is not added. To turn ejection off: `outlierDetection: {max_ejected_percent: 0}`. Connect timeouts are controller-wide only (a field in RproxyPolicy would change the CRD; decide separately if needed).
+- Controller flags: `--backend-outlier-http`, `--backend-outlier-l4` (`key=value,...`, empty for none), `--backend-connect-timeout-http`, `--backend-connect-timeout-l4` (empty for rproxy's own); `RPROXY_GATEWAY_BACKEND_*`.
+- rproxy version: `connect_timeout` is sent only to rproxy with `features.connect_timeout` (v0.4.3). `outlier_detection` and `timeouts.connect` exist since v0.4.0.
+- A changed default: existing Gateways' rules get them too (the owner's request; the rules change in place, connections are not cut).
+- Acceptance: scenario p (record-only, managed or fleet-vip): a node with an echo pod and no rproxy in the path is `docker pause`d; measured are how long requests keep failing (the last failure), when the EndpointSlice says NotReady, and when 10 s pass without a failure. The input `rproxy_ref` builds rproxy from an rproxy-api branch.
+
+#### Values from the acceptance test
+
+(written after the measurement)

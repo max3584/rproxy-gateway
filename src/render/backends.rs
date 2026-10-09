@@ -74,7 +74,10 @@ pub fn resolve_with(
 	let Some(svc_port) = spec.ports.iter().flatten().find(|p| p.port == port) else {
 		return Err(refused("BackendNotFound", format!("Service {ns}/{} has no port {port}", b.name)));
 	};
+	// ready endpoints; the serving ones that are terminating only when none is ready (KEP-1669, as
+	// kube-proxy does: a Service whose every pod is stopping still answers while they drain)
 	let mut out = vec![];
+	let mut draining = vec![];
 	for slice in world.slices.get(&(ns.to_string(), b.name.clone())).into_iter().flatten() {
 		if !matches!(slice.address_type.as_str(), "IPv4" | "IPv6") {
 			continue;
@@ -91,18 +94,50 @@ pub fn resolve_with(
 		};
 		let Ok(number) = u16::try_from(number) else { continue };
 		for ep in slice.endpoints.iter().flatten() {
-			let ready = ep.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true);
-			if !ready {
-				continue;
-			}
+			let to = match condition(ep.conditions.as_ref()) {
+				Use::Ready => &mut out,
+				Use::Draining => &mut draining,
+				Use::Not => continue,
+			};
 			for addr in &ep.addresses {
-				out.push(Endpoint { addr: addr.clone(), port: number });
+				to.push(Endpoint { addr: addr.clone(), port: number });
 			}
 		}
+	}
+	// the same address can be in two slices for a moment (moving between them): ready wins
+	if out.is_empty() {
+		out = draining;
 	}
 	out.sort();
 	out.dedup();
 	Ok(out)
+}
+
+/// How an endpoint of an EndpointSlice is used.
+#[derive(Debug, PartialEq, Eq)]
+enum Use {
+	/// Ready (and not terminating): takes traffic.
+	Ready,
+	/// Terminating but still serving: only when the backend has no ready endpoint.
+	Draining,
+	/// Not ready (starting, failing its readiness probe, on a node that stopped answering) or
+	/// terminating and no longer serving.
+	Not,
+}
+
+/// The EndpointSlice conditions (discovery.k8s.io/v1): `ready` unset means ready, `serving`
+/// unset means the same as `ready`, `terminating` unset means not terminating. A terminating
+/// endpoint is never ready (the API server's rule), but a `ready: true` with `terminating: true`
+/// written by another controller is not trusted either.
+fn condition(c: Option<&k8s_openapi::api::discovery::v1::EndpointConditions>) -> Use {
+	let ready = c.and_then(|c| c.ready).unwrap_or(true);
+	let serving = c.and_then(|c| c.serving).unwrap_or(ready);
+	let terminating = c.and_then(|c| c.terminating).unwrap_or(false);
+	match (ready, serving, terminating) {
+		(true, _, false) => Use::Ready,
+		(_, true, true) => Use::Draining,
+		_ => Use::Not,
+	}
 }
 
 /// The name of the Service port a backendRef names (`Some(None)`: an unnamed port; `None`: no such Service or port).
@@ -192,6 +227,22 @@ mod tests {
 
 	fn eps(n: usize, base: &str) -> Vec<Endpoint> {
 		(0..n).map(|i| Endpoint { addr: format!("{base}.{i}"), port: 80 }).collect()
+	}
+
+	#[test]
+	fn endpoint_conditions() {
+		use k8s_openapi::api::discovery::v1::EndpointConditions;
+		let c = |ready: Option<bool>, serving: Option<bool>, terminating: Option<bool>| {
+			condition(Some(&EndpointConditions { ready, serving, terminating }))
+		};
+		assert_eq!(condition(None), Use::Ready, "no conditions: ready");
+		assert_eq!(c(None, None, None), Use::Ready);
+		assert_eq!(c(Some(true), Some(true), Some(false)), Use::Ready);
+		assert_eq!(c(Some(false), Some(false), Some(false)), Use::Not, "not ready (a stopped node, a failing probe)");
+		assert_eq!(c(Some(false), None, None), Use::Not, "serving unset follows ready");
+		assert_eq!(c(Some(false), Some(true), Some(true)), Use::Draining, "terminating, still serving");
+		assert_eq!(c(Some(false), Some(false), Some(true)), Use::Not, "terminating, done serving");
+		assert_eq!(c(Some(true), Some(true), Some(true)), Use::Draining, "ready but terminating: not trusted as ready");
 	}
 
 	#[test]

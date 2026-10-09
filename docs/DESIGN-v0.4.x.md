@@ -471,3 +471,23 @@ fleet:
 | — | chart のクラスの既定の parameters | **`managed.parameters` が空でないときだけ描く**（`helm upgrade` は新しい CRD を入れないため。2.7） |
 
 Q10〜Q16（UI の migration・MariaDB、rproxy-api の #240・#241、利用量）は UI・rproxy-api の設計にある。
+
+## 11. ノードの喪失とバックエンド（v0.4.5）
+
+ノードが止まると、そのノードのバックエンドの Pod は、ノードが NotReady になって EndpointSlice の `ready` が false になるまで（node-monitor-grace-period、40〜60 秒）宛先に残り、rproxy はそこへ送り続ける。止まったノードの Pod は SYN に答えないので、接続は rproxy の接続の時間（L7 は 5 秒、L4 は宛先が複数なら 5 秒、1 つなら OS の再送で約 2 分）まで待ってから失敗する。ノードの喪失を見つけること自体（CNI・ロードバランサ・ノードの監視の時間）は扱わない（記録だけ。8.）。rproxy-gateway で決められるのは次の 3 つ。
+
+| 項目 | 形 | 既定 |
+|---|---|---|
+| a. EndpointSlice の条件 | `ready`（なしは true）の endpoint だけを使う。`terminating` のものは使わず、ready な endpoint が 1 つもないときだけ `serving` で終了中のものを使う（KEP-1669、kube-proxy と同じ：全部の Pod が止まりかけでも drain の間は答える）。`ready: true` でも `terminating: true` なら ready とみなさない | 常に（今までは `ready` だけを見て、終了中で serving のものも捨てていた） |
+| b. 受け身のヘルスチェック | rproxy の `outlier_detection` を、コントローラが描くすべてのバックエンドに付ける。HTTP（HTTPRoute・GRPCRoute のサービス）：`consecutive_gateway_failures: 3`（502・503・504・接続できない・応答の時間切れ）、`consecutive_5xx: 0`（アプリの 5xx では外さない）、`ejection_time: 10s`、`max_ejection_time: 1m`、`max_ejected_percent: 50`。L4（TCP・TLS・UDP のルール）：`consecutive_failures: 1`、`ejection_time: 10s`、`max_ejection_time: 1m`（rproxy の既定の 1 回・10 秒に、続けて外れたら倍にする上限を足したもの） | 有効（chart の `backends.outlierDetection`。`null` で外す） |
+| c. 接続の時間 | HTTP のサービスの `timeouts.connect: 2s`（失敗は 502 なので長め）、L4 の tcp のルールの `connect_timeout: 1s`（rproxy v0.4.3。過ぎたら次の宛先へ。宛先が 1 つならクライアントの接続を閉じる） | 有効（chart の `backends.connectTimeout`。`""` で rproxy の既定） |
+
+- 上書き：RproxyPolicy の `outlierDetection`（Gateway・リスナー・Service）があればそれを使い、既定は足さない。外すには `outlierDetection: {max_ejected_percent: 0}`。接続の時間はコントローラ全体の値だけ（RproxyPolicy に項目を足すのは CRD の変更なので、要るなら別に決める）。
+- コントローラの引数：`--backend-outlier-http`・`--backend-outlier-l4`（`key=value,...`、空で外す）、`--backend-connect-timeout-http`・`--backend-connect-timeout-l4`（空で rproxy の既定）。`RPROXY_GATEWAY_BACKEND_*`。
+- rproxy の版：`connect_timeout` は `features.connect_timeout` のある rproxy（v0.4.3）にだけ送る。`outlier_detection` と `timeouts.connect` は v0.4.0 からある。
+- 既定を変えたこと：今までの Gateway のルールにも付く（オーナーの依頼。ルールはその場で変わり、接続は切れない）。
+- 受け入れ：シナリオ p（記録だけ。managed・fleet-vip のどちらでも）：rproxy が通らないノードのうち echo の Pod があるものを `docker pause` し、失敗が続いた時間（最後の失敗）、EndpointSlice で NotReady になった時刻、10 秒失敗のない状態に戻るまでを測る。入力 `rproxy_ref` で rproxy を rproxy-api のブランチから作る。
+
+#### 受け入れテストでの値
+
+（測定の後に書く）

@@ -145,6 +145,24 @@ fleet:
       requests: {cpu: 10m, memory: 16Mi}
       limits: {memory: 64Mi}
 
+# what every backend the controller renders gets (the pods of the Services behind HTTPRoutes,
+# GRPCRoutes, TLSRoutes, TCPRoutes, UDPRoutes), unless an RproxyPolicy sets outlierDetection
+# (docs/DESIGN-v0.4.x.md 11.). A pod on a node that died stays in its EndpointSlice until the node is
+# NotReady (40-60 s); rproxy's passive health checks leave it out after a few failed connections.
+backends:
+  # rproxy's outlier_detection (rproxy-api docs/API.md "受け身のヘルスチェック"): http for the services
+  # of HTTP routes (3 gateway failures in a row: 502/503/504, no connection, a response timeout; the
+  # app's own 5xx are not counted), l4 for TCP, TLS and UDP routes. Ejected for ejection_time,
+  # doubling up to max_ejection_time. {}: none (rproxy's own: L4 ejects after one failed connection
+  # for 10 s; HTTP does not eject)
+  outlierDetection:
+    http: {consecutive_gateway_failures: 3, consecutive_5xx: 0, ejection_time: 10s, max_ejection_time: 1m, max_ejected_percent: 50}
+    l4: {consecutive_failures: 1, ejection_time: 10s, max_ejection_time: 1m}
+  # how long rproxy may take to connect to a backend pod: http (timeouts.connect; a failure is a 502)
+  # and l4 (connect_timeout, then the next pod is tried; rproxy v0.4.3). "": rproxy's own (5 s; L4
+  # with one pod: the OS's, about 2 minutes)
+  connectTimeout: {http: 2s, l4: 1s}
+
 # a GatewayClass for this controller
 gatewayClass:
   create: true

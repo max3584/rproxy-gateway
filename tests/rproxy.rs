@@ -275,6 +275,8 @@ spec:
 		listen_addrs: vec!["127.0.0.1".into()],
 		cert_dir: certs.display().to_string(),
 		features: features.clone(),
+		// the controller's defaults: passive health checks, connect timeouts (rproxy takes their shapes)
+		backends: render::BackendDefaults::standard(),
 		..Default::default()
 	};
 	let plan = render::render_gateway(&world, &world.gateways[0], &opts);

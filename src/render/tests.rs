@@ -1570,3 +1570,97 @@ fn cross_namespace_secrets_can_be_turned_off() {
 	assert_eq!(cond(&off.listeners[0].conds, "ResolvedRefs").reason, "RefNotPermitted");
 	assert!(off.files.is_empty(), "no key copied");
 }
+
+/// v0.4.5: every backend gets passive health checks and connect timeouts (the controller's
+/// `--backend-*`) unless an RproxyPolicy sets `outlierDetection`; connect_timeout only for L4 tcp
+/// rules of an rproxy that has it.
+#[test]
+fn backends_get_health_checks_and_connect_timeouts() {
+	let routes = r#"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata: {name: pg, namespace: default}
+spec:
+  parentRefs: [{name: gw, sectionName: pg}]
+  rules: [{backendRefs: [{name: db, port: 5432}]}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: web, namespace: default}
+spec:
+  parentRefs: [{name: gw, sectionName: http}]
+  rules: [{backendRefs: [{name: web, port: 80}]}]
+"#;
+	let listeners = "  - {name: http, port: 80, protocol: HTTP}\n  - {name: pg, port: 5432, protocol: TCP}";
+	let yaml = format!("{BASE}{L4_BASE}{}{routes}", gw(listeners));
+	let w = world(&yaml);
+	let opts = Options { backends: BackendDefaults::standard(), ..Options::default() };
+	let rules = render_gateway(&w, &w.gateways[0], &opts).rules_json();
+	let rule = |rules: &[Value], port: u16| rules.iter().find(|r| r["listen_port"] == port).unwrap().clone();
+	let pg = rule(&rules, 5432);
+	assert_eq!(pg["outlier_detection"], json!({"consecutive_failures": 1, "ejection_time": "10s", "max_ejection_time": "1m"}));
+	assert_eq!(pg["connect_timeout"], "1s");
+	let svc = &rule(&rules, 80)["http"]["services"]["default/web/r0"];
+	assert_eq!(svc["outlier_detection"]["consecutive_gateway_failures"], 3);
+	assert_eq!(svc["outlier_detection"]["max_ejected_percent"], 50);
+	assert_eq!(svc["timeouts"], json!({"connect": "2s"}));
+	assert!(rule(&rules, 80).get("outlier_detection").is_none() && rule(&rules, 80).get("connect_timeout").is_none(), "not on http rules");
+	// an rproxy without connect_timeout (before v0.4.3)
+	let old = Options { features: Features { connect_timeout: false, ..Features::default() }, ..opts.clone() };
+	let rules = render_gateway(&w, &w.gateways[0], &old).rules_json();
+	assert!(rule(&rules, 5432).get("connect_timeout").is_none());
+	assert!(rule(&rules, 5432).get("outlier_detection").is_some());
+	// an RproxyPolicy's outlierDetection wins (here: off for the Gateway's rules)
+	let policy = r#"
+---
+apiVersion: rproxy.max3584.net/v1alpha1
+kind: RproxyPolicy
+metadata: {name: no-ejection, namespace: default}
+spec:
+  targetRefs: [{group: gateway.networking.k8s.io, kind: Gateway, name: gw}]
+  outlierDetection: {max_ejected_percent: 0}
+"#;
+	let w = world(&format!("{yaml}{policy}"));
+	let rules = render_gateway(&w, &w.gateways[0], &opts).rules_json();
+	assert_eq!(rule(&rules, 5432)["outlier_detection"], json!({"max_ejected_percent": 0}));
+	assert_eq!(rule(&rules, 80)["http"]["services"]["default/web/r0"]["outlier_detection"], json!({"max_ejected_percent": 0}));
+	// none (the controller's flags set to ""): nothing added
+	let rules = render_gateway(&world(&yaml), &world(&yaml).gateways[0], &Options::default()).rules_json();
+	assert!(rule(&rules, 5432).get("outlier_detection").is_none());
+}
+
+/// EndpointSlice conditions: ready endpoints only; terminating ones that still serve only when
+/// none is ready.
+#[test]
+fn endpoints_follow_their_conditions() {
+	let slices = |extra: &str| {
+		format!(
+			r#"
+apiVersion: v1
+kind: Service
+metadata: {{name: app, namespace: default}}
+spec: {{ports: [{{name: http, port: 80}}]}}
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata: {{name: app-1, namespace: default, labels: {{kubernetes.io/service-name: app}}}}
+addressType: IPv4
+ports: [{{name: http, port: 8080}}]
+endpoints:
+  - addresses: [10.9.0.1]
+    conditions: {{ready: false, serving: true, terminating: true}}
+  - addresses: [10.9.0.2]
+    conditions: {{ready: false, serving: false, terminating: true}}
+  - addresses: [10.9.0.3]
+    conditions: {{ready: false}}
+{extra}"#
+		)
+	};
+	let b = crate::k8s::gateway::BackendRef { name: "app".into(), port: Some(80), ..Default::default() };
+	let addrs =
+		|yaml: &str| backends::resolve(&world(yaml), "HTTPRoute", "default", &b).unwrap().into_iter().map(|e| e.addr).collect::<Vec<_>>();
+	assert_eq!(addrs(&slices("")), vec!["10.9.0.1"], "only draining ones: the serving one takes traffic");
+	let ready = "  - addresses: [10.9.0.4]\n    conditions: {ready: true}\n  - addresses: [10.9.0.5]\n";
+	assert_eq!(addrs(&slices(ready)), vec!["10.9.0.4", "10.9.0.5"], "ready ones (unset: ready); no terminating one");
+}
