@@ -269,7 +269,7 @@ spec:
         app.kubernetes.io/name: rproxy-gateway
       annotations:
         # a changed configuration rolls the controller
-        rproxy.max3584.net/config: ac622e7d9423468e
+        rproxy.max3584.net/config: 4a639af31bf44dcc
     spec:
       serviceAccountName: rproxy-gateway
       securityContext:

@@ -803,6 +803,11 @@ pub fn build(ctx: &Ctx, route: &HttpRoute, hosts: Option<&[String]>, exclusions:
 			None
 		} else {
 			let mut svc = rp::Service { servers, tls: service_tls.clone(), ..Default::default() };
+			let has_timeouts = rule.timeouts.as_ref().is_some_and(|t| {
+				[&t.request, &t.backend_request].iter().any(|d| d.as_deref().and_then(crate::render::duration_ms).is_some_and(|ms| ms > 0))
+			});
+			svc.route_timeouts = has_timeouts;
+			svc.default_response = !has_timeouts && !ctx.grpc;
 			if let Some(t) = &rule.timeouts {
 				match timeouts(ctx, t) {
 					Ok((on_route, on_service)) => {

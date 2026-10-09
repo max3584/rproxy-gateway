@@ -72,6 +72,44 @@ fn settings(p: &RproxyPolicy) -> Vec<(&'static str, Value)> {
 	out
 }
 
+/// A policy's `connectTimeout` and `responseTimeout`, checked (`Err`: why not).
+fn timeouts(p: &RproxyPolicy) -> Result<(Option<String>, Option<String>), String> {
+	let check = |what: &str, v: &Option<String>, min: u64, max: u64| -> Result<Option<String>, String> {
+		match v.as_deref().map(str::trim) {
+			None => Ok(None),
+			Some(d) => match crate::render::duration_ms(d) {
+				Some(ms) if (min..=max).contains(&ms) => Ok(Some(d.to_string())),
+				_ => Err(format!("{what} {d:?}: a duration from {}", if min == 100 { "100ms to 10m" } else { "1ms to 1h" })),
+			},
+		}
+	};
+	Ok((check("connectTimeout", &p.spec.connect_timeout, 100, 600_000)?, check("responseTimeout", &p.spec.response_timeout, 1, 3_600_000)?))
+}
+
+/// Puts a policy's timeouts on a rule: an L4 tcp rule's `connect_timeout`, or the `http` services
+/// `service` picks: `timeouts.connect`, and `timeouts.response` unless the route rule set its own.
+/// What is set already (an older policy) stays.
+fn put_timeouts(r: &mut rp::Rule, connect: &Option<String>, response: &Option<String>, service: impl Fn(&str) -> bool) {
+	match r.http.as_mut() {
+		Some(http) => {
+			for (_, svc) in http.services.iter_mut().filter(|(n, _)| service(n)) {
+				if let Some(c) = connect {
+					crate::render::set_timeout(svc, "connect", c);
+				}
+				if let (Some(t), false) = (response, svc.route_timeouts) {
+					crate::render::set_timeout(svc, "response", t);
+				}
+			}
+		}
+		None if r.protocol == rp::Protocol::Tcp => {
+			if let Some(c) = connect {
+				set_once(&mut r.extra, "connect_timeout", &Value::String(c.clone()));
+			}
+		}
+		None => {}
+	}
+}
+
 fn set_once(map: &mut serde_json::Map<String, Value>, key: &str, value: &Value) {
 	if !map.contains_key(key) {
 		map.insert(key.to_string(), value.clone());
@@ -90,6 +128,20 @@ pub fn apply(world: &World, gw: &Gateway, rules: &mut [rp::Rule], targets: &Targ
 	for p in policies {
 		let mut touched = false;
 		let mut problems = vec![];
+		let (connect, response) = match timeouts(p) {
+			Ok(t) => t,
+			Err(e) => {
+				// a wrong timeout: the policy is not used (its other settings neither)
+				out.push(PolicyStatus {
+					namespace: gw_ns.clone(),
+					name: p.metadata.name.clone().unwrap_or_default(),
+					generation: p.metadata.generation.unwrap_or(0),
+					ancestor: json!({"group": GROUP, "kind": "Gateway", "namespace": gw_ns, "name": gw_name}),
+					conds: vec![Cond::new("Accepted", false, "Invalid", e)],
+				});
+				continue;
+			}
+		};
 		for t in &p.spec.target_refs {
 			let is_gateway = t.group == GROUP && t.kind == "Gateway";
 			let is_service = t.group.is_empty() && t.kind == "Service";
@@ -116,6 +168,7 @@ pub fn apply(world: &World, gw: &Gateway, rules: &mut [rp::Rule], targets: &Targ
 						}
 						set_once(&mut r.extra, k, &v);
 					}
+					put_timeouts(r, &connect, &response, |_| true);
 				}
 			} else if is_service {
 				let svc: Key = (gw_ns.clone(), t.name.clone());
@@ -127,6 +180,7 @@ pub fn apply(world: &World, gw: &Gateway, rules: &mut [rp::Rule], targets: &Targ
 						for (k, v) in settings(p) {
 							set_once(&mut r.extra, k, &v);
 						}
+						put_timeouts(r, &connect, &response, |_| true);
 					}
 					if let Some(http) = r.http.as_mut() {
 						for (name, s) in http.services.iter_mut() {
@@ -138,6 +192,15 @@ pub fn apply(world: &World, gw: &Gateway, rules: &mut [rp::Rule], targets: &Targ
 									}
 								}
 							}
+						}
+						let picked: Vec<String> = http
+							.services
+							.keys()
+							.filter(|name| targets.http_services.get(&(key.clone(), (*name).clone())).is_some_and(|l| l.contains(&svc)))
+							.cloned()
+							.collect();
+						if !picked.is_empty() {
+							put_timeouts(r, &connect, &response, |n| picked.iter().any(|p| p == n));
 						}
 					}
 				}

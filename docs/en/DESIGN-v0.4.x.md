@@ -437,7 +437,7 @@ When a node stops, its backend pods stay among the destinations until the node t
 | b. Passive health checks | rproxy's `outlier_detection` on every backend the controller renders. HTTP (services of HTTPRoutes, GRPCRoutes): `consecutive_gateway_failures: 3` (502, 503, 504, no connection, a response timeout), `consecutive_5xx: 0` (the app's own 5xx do not eject), `ejection_time: 10s`, `max_ejection_time: 1m`, `max_ejected_percent: 50`. L4 (TCP, TLS, UDP rules): `consecutive_failures: 1`, `ejection_time: 10s`, `max_ejection_time: 1m` (rproxy's default of 1 failure for 10 s, plus doubling up to a limit when it keeps failing) | On (the chart's `backends.outlierDetection`; `null` turns it off) |
 | c. Connect timeouts | `timeouts.connect: 1s` for HTTP services, `connect_timeout: 1s` for L4 tcp rules (rproxy v0.4.3; then the next destination; with one destination the client's connection is closed) | On (the chart's `backends.connectTimeout`; `""` for rproxy's own) |
 
-- Overrides: an RproxyPolicy's `outlierDetection` (Gateway, listener, Service) is used as it is and the default is not added. To turn ejection off: `outlierDetection: {max_ejected_percent: 0}`. Connect timeouts are controller-wide only (a field in RproxyPolicy would change the CRD; decide separately if needed).
+- Overrides: an RproxyPolicy's `outlierDetection` (Gateway, listener, Service) is used as it is and the default is not added. To turn ejection off: `outlierDetection: {max_ejected_percent: 0}`. Connect and response timeouts: RproxyPolicy's `connectTimeout` and `responseTimeout` (added in v0.4.5; d. below).
 - Controller flags: `--backend-outlier-http`, `--backend-outlier-l4` (`key=value,...`, empty for none), `--backend-connect-timeout-http`, `--backend-connect-timeout-l4` (empty for rproxy's own); `RPROXY_GATEWAY_BACKEND_*`.
 - rproxy version: `connect_timeout` is sent only to rproxy with `features.connect_timeout` (v0.4.3). `outlier_detection` and `timeouts.connect` exist since v0.4.0.
 - A changed default: existing Gateways' rules get them too (the owner's request; the rules change in place, connections are not cut).
@@ -458,3 +458,17 @@ Measured with v0.4.4's `mode=fleet-vip` (the VIP sidecar is gone in v0.4.5; the 
 - `docker kill` (a node that lost power: nothing answers): before, a connection to the dead pod was given up by the client (2 s) before rproxy's connect time (5 s), so rproxy never counted a failure and never ejected it; about one request in four failed until NotReady. After, rproxy gives up the connection after 1 s and ejects the pod (L7 after 3, L4 after 1), and only re-tries when the ejection time (10 s, then 20 s) ends cost a few requests. TCP moves to the next destination: no failures.
 - With HTTP connect at 2 s, HTTPS (whose client has less time left after TLS) gave up before rproxy's 2 s, so the pod was not ejected. Hence the 1 s default (pods in the cluster answer within milliseconds).
 - `docker pause` (the kernel runs, so a TCP connection to a frozen pod succeeds and only the answer never comes: a failing node, a hung app): connect timeouts do not help, and without a response timeout (`timeouts.response`) it is no gateway failure, so both fail until NotReady. Response times are per application, so no default (HTTPRoute's `timeouts.backendRequest` sets one).
+
+### 13.1 Added after the decisions (the owner's, 2026-10-09)
+
+- Connect timeouts stay 1 s for HTTP and L4 by default; on by default, existing Gateways included. No retry by default.
+- **d. RproxyPolicy `connectTimeout` and `responseTimeout`** (the same schema in `v1beta1` and `v1alpha1`):
+  - `connectTimeout` (100ms-10m): an L4 tcp rule's `connect_timeout`, an `http` service's `timeouts.connect`.
+  - `responseTimeout` (up to 1h): an `http` service's `timeouts.response`.
+  - They replace the controller's defaults for what targetRefs reach (a Gateway, a listener by `sectionName`, a Service). The oldest policy wins, as for the other fields. Services of an HTTPRoute rule with its own `timeouts` (`request`, `backendRequest`) get no `responseTimeout` (the route wins).
+  - A malformed duration makes the policy unused and `Accepted: False` (`Invalid`).
+- **e. A default response timeout of 30 s** (`--backend-response-timeout`, the chart's `backends.responseTimeout`; `""` for rproxy's 60 s): `timeouts.response: 30s` on the services of HTTPRoute rules without `timeouts`.
+  - rproxy's `timeouts.response` runs from the end of the request body to the response headers. Response bodies (large downloads, SSE, long-polling bodies) and a WebSocket after its 101 are not cut. A request still sending its body (uploads, streams) does not start the clock until it ends.
+  - A timeout is a 504 and counts as a gateway failure for `outlier_detection` (ejected after 3).
+  - Not for GRPCRoutes: a server stream may hold its headers back until its first message (grpc-go's default), so a watch without events would be cut at 30 s. gRPC deadlines come from `grpc-timeout`. Use RproxyPolicy's `responseTimeout` if needed.
+  - What makes the headers wait longer than 30 s (long polling that waits before the headers, heavy work) needs HTTPRoute's `timeouts.backendRequest` or RproxyPolicy's `responseTimeout`.

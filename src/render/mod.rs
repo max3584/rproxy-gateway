@@ -72,6 +72,20 @@ pub struct BackendDefaults {
 	pub http_connect_timeout: Option<String>,
 	/// `connect_timeout` of L4 tcp rules (rproxy v0.4.3).
 	pub l4_connect_timeout: Option<String>,
+	/// `timeouts.response` of the services of HTTPRoute rules without `timeouts` (time from the end of
+	/// the request body to the response headers: streamed bodies, SSE, WebSocket after its 101 and
+	/// requests still sending are not cut).
+	pub http_response_timeout: Option<String>,
+}
+
+/// Sets `timeouts.<key>` of a service unless it has one.
+pub fn set_timeout(svc: &mut rp::Service, key: &str, value: &str) {
+	match svc.timeouts.as_mut().and_then(Value::as_object_mut) {
+		Some(o) => {
+			o.entry(key).or_insert_with(|| Value::String(value.to_string()));
+		}
+		None => svc.timeouts = Some(serde_json::json!({ key: value })),
+	}
 }
 
 impl BackendDefaults {
@@ -79,7 +93,9 @@ impl BackendDefaults {
 	/// (502/503/504, no connection, `timeouts.response`; not the app's own 5xx) for 10 s, doubling
 	/// up to 1 m, at most half of a service's servers; an L4 target after a failed connection (as
 	/// rproxy does), doubling up to 1 m; connect within 1 s (a pod in the cluster answers in
-	/// milliseconds; a client that gives up first is not counted as the backend's failure).
+	/// milliseconds; a client that gives up first is not counted as the backend's failure); response
+	/// headers within 30 s for HTTPRoute backends (rproxy's own is 60 s; a timeout is a gateway failure,
+	/// counted by the passive health checks).
 	pub fn standard() -> BackendDefaults {
 		BackendDefaults {
 			http_outlier: Some(serde_json::json!({
@@ -89,6 +105,7 @@ impl BackendDefaults {
 			l4_outlier: Some(serde_json::json!({"consecutive_failures": 1, "ejection_time": "10s", "max_ejection_time": "1m"})),
 			http_connect_timeout: Some("1s".into()),
 			l4_connect_timeout: Some("1s".into()),
+			http_response_timeout: Some("30s".into()),
 		}
 	}
 
@@ -106,12 +123,10 @@ impl BackendDefaults {
 							svc.outlier_detection = self.http_outlier.clone();
 						}
 						if let Some(t) = &self.http_connect_timeout {
-							match svc.timeouts.as_mut().and_then(Value::as_object_mut) {
-								Some(o) => {
-									o.entry("connect").or_insert_with(|| Value::String(t.clone()));
-								}
-								None => svc.timeouts = Some(serde_json::json!({ "connect": t })),
-							}
+							set_timeout(svc, "connect", t);
+						}
+						if let (true, Some(t)) = (svc.default_response, &self.http_response_timeout) {
+							set_timeout(svc, "response", t);
 						}
 					}
 				}
