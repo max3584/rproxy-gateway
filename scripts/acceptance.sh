@@ -23,8 +23,11 @@
 # RPROXY_IMAGE_FROM=dist: the rproxy image from dist/amd64/rproxy-api (the workflow's rproxy_ref) instead
 # of the chart's.
 # Scenario p (record-only, both modes): a node that runs a backend (echo) pod but no rproxy pod that
-# traffic goes through is paused: how long requests keep failing (rproxy sends some to the pod there
+# traffic goes through is lost (P_HOW=kill, the default: docker kill, nothing answers any more, as a
+# node that lost power; P_HOW=pause: docker pause, whose kernel still completes TCP handshakes for the
+# frozen pods, as a hung node): how long requests keep failing (rproxy sends some to the pod there
 # until its EndpointSlice says NotReady, unless its passive health checks leave it out first).
+P_HOW=${P_HOW:-kill}
 # Outages are measured and reported. With MANAGED_REPLICAS >= 2, a pod deletion, a node drain, a
 # rollout restart and a parameters change fail the run when the longest gap without a 200 exceeds
 # GAP_LIMIT seconds (l2-local, l2-cluster, nodeport-lb: what rproxy-gateway controls; bgp and a lost
@@ -1071,7 +1074,7 @@ last_fail() {
   echo "$last"
 }
 scenario_p() {
-  local label="p. a backend's node lost (docker pause; no rproxy there that traffic goes through)" t0 ok=PASS node="" n skip ld_node t_nr=0 t_ok t_end lf notes
+  local label="p. a backend's node lost (docker $P_HOW; no rproxy there that traffic goes through)" t0 ok=PASS node="" n skip ld_node t_nr=0 t_ok t_end lf notes
   ld_node=$(kubectl -n "$NS" get pod "$(leader)" -o jsonpath='{.spec.nodeName}' 2> /dev/null || true)
   # not the VIP holder's node (fleet-vip) / an rproxy pod's or the announcing node (managed); not the
   # controller leader's when possible
@@ -1092,7 +1095,7 @@ scenario_p() {
   fi
   log "== $label: $node (echo pods on $(echo_nodes | tr '\n' ' ')); placement: $(placement)"
   t0=$(now_ms)
-  docker pause "$node" > /dev/null
+  docker "$P_HOW" "$node" > /dev/null
   sleep 3
   # until the probes have been steady for 10 s (passive health checks re-try an ejected pod after
   # 10 s, 20 s, ...), noting when the endpoint there turns not ready
@@ -1106,8 +1109,13 @@ scenario_p() {
   [ "$t_nr" != 0 ] || ok=FAIL
   lf=$(last_fail "$t0" "$t_end")
   t_ok=$t_end
-  notes="paused $node; the echo endpoint there not ready in the EndpointSlice after $([ "$t_nr" != 0 ] && secs $((t_nr - t0)) || echo never)s; last failed request $([ "$lf" -gt 0 ] && echo "at $(secs $((lf - t0)))s" || echo "none")"
-  docker unpause "$node" > /dev/null
+  notes="docker $P_HOW $node; the echo endpoint there not ready in the EndpointSlice after $([ "$t_nr" != 0 ] && secs $((t_nr - t0)) || echo never)s; last failed request $([ "$lf" -gt 0 ] && echo "at $(secs $((lf - t0)))s" || echo "none")"
+  if [ "$P_HOW" = pause ]; then
+    docker unpause "$node" > /dev/null
+  else
+    docker start "$node" > /dev/null
+    notes+="; started again as $(kind_ip "$node")"
+  fi
   wait_for 300 node_ready "$node" || ok=FAIL
   settle || ok=FAIL
   record "$label" "$t0" "$t_ok" "$([ "$lf" -gt 0 ] && secs $((lf - t0)) || echo 0)s" "$ok" "$notes"
