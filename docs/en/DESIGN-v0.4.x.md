@@ -486,8 +486,20 @@ When a node stops, its backend pods stay among the destinations until the node t
 - Controller flags: `--backend-outlier-http`, `--backend-outlier-l4` (`key=value,...`, empty for none), `--backend-connect-timeout-http`, `--backend-connect-timeout-l4` (empty for rproxy's own); `RPROXY_GATEWAY_BACKEND_*`.
 - rproxy version: `connect_timeout` is sent only to rproxy with `features.connect_timeout` (v0.4.3). `outlier_detection` and `timeouts.connect` exist since v0.4.0.
 - A changed default: existing Gateways' rules get them too (the owner's request; the rules change in place, connections are not cut).
-- Acceptance: scenario p (record-only, managed or fleet-vip): a node with an echo pod and no rproxy in the path is `docker pause`d; measured are how long requests keep failing (the last failure), when the EndpointSlice says NotReady, and when 10 s pass without a failure. The input `rproxy_ref` builds rproxy from an rproxy-api branch.
+- Acceptance: scenario p (record-only, managed or fleet-vip): a node with an echo pod and no rproxy in the path is `docker kill`ed (`P_HOW=pause`: `docker pause`d); measured are how long requests keep failing (the last failure), when the EndpointSlice says NotReady, and when 10 s pass without a failure. The input `rproxy_ref` builds rproxy from an rproxy-api branch.
 
 #### Values from the acceptance test
 
-(written after the measurement)
+`mode=fleet-vip`, scenario p: of the nodes with an echo pod (3, one per worker), one that holds neither the VIP nor the controller's leader is stopped. Probes: HTTP, HTTPS and TCP every 0.1 s, a new connection each (`--max-time 2`). Recorded only.
+
+| How | Version | Failed (HTTP/HTTPS/TCP) | Longest gap | Failing for (last failure) | NotReady |
+|---|---|---|---|---|---|
+| `docker kill` | before (chart 0.4.4, rproxy 0.4.2; run 37881266745) | 29/30/4 (781) | 2.3 s | 47.1 s (until NotReady) | 47.0 s |
+| `docker kill` | after (this version, rproxy v0.4.3, HTTP connect 1 s; run 37882953598) | 9/9/0 (1146) | 1.2 s | 37.5 s (only at 0–1 s, 11–14 s, 35–37 s) | 44.9 s |
+| `docker kill` | after (HTTP connect 2 s; run 37881273245) | 10/18/0 (1055) | 2.2 s | 44.9 s | 44.9 s |
+| `docker pause` | before (run 37878937573) | 30/30/30 | 2.3 s | 68.4 s | 49.2 s |
+| `docker pause` | after (HTTP connect 2 s; run 37880239529) | 21/21/21 (411) | 2.2 s | 46.9 s | 46.5 s |
+
+- `docker kill` (a node that lost power: nothing answers): before, a connection to the dead pod was given up by the client (2 s) before rproxy's connect time (5 s), so rproxy never counted a failure and never ejected it; about one request in four failed until NotReady. After, rproxy gives up the connection after 1 s and ejects the pod (L7 after 3, L4 after 1), and only re-tries when the ejection time (10 s, then 20 s) ends cost a few requests. TCP moves to the next destination: no failures.
+- With HTTP connect at 2 s, HTTPS (whose client has less time left after TLS) gave up before rproxy's 2 s, so the pod was not ejected. Hence the 1 s default (pods in the cluster answer within milliseconds).
+- `docker pause` (the kernel runs, so a TCP connection to a frozen pod succeeds and only the answer never comes: a failing node, a hung app): connect timeouts do not help, and without a response timeout (`timeouts.response`) it is no gateway failure, so both fail until NotReady. Response times are per application, so no default (HTTPRoute's `timeouts.backendRequest` sets one).

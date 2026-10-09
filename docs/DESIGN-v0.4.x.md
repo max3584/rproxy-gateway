@@ -486,8 +486,20 @@ Q10〜Q16（UI の migration・MariaDB、rproxy-api の #240・#241、利用量�
 - コントローラの引数：`--backend-outlier-http`・`--backend-outlier-l4`（`key=value,...`、空で外す）、`--backend-connect-timeout-http`・`--backend-connect-timeout-l4`（空で rproxy の既定）。`RPROXY_GATEWAY_BACKEND_*`。
 - rproxy の版：`connect_timeout` は `features.connect_timeout` のある rproxy（v0.4.3）にだけ送る。`outlier_detection` と `timeouts.connect` は v0.4.0 からある。
 - 既定を変えたこと：今までの Gateway のルールにも付く（オーナーの依頼。ルールはその場で変わり、接続は切れない）。
-- 受け入れ：シナリオ p（記録だけ。managed・fleet-vip のどちらでも）：rproxy が通らないノードのうち echo の Pod があるものを `docker pause` し、失敗が続いた時間（最後の失敗）、EndpointSlice で NotReady になった時刻、10 秒失敗のない状態に戻るまでを測る。入力 `rproxy_ref` で rproxy を rproxy-api のブランチから作る。
+- 受け入れ：シナリオ p（記録だけ。managed・fleet-vip のどちらでも）：rproxy が通らないノードのうち echo の Pod があるものを `docker kill`（`P_HOW=pause` で `docker pause`）し、失敗が続いた時間（最後の失敗）、EndpointSlice で NotReady になった時刻、10 秒失敗のない状態に戻るまでを測る。入力 `rproxy_ref` で rproxy を rproxy-api のブランチから作る。
 
 #### 受け入れテストでの値
 
-（測定の後に書く）
+`mode=fleet-vip`、シナリオ p、echo（3 つ、ワーカーごとに 1 つ）のあるノードのうち VIP の持ち主でもコントローラのリーダーでもないものを止めた。プローブは HTTP・HTTPS・TCP を 0.1 秒おきに新しい接続で（`--max-time 2`）。記録だけ。
+
+| 止め方 | 版 | 失敗（HTTP/HTTPS/TCP） | 最長の途切れ | 失敗が続いた時間（最後の失敗） | NotReady |
+|---|---|---|---|---|---|
+| `docker kill` | 前（chart 0.4.4・rproxy 0.4.2、run 37881266745） | 29/30/4（781） | 2.3 秒 | 47.1 秒（NotReady まで続く） | 47.0 秒 |
+| `docker kill` | 後（この版・rproxy v0.4.3、HTTP の接続 1 秒、run 37882953598） | 9/9/0（1146） | 1.2 秒 | 37.5 秒（0〜1 秒・11〜14 秒・35〜37 秒の 3 回だけ） | 44.9 秒 |
+| `docker kill` | 後（HTTP の接続 2 秒、run 37881273245） | 10/18/0（1055） | 2.2 秒 | 44.9 秒 | 44.9 秒 |
+| `docker pause` | 前（run 37878937573） | 30/30/30 | 2.3 秒 | 68.4 秒 | 49.2 秒 |
+| `docker pause` | 後（HTTP の接続 2 秒、run 37880239529） | 21/21/21（411） | 2.2 秒 | 46.9 秒 | 46.5 秒 |
+
+- `docker kill`（電源が落ちたノード：何も答えない）：前は死んだ Pod に送った接続が rproxy の接続の時間（5 秒）より先にクライアント（2 秒）に諦められるので、rproxy は失敗として数えず外さない。NotReady まで約 4 回に 1 回が落ち続けた。後は 1 秒で接続を諦めて外し（L7 は 3 回、L4 は 1 回）、外す時間（10 秒 → 20 秒）が過ぎて試し直すときだけ数回落ちる。TCP は次の宛先に移るので失敗 0。
+- HTTP の接続を 2 秒にした回は、HTTPS（TLS の分だけクライアントの残り時間が短い）が rproxy の 2 秒より先に諦められて外れなかった。既定を 1 秒にしたのはこのため（クラスタの中の Pod は数ミリ秒で答える）。
+- `docker pause`（カーネルは動くので、止めた Pod への TCP の接続は成り立ち、応答だけ来ない：止まりかけのノード・固まったアプリ）：接続の時間は効かず、応答の時間切れ（`timeouts.response`）がないと gateway の失敗にならないので、どちらも NotReady まで落ち続ける。応答の時間はアプリごとに違うので既定にはしない（HTTPRoute の `timeouts.backendRequest` で決める）。
