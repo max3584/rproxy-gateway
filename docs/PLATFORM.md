@@ -404,8 +404,24 @@ fleet:
 
 ### Gateway の `spec.addresses` と `addressCIDRs`
 
-- 今：fleet の Gateway の `spec.addresses` は `fleet.addresses` のどれかだけ（ほかは `Programmed: False`、`AddressNotUsable`）。rproxy は `0.0.0.0` で待ち受けるので、VIP を複数用意して `fleet.addresses` に並べても、同じポートを別の Gateway に使い分けることはできない（どの VIP に来てもポートが合えば受ける）。
-- 予定（作業中の PR）：fleet の rproxy が Gateway ごとに `spec.addresses` のアドレスで待ち受ける（rproxy の `listen_freebind`。rproxy-api #257）。アドレスは `managed.addressCIDRs` の内だけで、VIP がまだそのノードに来ていなくても待ち受けられるので、上の keepalived・Service の VIP をそのまま Gateway ごとに使い分けられる。マージされたらこの節を直す。
+- `fleet.listen: wildcard`（既定）：fleet の Gateway の `spec.addresses` は `fleet.addresses` のどれかだけ（ほかは `Programmed: False`、`AddressNotUsable`）。rproxy は `0.0.0.0` で待ち受けるので、VIP を複数用意して `fleet.addresses` に並べても、同じポートを別の Gateway に使い分けることはできない（どの VIP に来てもポートが合えば受ける）。
+- `fleet.listen: addresses`（v0.4.5、rproxy v0.4.3 の `listen_freebind`）：`spec.addresses` を持つ Gateway のルールは、そのアドレスでだけ待ち受ける（[DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) の 12.）。アドレスは `managed.addressCIDRs` の内だけ（chart が `--address-cidr` に渡す）。VIP がまだそのノードに来ていなくても、すべての fleet の Pod が待ち受けるので、上の keepalived・Service の VIP をそのまま Gateway ごとに使い分けられる（VIP が違えば同じポートを使える。あるアドレスに来たものはその Gateway にだけ届く）。`spec.addresses` のない Gateway は `0.0.0.0` のまま。同じアドレス（か `0.0.0.0`）の同じポートは古い Gateway が持ち、後の Gateway のリスナーは `Accepted: False`（`PortUnavailable`）。Gateway の `status.addresses` は `spec.addresses`。
+
+```yaml
+fleet:
+  enabled: true
+  listen: addresses
+managed:
+  addressCIDRs: [192.0.2.10/32, 192.0.2.11/32]   # keepalived・MetalLB などが置く VIP
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {name: web-a, namespace: team-a}
+spec:
+  gatewayClassName: rproxy
+  addresses: [{type: IPAddress, value: 192.0.2.10}]
+  listeners: [{name: https, port: 443, protocol: HTTPS, tls: {certificateRefs: [{name: web-a}]}}]
+```
 
 ## ClusterIP（クラスタの中だけ）
 

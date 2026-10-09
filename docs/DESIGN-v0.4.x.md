@@ -353,6 +353,7 @@ v0.4.4 で fleet の `vip` サイドカー（`rproxy-gateway vip`、chart の `f
 | Q8 | UI が Kubernetes の rproxy を見る方法 | **コントローラが読むだけのトークンと発見の Secret を UI の namespace に書く**（管理者の `ui.namespace` と Gateway の `ui.visible`） |
 | Q9 | Kubernetes のルールを UI の利用者に見せるか | **管理者だけ**。namespace と Keycloak のグループの対応は後で |
 | Q17 | F の方式 | v0.4.4 は案 1b（fleet + 自前の `rproxy-gateway vip`。Lease、gratuitous ARP / NA）。**v0.4.5 でやめ、アドレスはプラットフォームに任せる**（7.、[PLATFORM.md](PLATFORM.md)） |
+| Q19 | VIP ごとに待ち受けを分けるか | v0.4.4 は**分けない**（`0.0.0.0` のまま）。v0.4.5 で `fleet.listen: addresses` を足した（Gateway の `spec.addresses` で待ち受ける。rproxy-api v0.4.3 の `listen_freebind`。既定は `wildcard` のまま。12.） |
 | — | 版 | **v0.5.0 は作らない**。v0.4.2 から順にパッチで出す |
 | — | chart のクラスの既定の parameters | **`managed.parameters` が空でないときだけ描く**（`helm upgrade` は新しい CRD を入れないため。2.7） |
 
@@ -414,3 +415,14 @@ Gateway API の Mesh（GAMMA、conformance の `MESH-HTTP`・`MESH-GRPC`、機�
 
 **勧め：作らない**。rproxy-gateway は north-south（Gateway）に絞る。クラスタの中の通信にポリシー・mTLS が要るなら、Istio（ambient）・Linkerd・Cilium のメッシュと並べて使う（rproxy-gateway は入口のまま、メッシュは Pod の間。Gateway の rproxy の Pod をメッシュに入れるかはメッシュの側の設定）。需要がはっきりしたら、v0.4.x のパッチではなく次のマイナー（形が大きく変わる）で、ノードごとのプロキシの形（ambient に近い。fleet の DaemonSet を使える）から考える。docs/CONFORMANCE.md の「名乗っていないもの」には Mesh を残す。
 
+## 12. fleet で Gateway ごとのアドレスで待ち受ける（v0.4.5）
+
+fleet のルールは `0.0.0.0`（`--listen-addr`）で待ち受けるので、2 つ目の Gateway が同じポートを使うと rproxy が `409` で断る（アドレスが違っても）。rproxy-api v0.4.3 の `listen_freebind`（まだノードにないアドレスで待ち受ける、`IP_FREEBIND`）を使い、Gateway ごとに自分のアドレスで待ち受けられるようにした。アドレスをノードに置く（告げる・移す）のはプラットフォームの役目（MetalLB・kube-vip・Cilium の LB IPAM・クラウドの LB・ホストの keepalived など）で、rproxy-gateway は待ち受けるだけ（VIP のサイドカーには頼らない。オーナーの決定）。10. Q19 の見直し。
+
+- 値：chart の `fleet.listen: wildcard | addresses`（既定 `wildcard` で今までどおり）。`addresses` でコントローラに `RPROXY_GATEWAY_FLEET_LISTEN=addresses` と `RPROXY_GATEWAY_ADDRESS_CIDR`（`managed.addressCIDRs`）。
+- 待ち受けるアドレス：Gateway の `spec.addresses`（すべてが `--address-cidr` の内のとき。IPv4 が `listen_addr`、残りは `extra_listen_addrs`）。どのノードがそのアドレスを持つかでは変えない（`listen_freebind` なので、すべての fleet の Pod が同じルールで待ち受け、アドレスが来たノードで届く。アドレスが動いてもルールは変わらない）。ルールのキーは `tcp/<アドレス>:443`。`spec.addresses` のない Gateway は今までどおりワイルドカード。Gateway の `status.addresses` は `spec.addresses`。
+- rproxy の版：fleet の Pod の rproxy がすべて `features.listen_freebind` を持つときだけ（答えた Pod のどれかが持たなければワイルドカードに戻してログ。まだ答えていない新しい Pod では戻さない）。fleet の Pod を作り直す必要はない（ルールごとの印）。
+- 取り合い：fleet ではすべての Gateway のルールが同じ rproxy に入る。同じアドレス（か、それを含むワイルドカード）の同じポートを 2 つの Gateway が使うと、**古い Gateway**（作られた時刻、次に namespace・名前）が持ち、後の Gateway のそのルールは組から外してリスナーを `Accepted: False`（`PortUnavailable`、「tcp/192.0.2.10:443 is used by Gateway ns/name」）にする。`wildcard` でも同じ（今までは先に反映された方が勝ち、後の方には rproxy の `409` の文が `Programmed: False` に出ていた）。rproxy の `409` は残る（判定のずれの守り）。
+- UDP：特定のアドレスで待ち受けるので、返信はそのアドレスから出る（`IP_PKTINFO` は要らない）。
+- 守り：あるアドレスに来たものはそのアドレスの Gateway にだけ届く。アドレスは管理者の `managed.addressCIDRs` の内だけ（今までの `spec.addresses` の守りと同じ、[SECURITY.md](SECURITY.md)）。
+- 受け入れ：`mode=fleet`（VIP なし、`fleet.listen=addresses`）と入力 `rproxy_ref`（rproxy を rproxy-api のブランチ・タグから作る）。シナリオ q：kind の docker ネットワークのアドレス 2 つを、プラットフォームの代わりに 1 つのワーカーに `ip addr add` で置き（ネットワークの側は記録だけ）、同じポート 8080・8443・UDP 9002 の Gateway を 2 つ（アドレスごと）作る。両方が Programmed（アドレスを置く前から）、アドレスごとにそれぞれのバックエンドに届くこと、1 つ目のアドレスの 8080 を求めた 3 つ目が `PortUnavailable` になり、ワイルドカードの `acc`（80・443・9000）と 1 つ目が乱れないこと（`GAP_LIMIT`）。

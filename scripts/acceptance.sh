@@ -15,6 +15,13 @@
 #               (network-dependent)")
 #   nodeport-lb NodePort Services (externalTrafficPolicy Local; Cluster through HELM_ARGS) behind an HAProxy container that
 #               health-checks every node and sends to all healthy ones (a user's own L4 balancer)
+# MODE=fleet: fleet mode (hostNetwork DaemonSet) without VIPs, fleet.listen=addresses: a Gateway with
+# spec.addresses listens on those addresses only (listen_freebind; rproxy v0.4.3). The Gateway acc has
+# none (the wildcard, the nodes' addresses). Scenario q: two addresses put on one worker by hand (ip
+# addr: what MetalLB, kube-vip, keepalived... do; record-only), two Gateways on the same ports, one per
+# address, and a third asking for a port taken on one of them (PortUnavailable).
+# RPROXY_IMAGE_FROM=dist: the rproxy image from dist/amd64/rproxy-api (the workflow's rproxy_ref) instead
+# of the chart's.
 # Outages are measured and reported. With MANAGED_REPLICAS >= 2, a pod deletion, a node drain, a
 # rollout restart and a parameters change fail the run when the longest gap without a 200 exceeds
 # GAP_LIMIT seconds (l2-local, l2-cluster, nodeport-lb: what rproxy-gateway controls; bgp and a lost
@@ -27,6 +34,13 @@ cd "$(dirname "$0")/.."
 
 SOURCE=${SOURCE:-published}
 TOPOLOGY=${TOPOLOGY:-l2-local}
+# managed (TOPOLOGY decides how traffic reaches the Gateway) or fleet
+MODE=${MODE:-managed}
+case "$MODE" in
+  managed) ;;
+  fleet) TOPOLOGY=fleet ;;
+  *) echo "MODE: managed or fleet"; exit 1 ;;
+esac
 if [ "$SOURCE" = checkout ]; then
   CHART=${CHART:-charts/rproxy-gateway}
 else
@@ -41,8 +55,12 @@ GAP_LIMIT=${GAP_LIMIT:-3}
 # true: a pod deletion, drain, rollout or parameters change also fails on any failed request (not only
 # on a gap over GAP_LIMIT)
 STRICT=${STRICT:-false}
-# the scenarios to run (a b1 b2 c d e f g h i; u is added with UI=true)
-SCENARIOS=${SCENARIOS:-a b1 b2 c d e f g h i}
+# the scenarios to run (a b1 b2 c d e f g h i; u is added with UI=true; MODE=fleet: q)
+if [ "$MODE" = fleet ]; then
+  SCENARIOS=${SCENARIOS:-q}
+else
+  SCENARIOS=${SCENARIOS:-a b1 b2 c d e f g h i}
+fi
 # true: also the UI chart of UI_DIR (a checkout of TCP-UDP-rproxy-ui) with the bundled MariaDB, the
 # controller's ui.namespace, and scenario u
 UI=${UI:-false}
@@ -51,7 +69,7 @@ UI_DIR=${UI_DIR:-../TCP-UDP-rproxy-ui}
 UI_USAGE_SECS=${UI_USAGE_SECS:-15}
 FRR_IMAGE=${FRR_IMAGE:-quay.io/frrouting/frr:9.1.0}
 HAPROXY_IMAGE=${HAPROXY_IMAGE:-haproxy:3.0-alpine}
-case "$TOPOLOGY" in l2-local | l2-cluster | bgp | nodeport-lb) ;; *) echo "TOPOLOGY: l2-local, l2-cluster, bgp or nodeport-lb"; exit 1 ;; esac
+case "$TOPOLOGY" in l2-local | l2-cluster | bgp | nodeport-lb | fleet) ;; *) echo "TOPOLOGY: l2-local, l2-cluster, bgp or nodeport-lb"; exit 1 ;; esac
 CLUSTER=${CLUSTER:-rproxy-gateway-acc}
 GATEWAY_API_VERSION=${GATEWAY_API_VERSION:-v1.6.3}
 METALLB_VERSION=${METALLB_VERSION:-v0.15.2}
@@ -64,6 +82,12 @@ APPLY_TIMEOUT=${APPLY_TIMEOUT:-120}
 ROTATE_TIMEOUT=${ROTATE_TIMEOUT:-300}
 NS=rproxy-gateway-system
 APP=acc
+# the rproxy pods: the Gateway's (managed) or the fleet's
+if [ "$MODE" != managed ]; then
+  RP_NS=$NS RP_SEL=app.kubernetes.io/name=rproxy,app.kubernetes.io/component=fleet
+else
+  RP_NS=$APP RP_SEL=app.kubernetes.io/name=rproxy
+fi
 work=${RUNNER_TEMP:-/tmp}/rproxy-gateway-acceptance
 mkdir -p "$work"
 results=$work/results.tsv
@@ -91,7 +115,7 @@ dump() {
   kubectl get events -A --sort-by=.lastTimestamp > "$d/events.txt" 2>&1 || true
   kubectl -n "$NS" logs -l app.kubernetes.io/name=rproxy-gateway --prefix --tail=-1 > "$d/controller.log" 2>&1 || true
   kubectl -n "$NS" get lease rproxy-gateway -o yaml > "$d/lease.yaml" 2>&1 || true
-  kubectl -n "$APP" logs -l app.kubernetes.io/name=rproxy --prefix --all-containers --tail=-1 > "$d/rproxy.log" 2>&1 || true
+  kubectl -n "$RP_NS" logs -l "$RP_SEL" --prefix --all-containers --tail=-1 > "$d/rproxy.log" 2>&1 || true
   kubectl get gateways,httproutes,tcproutes,certificates -A -o yaml > "$d/objects.yaml" 2>&1 || true
   kubectl -n "$APP" get deploy,svc,networkpolicy,pdb,secret -o wide > "$d/managed.txt" 2>&1 || true
   docker logs "$CLUSTER-frr" > "$d/frr.log" 2>&1 || true
@@ -251,6 +275,12 @@ spec: {ipAddressPools: [kind]}" || { cat "$work/apply.log"; exit 1; }
   nodeport-lb)
     HELM_ARGS="--set managed.serviceType=NodePort --set managed.externalTrafficPolicy=Local $HELM_ARGS"
     ;;
+  fleet)
+    # two addresses from kind's docker network for scenario q (not on any node until it adds them)
+    ADDR1=${ADDR1:-$prefix.255.110} ADDR2=${ADDR2:-$prefix.255.111}
+    echo "kind network $subnet, scenario q's addresses $ADDR1 $ADDR2"
+    HELM_ARGS="--set fleet.enabled=true --set fleet.listen=addresses --set managed.addressCIDRs={$ADDR1/32,$ADDR2/32} $HELM_ARGS"
+    ;;
 esac
 case "$TOPOLOGY" in
   l2-cluster) HELM_ARGS="--set managed.externalTrafficPolicy=Cluster $HELM_ARGS" ;;
@@ -292,6 +322,15 @@ if [ "$SOURCE" = checkout ]; then
   kind load docker-image --name "$CLUSTER" "$rproxy_repo:$rproxy_tag"
 else
   image_args=(--version "$CHART_VERSION")
+fi
+RPROXY_IMAGE_FROM=${RPROXY_IMAGE_FROM:-chart}
+if [ "$RPROXY_IMAGE_FROM" = dist ]; then
+  # rproxy built from rproxy-api (the workflow's rproxy_ref), e.g. a branch not released yet
+  log "== rproxy image from dist/amd64/rproxy-api (sha256 $(sha256sum dist/amd64/rproxy-api | cut -c1-12))"
+  chmod +x dist/amd64/rproxy-api
+  docker build -q -t rproxy-api:acc --build-arg TARGETARCH=amd64 -f Dockerfile.rproxy .
+  kind load docker-image --name "$CLUSTER" rproxy-api:acc
+  image_args+=(--set rproxy.image.repository=rproxy-api --set rproxy.image.tag=acc --set rproxy.image.digest=)
 fi
 ui_args=()
 if [ "$UI" = true ]; then
@@ -426,9 +465,17 @@ kubectl -n "$APP" rollout status deploy/echo --timeout=300s
 kubectl -n "$APP" wait --for=condition=Ready certificate/secure-cert --timeout=180s
 kubectl -n "$APP" wait --for=condition=Programmed gateway/acc --timeout=300s
 LB=$(kubectl -n "$APP" get gateway acc -o jsonpath='{.status.addresses[0].value}')
-DEPLOY=$(kubectl -n "$APP" get deploy -l gateway.networking.k8s.io/gateway-name=acc -o jsonpath='{.items[0].metadata.name}')
-log "managed rproxy Deployment: $DEPLOY"
-kubectl -n "$APP" rollout status "deploy/$DEPLOY" --timeout=300s
+if [ "$MODE" = fleet ]; then
+  # every worker runs a fleet pod; the Gateway (no spec.addresses) listens on the wildcard: the nodes'
+  # addresses, the first in its status
+  DEPLOY=-
+  MANAGED_REPLICAS=$(echo "$WORKERS" | wc -w)
+  kubectl -n "$NS" rollout status ds/rproxy --timeout=300s
+else
+  DEPLOY=$(kubectl -n "$APP" get deploy -l gateway.networking.k8s.io/gateway-name=acc -o jsonpath='{.items[0].metadata.name}')
+  log "managed rproxy Deployment: $DEPLOY"
+  kubectl -n "$APP" rollout status "deploy/$DEPLOY" --timeout=300s
+fi
 if [ "$TOPOLOGY" = nodeport-lb ]; then
   # HAProxy (TCP) in front of every worker's node ports: health checks every 500 ms (down after 2
   # failures); a connection that fails marks the node down at once and is tried again on another
@@ -461,7 +508,7 @@ pod_serves() {
 }
 # live rproxy pods: name ip ready(true/false)
 rproxy_pods() {
-  kubectl -n "$APP" get pods -l app.kubernetes.io/name=rproxy -o json |
+  kubectl -n "$RP_NS" get pods -l "$RP_SEL" -o json |
     jq -r '.items[] | select(.metadata.deletionTimestamp == null and .status.phase == "Running" and .status.podIP != null)
       | "\(.metadata.name) \(.status.podIP) \(([.status.conditions[]? | select(.type == "Ready")][0].status // "False") == "True")"'
 }
@@ -503,7 +550,7 @@ kubectl -n "$APP" get pods -o wide
 kubectl -n "$NS" get pods -o wide
 {
   echo "controller: $(kubectl -n "$NS" get pods -l app.kubernetes.io/name=rproxy-gateway -o jsonpath='{.items[0].status.containerStatuses[0].imageID}')"
-  echo "rproxy: $(kubectl -n "$APP" get pods -l app.kubernetes.io/name=rproxy -o jsonpath='{.items[0].status.containerStatuses[?(@.name=="rproxy")].imageID}')"
+  echo "rproxy: $(kubectl -n "$RP_NS" get pods -l "$RP_SEL" -o jsonpath='{.items[0].status.containerStatuses[?(@.name=="rproxy")].imageID}')"
 } > "$work/images.txt"
 cat "$work/images.txt"
 
@@ -539,7 +586,7 @@ w_slices() {
       + (if .conditions.terminating then "/terminating" else "" end)] | sort | join(" "))'
 }
 w_pods() {
-  kubectl -n "$APP" get pods -l app.kubernetes.io/name=rproxy -w --output-watch-events -o json |
+  kubectl -n "$RP_NS" get pods -l "$RP_SEL" -w --output-watch-events -o json |
     jq -r --unbuffered '"pod " + (.object.metadata.name | split("-") | last) + " @" + (.object.spec.nodeName // "-")
       + " Ready=" + ([.object.status.conditions[]? | select(.type == "Ready") | .status][0] // "-")
       + " gate=" + ([.object.status.conditions[]? | select(.type == "rproxy.max3584.net/ruleset-applied") | .status][0] // "-")
@@ -553,7 +600,7 @@ w_route() {
   docker exec "$CLUSTER-frr" sh -c "while :; do echo \"route \$(ip route show $LB/32 | grep -o 'via [0-9.]*' | sort | tr '\n' ' ')\"; sleep 0.2; done"
 }
 w_lb() { docker logs -f --since 1s "$CLUSTER-lb" 2>&1 | grep --line-buffered -E ' is (UP|DOWN)' | sed -u 's/^/lb /'; }
-watch_bg slices w_slices
+[ "$MODE" != managed ] || watch_bg slices w_slices
 watch_bg pods w_pods
 case "$TOPOLOGY" in
   l2-*) watch_bg l2 w_l2 ;;
@@ -703,7 +750,7 @@ announcer() {
 }
 # live rproxy pods with their nodes: name node
 rproxy_nodes() {
-  kubectl -n "$APP" get pods -l app.kubernetes.io/name=rproxy -o json |
+  kubectl -n "$RP_NS" get pods -l "$RP_SEL" -o json |
     jq -r '.items[] | select(.metadata.deletionTimestamp == null) | "\(.metadata.name) \(.spec.nodeName)"'
 }
 placement() {
@@ -976,6 +1023,138 @@ scenario_i() {
   record "$label" "$t0" "$(now_ms)" "$(secs $((t_fixed - t0)))s" "$ok" "${notes}accepted again $(secs $((t_fixed - t_bad)))s after the fix" limit
 }
 
+# q. MODE=fleet, fleet.listen=addresses: see the header. Both Gateways must be Programmed and each
+# address must reach its own Gateway's backend (HTTP, HTTPS, UDP); the third Gateway gets
+# PortUnavailable; acc (the wildcard, other ports) is not disturbed (GAP_LIMIT)
+q_gateways_programmed() {
+  local g
+  for g in one two; do
+    [ "$(kubectl -n q get gateway "$g" -o jsonpath='{.status.conditions[?(@.type=="Programmed")].status}')" = True ] &&
+      [ "$(kubectl -n q get gateway "$g" -o jsonpath='{.status.listeners[*].conditions[?(@.type=="Programmed")].status}')" = "True True True" ] || return 1
+  done
+}
+ns_of() { curl -s --connect-timeout 1 --max-time 2 "$@" | jq -r '.namespace // empty' 2> /dev/null; }
+# q_serves <address> <tag>: HTTP, HTTPS and UDP on the address reach the echo pods tagged <tag>
+q_serves() {
+  [ "$(ns_of -H 'Host: echo.example.com' "http://$1:8080/")" = "$2" ] &&
+    [ "$(ns_of --cacert "$work/ca.crt" --resolve "q.example.com:8443:$1" https://q.example.com:8443/)" = "$2" ] &&
+    [ "$(echo "echo $2" | timeout 3 nc -u -w 1 "$1" 9002 2> /dev/null | head -c ${#2})" = "$2" ]
+}
+q_port_refused() {
+  [ "$(kubectl -n q get gateway three -o jsonpath='{.status.listeners[0].conditions[?(@.type=="Accepted")].reason}')" = PortUnavailable ]
+}
+scenario_q() {
+  local label="q. two Gateways on the same ports on two addresses (fleet.listen=addresses)" t0 ok=PASS t_prog t_serve notes msg node
+  if [ "$MODE" != fleet ]; then
+    printf '%s\t–\t–\t–\tSKIP\tMODE=fleet only\n' "$label" >> "$results"
+    return 0
+  fi
+  node=$(echo "$WORKERS" | awk '{print $1}')
+  log "== $label: $ADDR1 and $ADDR2 on $node"
+  t0=$(now_ms)
+  kubectl create namespace q --dry-run=client -o yaml | kubectl apply -f - > /dev/null
+  {
+    cat << YAML
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata: {name: q-cert, namespace: q}
+spec:
+  secretName: q-cert
+  dnsNames: [q.example.com]
+  privateKey: {algorithm: ECDSA, size: 256}
+  issuerRef: {name: acc-ca, kind: ClusterIssuer, group: cert-manager.io}
+YAML
+    local g addr
+    for g in one two; do
+      [ "$g" = one ] && addr=$ADDR1 || addr=$ADDR2
+      cat << YAML
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: echo-$g, namespace: q}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: echo-$g}}
+  template:
+    metadata: {labels: {app: echo-$g}}
+    spec:
+      containers:
+        - name: echo
+          image: registry.k8s.io/gateway-api/echo-basic:v1.5.1
+          env:
+            - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+            - {name: NAMESPACE, value: $g}
+          readinessProbe: {httpGet: {path: /, port: 3000}, periodSeconds: 2}
+        - name: udp
+          image: registry.k8s.io/e2e-test-images/agnhost:2.53
+          args: [netexec, --http-port=8081, --udp-port=8082]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: echo-$g, namespace: q}
+spec:
+  selector: {app: echo-$g}
+  ports: [{name: http, port: 8080, targetPort: 3000}, {name: udp, port: 8082, protocol: UDP}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {name: $g, namespace: q}
+spec:
+  gatewayClassName: rproxy
+  addresses: [{type: IPAddress, value: $addr}]
+  listeners:
+    - {name: http, port: 8080, protocol: HTTP}
+    - {name: https, port: 8443, protocol: HTTPS, hostname: q.example.com, tls: {certificateRefs: [{name: q-cert}]}}
+    - {name: udp, port: 9002, protocol: UDP}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: $g, namespace: q}
+spec:
+  parentRefs: [{name: $g, sectionName: http}, {name: $g, sectionName: https}]
+  hostnames: [echo.example.com, q.example.com]
+  rules: [{backendRefs: [{name: echo-$g, port: 8080}]}]
+---
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: UDPRoute
+metadata: {name: $g, namespace: q}
+spec:
+  parentRefs: [{name: $g, sectionName: udp}]
+  rules: [{backendRefs: [{name: echo-$g, port: 8082}]}]
+YAML
+    done
+  } | kubectl apply -f - > /dev/null
+  kubectl -n q rollout status deploy/echo-one deploy/echo-two --timeout=300s > /dev/null || ok=FAIL
+  if wait_for "$APPLY_TIMEOUT" q_gateways_programmed; then t_prog=$(now_ms); else t_prog=$(now_ms) ok=FAIL; fi
+  # the platform's part (MetalLB, kube-vip, keepalived...): the addresses on one node
+  docker exec "$node" ip addr add "$ADDR1/32" dev eth0
+  docker exec "$node" ip addr add "$ADDR2/32" dev eth0
+  if wait_for "$APPLY_TIMEOUT" q_serves "$ADDR1" one && wait_for 30 q_serves "$ADDR2" two; then t_serve=$(now_ms); else t_serve=$(now_ms) ok=FAIL; fi
+  statuses_ok || ok=FAIL
+  notes="both Gateways Programmed after $(secs $((t_prog - t0)))s (before the addresses were on any node); $ADDR1 → one, $ADDR2 → two (HTTP, HTTPS, UDP) $(secs $((t_serve - t0)))s after the start"
+  # the same port on the first address: refused on that listener
+  cat << YAML | kubectl apply -f - > /dev/null
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {name: three, namespace: q}
+spec:
+  gatewayClassName: rproxy
+  addresses: [{type: IPAddress, value: $ADDR1}]
+  listeners: [{name: http, port: 8080, protocol: HTTP}]
+YAML
+  if wait_for 60 q_port_refused; then
+    msg=$(kubectl -n q get gateway three -o jsonpath='{.status.listeners[0].conditions[?(@.type=="Accepted")].message}')
+    notes+="; three on $ADDR1:8080: PortUnavailable ($msg)"
+  else
+    ok=FAIL notes+="; three on $ADDR1:8080 not refused: $(kubectl -n q get gateway three -o jsonpath='{.status.listeners[0].conditions}')"
+  fi
+  if ! q_serves "$ADDR1" one || ! statuses_ok; then ok=FAIL notes+="; disturbed by three"; fi
+  kubectl delete namespace q --wait=true --timeout=180s > /dev/null || true
+  docker exec "$node" ip addr del "$ADDR1/32" dev eth0 || true
+  docker exec "$node" ip addr del "$ADDR2/32" dev eth0 || true
+  settle || ok=FAIL
+  record "$label" "$t0" "$(now_ms)" "$(secs $((t_serve - t0)))s" "$ok" "$notes" limit
+}
 # ---------------------------------------------------------------- u. the UI (UI=true)
 # The UI chart of UI_DIR (a checkout of TCP-UDP-rproxy-ui; its image built from it) with the bundled
 # MariaDB, reading the Gateway's rproxy pods through the controller's discovery Secret (ui.namespace).
@@ -1140,6 +1319,7 @@ stop_probes
     l2-cluster) echo "MetalLB $METALLB_VERSION L2, externalTrafficPolicy Cluster." ;;
     bgp) echo "MetalLB $METALLB_VERSION BGP (FRR mode, BFD 300 ms x 3) to an FRR router ($FRR_IMAGE) with ECMP over the announcing nodes (externalTrafficPolicy $ETP)." ;;
     nodeport-lb) echo "NodePort Services (externalTrafficPolicy $ETP) behind HAProxy ($HAPROXY_IMAGE, TCP, checks every 500 ms, a failed connection marks the node down and goes to another)." ;;
+    fleet) echo "fleet mode (a DaemonSet with hostNetwork on every worker) without VIPs, fleet.listen=addresses; scenario q's addresses $ADDR1 $ADDR2 put on one worker by hand (ip addr); rproxy image: $RPROXY_IMAGE_FROM." ;;
   esac
   echo "kind 1 control plane + 3 workers, cert-manager $CERT_MANAGER_VERSION, Gateway API $GATEWAY_API_VERSION experimental."
   echo "Controller replicas 2, managed.replicas $MANAGED_REPLICAS. Extra helm flags: \`${HELM_ARGS:-none}\`. Probes: HTTP, HTTPS, TCP through the Gateway's address every 100 ms, a new connection each."

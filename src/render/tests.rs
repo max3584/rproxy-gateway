@@ -1730,3 +1730,43 @@ fn cross_namespace_secrets_can_be_turned_off() {
 	assert_eq!(cond(&off.listeners[0].conds, "ResolvedRefs").reason, "RefNotPermitted");
 	assert!(off.files.is_empty(), "no key copied");
 }
+
+/// fleet listening on addresses: the rules listen on the Gateway's addresses (IPv4 first, IPv6 as an extra
+/// address) with `listen_freebind`, and their keys carry the VIP.
+#[test]
+fn rules_listen_on_the_addresses_given() {
+	let yaml = format!(
+		"{BASE}{}{}",
+		gw("    - {name: tcp, port: 9000, protocol: TCP}\n    - {name: udp, port: 5353, protocol: UDP}"),
+		r#"
+---
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TCPRoute
+metadata: {name: t, namespace: default}
+spec:
+  parentRefs: [{name: gw, sectionName: tcp}]
+  rules: [{backendRefs: [{name: web, port: 80}]}]
+---
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: UDPRoute
+metadata: {name: u, namespace: default}
+spec:
+  parentRefs: [{name: gw, sectionName: udp}]
+  rules: [{backendRefs: [{name: web, port: 80}]}]
+"#
+	);
+	let w = world(&yaml);
+	let opts = Options { listen_addrs: vec!["192.0.2.10".into(), "2001:db8::10".into()], listen_freebind: true, ..Options::default() };
+	let p = render_gateway(&w, &w.gateways[0], &opts);
+	let keys: Vec<String> = p.rules.iter().map(|r| r.key()).collect();
+	assert_eq!(keys, vec!["tcp/192.0.2.10:9000", "udp/192.0.2.10:5353"], "{:?}", p.rules);
+	for r in &p.rules {
+		assert_eq!(r.extra_listen_addrs, vec!["2001:db8::10"]);
+		let v = serde_json::to_value(r).unwrap();
+		assert_eq!(v["listen_freebind"], true, "{v}");
+	}
+	assert_eq!(p.listeners.iter().filter_map(|l| l.rule_key.clone()).collect::<Vec<_>>(), keys);
+	// the default (wildcard) does not send it
+	let p = render_gateway(&w, &w.gateways[0], &Options::default());
+	assert!(serde_json::to_value(&p.rules[0]).unwrap().get("listen_freebind").is_none());
+}

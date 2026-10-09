@@ -16,7 +16,7 @@ What the controller trusts, and what tenants (whoever can write Gateways and rou
 ## Managed and fleet
 
 - **managed (default)**: one rproxy per Gateway, in the Gateway's namespace, with its own control API certificate (issued by the CA for `<id>.rproxy-api.rproxy-gateway.internal`) and token (HMAC-derived from the master token). This is the mode that separates tenants.
-- **fleet**: every Gateway uses the same rproxy pods (a hostNetwork DaemonSet). **It is for one trust domain (one administrator)** and does not separate tenants: every Gateway's certificates go into one Secret (`rproxy-fleet-certs`) mounted into every pod, and a node port belongs to the Gateway that took it first (later ones get `Programmed: False`). In fleet mode RproxyRules are not read by default (`fleet.rproxyRules` / `--fleet-rproxy-rules`).
+- **fleet**: every Gateway uses the same rproxy pods (a hostNetwork DaemonSet). **It is for one trust domain (one administrator)** and does not separate tenants: every Gateway's certificates go into one Secret (`rproxy-fleet-certs`) mounted into every pod, and a node port belongs to the older Gateway (the newer one's listener gets `Accepted: False`, `PortUnavailable`; v0.4.5). With `fleet.listen: addresses` (v0.4.5, rproxy v0.4.3) a Gateway with `spec.addresses` listens on its own addresses only (inside `managed.addressCIDRs`): Gateways on different addresses can use the same port, and traffic to an address reaches only its Gateways (the platform puts the addresses on the nodes: MetalLB, kube-vip, keepalived...). In fleet mode RproxyRules are not read by default (`fleet.rproxyRules` / `--fleet-rproxy-rules`).
 
 ## Limits on tenant input
 
