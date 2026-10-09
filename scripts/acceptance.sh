@@ -910,8 +910,11 @@ scenario_g() {
 params_crd() { kubectl get crd rproxygatewayparameters.rproxy.max3584.net > /dev/null 2>&1; }
 as_tenant() { kubectl --as="system:serviceaccount:$APP:tenant" "$@"; }
 tenant_params() {  # tenant_params <replicas> [more pod fields]: writes RproxyGatewayParameters acc as the tenant
+  # the stored version: v1beta1 from chart 0.4.5, v1alpha1 with a published older chart
+  local version
+  version=$(kubectl get crd rproxygatewayparameters.rproxy.max3584.net -o jsonpath='{.spec.versions[?(@.storage==true)].name}')
   cat << YAML | as_tenant apply -f - > /dev/null
-apiVersion: rproxy.max3584.net/v1alpha1
+apiVersion: rproxy.max3584.net/$version
 kind: RproxyGatewayParameters
 metadata: {name: acc, namespace: $APP}
 spec:

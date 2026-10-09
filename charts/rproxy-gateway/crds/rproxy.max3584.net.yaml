@@ -5,6 +5,8 @@ kind: CustomResourceDefinition
 metadata:
   name: rproxymiddlewares.rproxy.max3584.net
 spec:
+  conversion:
+    strategy: None
   group: rproxy.max3584.net
   names:
     kind: RproxyMiddleware
@@ -14,7 +16,7 @@ spec:
     singular: rproxymiddleware
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - name: v1beta1
     schema:
       openAPIV3Schema:
         description: >-
@@ -31,12 +33,35 @@ spec:
         type: object
     served: true
     storage: true
+  - deprecated: true
+    deprecationWarning: >-
+      rproxy.max3584.net/v1alpha1 RproxyMiddleware is deprecated; use
+      rproxy.max3584.net/v1beta1
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: >-
+          One rproxy HTTP middleware (the shape of http.middlewares.<name>), used through
+          an HTTPRoute ExtensionRef filter
+        properties:
+          spec:
+            description: "`spec` is one middleware of rproxy's `http.middlewares`, e.g. `{\"rate_limit\": {\"average\": 10}}`."
+            type: object
+            x-kubernetes-preserve-unknown-fields: true
+        required:
+        - spec
+        title: RproxyMiddleware
+        type: object
+    served: true
+    storage: false
 ---
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   name: rproxypolicies.rproxy.max3584.net
 spec:
+  conversion:
+    strategy: None
   group: rproxy.max3584.net
   names:
     kind: RproxyPolicy
@@ -46,7 +71,7 @@ spec:
     singular: rproxypolicy
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - name: v1beta1
     schema:
       openAPIV3Schema:
         description: >-
@@ -129,12 +154,101 @@ spec:
     storage: true
     subresources:
       status: {}
+  - deprecated: true
+    deprecationWarning: >-
+      rproxy.max3584.net/v1alpha1 RproxyPolicy is deprecated; use
+      rproxy.max3584.net/v1beta1
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: >-
+          rproxy rule settings (limits, bandwidth, geoip, outlier_detection, allow_from,
+          crowdsec) attached to Gateways, listeners or Services
+        properties:
+          spec:
+            description: A rule's settings attached to Gateways, listeners or Services.
+            properties:
+              allowFrom:
+                description: A rule's `allow_from` (CIDRs).
+                items:
+                  type: string
+                nullable: true
+                type: array
+              bandwidth:
+                description: "A rule's `bandwidth` (rproxy #166)."
+                nullable: true
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
+              crowdsec:
+                description: A rule's `crowdsec`.
+                nullable: true
+                type: boolean
+              geoip:
+                description: "A rule's `geoip` (rproxy #168)."
+                nullable: true
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
+              limits:
+                description: "A rule's `limits` (rproxy #165)."
+                nullable: true
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
+              outlierDetection:
+                description: "L4: a rule's `outlier_detection`; on a Service used by HTTPRoutes, the service's (rproxy #170)."
+                nullable: true
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
+              targetRefs:
+                items:
+                  description: What a policy attaches to (GEP-713).
+                  properties:
+                    group:
+                      default: ""
+                      description: "`gateway.networking.k8s.io` for a Gateway, `\"\"` for a Service."
+                      type: string
+                    kind:
+                      description: "`Gateway` or `Service`."
+                      type: string
+                    name:
+                      type: string
+                    sectionName:
+                      description: A listener of the Gateway (its rule only).
+                      nullable: true
+                      type: string
+                  required:
+                  - kind
+                  - name
+                  type: object
+                type: array
+            required:
+            - targetRefs
+            type: object
+          status:
+            nullable: true
+            properties:
+              ancestors:
+                default: []
+                items:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                type: array
+            type: object
+        required:
+        - spec
+        title: RproxyPolicy
+        type: object
+    served: true
+    storage: false
+    subresources:
+      status: {}
 ---
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   name: rproxyrules.rproxy.max3584.net
 spec:
+  conversion:
+    strategy: None
   group: rproxy.max3584.net
   names:
     kind: RproxyRule
@@ -151,7 +265,7 @@ spec:
     - jsonPath: .status.conditions[?(@.type=="Programmed")].status
       name: Programmed
       type: string
-    name: v1alpha1
+    name: v1beta1
     schema:
       openAPIV3Schema:
         description: >-
@@ -200,12 +314,74 @@ spec:
     storage: true
     subresources:
       status: {}
+  - additionalPrinterColumns:
+    - jsonPath: .spec.parentRef.name
+      name: Gateway
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Programmed")].status
+      name: Programmed
+      type: string
+    deprecated: true
+    deprecationWarning: >-
+      rproxy.max3584.net/v1alpha1 RproxyRule is deprecated; use
+      rproxy.max3584.net/v1beta1
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: >-
+          One rproxy rule verbatim (the body of POST /rules), added to a Gateway's rule
+          set
+        properties:
+          spec:
+            description: >-
+              One rproxy rule verbatim (the body of `POST /rules`), added to a Gateway's rule
+              set.
+            properties:
+              parentRef:
+                description: The Gateway whose rule set gets the rule.
+                properties:
+                  name:
+                    type: string
+                  namespace:
+                    description: Defaults to the RproxyRule's namespace.
+                    nullable: true
+                    type: string
+                required:
+                - name
+                type: object
+              rule:
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
+            required:
+            - parentRef
+            - rule
+            type: object
+          status:
+            nullable: true
+            properties:
+              conditions:
+                default: []
+                items:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                type: array
+            type: object
+        required:
+        - spec
+        title: RproxyRule
+        type: object
+    served: true
+    storage: false
+    subresources:
+      status: {}
 ---
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   name: rproxygatewayparameters.rproxy.max3584.net
 spec:
+  conversion:
+    strategy: None
   group: rproxy.max3584.net
   names:
     kind: RproxyGatewayParameters
@@ -219,7 +395,7 @@ spec:
     - jsonPath: .spec.replicas
       name: Replicas
       type: integer
-    name: v1alpha1
+    name: v1beta1
     schema:
       openAPIV3Schema:
         description: >-
@@ -500,3 +676,292 @@ spec:
         type: object
     served: true
     storage: true
+  - additionalPrinterColumns:
+    - jsonPath: .spec.replicas
+      name: Replicas
+      type: integer
+    deprecated: true
+    deprecationWarning: >-
+      rproxy.max3584.net/v1alpha1 RproxyGatewayParameters is deprecated; use
+      rproxy.max3584.net/v1beta1
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: >-
+          How a managed Gateway's rproxy Deployment, Service and pods are made; named by
+          a GatewayClass's parametersRef (in the controller's namespace) or a Gateway's
+          spec.infrastructure.parametersRef
+        properties:
+          spec:
+            description: |-
+              How a managed Gateway's rproxy is made: replicas, the PodDisruptionBudget, the pods, the
+              Service and rproxy's settings. Every field may be left out (the controller's flags then).
+            properties:
+              pod:
+                nullable: true
+                properties:
+                  affinity:
+                    description: A Kubernetes Affinity.
+                    nullable: true
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                  annotations:
+                    additionalProperties:
+                      type: string
+                    nullable: true
+                    type: object
+                  labels:
+                    additionalProperties:
+                      type: string
+                    nullable: true
+                    type: object
+                  nodeSelector:
+                    additionalProperties:
+                      type: string
+                    nullable: true
+                    type: object
+                  priorityClassName:
+                    nullable: true
+                    type: string
+                  resources:
+                    description: Kubernetes ResourceRequirements of each container.
+                    nullable: true
+                    properties:
+                      certsync:
+                        nullable: true
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                      rproxy:
+                        nullable: true
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                    type: object
+                  tolerations:
+                    description: Kubernetes Tolerations.
+                    items:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    nullable: true
+                    type: array
+                  topologySpreadConstraints:
+                    description: >-
+                      Kubernetes TopologySpreadConstraints; without a labelSelector, the Gateway's
+                      pods are selected.
+                    items:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    nullable: true
+                    type: array
+                type: object
+              podDisruptionBudget:
+                description: "The Gateway's PodDisruptionBudget (default: maxUnavailable 1 with 2 or more replicas, none with 1)."
+                nullable: true
+                properties:
+                  maxUnavailable:
+                    nullable: true
+                    x-kubernetes-int-or-string: true
+                  minAvailable:
+                    nullable: true
+                    x-kubernetes-int-or-string: true
+                type: object
+                x-kubernetes-validations:
+                - message: one of minAvailable and maxUnavailable
+                  rule: "!(has(self.minAvailable) && has(self.maxUnavailable))"
+              policy:
+                description: "What Gateways' own parameters may set: only in the GatewayClass's parameters."
+                nullable: true
+                properties:
+                  allowedLoadBalancerClasses:
+                    description: >-
+                      loadBalancerClass values a Gateway's parameters may use (with
+                      service.loadBalancerClass allowed).
+                    items:
+                      type: string
+                    nullable: true
+                    type: array
+                  allowedPriorityClasses:
+                    description: >-
+                      priorityClassName values a Gateway's parameters may use (with
+                      pod.priorityClassName allowed).
+                    items:
+                      type: string
+                    nullable: true
+                    type: array
+                  gatewayOverrides:
+                    description: |-
+                      The fields a Gateway's parameters may set (default: replicas, podDisruptionBudget,
+                      pod.labels, pod.annotations, pod.resources, pod.topologySpreadConstraints,
+                      service.externalTrafficPolicy, service.loadBalancerSourceRanges, service.ipFamilyPolicy,
+                      service.labels, service.annotations, rproxy.logLevel, rproxy.performance, rproxy.shutdown, ui).
+                      rproxy.image, rproxy.extraEnv and policy cannot be listed.
+                    items:
+                      type: string
+                    nullable: true
+                    type: array
+                  maxReplicas:
+                    description: The most replicas a Gateway's parameters may ask for (10 by default).
+                    format: int32
+                    minimum: 1.0
+                    nullable: true
+                    type: integer
+                type: object
+              replicas:
+                description: rproxy pods per Gateway (1 to policy.maxReplicas, 10 by default).
+                format: int32
+                minimum: 1.0
+                nullable: true
+                type: integer
+              rproxy:
+                nullable: true
+                properties:
+                  extraEnv:
+                    description: |-
+                      More RPROXY_* environment variables of the rproxy container (Kubernetes EnvVars): only in
+                      the GatewayClass's parameters; names the controller sets are refused.
+                    items:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    nullable: true
+                    type: array
+                  image:
+                    description: "The rproxy image (`repo:tag` or `repo@sha256:...`): only in the GatewayClass's parameters."
+                    nullable: true
+                    type: string
+                  logLevel:
+                    enum:
+                    - error
+                    - warn
+                    - info
+                    - debug
+                    - trace
+                    - null
+                    nullable: true
+                    type: string
+                  performance:
+                    description: rproxy's global.performance, passed as environment variables.
+                    nullable: true
+                    properties:
+                      busyPollUsecs:
+                        description: "RPROXY_BUSY_POLL_USECS: 0 (off) to 1000."
+                        format: uint32
+                        maximum: 1000.0
+                        minimum: 0.0
+                        nullable: true
+                        type: integer
+                      cpuAffinity:
+                        description: "RPROXY_CPU_AFFINITY: none, auto or a CPU list (0-3,6)."
+                        nullable: true
+                        type: string
+                      splice:
+                        description: splice(2) for plain L4 TCP (RPROXY_SPLICE*).
+                        nullable: true
+                        properties:
+                          after:
+                            description: Bytes relayed in user space first (a number or "64KiB").
+                            nullable: true
+                            x-kubernetes-int-or-string: true
+                          enabled:
+                            nullable: true
+                            type: boolean
+                          fullReads:
+                            description: 0 to 64.
+                            format: uint32
+                            maximum: 64.0
+                            minimum: 0.0
+                            nullable: true
+                            type: integer
+                          pipeSize:
+                            description: 0 (the kernel's) or 4KiB to 16MiB.
+                            nullable: true
+                            x-kubernetes-int-or-string: true
+                        type: object
+                      udpShards:
+                        description: "RPROXY_UDP_SHARDS: 1 to 64, or auto."
+                        nullable: true
+                        x-kubernetes-int-or-string: true
+                      workers:
+                        description: "RPROXY_WORKERS: tokio worker threads."
+                        format: uint32
+                        maximum: 1024.0
+                        minimum: 1.0
+                        nullable: true
+                        type: integer
+                    type: object
+                  shutdown:
+                    description: |-
+                      How rproxy stops on SIGTERM (RPROXY_SHUTDOWN_DELAY, RPROXY_SHUTDOWN_DRAIN; terminationGracePeriodSeconds
+                      is both and 5 s more): keep accepting for `delay` while /readyz says draining, then let
+                      connections end for up to `drain`. Default: the controller's (15s, 25s). Only for rproxy with
+                      features.graceful_shutdown (v0.4.1); older rproxy keeps a preStop (docs/DESIGN-v0.4.x.md, E).
+                    nullable: true
+                    properties:
+                      delay:
+                        nullable: true
+                        type: string
+                      drain:
+                        nullable: true
+                        type: string
+                    type: object
+                type: object
+              service:
+                nullable: true
+                properties:
+                  annotations:
+                    additionalProperties:
+                      type: string
+                    nullable: true
+                    type: object
+                  externalTrafficPolicy:
+                    enum:
+                    - Local
+                    - Cluster
+                    - null
+                    nullable: true
+                    type: string
+                  ipFamilyPolicy:
+                    enum:
+                    - SingleStack
+                    - PreferDualStack
+                    - RequireDualStack
+                    - null
+                    nullable: true
+                    type: string
+                  labels:
+                    additionalProperties:
+                      type: string
+                    nullable: true
+                    type: object
+                  loadBalancerClass:
+                    description: Cannot change once the Service exists (create the Gateway again).
+                    nullable: true
+                    type: string
+                  loadBalancerSourceRanges:
+                    items:
+                      type: string
+                    nullable: true
+                    type: array
+                  type:
+                    enum:
+                    - LoadBalancer
+                    - NodePort
+                    - ClusterIP
+                    - null
+                    nullable: true
+                    type: string
+                type: object
+              ui:
+                description: What the UI is shown (docs/DESIGN-v0.4.x.md, C).
+                nullable: true
+                properties:
+                  visible:
+                    description: Listed for the UI (a Gateway can only turn the class's true into false).
+                    nullable: true
+                    type: boolean
+                type: object
+            type: object
+        required:
+        - spec
+        title: RproxyGatewayParameters
+        type: object
+    served: true
+    storage: false

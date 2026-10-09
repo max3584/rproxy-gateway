@@ -60,7 +60,7 @@ spec:
           requestHeaderModifier: {set: [{name: X-E2e, value: rproxy}]}
       backendRefs: [{name: echo, port: 8080}]
 ---
-apiVersion: rproxy.max3584.net/v1alpha1
+apiVersion: rproxy.max3584.net/v1beta1
 kind: RproxyMiddleware
 metadata: {name: one-per-minute, namespace: e2e}
 spec: {rate_limit: {average: 1, period: 1m, burst: 1}}

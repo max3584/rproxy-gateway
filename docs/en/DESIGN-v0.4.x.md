@@ -44,7 +44,7 @@ The controller creates the managed Deployments and Services at run time, so neit
 
 ### 2.1 Shape
 
-A CRD `RproxyGatewayParameters` (`rproxy.max3584.net/v1alpha1`, namespaced, shortname `rpgwp`), named both by a GatewayClass's `spec.parametersRef` (the class's defaults) and by a Gateway's `spec.infrastructure.parametersRef` (that Gateway's overrides).
+A CRD `RproxyGatewayParameters` (`rproxy.max3584.net/v1alpha1`, `v1beta1` from v0.4.5 (11.4), namespaced, shortname `rpgwp`), named both by a GatewayClass's `spec.parametersRef` (the class's defaults) and by a Gateway's `spec.infrastructure.parametersRef` (that Gateway's overrides).
 
 ```yaml
 apiVersion: rproxy.max3584.net/v1alpha1
@@ -383,4 +383,15 @@ Closing "Not claimed" of docs/en/CONFORMANCE.md (requested by the owner, 2026-10
 - `forwardBody.maxSize` (0 sends no body). Larger bodies get 413 (the filter's description and Envoy's default, "reject", rather than the type's "truncate"; rproxy-api's design 7.3).
 - When the auth backend cannot be used (not found, no ReferenceGrant, no ready pod, no usable CA in its BackendTLSPolicy), the rule answers 500 (`ResolvedRefs: False`) so that nothing goes through unchecked. For `ExternalAuth` on a backendRef, only that backend's share gets 500 (`servers[].status`; with rproxies without it the backend is left out).
 - Claimed features: `HTTPRouteExternalAuth`, `HTTPRouteExternalAuthHTTP`, `HTTPRouteExternalAuthGRPC`, `HTTPRouteExternalAuthForwardBody` (GatewayClass `supportedFeatures`). Gateway API v1.6.3's conformance has neither these feature names nor tests (not in `pkg/features`), so the tests are `tests/rproxy.rs` (a real rproxy), unit tests, and rproxy-api's `tests/ext_authz.rs`.
+
+### 11.4 rproxy's CRDs to `v1beta1`
+
+- The four CRDs (`RproxyRule`, `RproxyMiddleware`, `RproxyPolicy`, `RproxyGatewayParameters`) serve `v1beta1` (the stored version) and `v1alpha1` (`deprecated: true`, with a `deprecationWarning`). The schema is the same, so there is no conversion webhook: `conversion.strategy: None` (the API server only rewrites `apiVersion`). `rproxy-gateway crds` makes the `v1alpha1` entry from the `v1beta1` types (a unit test checks the schemas are equal).
+- The controller watches the CRDs at discovery's preferred version (as before): `v1beta1` with the new CRDs, and `v1alpha1` when `helm upgrade` left the old CRDs (`v1alpha1` only). Status (`RproxyRule`'s `status`) is written at the same version.
+- When the chart renders the class's default `RproxyGatewayParameters`, it uses `v1beta1` if the cluster serves it, else `v1alpha1` (Helm's `.Capabilities`; `helm install` looks after installing `crds/`). `config/`, examples and e2e use `v1beta1`. e2e writes one `RproxyRule` as `v1alpha1` and checks it reads as `v1beta1` and that the stored version is `v1beta1`. The acceptance test writes the CRDs' stored version (it works with an older published chart too).
+- **Upgrading from v0.4.4**:
+  1. `kubectl apply --server-side -f https://github.com/max3584/rproxy-gateway/releases/download/v0.4.5/rproxy.max3584.net.yaml` (`helm upgrade` does not update CRDs; Kustomize's `config/crd` is applied along).
+  2. Upgrade the controller. Existing `v1alpha1` objects read as `v1beta1` as they are (nothing to rewrite). A controller upgraded before the CRDs keeps working on `v1alpha1`.
+  3. Change your manifests' `apiVersion` to `rproxy.max3584.net/v1beta1` when convenient (`v1alpha1` only warns).
+- **Stored versions**: existing objects stay stored as `v1alpha1` in etcd until they are next written (the CRDs' `status.storedVersions` is `["v1alpha1", "v1beta1"]`); with one schema nothing behaves differently. Before a future (minor) version stops serving `v1alpha1`, rewrite every object (`kubectl get rproxyrules,rproxymiddlewares,rproxypolicies,rproxygatewayparameters -A -o json | kubectl replace -f -`, or kube-storage-version-migrator) and then set `status.storedVersions` to `["v1beta1"]` (`kubectl patch crd <name> --subresource=status --type=merge -p '{"status":{"storedVersions":["v1beta1"]}}'`). v0.4.x keeps serving `v1alpha1` (patches do not break).
 

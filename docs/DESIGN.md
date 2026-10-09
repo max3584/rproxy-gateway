@@ -143,7 +143,7 @@ rproxy は `RPROXY_API_ADDR=0.0.0.0`、`RPROXY_API_PORT=9443`、`RPROXY_TOKEN_FI
 | Gateway の `spec.tls.frontend`（クライアント証明書の検証） | そのポートのルールの `tls.client_auth`（`mode: required`、`ca_file` は `caCertificateRefs` の ConfigMap の `ca.crt` をまとめたファイル）。`perPort` があればそのポート、なければ `default`。ConfigMap 以外は `InvalidCACertificateKind`、見つからない・`ca.crt` のないものは `InvalidCACertificateRef`、ほかの namespace は ReferenceGrant（to `ConfigMap`）が要る（`RefNotPermitted`）。使えるものが 1 つもなければリスナーは `Accepted: False`（`NoValidCACertificate`）。`AllowInsecureFallback` は `mode: optional_no_verify`（証明書を求めて確かめるが、なくても通らなくてもつなぐ。結果は `X-Client-Verify: SUCCESS / FAILED / NONE` と `X-Forwarded-Client-Cert` で backend に渡る）で、Gateway に `InsecureFrontendValidationMode: True`。そのモードのない rproxy（`features.client_auth_modes`）では証明書を求めない |
 | 証明書の使えない `HTTPS` のリスナー | ルートはつながる（`attachedRoutes` に数える）が、ルールは作らない（`ResolvedRefs: False`、`Programmed: False`） |
 
-### rproxy の CRD（`rproxy.max3584.net/v1alpha1`）
+### rproxy の CRD（`rproxy.max3584.net/v1beta1`、`v1alpha1` も同じ形で非推奨のまま使える。[DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) の 11.4）
 
 | CRD | 使い方 |
 |---|---|
