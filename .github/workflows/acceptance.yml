@@ -6,8 +6,6 @@ name: acceptance
 # of the ref the workflow runs on with a controller image built from it (rproxy: the chart's
 # published image). Heavy: run by hand only, e.g.
 #   gh workflow run acceptance.yml --ref <branch> -f source=checkout -f topology=bgp
-# fleet with a VIP held by the fleet's pods (the vip sidecar), e.g.
-#   gh workflow run acceptance.yml --ref <branch> -f source=checkout -f mode=fleet-vip
 # The UI (TCP-UDP-rproxy-ui's chart and image from ui_ref, bundled MariaDB) only, e.g.
 #   gh workflow run acceptance.yml --ref <branch> -f source=checkout -f ui=true -f ui_ref=main -f scenarios=u
 on:
@@ -29,12 +27,6 @@ on:
         default: l2-local
         type: choice
         options: [l2-local, l2-cluster, bgp, nodeport-lb]
-      mode:
-        description: "managed (topology decides how traffic reaches the Gateway) or fleet-vip (fleet with a VIP held by the fleet's pods; scenarios j k l o n m)"
-        required: false
-        default: managed
-        type: choice
-        options: [managed, fleet-vip]
       managed_replicas:
         description: "rproxy replicas per Gateway (managed.replicas)"
         required: false
@@ -92,7 +84,7 @@ jobs:
           path: dist/amd64/rproxy-gateway
 
   acceptance:
-    name: acceptance (${{ inputs.source || 'published' }}, ${{ inputs.mode == 'fleet-vip' && 'fleet-vip' || inputs.topology || 'l2-local' }})
+    name: acceptance (${{ inputs.source || 'published' }}, ${{ inputs.topology || 'l2-local' }})
     needs: build
     if: ${{ !cancelled() && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
     # kind runs the nodes as Docker containers: on the runner VM (like e2e)
@@ -120,18 +112,16 @@ jobs:
           SOURCE: ${{ inputs.source || 'published' }}
           CHART_VERSION: ${{ inputs.chart_version || '0.4.0' }}
           TOPOLOGY: ${{ inputs.topology || 'l2-local' }}
-          MODE: ${{ inputs.mode || 'managed' }}
           MANAGED_REPLICAS: ${{ inputs.managed_replicas || '2' }}
           HELM_ARGS: ${{ inputs.helm_args }}
           GAP_LIMIT: ${{ inputs.gap_limit || '3' }}
           STRICT: ${{ inputs.strict && 'true' || 'false' }}
-          # fleet-vip: its own default (j k l o n m) unless scenarios are given
-          SCENARIOS: ${{ (inputs.mode == 'fleet-vip' && inputs.scenarios == 'a b1 b2 c d e f g h i') && 'j k l o n m' || inputs.scenarios || 'a b1 b2 c d e f g h i' }}
+          SCENARIOS: ${{ inputs.scenarios || 'a b1 b2 c d e f g h i' }}
           UI: ${{ inputs.ui && 'true' || 'false' }}
           UI_DIR: ${{ github.workspace }}/ui-src
         run: scripts/acceptance.sh
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: acceptance-logs-${{ inputs.mode == 'fleet-vip' && 'fleet-vip' || inputs.topology || 'l2-local' }}
+          name: acceptance-logs-${{ inputs.topology || 'l2-local' }}
           path: ${{ runner.temp }}/rproxy-gateway-acceptance

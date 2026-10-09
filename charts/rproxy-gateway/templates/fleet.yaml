@@ -22,12 +22,7 @@ spec:
         app.kubernetes.io/name: rproxy
         app.kubernetes.io/component: fleet
     spec:
-      {{- if .Values.fleet.vip.enabled }}
-      # the vip sidecar's identity (the VIPs' Leases); only that container gets its token
-      serviceAccountName: rproxy-gateway-vip
-      {{- else }}
       serviceAccountName: rproxy-gateway-proxy
-      {{- end }}
       # rproxy and certsync do not use the Kubernetes API: certificates come as a mounted Secret
       automountServiceAccountToken: false
       securityContext:
@@ -94,67 +89,7 @@ spec:
             capabilities: {drop: [ALL]}
           volumeMounts:
             - {name: certs, mountPath: /var/run/rproxy-gateway/certs, readOnly: true}
-        {{- with .Values.fleet.vip }}
-        {{- if .enabled }}
-        # holds the VIPs (fleet.vip, docs/DESIGN-v0.4.x.md 7.): a Lease per VIP; the holder adds it to the
-        # node's interface and announces it, while this pod's rproxy is ready and has its rule sets
-        - name: vip
-          image: {{ include "rproxy-gateway.controllerImage" $ }}
-          imagePullPolicy: {{ $.Values.controller.image.pullPolicy }}
-          args: [vip]
-          env:
-            - name: POD_NAME
-              valueFrom: {fieldRef: {fieldPath: metadata.name}}
-            - name: POD_NAMESPACE
-              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
-            - name: NODE_NAME
-              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
-            - name: POD_IP
-              valueFrom: {fieldRef: {fieldPath: status.podIP}}
-            - {name: RPROXY_VIPS, value: {{ toJson .addresses | quote }}}
-            - {name: RPROXY_VIP_INTERFACE, value: {{ .interface | quote }}}
-            - {name: RPROXY_GATEWAY_ADDRESS_CIDR, value: {{ join "," $.Values.managed.addressCIDRs | quote }}}
-            - {name: RPROXY_VIP_LEASE_DURATION, value: {{ .leaseDuration | toString | quote }}}
-            - {name: RPROXY_VIP_RENEW_INTERVAL, value: {{ .renewInterval | toString | quote }}}
-            - {name: RPROXY_VIP_RETRY_INTERVAL, value: {{ .retryInterval | toString | quote }}}
-            - {name: RPROXY_VIP_GARP_COUNT, value: {{ .garp.count | toString | quote }}}
-            - {name: RPROXY_VIP_GARP_INTERVAL, value: {{ .garp.interval | toString | quote }}}
-            - {name: RPROXY_VIP_ON_API_UNREACHABLE, value: {{ .onApiUnreachable | quote }}}
-            - {name: RPROXY_GATEWAY_LOG_FORMAT, value: {{ $.Values.controller.logFormat | quote }}}
-          ports:
-            - {name: vip-metrics, containerPort: {{ .metricsPort }}}
-          livenessProbe:
-            httpGet: {path: /healthz, port: {{ .metricsPort }}}
-            periodSeconds: 10
-          # root with only NET_ADMIN (the VIP on the node's interface) and NET_RAW (ARP, neighbor
-          # advertisements) in the node's network namespace (hostNetwork)
-          securityContext:
-            runAsUser: 0
-            runAsNonRoot: false
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities: {drop: [ALL], add: [NET_ADMIN, NET_RAW]}
-          {{- with .resources }}
-          resources: {{- toYaml . | nindent 12 }}
-          {{- end }}
-          volumeMounts:
-            - {name: vip-api-token, mountPath: /var/run/secrets/kubernetes.io/serviceaccount, readOnly: true}
-            - {name: api-ca, mountPath: /etc/rproxy-gateway/api-tls, readOnly: true}
-        {{- end }}
-        {{- end }}
       volumes:
-        {{- if .Values.fleet.vip.enabled }}
-        # the vip container's API token (this pod's ServiceAccount, rproxy-gateway-vip)
-        - name: vip-api-token
-          projected:
-            sources:
-              - serviceAccountToken: {path: token, expirationSeconds: 3607}
-              - configMap: {name: kube-root-ca.crt, items: [{key: ca.crt, path: ca.crt}]}
-              - downwardAPI: {items: [{path: namespace, fieldRef: {fieldPath: metadata.namespace}}]}
-        # the CA of rproxy's control API certificate only (vip reads rproxy's /readyz)
-        - name: api-ca
-          secret: {secretName: rproxy-gateway-api-tls, items: [{key: ca.crt, path: ca.crt}]}
-        {{- end }}
         - name: token
           secret:
             secretName: rproxy-gateway-token
