@@ -131,6 +131,7 @@ rproxy は `RPROXY_API_ADDR=0.0.0.0`、`RPROXY_API_PORT=9443`、`RPROXY_TOKEN_FI
 | Gateway の `spec.tls.backend.clientCertificateRef` | BackendTLSPolicy のサービスの `tls` の `cert_file` / `key_file`。Gateway の `ResolvedRefs`（`InvalidClientCertificateRef`・`RefNotPermitted`） |
 | リスナー `TLS`（`tls.mode: Passthrough`） | tcp のルール、`tls.mode: sni`、`unmatched: reject`。TLSRoute のホスト名ごとに `tls.routes` |
 | 同じポートの `HTTPS` と `TLS`（Passthrough） | `http` のルールの `tls.routes`（`passthrough: true`）。そのホスト名だけ復号しない |
+| 同じポートの複数の `HTTPS` のリスナー（HTTP/2 の接続の使い回し） | `tls.misdirected`：リスナーごとに 1 つのグループ（ホスト名、ないものは `*`）。SNI で選んだリスナーとは別のリスナーのホスト名のリクエストは 421（`GatewayHTTPSListenerDetectMisdirectedRequests`、rproxy v0.4.3 の `http_options` の `misdirected`。ない rproxy では付けない） |
 | リスナー `TLS`（`tls.mode: Terminate`） | tcp のルール、`tls.mode: terminate`、TLSRoute のホスト名ごとに `tls.routes`（同じポートの Passthrough のリスナーの分は `passthrough: true`） |
 | TLSRoute の宛先 | `tls.routes[].targets`：すべての backend の Pod の IP（weight を Pod の数で配る） |
 | リスナー `TCP` / `UDP` | tcp / udp のルール、`targets`（TCPRoute / UDPRoute のすべての backend の Pod の IP、weight を Pod の数で配る） |

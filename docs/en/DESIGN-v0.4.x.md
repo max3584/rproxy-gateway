@@ -357,3 +357,14 @@ Scenarios added (A), run after today's a-g; SKIP when the `RproxyGatewayParamete
 | — | The class's default parameters in the chart | **Rendered only when `managed.parameters` is not empty** (`helm upgrade` does not install new CRDs; 2.7) |
 
 Q10-Q16 (the UI's migrations and MariaDB, rproxy-api #240 and #241, usage) are in the UI's and rproxy-api's designs.
+
+## 11. The rest of the Gateway API (v0.4.5, rproxy v0.4.3)
+
+Closing "Not claimed" of docs/en/CONFORMANCE.md (requested by the owner, 2026-10-08). What rproxy needs is in rproxy-api's docs/en/DESIGN-v0.4.x.md, 7. Each is told by rproxy's `features`; with an rproxy without it things stay as before (routes using the feature are `UnsupportedValue`, no 421).
+
+### 11.1 421 Misdirected Request (`GatewayHTTPSListenerDetectMisdirectedRequests`)
+
+- With two or more `HTTPS` listeners on a port, the rule's `tls.misdirected.groups` gets one group per listener (the host name in rproxy's form, `*.example.com` → `**.example.com`; `*` for a listener without a host name). rproxy answers 421 when the SNI and the Host fall in different groups. A Host of no listener (no `*` listener) is routed as before: 404.
+- With one listener there is nothing to tell apart, so none is written. `TLS` (Terminate) listeners do not speak HTTP and are left out.
+- Not written for rproxies without `misdirected` in `http_options` (rproxy v0.4.3): requests reach another listener's routes, as before.
+

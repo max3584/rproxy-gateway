@@ -131,6 +131,7 @@ rproxy runs with `RPROXY_API_ADDR=0.0.0.0`, `RPROXY_API_PORT=9443`, `RPROXY_TOKE
 | The Gateway's `spec.tls.backend.clientCertificateRef` | `cert_file` / `key_file` of the BackendTLSPolicy services' `tls`; the Gateway's `ResolvedRefs` (`InvalidClientCertificateRef`, `RefNotPermitted`) |
 | Listener `TLS` (`tls.mode: Passthrough`) | a tcp rule, `tls.mode: sni`, `unmatched: reject`; `tls.routes` by TLSRoute host name |
 | `HTTPS` and `TLS` (Passthrough) on the same port | `tls.routes` (`passthrough: true`) of the `http` rule: only those names are not decrypted |
+| Several `HTTPS` listeners on one port (HTTP/2 connection reuse) | `tls.misdirected`: one group per listener (its host name, `*` without one). A request for another listener's host name than the one chosen by SNI gets 421 (`GatewayHTTPSListenerDetectMisdirectedRequests`, `misdirected` in rproxy v0.4.3's `http_options`; left out for rproxies without it) |
 | Listener `TLS` (`tls.mode: Terminate`) | a tcp rule, `tls.mode: terminate`, `tls.routes` by TLSRoute host name (those of Passthrough listeners on the same port with `passthrough: true`) |
 | TLSRoute destination | `tls.routes[].targets`: the pod IPs of all backends (weights spread over the pods) |
 | Listener `TCP` / `UDP` | a tcp / udp rule, `targets` (the pod IPs of all backends of the TCPRoutes / UDPRoutes, weights spread over the pods) |
