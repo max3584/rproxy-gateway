@@ -350,6 +350,50 @@ pub struct HttpRouteFilter {
 	pub request_mirror: Option<RequestMirror>,
 	#[serde(default)]
 	pub cors: Option<CorsFilter>,
+	/// `ExternalAuth` (experimental).
+	#[serde(default)]
+	pub external_auth: Option<ExternalAuth>,
+}
+
+/// HTTPExternalAuthFilter (experimental): Envoy's ext_authz over HTTP or gRPC.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalAuth {
+	/// `HTTP` or `GRPC`.
+	#[serde(default)]
+	pub protocol: String,
+	pub backend_ref: BackendRef,
+	#[serde(default)]
+	pub grpc: Option<GrpcAuthConfig>,
+	#[serde(default)]
+	pub http: Option<HttpAuthConfig>,
+	#[serde(default)]
+	pub forward_body: Option<ForwardBody>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GrpcAuthConfig {
+	#[serde(default)]
+	pub allowed_headers: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HttpAuthConfig {
+	#[serde(default)]
+	pub path: Option<String>,
+	#[serde(default)]
+	pub allowed_headers: Vec<String>,
+	#[serde(default)]
+	pub allowed_response_headers: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForwardBody {
+	#[serde(default)]
+	pub max_size: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

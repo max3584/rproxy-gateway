@@ -375,3 +375,12 @@ Closing "Not claimed" of docs/en/CONFORMANCE.md (requested by the owner, 2026-10
 - A mirror copies only the requests that land on that backend (rproxy copies once per request). A mirror whose backend is not found is dropped with `ResolvedRefs: False`, as for the rule's filter.
 - `ExtensionRef` on a backendRef is still refused (there is no check of the `RproxyMiddleware`'s kind per server).
 
+### 11.3 `ExternalAuth` (HTTP and gRPC)
+
+- The `ExternalAuth` filter becomes rproxy's `forward_auth` (with `service`, `client_request`, `allow_status`, `response_headers: ["*"]`, `forward_body` and `protocol: grpc` added in v0.4.3). It asks a service of the backendRef's Service pod IPs (from EndpointSlices, as other backends; BackendTLSPolicy applies the same way).
+- HTTP: Host, method, path and Content-Length, which the Gateway API says are always sent, go with `client_request`. `Authorization` is always in `request_headers` (the Gateway API's "only the fixed ones when `allowedHeaders` is empty"; rproxy's `request_headers` sends all when empty). An empty `allowedResponseHeaders` is `["*"]` (headers describing the answer itself are not copied). Only 200 allows (`allow_status`).
+- gRPC: an empty `allowedHeaders` is all headers (the same meaning in the Gateway API and rproxy). The service is h2c (h2 and `tls` under a BackendTLSPolicy).
+- `forwardBody.maxSize` (0 sends no body). Larger bodies get 413 (the filter's description and Envoy's default, "reject", rather than the type's "truncate"; rproxy-api's design 7.3).
+- When the auth backend cannot be used (not found, no ReferenceGrant, no ready pod, no usable CA in its BackendTLSPolicy), the rule answers 500 (`ResolvedRefs: False`) so that nothing goes through unchecked. For `ExternalAuth` on a backendRef, only that backend's share gets 500 (`servers[].status`; with rproxies without it the backend is left out).
+- Claimed features: `HTTPRouteExternalAuth`, `HTTPRouteExternalAuthHTTP`, `HTTPRouteExternalAuthGRPC`, `HTTPRouteExternalAuthForwardBody` (GatewayClass `supportedFeatures`). Gateway API v1.6.3's conformance has neither these feature names nor tests (not in `pkg/features`), so the tests are `tests/rproxy.rs` (a real rproxy), unit tests, and rproxy-api's `tests/ext_authz.rs`.
+
