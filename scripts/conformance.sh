@@ -22,6 +22,11 @@ SETUP_ONLY=1 GATEWAY_API_CHANNEL=${GATEWAY_API_CHANNEL:-experimental} \
 if [ ! -d "$work/gateway-api" ]; then
   git clone -q --depth 1 --branch "$GATEWAY_API_VERSION" https://github.com/kubernetes-sigs/gateway-api.git "$work/gateway-api"
 fi
+# only the profiles this suite knows (GATEWAY-TCP and GATEWAY-UDP came with v1.6; an older suite
+# refuses an unknown profile before running anything)
+known=$(grep -ohE '"(GATEWAY|MESH)-[A-Z]+"' "$work/gateway-api/conformance/utils/suite/profiles.go" | tr -d '"' | sort -u)
+PROFILES=$(tr ',' '\n' <<< "$PROFILES" | grep -Fxf <(echo "$known") | paste -sd, -)
+echo "profiles in this suite: $PROFILES"
 status=0
 (
   cd "$work/gateway-api"

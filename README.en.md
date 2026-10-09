@@ -79,6 +79,19 @@ spec:
 - With `fleet.enabled=true`, the chart's DaemonSet (`hostNetwork: true`) runs rproxy, which serves every Gateway. With `fleet.listen: addresses` (default `wildcard`; rproxy v0.4.3's `listen_freebind`) a Gateway with `spec.addresses` listens on its own addresses only (inside `managed.addressCIDRs`): Gateways on different addresses can use the same port (443 and so on), even before a node has the address (the platform puts it there: MetalLB, kube-vip, keepalived, a cloud LB...; [docs/en/DESIGN-v0.4.x.md](docs/en/DESIGN-v0.4.x.md) 12.). The same port on the same address (or a wildcard) belongs to the older Gateway. When it stops it keeps accepting for `fleet.shutdown.delay` (5 s by default) and waits for open connections up to `fleet.shutdown.drain` (25 s by default). Point the health check of the load balancer or VIP in front at `https://<node>:9443/readyz` (503 once it starts stopping), and make the delay longer than it takes to take the node out. rproxy-gateway does not hold addresses (VIPs) itself (v0.4.4's `fleet.vip` was removed in v0.4.5): keepalived, your own L4, or a Service selecting the fleet's pods are in [docs/en/PLATFORM.md](docs/en/PLATFORM.md), "fleet".
 - Chart values: [charts/rproxy-gateway/values.yaml](charts/rproxy-gateway/values.yaml). The controller's settings are passed in a ConfigMap `rproxy-gateway-config` (`RPROXY_GATEWAY_*` environment variables); `controller.extraArgs` stay arguments and win over it.
 
+### Supported versions
+
+Kubernetes 1.29 or later (the chart's `kubeVersion`) with Gateway API CRDs v1.2 or later. Every pairing below passes the e2e in the manual compatibility run (`gh workflow run e2e.yml -f compat=true`); v1.5 and v1.6 (the latest two) also pass conformance core.
+
+| Gateway API CRDs | Kubernetes needed (for the CRDs' validation) | Pairings checked |
+|---|---|---|
+| v1.2, v1.3, v1.4 | 1.29 or later | k8s 1.29, 1.30 (v1.4); 1.37 (v1.2-v1.4) |
+| v1.5 | 1.31 or later (`isIP`) | k8s 1.31, 1.37 |
+| v1.6 | 1.32 or later (`dns1123Label`) | k8s 1.32-1.37 |
+| v1.7.0-rc.1 | — | k8s 1.37 |
+
+With older CRDs, TCPRoute and UDPRoute (`v1alpha2` before v1.6), TLSRoute (`v1alpha3` in v1.4) and ReferenceGrant (`v1beta1` in v1.4) are read and written at the version the API server serves. `experimental-install.yaml` is recommended (TCPRoute, UDPRoute and HTTPRoute retries).
+
 ### Installing without Helm (kubectl, Kustomize)
 
 Releases carry manifests rendered from the chart: `install.yaml` (managed), `install-fleet.yaml` (fleet) and `crds.yaml` (rproxy's CRDs only, for GitOps that applies CRDs first). None includes Gateway API's CRDs.

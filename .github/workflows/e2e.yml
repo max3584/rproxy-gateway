@@ -13,6 +13,14 @@ name: e2e
 #   (<channel>-v<version>-default-report.yaml), the suite's and the controller's logs and the
 #   environment (versions, image digests). It fails unless every profile is core and extended success
 #   with nothing skipped.
+# - by hand with compat: only "compat", the e2e and the conformance suite on older (and the next)
+#   Kubernetes and Gateway API versions (see the matrix), e.g.
+#     gh workflow run e2e.yml -f compat=true
+#   e2e must pass on every pair (rproxy-gateway works there); conformance core must pass on the latest two
+#   Gateway API minors, the others are recorded (the artifact compat-<k8s>-<gateway api> has the report).
+# - by hand with stress: only "stress", random HTTP / TCP / UDP requests (stress_total, default 120000)
+#   through a Gateway with every byte checked (scripts/stress.sh, test/stress), e.g.
+#     gh workflow run e2e.yml -f stress=true
 on:
   pull_request:
   push:
@@ -26,6 +34,20 @@ on:
         description: "only the conformance report for submission upstream, from the PUBLISHED chart and images of this released version (e.g. 0.4.5; scripts/conformance-report.sh). Empty: the usual jobs"
         required: false
         default: ""
+      compat:
+        description: "only the compatibility matrix: e2e (must pass) and conformance (recorded) on older and next Kubernetes / Gateway API versions"
+        required: false
+        default: false
+        type: boolean
+      stress:
+        description: "only the stress test: random HTTP / TCP / UDP requests through a Gateway, every byte checked (scripts/stress.sh)"
+        required: false
+        default: false
+        type: boolean
+      stress_total:
+        description: "stress: requests in all (at least 100000)"
+        required: false
+        default: "120000"
       report_channel:
         description: "report_version: the Gateway API channel of the CRDs (experimental: the claimed HTTPRouteRetry* use experimental fields)"
         required: false
@@ -99,7 +121,7 @@ jobs:
 
   real:
     name: real rproxy (rule sets)
-    if: ${{ !inputs.report_version }}
+    if: ${{ !inputs.report_version && !inputs.compat && !inputs.stress }}
     needs: rproxy
     runs-on: ubuntu-latest
     container: alpine:3.24
@@ -122,7 +144,7 @@ jobs:
 
   kind:
     name: e2e (kind)
-    if: ${{ !inputs.report_version }}
+    if: ${{ !inputs.report_version && !inputs.compat && !inputs.stress }}
     needs: [build, rproxy]
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -143,7 +165,7 @@ jobs:
 
   conformance:
     name: Gateway API conformance
-    if: ${{ !inputs.report_version }}
+    if: ${{ !inputs.report_version && !inputs.compat && !inputs.stress }}
     needs: [build, rproxy]
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -179,6 +201,118 @@ jobs:
       - name: extended
         continue-on-error: true
         run: exit "$(cat "$RUNNER_TEMP/rproxy-gateway-conformance/status")"
+
+  compat:
+    name: compat (k8s ${{ matrix.k8s }}, Gateway API ${{ matrix.gwapi }})
+    if: ${{ inputs.compat && !inputs.stress }}
+    needs: [build, rproxy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # every Gateway API minor still in use (v1.2 and later; v1.0 / v1.1 are too old) on the newest
+          # Kubernetes, and the next one (release candidate). strict: the latest two minors must pass
+          # conformance core (the badge counts them), the others are recorded
+          - { k8s: v1.37.0, gwapi: v1.2.1 }
+          - { k8s: v1.37.0, gwapi: v1.3.0 }
+          - { k8s: v1.37.0, gwapi: v1.4.1 }
+          - { k8s: v1.37.0, gwapi: v1.5.1, strict: true }
+          - { k8s: v1.37.0, gwapi: v1.6.3, strict: true }
+          - { k8s: v1.37.0, gwapi: v1.7.0-rc.1 }
+          # every Kubernetes minor the chart allows (kubeVersion >=1.29), each with the newest Gateway API
+          # whose CRDs it accepts: the CRDs use CEL functions older API servers do not have (v1.5:
+          # isIP, needs k8s 1.31; v1.6: also dns1123Label, needs k8s 1.32)
+          - { k8s: v1.29.14, gwapi: v1.4.1 }
+          - { k8s: v1.30.13, gwapi: v1.4.1 }
+          - { k8s: v1.31.14, gwapi: v1.5.1, strict: true }
+          - { k8s: v1.32.11, gwapi: v1.6.3, strict: true }
+          - { k8s: v1.33.12, gwapi: v1.6.3, strict: true }
+          - { k8s: v1.34.11, gwapi: v1.6.3, strict: true }
+          - { k8s: v1.35.8, gwapi: v1.6.3, strict: true }
+          - { k8s: v1.36.4, gwapi: v1.6.3, strict: true }
+    env:
+      KIND_NODE_IMAGE: kindest/node:${{ matrix.k8s }}
+      GATEWAY_API_VERSION: ${{ matrix.gwapi }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/amd64
+          merge-multiple: true
+      - name: kind
+        run: |
+          curl -sLo "$RUNNER_TEMP/kind" https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+          sudo install -m 755 "$RUNNER_TEMP/kind" /usr/local/bin/kind
+      # rproxy-gateway works here: the same e2e as on every PR, against this Kubernetes and these CRDs
+      - name: scripts/e2e.sh
+        env:
+          MIGRATE: e2e/e2e
+          GATEWAY_API_CHANNEL: experimental
+        run: scripts/e2e.sh
+      - name: controller log
+        if: always()
+        run: kubectl -n rproxy-gateway-system logs deploy/rproxy-gateway --tail=200 || true
+      - name: delete the e2e cluster
+        if: always()
+        run: kind delete cluster --name rproxy-gateway || true
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      # strict pairs must pass core; the others are recorded (an older suite does not know the newer features)
+      - name: scripts/conformance.sh
+        continue-on-error: ${{ !matrix.strict }}
+        run: scripts/conformance.sh
+      - name: core (strict pairs)
+        if: ${{ matrix.strict }}
+        run: |
+          f="$RUNNER_TEMP/rproxy-gateway-conformance/core-failures"
+          if [ -s "$f" ]; then echo "::error::conformance core failed on k8s ${{ matrix.k8s }}, Gateway API ${{ matrix.gwapi }}"; cat "$f"; exit 1; fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compat-${{ matrix.k8s }}-${{ matrix.gwapi }}
+          path: |
+            conformance-report.yaml
+            ${{ runner.temp }}/rproxy-gateway-conformance/conformance.log
+            ${{ runner.temp }}/rproxy-gateway-conformance/controller.log
+
+  stress:
+    name: stress (random traffic)
+    if: ${{ inputs.stress }}
+    needs: [build, rproxy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/amd64
+          merge-multiple: true
+      - name: kind
+        run: |
+          curl -sLo "$RUNNER_TEMP/kind" https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+          sudo install -m 755 "$RUNNER_TEMP/kind" /usr/local/bin/kind
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - name: scripts/stress.sh
+        env:
+          TOTAL: ${{ inputs.stress_total }}
+        run: scripts/stress.sh
+      - name: controller and rproxy logs
+        if: always()
+        run: |
+          kubectl -n rproxy-gateway-system logs deploy/rproxy-gateway --tail=100 || true
+          kubectl -n stress logs -l gateway.networking.k8s.io/gateway-name=stress -c rproxy --tail=100 || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stress
+          path: ${{ runner.temp }}/rproxy-gateway-stress/
 
   report:
     name: conformance report (published)

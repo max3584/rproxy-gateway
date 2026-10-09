@@ -79,6 +79,19 @@ spec:
 - `fleet.enabled=true` では、chart の DaemonSet（`hostNetwork: true`）の rproxy がすべての Gateway を受け持つ。`fleet.listen: addresses`（既定は `wildcard`。rproxy v0.4.3 の `listen_freebind`）で、`spec.addresses` を持つ Gateway は自分のアドレス（`managed.addressCIDRs` の内）でだけ待ち受ける：アドレスが違えば同じポート（443 など）を別の Gateway が使え、ノードにまだアドレスがなくても待ち受ける（アドレスを置くのは MetalLB・kube-vip・keepalived・クラウドの LB など。[docs/DESIGN-v0.4.x.md](docs/DESIGN-v0.4.x.md) の 12.）。同じアドレス（かワイルドカード）の同じポートは古い Gateway が持つ。止まるときは `fleet.shutdown.delay`（既定 5 秒）受け付けを続け、`fleet.shutdown.drain`（既定 25 秒）まで今の接続を待つ。前に置くロードバランサ・VIP のヘルスチェックを `https://<ノード>:9443/readyz`（止まり始めると 503）に向け、それがノードを外すまでの時間より delay を長くする。アドレス（VIP）は rproxy-gateway では持たない（v0.4.4 の `fleet.vip` は v0.4.5 で外した）。keepalived・自前の L4・fleet の Pod を選ぶ Service の書き方は [docs/PLATFORM.md](docs/PLATFORM.md) の「fleet」。
 - chart の値は [charts/rproxy-gateway/values.yaml](charts/rproxy-gateway/values.yaml)。コントローラの設定は ConfigMap `rproxy-gateway-config`（`RPROXY_GATEWAY_*` の環境変数）にして渡す（`controller.extraArgs` は引数のままで、ConfigMap より強い）。
 
+### 対応する版
+
+Kubernetes 1.29 以上（chart の `kubeVersion`）と、Gateway API v1.2 以上の CRD で動きます。どの組み合わせも、手動の互換性テスト（`gh workflow run e2e.yml -f compat=true`）で e2e が通ることを確かめています。v1.5 と v1.6（直近 2 つ）は conformance の core も通ります。
+
+| Gateway API の CRD | 必要な Kubernetes（CRD の検証の都合） | 確かめた組み合わせ |
+|---|---|---|
+| v1.2・v1.3・v1.4 | 1.29 以上 | k8s 1.29・1.30（v1.4）、1.37（v1.2〜v1.4） |
+| v1.5 | 1.31 以上（`isIP`） | k8s 1.31・1.37 |
+| v1.6 | 1.32 以上（`dns1123Label`） | k8s 1.32〜1.37 |
+| v1.7.0-rc.1 | — | k8s 1.37 |
+
+古い CRD では、TCPRoute・UDPRoute（v1.6 より前は `v1alpha2`）、TLSRoute（v1.4 は `v1alpha3`）、ReferenceGrant（v1.4 は `v1beta1`）を、API サーバが出している版で読み書きします。CRD は `experimental-install.yaml` を勧めます（TCPRoute・UDPRoute と HTTPRoute の retry のため）。
+
 ### Helm を使わずに入れる（kubectl・Kustomize）
 
 リリースに、chart から描いたマニフェストを付けている：`install.yaml`（managed）、`install-fleet.yaml`（fleet）、`crds.yaml`（rproxy の CRD だけ。GitOps で CRD を先に当てるとき）。どれも Gateway API の CRD は含まない。

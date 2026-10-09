@@ -305,7 +305,11 @@ fn spawn_pod_watch(api: Api<Pod>, changed: Arc<Notify>) -> Store<Pod> {
 	reader
 }
 
-/// (group, kind, resource at the preferred version) of the groups the controller reads.
+/// (group, kind, resource) of the groups the controller reads, each kind at its
+/// most stable served version: not the group's preferred version only, since
+/// older Gateway API CRDs serve some kinds only at older versions (v1.4/v1.5:
+/// TCPRoute and UDPRoute v1alpha2, v1.4: TLSRoute v1alpha3, ReferenceGrant
+/// v1beta1). The objects are read and their status written at that version.
 async fn discover(client: &kube::Client) -> anyhow::Result<Vec<(String, String, ApiResource)>> {
 	let mut out = vec![];
 	let mut groups: Vec<&str> = DYNAMIC_KINDS.iter().map(|(g, _)| *g).collect();
@@ -315,7 +319,7 @@ async fn discover(client: &kube::Client) -> anyhow::Result<Vec<(String, String, 
 	for g in groups {
 		match kube::discovery::group(client, g).await {
 			Ok(api_group) => {
-				for (ar, _caps) in api_group.recommended_resources() {
+				for (ar, _caps) in api_group.resources_by_stability() {
 					out.push((g.to_string(), ar.kind.clone(), ar));
 				}
 			}

@@ -3,6 +3,7 @@
 # binaries the Alpine jobs built: dist/amd64/rproxy-gateway and dist/amd64/rproxy-api.
 #   scripts/e2e.sh            # create the cluster, install, test
 #   SETUP_ONLY=1 scripts/e2e.sh   # stop after installing (conformance.sh uses this)
+#   KIND_NODE_IMAGE=kindest/node:v1.29.14 scripts/e2e.sh   # another Kubernetes version (the compat run)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 CLUSTER=${CLUSTER:-rproxy-gateway}
@@ -41,7 +42,7 @@ docker build -q -t rproxy-gateway:e2e --build-arg TARGETARCH=amd64 -f Dockerfile
 docker build -q -t rproxy:e2e --build-arg TARGETARCH=amd64 -f Dockerfile.rproxy .
 
 echo "== cluster"
-kind get clusters | grep -qx "$CLUSTER" || kind create cluster --name "$CLUSTER" --wait 180s
+kind get clusters | grep -qx "$CLUSTER" || kind create cluster --name "$CLUSTER" ${KIND_NODE_IMAGE:+--image "$KIND_NODE_IMAGE"} --wait 180s
 kind load docker-image --name "$CLUSTER" rproxy-gateway:e2e rproxy:e2e
 kubectl apply --server-side -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/$GATEWAY_API_VERSION/$GATEWAY_API_CHANNEL-install.yaml" > /dev/null
 # the runner reaches ClusterIPs (Gateway addresses) through the kind node (kube-proxy there)
@@ -71,7 +72,21 @@ kubectl create namespace e2e --dry-run=client -o yaml | kubectl apply -f - > /de
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=secure.example.com -addext subjectAltName=DNS:secure.example.com \
   -keyout "$work/tls.key" -out "$work/tls.crt" 2> /dev/null
 kubectl -n e2e create secret tls secure-cert --cert="$work/tls.crt" --key="$work/tls.key" --dry-run=client -o yaml | kubectl apply -f - > /dev/null
-kubectl apply -f test/e2e/manifests.yaml > /dev/null
+# older Gateway API CRDs serve some kinds only at older versions (v1.4/v1.5: TCPRoute and UDPRoute
+# v1alpha2): write the manifests' Gateway API objects at the version the cluster serves
+served() {
+  local crd=$1
+  if kubectl get crd "$crd" -o jsonpath='{.spec.versions[?(@.name=="v1")].served}' | grep -qx true; then echo v1
+  else kubectl get crd "$crd" -o jsonpath='{.spec.versions[?(@.storage==true)].name}'; fi
+}
+tcp_v=$(served tcproutes.gateway.networking.k8s.io) udp_v=$(served udproutes.gateway.networking.k8s.io)
+awk -v tcp="$tcp_v" -v udp="$udp_v" '
+  /^apiVersion: gateway.networking.k8s.io\// { held = $0; next }
+  held != "" { if ($0 == "kind: TCPRoute") held = "apiVersion: gateway.networking.k8s.io/" tcp
+               else if ($0 == "kind: UDPRoute") held = "apiVersion: gateway.networking.k8s.io/" udp
+               print held; held = "" }
+  { print }' test/e2e/manifests.yaml > "$work/manifests.yaml"
+kubectl apply -f "$work/manifests.yaml" > /dev/null
 kubectl -n e2e rollout status deploy/echo --timeout=180s
 kubectl -n e2e wait --for=condition=Programmed gateway/e2e --timeout=240s
 addr=$(kubectl -n e2e get gateway e2e -o jsonpath='{.status.addresses[0].value}')
