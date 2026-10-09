@@ -395,3 +395,22 @@ Closing "Not claimed" of docs/en/CONFORMANCE.md (requested by the owner, 2026-10
   3. Change your manifests' `apiVersion` to `rproxy.max3584.net/v1beta1` when convenient (`v1alpha1` only warns).
 - **Stored versions**: existing objects stay stored as `v1alpha1` in etcd until they are next written (the CRDs' `status.storedVersions` is `["v1alpha1", "v1beta1"]`); with one schema nothing behaves differently. Before a future (minor) version stops serving `v1alpha1`, rewrite every object (`kubectl get rproxyrules,rproxymiddlewares,rproxypolicies,rproxygatewayparameters -A -o json | kubectl replace -f -`, or kube-storage-version-migrator) and then set `status.storedVersions` to `["v1beta1"]` (`kubectl patch crd <name> --subresource=status --type=merge -p '{"status":{"storedVersions":["v1beta1"]}}'`). v0.4.x keeps serving `v1alpha1` (patches do not break).
 
+### 11.5 Mesh (GAMMA): an assessment (not built)
+
+The Gateway API's Mesh support (GAMMA; conformance profiles `MESH-HTTP` and `MESH-GRPC`, features `Mesh`, `MeshClusterIPMatching`, `MeshConsumerRoute` and others) puts a **Service** in the `parentRefs` of HTTPRoutes and GRPCRoutes, applying routes to traffic from pods to Services inside the cluster (east-west). As the owner asked, it is not built; this is the assessment (2026-10-08).
+
+**What it takes**
+
+| Part | What | rproxy-gateway / rproxy today |
+|---|---|---|
+| Capturing traffic | Send every pod's outgoing traffic to rproxy: inject a sidecar per pod (a mutating webhook plus an init container or CNI plugin writing iptables / nftables rules), or a proxy per node (Istio ambient's ztunnel, Cilium's way; eBPF or TPROXY catching all pods of the node) | None. The fleet's hostNetwork DaemonSet exists but does not intercept pod traffic |
+| Routing by the original destination | Read a captured connection's original destination (`SO_ORIGINAL_DST` or the TPROXY destination) and pick L7 routes per Service ClusterIP:port, as a "virtual listener" (`MeshClusterIPMatching`). Services without routes must behave like kube-proxy (spread over pod IPs) | rproxy's rules are keyed by the listening (address, port). Choosing by the original destination is a large rproxy-api change (a new kind of listener, as many rules as the cluster has Services) |
+| Every Service's settings | Every Service and EndpointSlice of the cluster, routed or not, goes to every proxy (thousands of Services, busy EndpointSlices). Today's "one Gateway = one rule set PUT" replaces everything each time and would be heavy | Rule set PUTs replace the whole set (with an etag); there is no incremental distribution (like incremental xDS) |
+| Consumer routes | `MeshConsumerRoute`: a route that applies only when pods of the route's namespace send. The sender (which pod) must be known | A table from source IP to pod and namespace would be needed |
+| Identity and mTLS | Meshes usually do mutual TLS with workload certificates (SPIFFE) (the Gateway API conformance does not ask for it, but a mesh is used for it): a CA, issuing and rotating certificates, a key per pod | rproxy terminates TLS, does TLS to backends and checks client certificates, but issues no per-pod certificates |
+| The conformance setup | The mesh tests (22 in v1.6.3) exec into echo pods of the `gateway-conformance-mesh` namespace and curl Services; namespace labels (`--namespace-labels`) turn injection on | Without injection not a single test can run |
+
+**Estimate**: in rproxy-api, listeners choosing by the original destination and incremental application of large rule sets; in rproxy-gateway, an injection webhook and an iptables init (or CNI), rendering all Services, the sender table, and (if used) mTLS certificates. Several times all of this section 11, and it sits in the path of all pod traffic, so a failure spreads over the whole cluster (today: Gateway traffic only). The acceptance tests and the security lines ("rproxy pods do not use the Kubernetes API", "tenants stay in their namespace") would need redoing too.
+
+**Recommendation: do not build it.** rproxy-gateway stays north-south (Gateway). Where in-cluster traffic needs policies or mTLS, run a mesh (Istio ambient, Linkerd, Cilium) next to it (rproxy-gateway is the entrance, the mesh is between pods; whether the Gateway's rproxy pods join the mesh is the mesh's setting). If demand becomes clear, consider it in the next minor (a big change of shape), not a v0.4.x patch, starting from a per-node proxy (close to ambient; the fleet DaemonSet could carry it). docs/en/CONFORMANCE.md keeps Mesh under "Not claimed".
+
