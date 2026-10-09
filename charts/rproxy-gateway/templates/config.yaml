@@ -1,3 +1,7 @@
+{{- /* fleet.vip (the built-in VIP sidecar of 0.4.4) was removed in 0.4.5: stop instead of ignoring it */}}
+{{- if hasKey .Values.fleet "vip" }}
+{{- fail "fleet.vip was removed in rproxy-gateway 0.4.5 (the built-in VIP sidecar of 0.4.4). Delete fleet.vip from your values and give rproxy its addresses from the platform (MetalLB, kube-vip, Cilium, keepalived, a cloud load balancer): https://github.com/max3584/rproxy-gateway/blob/main/docs/en/PLATFORM.md (ja: docs/PLATFORM.md), including how to clean up what 0.4.4 left (Leases, RBAC, addresses on the nodes)" }}
+{{- end }}
 # the controller's settings as RPROXY_GATEWAY_* environment variables (`rproxy-gateway controller --help`);
 # with Kustomize, change them with a configMapGenerator (behavior: merge) on config/default
 apiVersion: v1
