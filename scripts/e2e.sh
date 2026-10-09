@@ -72,7 +72,21 @@ kubectl create namespace e2e --dry-run=client -o yaml | kubectl apply -f - > /de
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=secure.example.com -addext subjectAltName=DNS:secure.example.com \
   -keyout "$work/tls.key" -out "$work/tls.crt" 2> /dev/null
 kubectl -n e2e create secret tls secure-cert --cert="$work/tls.crt" --key="$work/tls.key" --dry-run=client -o yaml | kubectl apply -f - > /dev/null
-kubectl apply -f test/e2e/manifests.yaml > /dev/null
+# older Gateway API CRDs serve some kinds only at older versions (v1.4/v1.5: TCPRoute and UDPRoute
+# v1alpha2): write the manifests' Gateway API objects at the version the cluster serves
+served() {
+  local crd=$1
+  if kubectl get crd "$crd" -o jsonpath='{.spec.versions[?(@.name=="v1")].served}' | grep -qx true; then echo v1
+  else kubectl get crd "$crd" -o jsonpath='{.spec.versions[?(@.storage==true)].name}'; fi
+}
+tcp_v=$(served tcproutes.gateway.networking.k8s.io) udp_v=$(served udproutes.gateway.networking.k8s.io)
+awk -v tcp="$tcp_v" -v udp="$udp_v" '
+  /^apiVersion: gateway.networking.k8s.io\// { held = $0; next }
+  held != "" { if ($0 == "kind: TCPRoute") held = "apiVersion: gateway.networking.k8s.io/" tcp
+               else if ($0 == "kind: UDPRoute") held = "apiVersion: gateway.networking.k8s.io/" udp
+               print held; held = "" }
+  { print }' test/e2e/manifests.yaml > "$work/manifests.yaml"
+kubectl apply -f "$work/manifests.yaml" > /dev/null
 kubectl -n e2e rollout status deploy/echo --timeout=180s
 kubectl -n e2e wait --for=condition=Programmed gateway/e2e --timeout=240s
 addr=$(kubectl -n e2e get gateway e2e -o jsonpath='{.status.addresses[0].value}')
