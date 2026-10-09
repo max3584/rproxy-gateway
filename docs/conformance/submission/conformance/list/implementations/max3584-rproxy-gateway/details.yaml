@@ -1,0 +1,15 @@
+apiVersion: gateway.networking.kubernetes.io/v1
+kind: ImplementationListDetails
+organization: max3584
+project: rproxy-gateway
+fullName: rproxy-gateway
+description: |
+  [rproxy-gateway][rproxy-gateway] is an open source (MIT) Kubernetes controller, written in Rust,
+  that implements the Gateway API on top of [rproxy][rproxy], a reverse proxy for HTTP, TLS, TCP
+  and UDP. It turns Gateways and routes (HTTPRoute, GRPCRoute, TLSRoute, TCPRoute, UDPRoute) into
+  rproxy rule sets and applies them through rproxy's control API, either to an rproxy Deployment
+  it provisions per Gateway or to a node-level fleet. See the [README][rproxy-gateway] to get
+  started.
+
+  [rproxy-gateway]: https://github.com/max3584/rproxy-gateway
+  [rproxy]: https://github.com/max3584/rproxy-api
