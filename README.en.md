@@ -85,7 +85,7 @@ Kubernetes 1.29 or later (the chart's `kubeVersion`) with Gateway API CRDs v1.0 
 
 | Gateway API CRDs | Kubernetes needed (for the CRDs' validation) | Pairings checked |
 |---|---|---|
-| v1.0 | — | k8s 1.37. Gateway `infrastructure` came with v1.1, so per-Gateway RproxyGatewayParameters are not available (the GatewayClass parametersRef is) |
+| v1.0 | — | k8s 1.37. Gateway `infrastructure.parametersRef` came with v1.1, so per-Gateway RproxyGatewayParameters are not available (the GatewayClass parametersRef is) |
 | v1.1 | — | k8s 1.37. GRPCRoute does not work ([#61](https://github.com/max3584/rproxy-gateway/issues/61)) |
 | v1.2, v1.3, v1.4 | 1.29 or later | k8s 1.29, 1.30 (v1.4); 1.37 (v1.2-v1.4) |
 | v1.5 | 1.31 or later (`isIP`) | k8s 1.31, 1.37 |

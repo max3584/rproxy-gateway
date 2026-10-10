@@ -215,15 +215,15 @@ retry 180 sh -c "test \"\$(kubectl -n e2e get pods -l gateway.networking.k8s.io/
 retry 60 sh -c "curl -sf -H 'Host: e2e.example.com' http://$addr/two > /dev/null"
 
 deploy=$(kubectl -n e2e get deploy -l gateway.networking.k8s.io/gateway-name=e2e -o jsonpath='{.items[0].metadata.name}')
-# Gateway spec.infrastructure (a Gateway's own parameters) came with Gateway API v1.1: with older CRDs
-# the API server drops it, and the parameters steps are left out (the GatewayClass's parametersRef
+# Gateway spec.infrastructure.parametersRef (a Gateway's own parameters) came with Gateway API v1.1: with
+# older CRDs the API server drops it, and the parameters steps are left out (the GatewayClass's parametersRef
 # still works)
 if kubectl get crd gateways.gateway.networking.k8s.io -o json \
-  | jq -e '.spec.versions[] | select(.name == "v1") | .schema.openAPIV3Schema.properties.spec.properties | has("infrastructure")' > /dev/null; then
+  | jq -e '.spec.versions[] | select(.name == "v1") | .schema.openAPIV3Schema.properties.spec.properties.infrastructure.properties // {} | has("parametersRef")' > /dev/null; then
   infrastructure=1
 else
   infrastructure=""
-  echo "== Gateway spec.infrastructure is not in these CRDs (Gateway API v1.0): the parameters steps are left out"
+  echo "== Gateway spec.infrastructure.parametersRef is not in these CRDs (Gateway API v1.0): the parameters steps are left out"
 fi
 if [ -n "$infrastructure" ]; then
 echo "== RproxyGatewayParameters: the Gateway's own replicas, resources, labels and topology spread"
@@ -329,7 +329,7 @@ codes=$(kubectl -n rproxy-ui logs ui-probe)
 echo "UI token: GET /rules, PUT /rulesets: $codes"
 test "$codes" = "200 403"
 kubectl -n rproxy-ui delete pod ui-probe --wait=false > /dev/null
-# the Gateway's own parameters (Gateway spec.infrastructure, Gateway API v1.1)
+# the Gateway's own parameters (Gateway spec.infrastructure.parametersRef, Gateway API v1.1)
 if [ -n "$infrastructure" ]; then
 echo "== the UI: the Gateway hidden (parameters ui.visible: false): the Secret goes, the token goes (no rollout)"
 cat <<YAML | kubectl --as=system:serviceaccount:e2e:tenant apply -f - > /dev/null

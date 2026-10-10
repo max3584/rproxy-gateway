@@ -85,7 +85,7 @@ Kubernetes 1.29 以上（chart の `kubeVersion`）と、Gateway API v1.0 以上
 
 | Gateway API の CRD | 必要な Kubernetes（CRD の検証の都合） | 確かめた組み合わせ |
 |---|---|---|
-| v1.0 | — | k8s 1.37。Gateway の `infrastructure` が v1.1 からなので、Gateway ごとの RproxyGatewayParameters は使えない（GatewayClass の parametersRef は使える） |
+| v1.0 | — | k8s 1.37。Gateway の `infrastructure.parametersRef` が v1.1 からなので、Gateway ごとの RproxyGatewayParameters は使えない（GatewayClass の parametersRef は使える） |
 | v1.1 | — | k8s 1.37。GRPCRoute は動かない（[#61](https://github.com/max3584/rproxy-gateway/issues/61)） |
 | v1.2・v1.3・v1.4 | 1.29 以上 | k8s 1.29・1.30（v1.4）、1.37（v1.2〜v1.4） |
 | v1.5 | 1.31 以上（`isIP`） | k8s 1.31・1.37 |
