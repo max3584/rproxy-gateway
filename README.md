@@ -92,7 +92,7 @@ Kubernetes 1.29 以上（chart の `kubeVersion`）と、Gateway API v1.0 以上
 | v1.6 | 1.32 以上（`dns1123Label`） | k8s 1.32〜1.37 |
 | v1.7.0-rc.1 | — | k8s 1.37（conformance の新しい試験は [#62](https://github.com/max3584/rproxy-gateway/issues/62)） |
 
-chart の範囲より古い Kubernetes も、試験のときだけ `kubeVersion` を外して確かめています（記録だけ）：1.26〜1.28 は e2e がすべて通ります。1.23〜1.25 は PodDisruptionBudget の `unhealthyPodEvictionPolicy`（1.26 から）を断られ、replicas が 2 以上の Gateway に PodDisruptionBudget ができません。1.22 は Gateway API の CRD が入りません。
+chart の範囲より古い Kubernetes も、試験のときだけ `kubeVersion` を外して確かめています（記録だけ）：1.26〜1.28 は e2e がすべて通ります。1.23〜1.25 は PodDisruptionBudget の `unhealthyPodEvictionPolicy`（1.26 から）を断られ、replicas が 2 以上の Gateway に PodDisruptionBudget ができません（e2e はそこで止まり、その後は確かめていません。conformance は通ります）。1.22 は Gateway API の CRD が入りません。
 
 古い CRD では、TCPRoute・UDPRoute（v1.6 より前は `v1alpha2`）、TLSRoute（v1.4 は `v1alpha3`）、ReferenceGrant（v1.4 は `v1beta1`）を、API サーバが出している版で読み書きします。CRD は `experimental-install.yaml` を勧めます（TCPRoute・UDPRoute と HTTPRoute の retry のため）。
 

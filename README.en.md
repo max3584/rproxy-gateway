@@ -92,7 +92,7 @@ Kubernetes 1.29 or later (the chart's `kubeVersion`) with Gateway API CRDs v1.0 
 | v1.6 | 1.32 or later (`dns1123Label`) | k8s 1.32-1.37 |
 | v1.7.0-rc.1 | — | k8s 1.37 (the new conformance tests: [#62](https://github.com/max3584/rproxy-gateway/issues/62)) |
 
-Kubernetes older than the chart allows is checked too, with `kubeVersion` relaxed for those runs only (recorded): 1.26 to 1.28 pass the whole e2e. 1.23 to 1.25 refuse the PodDisruptionBudget's `unhealthyPodEvictionPolicy` (from 1.26), so Gateways with 2 or more replicas get no PodDisruptionBudget. On 1.22 the Gateway API CRDs do not install.
+Kubernetes older than the chart allows is checked too, with `kubeVersion` relaxed for those runs only (recorded): 1.26 to 1.28 pass the whole e2e. 1.23 to 1.25 refuse the PodDisruptionBudget's `unhealthyPodEvictionPolicy` (from 1.26), so Gateways with 2 or more replicas get no PodDisruptionBudget (the e2e stops there and the rest is not checked; conformance passes). On 1.22 the Gateway API CRDs do not install.
 
 With older CRDs, TCPRoute and UDPRoute (`v1alpha2` before v1.6), TLSRoute (`v1alpha3` in v1.4) and ReferenceGrant (`v1beta1` in v1.4) are read and written at the version the API server serves. `experimental-install.yaml` is recommended (TCPRoute, UDPRoute and HTTPRoute retries).
 
