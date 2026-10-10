@@ -214,6 +214,18 @@ retry 120 sh -c "test \"\$(kubectl -n e2e get pdb -l gateway.networking.k8s.io/g
 retry 180 sh -c "test \"\$(kubectl -n e2e get pods -l gateway.networking.k8s.io/gateway-name=e2e,app.kubernetes.io/name=rproxy -o json | jq '[.items[] | select(.metadata.deletionTimestamp == null) | .status.conditions[] | select(.type == \"Ready\" and .status == \"True\")] | length')\" = 2"
 retry 60 sh -c "curl -sf -H 'Host: e2e.example.com' http://$addr/two > /dev/null"
 
+deploy=$(kubectl -n e2e get deploy -l gateway.networking.k8s.io/gateway-name=e2e -o jsonpath='{.items[0].metadata.name}')
+# Gateway spec.infrastructure.parametersRef (a Gateway's own parameters) came with Gateway API v1.1: with
+# older CRDs the API server drops it, and the parameters steps are left out (the GatewayClass's parametersRef
+# still works)
+if kubectl get crd gateways.gateway.networking.k8s.io -o json \
+  | jq -e '.spec.versions[] | select(.name == "v1") | .schema.openAPIV3Schema.properties.spec.properties.infrastructure.properties // {} | has("parametersRef")' > /dev/null; then
+  infrastructure=1
+else
+  infrastructure=""
+  echo "== Gateway spec.infrastructure.parametersRef is not in these CRDs (Gateway API v1.0): the parameters steps are left out"
+fi
+if [ -n "$infrastructure" ]; then
 echo "== RproxyGatewayParameters: the Gateway's own replicas, resources, labels and topology spread"
 cat <<YAML | kubectl apply -f - > /dev/null
 apiVersion: rproxy.max3584.net/v1beta1
@@ -228,7 +240,6 @@ spec:
 YAML
 kubectl -n e2e patch gateway e2e --type=merge \
   -p '{"spec":{"infrastructure":{"parametersRef":{"group":"rproxy.max3584.net","kind":"RproxyGatewayParameters","name":"e2e"}}}}' > /dev/null
-deploy=$(kubectl -n e2e get deploy -l gateway.networking.k8s.io/gateway-name=e2e -o jsonpath='{.items[0].metadata.name}')
 retry 120 sh -c "test \"\$(kubectl -n e2e get deploy $deploy -o jsonpath='{.spec.replicas}')\" = 3"
 d_json=$(kubectl -n e2e get deploy "$deploy" -o json)
 jq -e '.spec.template.spec.containers[0].resources.requests.cpu == "10m" and .spec.template.metadata.labels["cost-center"] == "e2e"' <<< "$d_json" > /dev/null
@@ -270,6 +281,7 @@ spec:
 YAML
 retry 60 sh -c "test \"\$(kubectl -n e2e get gateway e2e -o jsonpath='{.status.conditions[?(@.type==\"Accepted\")].status}')\" = True"
 retry 60 sh -c "test \"\$(kubectl -n e2e get deploy $deploy -o jsonpath='{.spec.replicas}')\" = 2"
+fi
 
 echo "== the UI (docs/DESIGN-v0.4.x.md 4.): nothing without ui.namespace"
 kubectl create namespace rproxy-ui --dry-run=client -o yaml | kubectl apply -f - > /dev/null
@@ -317,6 +329,8 @@ codes=$(kubectl -n rproxy-ui logs ui-probe)
 echo "UI token: GET /rules, PUT /rulesets: $codes"
 test "$codes" = "200 403"
 kubectl -n rproxy-ui delete pod ui-probe --wait=false > /dev/null
+# the Gateway's own parameters (Gateway spec.infrastructure.parametersRef, Gateway API v1.1)
+if [ -n "$infrastructure" ]; then
 echo "== the UI: the Gateway hidden (parameters ui.visible: false): the Secret goes, the token goes (no rollout)"
 cat <<YAML | kubectl --as=system:serviceaccount:e2e:tenant apply -f - > /dev/null
 apiVersion: rproxy.max3584.net/v1beta1
@@ -331,6 +345,7 @@ retry 60 sh -c "! kubectl -n e2e get secret rproxy-$id-api -o jsonpath='{.data.t
 sleep 5
 test "$(kubectl -n e2e get deploy "$deploy" -o jsonpath='{.metadata.generation}')" = "$generation"
 curl -sf -H 'Host: e2e.example.com' "http://$addr/after-ui" > /dev/null
+fi
 
 echo "== Gateway deleted: its rproxy goes"
 kubectl -n e2e delete gateway e2e > /dev/null
