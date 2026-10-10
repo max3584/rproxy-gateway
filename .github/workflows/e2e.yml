@@ -152,6 +152,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
+          # the binaries only (rproxy-gateway, rproxy-api), not the reports other jobs upload meanwhile
+          pattern: rproxy-*
           path: dist/amd64
           merge-multiple: true
       - name: kind
@@ -173,6 +175,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
+          # the binaries only (rproxy-gateway, rproxy-api), not the reports other jobs upload meanwhile
+          pattern: rproxy-*
           path: dist/amd64
           merge-multiple: true
       - name: kind
@@ -254,6 +258,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
+          # the binaries only (rproxy-gateway, rproxy-api), not the reports other jobs upload meanwhile
+          pattern: rproxy-*
           path: dist/amd64
           merge-multiple: true
       - name: kind
@@ -328,6 +334,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
+          # the binaries only (rproxy-gateway, rproxy-api), not the reports other jobs upload meanwhile
+          pattern: rproxy-*
           path: dist/amd64
           merge-multiple: true
       - name: kind

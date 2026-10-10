@@ -275,10 +275,39 @@ pub fn class_status(generation: i64, features: &[&str], invalid: Option<&str>, p
 	})
 }
 
+/// `status` without `supportedFeatures`, for the CRDs of Gateway API v1.0 and v1.1: there the field is a list of
+/// strings from a fixed set (objects with `name` since v1.2), and the API server refuses the whole status. The
+/// conformance suites of that time take the features from their flags instead.
+pub fn without_features(status: &Value) -> Value {
+	let mut st = status.clone();
+	if let Some(o) = st.as_object_mut() {
+		o.remove("supportedFeatures");
+	}
+	st
+}
+
+/// Whether the API server refused a status for the shape of `supportedFeatures` (an older CRD).
+pub fn refused_features(error: &str) -> bool {
+	error.contains("supportedFeatures")
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use crate::render::ListenerPlan;
+
+	#[test]
+	fn the_status_for_older_crds_has_no_features() {
+		let c = class_status(1, &["HTTPRoute", "Gateway"], None, None, "T");
+		let old = without_features(&c);
+		assert!(old.get("supportedFeatures").is_none());
+		assert_eq!(old["conditions"], c["conditions"]);
+		// the API server's answer with the CRDs of Gateway API v1.1
+		assert!(refused_features(
+			r#"GatewayClass.gateway.networking.k8s.io "rproxy" is invalid: [status.supportedFeatures[0]: Invalid value: "object": supportedFeatures[0] in body must be of type string: "object"]"#
+		));
+		assert!(!refused_features("conflict"));
+	}
 
 	fn view(key_port: u16, programmed: &str) -> RuleView {
 		serde_json::from_value(json!({
