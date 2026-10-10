@@ -343,9 +343,18 @@ async fn reconcile_all(
 			let invalid = render::params::class_parameters(&world, c, &params_opts).err();
 			let st =
 				status::class_status(c.metadata.generation.unwrap_or(0), SUPPORTED_FEATURES, invalid.as_deref(), previous.as_ref(), &now);
-			if previous.as_ref() != Some(&st) {
-				if let Err(e) = patch_status(&api, &name, st).await {
-					warn!(class = name, error = %e, "cannot write GatewayClass status");
+			let old = status::without_features(&st);
+			if previous.as_ref() != Some(&st) && previous.as_ref() != Some(&old) {
+				match patch_status(&api, &name, st).await {
+					// Gateway API v1.0 / v1.1 CRDs: supportedFeatures is a list of strings there
+					Err(e) if status::refused_features(&format!("{e:#}")) => {
+						info!(class = name, "the GatewayClass CRD is older than Gateway API v1.2: status without supportedFeatures");
+						if let Err(e) = patch_status(&api, &name, old).await {
+							warn!(class = name, error = %e, "cannot write GatewayClass status");
+						}
+					}
+					Err(e) => warn!(class = name, error = %e, "cannot write GatewayClass status"),
+					Ok(()) => {}
 				}
 			}
 		}

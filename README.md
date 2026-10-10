@@ -81,14 +81,18 @@ spec:
 
 ### 対応する版
 
-Kubernetes 1.29 以上（chart の `kubeVersion`）と、Gateway API v1.2 以上の CRD で動きます。どの組み合わせも、手動の互換性テスト（`gh workflow run e2e.yml -f compat=true`）で e2e が通ることを確かめています。v1.5 と v1.6（直近 2 つ）は conformance の core も通ります。
+Kubernetes 1.29 以上（chart の `kubeVersion`）と、Gateway API v1.0 以上の CRD で動きます（v1.0・v1.1 は下の制限つき）。下の組み合わせは、手動の互換性テスト（`gh workflow run e2e.yml -f compat=true`）で e2e が通ることを確かめています。v1.5 と v1.6（直近 2 つ）は conformance の core も通ります。
 
 | Gateway API の CRD | 必要な Kubernetes（CRD の検証の都合） | 確かめた組み合わせ |
 |---|---|---|
+| v1.0 | — | k8s 1.37。Gateway の `infrastructure` が v1.1 からなので、Gateway ごとの RproxyGatewayParameters は使えない（GatewayClass の parametersRef は使える） |
+| v1.1 | — | k8s 1.37。GRPCRoute は動かない（[#61](https://github.com/max3584/rproxy-gateway/issues/61)） |
 | v1.2・v1.3・v1.4 | 1.29 以上 | k8s 1.29・1.30（v1.4）、1.37（v1.2〜v1.4） |
 | v1.5 | 1.31 以上（`isIP`） | k8s 1.31・1.37 |
 | v1.6 | 1.32 以上（`dns1123Label`） | k8s 1.32〜1.37 |
-| v1.7.0-rc.1 | — | k8s 1.37 |
+| v1.7.0-rc.1 | — | k8s 1.37（conformance の新しい試験は [#62](https://github.com/max3584/rproxy-gateway/issues/62)） |
+
+chart の範囲より古い Kubernetes も、試験のときだけ `kubeVersion` を外して確かめています（記録だけ）：1.26〜1.28 は e2e がすべて通ります。1.23〜1.25 は PodDisruptionBudget の `unhealthyPodEvictionPolicy`（1.26 から）を断られ、replicas が 2 以上の Gateway に PodDisruptionBudget ができません（e2e はそこで止まり、その後は確かめていません。conformance は通ります）。1.22 は Gateway API の CRD が入りません。
 
 古い CRD では、TCPRoute・UDPRoute（v1.6 より前は `v1alpha2`）、TLSRoute（v1.4 は `v1alpha3`）、ReferenceGrant（v1.4 は `v1beta1`）を、API サーバが出している版で読み書きします。CRD は `experimental-install.yaml` を勧めます（TCPRoute・UDPRoute と HTTPRoute の retry のため）。
 

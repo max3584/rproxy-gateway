@@ -152,6 +152,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
+          # the binaries only (rproxy-gateway, rproxy-api), not the reports other jobs upload meanwhile
+          pattern: rproxy-*
           path: dist/amd64
           merge-multiple: true
       - name: kind
@@ -173,6 +175,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
+          # the binaries only (rproxy-gateway, rproxy-api), not the reports other jobs upload meanwhile
+          pattern: rproxy-*
           path: dist/amd64
           merge-multiple: true
       - name: kind
@@ -215,6 +219,8 @@ jobs:
           # every Gateway API minor still in use (v1.2 and later; v1.0 / v1.1 are too old) on the newest
           # Kubernetes, and the next one (release candidate). strict: the latest two minors must pass
           # conformance core (the badge counts them), the others are recorded
+          - { k8s: v1.37.0, gwapi: v1.0.0 }
+          - { k8s: v1.37.0, gwapi: v1.1.1 }
           - { k8s: v1.37.0, gwapi: v1.2.1 }
           - { k8s: v1.37.0, gwapi: v1.3.0 }
           - { k8s: v1.37.0, gwapi: v1.4.1 }
@@ -232,6 +238,19 @@ jobs:
           - { k8s: v1.34.11, gwapi: v1.6.3, strict: true }
           - { k8s: v1.35.8, gwapi: v1.6.3, strict: true }
           - { k8s: v1.36.4, gwapi: v1.6.3, strict: true }
+          # how far back it works: Kubernetes below the chart's kubeVersion (the check is relaxed for
+          # these runs only), each with the Gateway API CRDs of that time. Recorded, never failing
+          - { k8s: v1.22.17, gwapi: v1.0.0, floor: true }
+          - { k8s: v1.23.17, gwapi: v1.0.0, floor: true }
+          - { k8s: v1.24.17, gwapi: v1.0.0, floor: true }
+          - { k8s: v1.25.16, gwapi: v1.2.1, floor: true }
+          - { k8s: v1.26.15, gwapi: v1.2.1, floor: true }
+          - { k8s: v1.27.16, gwapi: v1.2.1, floor: true }
+          - { k8s: v1.28.15, gwapi: v1.2.1, floor: true }
+          - { k8s: v1.25.16, gwapi: v1.4.1, floor: true }
+          - { k8s: v1.26.15, gwapi: v1.4.1, floor: true }
+          - { k8s: v1.27.16, gwapi: v1.4.1, floor: true }
+          - { k8s: v1.28.15, gwapi: v1.4.1, floor: true }
     env:
       KIND_NODE_IMAGE: kindest/node:${{ matrix.k8s }}
       GATEWAY_API_VERSION: ${{ matrix.gwapi }}
@@ -239,14 +258,22 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
+          # the binaries only (rproxy-gateway, rproxy-api), not the reports other jobs upload meanwhile
+          pattern: rproxy-*
           path: dist/amd64
           merge-multiple: true
       - name: kind
         run: |
           curl -sLo "$RUNNER_TEMP/kind" https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
           sudo install -m 755 "$RUNNER_TEMP/kind" /usr/local/bin/kind
+      - name: relax the chart's kubeVersion (floor runs only)
+        if: ${{ matrix.floor }}
+        run: |
+          sed -i 's/^kubeVersion:.*/kubeVersion: ">=1.18.0-0"/' charts/rproxy-gateway/Chart.yaml
       # rproxy-gateway works here: the same e2e as on every PR, against this Kubernetes and these CRDs
       - name: scripts/e2e.sh
+        id: e2e
+        continue-on-error: ${{ matrix.floor == true }}
         env:
           MIGRATE: e2e/e2e
           GATEWAY_API_CHANNEL: experimental
@@ -263,6 +290,7 @@ jobs:
           cache: false
       # strict pairs must pass core; the others are recorded (an older suite does not know the newer features)
       - name: scripts/conformance.sh
+        id: conformance
         continue-on-error: ${{ !matrix.strict }}
         run: scripts/conformance.sh
       - name: core (strict pairs)
@@ -270,11 +298,28 @@ jobs:
         run: |
           f="$RUNNER_TEMP/rproxy-gateway-conformance/core-failures"
           if [ -s "$f" ]; then echo "::error::conformance core failed on k8s ${{ matrix.k8s }}, Gateway API ${{ matrix.gwapi }}"; cat "$f"; exit 1; fi
+      # one line per pair for the compatibility report (docs/COMPATIBILITY.md)
+      - name: result
+        if: always()
+        run: |
+          w="$RUNNER_TEMP/rproxy-gateway-conformance"
+          log="$w/conformance.log"
+          mkdir -p "$w"; [ -f "$log" ] || : > "$log"
+          passed=$(grep -cE '^\s*--- PASS' "$log" || true)
+          failed=$(grep -cE '^\s*--- FAIL' "$log" || true)
+          failures=$(grep -E '^\s*--- FAIL' "$log" | sed 's/^\s*--- FAIL: //; s/ (.*//' | paste -sd';' - || true)
+          jq -n --arg k8s "${{ matrix.k8s }}" --arg gwapi "${{ matrix.gwapi }}" \
+            --arg kind "${{ matrix.floor && 'floor' || (matrix.strict && 'strict' || 'recorded') }}" \
+            --arg e2e "${{ steps.e2e.outcome }}" --arg conformance "${{ steps.conformance.outcome }}" \
+            --argjson passed "${passed:-0}" --argjson failed "${failed:-0}" --arg failures "$failures" \
+            --arg core "$(cat "$w/core-failures" 2>/dev/null || true)" \
+            '$ARGS.named' | tee result.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: compat-${{ matrix.k8s }}-${{ matrix.gwapi }}
           path: |
+            result.json
             conformance-report.yaml
             ${{ runner.temp }}/rproxy-gateway-conformance/conformance.log
             ${{ runner.temp }}/rproxy-gateway-conformance/controller.log
@@ -289,6 +334,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
+          # the binaries only (rproxy-gateway, rproxy-api), not the reports other jobs upload meanwhile
+          pattern: rproxy-*
           path: dist/amd64
           merge-multiple: true
       - name: kind

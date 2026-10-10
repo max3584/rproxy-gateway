@@ -24,21 +24,32 @@ if [ ! -d "$work/gateway-api" ]; then
 fi
 # only the profiles this suite knows (GATEWAY-TCP and GATEWAY-UDP came with v1.6; an older suite
 # refuses an unknown profile before running anything)
-known=$(grep -ohE '"(GATEWAY|MESH)-[A-Z]+"' "$work/gateway-api/conformance/utils/suite/profiles.go" | tr -d '"' | sort -u)
-PROFILES=$(tr ',' '\n' <<< "$PROFILES" | grep -Fxf <(echo "$known") | paste -sd, -)
-echo "profiles in this suite: $PROFILES"
+known=$(grep -ohE '"(GATEWAY|MESH)-[A-Z]+"' "$work/gateway-api/conformance/utils/suite/profiles.go" 2>/dev/null | tr -d '"' | sort -u || true)
+PROFILES=$(tr ',' '\n' <<< "$PROFILES" | grep -Fxf <(echo "$known") | paste -sd, - || true)
+echo "profiles in this suite: ${PROFILES:-none}"
+# only the flags this suite defines (--usable-address and --unusable-address came with v1.5; an older
+# suite stops at an unknown flag)
+flags_go=$(cat "$work/gateway-api/conformance/utils/flags/"*.go 2>/dev/null || true)
+args=()
+add() { # add NAME VALUE: --NAME=VALUE when the suite has the flag
+  if grep -qE "\"$1\"" <<< "$flags_go"; then args+=("--$1=$2"); else echo "this suite has no --$1"; fi
+}
+args+=(--gateway-class=rproxy)
+[ -n "$PROFILES" ] && add conformance-profiles "$PROFILES"
+add supported-features "$FEATURES"
+add report-output "$REPORT"
+add organization max3584
+add project rproxy-gateway
+add url https://github.com/max3584/rproxy-gateway
+add version "${VERSION:-v0.4.0-dev}"
+add contact https://github.com/max3584/rproxy-gateway/issues
+add cleanup-base-resources false
+add usable-address "${USABLE_ADDRESS:-192.0.2.10}"
+add unusable-address "${UNUSABLE_ADDRESS:-0.0.0.0}"
 status=0
 (
   cd "$work/gateway-api"
-  GOTOOLCHAIN=auto go test ./conformance -run TestConformance -count=1 -timeout 100m -v -args \
-    --gateway-class=rproxy \
-    --conformance-profiles="$PROFILES" \
-    --supported-features="$FEATURES" \
-    --report-output="$REPORT" \
-    --organization=max3584 --project=rproxy-gateway --url=https://github.com/max3584/rproxy-gateway \
-    --version="${VERSION:-v0.4.0-dev}" --contact=https://github.com/max3584/rproxy-gateway/issues \
-    --cleanup-base-resources=false \
-    --usable-address="${USABLE_ADDRESS:-192.0.2.10}" --unusable-address="${UNUSABLE_ADDRESS:-0.0.0.0}"
+  GOTOOLCHAIN=auto go test ./conformance -run TestConformance -count=1 -timeout 100m -v -args "${args[@]}"
 ) 2>&1 | tee "$work/conformance.log" || status=$?
 echo "$status" > "$work/status"
 # the controllers' logs (both replicas) for the artifact
