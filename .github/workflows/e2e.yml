@@ -13,11 +13,14 @@ name: e2e
 #   (<channel>-v<version>-default-report.yaml), the suite's and the controller's logs and the
 #   environment (versions, image digests). It fails unless every profile is core and extended success
 #   with nothing skipped.
-# - by hand with compat: only "compat", the e2e and the conformance suite on older (and the next)
-#   Kubernetes and Gateway API versions (see the matrix), e.g.
+# - by hand with compat, and every week (schedule): only "compat", the e2e and the conformance suite on
+#   every Kubernetes and Gateway API version from the oldest to the newest released and the next one
+#   (scripts/compat-matrix.py works the matrix out at run time), e.g.
 #     gh workflow run e2e.yml -f compat=true
-#   e2e must pass on every pair (rproxy-gateway works there); conformance core must pass on the latest two
-#   Gateway API minors, the others are recorded (the artifact compat-<k8s>-<gateway api> has the report).
+#   e2e must pass on every pair the chart allows (rproxy-gateway works there); conformance core must pass
+#   on the latest two Gateway API minors, the others are recorded (the artifact compat-<k8s>-<gateway api>
+#   has result.json and the report; "compat summary" puts them in one table). A weekly run that fails
+#   opens an issue (or comments on the open one).
 # - by hand with stress: only "stress", random HTTP / TCP / UDP requests (stress_total, default 120000)
 #   through a Gateway with every byte checked (scripts/stress.sh, test/stress), e.g.
 #     gh workflow run e2e.yml -f stress=true
@@ -25,6 +28,9 @@ on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    # every Monday, 04:23 JST: a new Kubernetes or Gateway API release is in the next run
+    - cron: "23 19 * * 0"
   workflow_dispatch:
     inputs:
       rproxy_ref:
@@ -59,7 +65,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: e2e-${{ github.ref }}
+  # the weekly run and a run by hand on main do not cancel a push's run (or each other)
+  group: e2e-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 env:
@@ -121,7 +128,7 @@ jobs:
 
   real:
     name: real rproxy (rule sets)
-    if: ${{ !inputs.report_version && !inputs.compat && !inputs.stress }}
+    if: ${{ !inputs.report_version && !inputs.compat && !inputs.stress && github.event_name != 'schedule' }}
     needs: rproxy
     runs-on: ubuntu-latest
     container: alpine:3.24
@@ -144,7 +151,7 @@ jobs:
 
   kind:
     name: e2e (kind)
-    if: ${{ !inputs.report_version && !inputs.compat && !inputs.stress }}
+    if: ${{ !inputs.report_version && !inputs.compat && !inputs.stress && github.event_name != 'schedule' }}
     needs: [build, rproxy]
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -167,7 +174,7 @@ jobs:
 
   conformance:
     name: Gateway API conformance
-    if: ${{ !inputs.report_version && !inputs.compat && !inputs.stress }}
+    if: ${{ !inputs.report_version && !inputs.compat && !inputs.stress && github.event_name != 'schedule' }}
     needs: [build, rproxy]
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -206,53 +213,88 @@ jobs:
         continue-on-error: true
         run: exit "$(cat "$RUNNER_TEMP/rproxy-gateway-conformance/status")"
 
-  compat:
-    name: compat (k8s ${{ matrix.k8s }}, Gateway API ${{ matrix.gwapi }})
-    if: ${{ inputs.compat && !inputs.stress }}
-    needs: [build, rproxy]
+  # the compatibility matrix, from what is released today (scripts/compat-matrix.py)
+  matrix:
+    name: compat matrix
+    if: ${{ (inputs.compat || github.event_name == 'schedule') && !inputs.stress }}
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    outputs:
+      include: ${{ steps.m.outputs.include }}
+      builds: ${{ steps.m.outputs.builds }}
+      kind: ${{ steps.m.outputs.kind }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: m
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          m=$(scripts/compat-matrix.py)
+          jq . <<< "$m"
+          {
+            echo "include=$(jq -c .include <<< "$m")"
+            echo "builds=$(jq -c .builds <<< "$m")"
+            echo "kind=$(jq -r .kind <<< "$m")"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## Compatibility matrix ($(jq '.include | length' <<< "$m") pairs, kind $(jq -r .kind <<< "$m"))"
+            echo
+            echo "| Kubernetes | Gateway API | kind | node image |"
+            echo "|---|---|---|---|"
+            jq -r '.include[] | "| \(.k8s) | \(.gwapi) | \(if .strict then "strict" elif .floor then "floor (recorded)" else "recorded" end) | \(.image) |"' <<< "$m"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # node images kind has not published (the newest patch, the next minor's beta / rc): built once from
+  # the Kubernetes release and kept in GHCR for the next runs
+  node-images:
+    name: node image ${{ matrix.k8s }}
+    needs: matrix
+    if: ${{ needs.matrix.outputs.builds != '[]' && needs.matrix.outputs.builds != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # every Gateway API minor still in use (v1.2 and later; v1.0 / v1.1 are too old) on the newest
-          # Kubernetes, and the next one (release candidate). strict: the latest two minors must pass
-          # conformance core (the badge counts them), the others are recorded
-          - { k8s: v1.37.0, gwapi: v1.0.0 }
-          - { k8s: v1.37.0, gwapi: v1.1.1 }
-          - { k8s: v1.37.0, gwapi: v1.2.1 }
-          - { k8s: v1.37.0, gwapi: v1.3.0 }
-          - { k8s: v1.37.0, gwapi: v1.4.1 }
-          - { k8s: v1.37.0, gwapi: v1.5.1, strict: true }
-          - { k8s: v1.37.0, gwapi: v1.6.3, strict: true }
-          - { k8s: v1.37.0, gwapi: v1.7.0-rc.1 }
-          # every Kubernetes minor the chart allows (kubeVersion >=1.29), each with the newest Gateway API
-          # whose CRDs it accepts: the CRDs use CEL functions older API servers do not have (v1.5:
-          # isIP, needs k8s 1.31; v1.6: also dns1123Label, needs k8s 1.32)
-          - { k8s: v1.29.14, gwapi: v1.4.1 }
-          - { k8s: v1.30.13, gwapi: v1.4.1 }
-          - { k8s: v1.31.14, gwapi: v1.5.1, strict: true }
-          - { k8s: v1.32.11, gwapi: v1.6.3, strict: true }
-          - { k8s: v1.33.12, gwapi: v1.6.3, strict: true }
-          - { k8s: v1.34.11, gwapi: v1.6.3, strict: true }
-          - { k8s: v1.35.8, gwapi: v1.6.3, strict: true }
-          - { k8s: v1.36.4, gwapi: v1.6.3, strict: true }
-          # how far back it works: Kubernetes below the chart's kubeVersion (the check is relaxed for
-          # these runs only), each with the Gateway API CRDs of that time. Recorded, never failing
-          - { k8s: v1.22.17, gwapi: v1.0.0, floor: true }
-          - { k8s: v1.23.17, gwapi: v1.0.0, floor: true }
-          - { k8s: v1.24.17, gwapi: v1.0.0, floor: true }
-          - { k8s: v1.25.16, gwapi: v1.2.1, floor: true }
-          - { k8s: v1.26.15, gwapi: v1.2.1, floor: true }
-          - { k8s: v1.27.16, gwapi: v1.2.1, floor: true }
-          - { k8s: v1.28.15, gwapi: v1.2.1, floor: true }
-          - { k8s: v1.25.16, gwapi: v1.4.1, floor: true }
-          - { k8s: v1.26.15, gwapi: v1.4.1, floor: true }
-          - { k8s: v1.27.16, gwapi: v1.4.1, floor: true }
-          - { k8s: v1.28.15, gwapi: v1.4.1, floor: true }
+        k8s: ${{ fromJSON(needs.matrix.outputs.builds) }}
     env:
-      KIND_NODE_IMAGE: kindest/node:${{ matrix.k8s }}
+      IMAGE: ghcr.io/${{ github.repository }}/kind-node:${{ matrix.k8s }}
+    steps:
+      - run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - id: have
+        run: |
+          if docker manifest inspect "$IMAGE" > /dev/null 2>&1; then echo "have=true" >> "$GITHUB_OUTPUT"; fi
+      - name: kind
+        if: steps.have.outputs.have != 'true'
+        run: |
+          curl -sLo "$RUNNER_TEMP/kind" "https://github.com/kubernetes-sigs/kind/releases/download/${{ needs.matrix.outputs.kind }}/kind-linux-amd64"
+          sudo install -m 755 "$RUNNER_TEMP/kind" /usr/local/bin/kind
+      - name: kind build node-image
+        if: steps.have.outputs.have != 'true'
+        run: |
+          kind build node-image --type release "${{ matrix.k8s }}" --image "$IMAGE"
+          docker push "$IMAGE"
+
+  compat:
+    name: compat (k8s ${{ matrix.k8s }}, Gateway API ${{ matrix.gwapi }})
+    # node-images is skipped when kind has every image
+    if: >-
+      ${{ !cancelled() && (inputs.compat || github.event_name == 'schedule') && !inputs.stress
+      && needs.build.result == 'success' && needs.rproxy.result == 'success' && needs.matrix.result == 'success'
+      && needs.node-images.result != 'failure' }}
+    needs: [build, rproxy, matrix, node-images]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.matrix.outputs.include) }}
+    env:
+      KIND_NODE_IMAGE: ${{ matrix.image }}
       GATEWAY_API_VERSION: ${{ matrix.gwapi }}
     steps:
       - uses: actions/checkout@v4
@@ -264,8 +306,13 @@ jobs:
           merge-multiple: true
       - name: kind
         run: |
-          curl -sLo "$RUNNER_TEMP/kind" https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+          curl -sLo "$RUNNER_TEMP/kind" "https://github.com/kubernetes-sigs/kind/releases/download/${{ needs.matrix.outputs.kind }}/kind-linux-amd64"
           sudo install -m 755 "$RUNNER_TEMP/kind" /usr/local/bin/kind
+      - name: node image from GHCR
+        if: ${{ startsWith(matrix.image, 'ghcr.io/') }}
+        run: |
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker pull -q "${{ matrix.image }}"
       - name: relax the chart's kubeVersion (floor runs only)
         if: ${{ matrix.floor }}
         run: |
@@ -323,6 +370,43 @@ jobs:
             conformance-report.yaml
             ${{ runner.temp }}/rproxy-gateway-conformance/conformance.log
             ${{ runner.temp }}/rproxy-gateway-conformance/controller.log
+
+  # one table of every pair; a failing weekly run opens an issue (or comments on the open one)
+  compat-summary:
+    name: compat summary
+    needs: [matrix, compat]
+    if: ${{ !cancelled() && needs.matrix.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: compat-*
+          path: compat
+      - name: table
+        run: |
+          {
+            echo "## Compatibility: every pair (run ${{ github.run_id }})"
+            echo
+            echo "| Kubernetes | Gateway API | kind | e2e | conformance passed | failed tests | core failures |"
+            echo "|---|---|---|---|---|---|---|"
+            find compat -name result.json -print0 | xargs -0 cat | jq -s -r 'sort_by(.k8s, .gwapi) | reverse | .[]
+              | (.failures | split(";") | map(select(. != "TestConformance" and (ltrimstr("TestConformance/") | contains("/") | not))) | map(ltrimstr("TestConformance/")) | join(", ")) as $f
+              | "| \(.k8s) | \(.gwapi) | \(.kind) | \(.e2e) | \(.passed) | \($f) | \(.core | gsub("\n"; "; ")) |"'
+          } | tee table.md >> "$GITHUB_STEP_SUMMARY"
+      - name: issue (weekly run failed)
+        if: ${{ github.event_name == 'schedule' && needs.compat.result == 'failure' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Weekly compatibility run failed"
+          body=$(printf 'The weekly compatibility run failed: %s\n\nA strict pair (the latest two Gateway API minors) failed conformance core, or the e2e failed on a Kubernetes the chart allows.\n\n%s\n' "$RUN_URL" "$(cat table.md)")
+          n=$(gh issue list --state open --search "in:title \"$title\"" --json number -q '.[0].number')
+          if [ -n "$n" ]; then gh issue comment "$n" --body "$body"; else gh issue create --title "$title" --body "$body"; fi
 
   stress:
     name: stress (random traffic)

@@ -81,7 +81,7 @@ spec:
 
 ### Supported versions
 
-Kubernetes 1.29 or later (the chart's `kubeVersion`) with Gateway API CRDs v1.0 or later (v1.0 and v1.1 with the limits below). The pairings below pass the e2e in the manual compatibility run (`gh workflow run e2e.yml -f compat=true`); v1.5 and v1.6 (the latest two) also pass conformance core.
+Kubernetes 1.29 or later (the chart's `kubeVersion`) with Gateway API CRDs v1.0 or later (v1.0 and v1.1 with the limits below). The pairings below pass the e2e in the compatibility run (every Monday, or by hand with `gh workflow run e2e.yml -f compat=true`). The pairings are worked out from what is released at run time, so a new Kubernetes (the newest patch and the next minor's beta / rc) or Gateway API is in the next run; v1.5 and v1.6 (the latest two) also pass conformance core.
 
 | Gateway API CRDs | Kubernetes needed (for the CRDs' validation) | Pairings checked |
 |---|---|---|
