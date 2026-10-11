@@ -803,16 +803,8 @@ fn tls_route_terminated_with_a_backend_tls_policy() {
 	let (crt, key) = crate::pem::tests::pair("tls.example.com");
 	let (ca, _) = crate::pem::tests::pair("ca");
 	let yaml = |validation: &str| {
-		format!(
-			"{BASE}{L4_BASE}\n---\napiVersion: v1\nkind: Secret\nmetadata: {{name: cert, namespace: default}}\nstringData:\n  tls.crt: |\n{}\n  tls.key: |\n{}\n---\napiVersion: v1\nkind: ConfigMap\nmetadata: {{name: ca, namespace: default}}\ndata:\n  ca.crt: |\n{}\n{}{}",
-			indent(&crt),
-			indent(&key),
-			indent(&ca),
-			gw(
-				r#"  - {name: tls, port: 8443, protocol: TLS, hostname: tls.example.com, tls: {mode: Terminate, certificateRefs: [{name: cert}]}}"#
-			),
-			format!(
-				r#"
+		let objects = format!(
+			r#"
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: TLSRoute
@@ -828,7 +820,16 @@ spec:
   targetRefs: [{{group: "", kind: Service, name: tls}}]
   validation: {validation}
 "#
-			)
+		);
+		format!(
+			"{BASE}{L4_BASE}\n---\napiVersion: v1\nkind: Secret\nmetadata: {{name: cert, namespace: default}}\nstringData:\n  tls.crt: |\n{}\n  tls.key: |\n{}\n---\napiVersion: v1\nkind: ConfigMap\nmetadata: {{name: ca, namespace: default}}\ndata:\n  ca.crt: |\n{}\n{}{}",
+			indent(&crt),
+			indent(&key),
+			indent(&ca),
+			gw(
+				r#"  - {name: tls, port: 8443, protocol: TLS, hostname: tls.example.com, tls: {mode: Terminate, certificateRefs: [{name: cert}]}}"#
+			),
+			objects
 		)
 	};
 	let p = plan(&yaml("{caCertificateRefs: [{group: \"\", kind: ConfigMap, name: ca}], hostname: abc.example.com}"));
