@@ -138,6 +138,9 @@ pub struct TlsRoute {
 	pub targets: Vec<Target>,
 	#[serde(skip_serializing_if = "std::ops::Not::not")]
 	pub passthrough: bool,
+	/// TLS to this route's backends (`features.tls_route_upstream`, rproxy v0.4.7): a BackendTLSPolicy.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub upstream: Option<Value>,
 }
 
 fn is_zero(p: &u16) -> bool {

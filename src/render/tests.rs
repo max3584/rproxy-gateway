@@ -796,6 +796,74 @@ spec:
 	assert!(p.listeners.iter().all(|l| !cond(&l.conds, "Conflicted").status));
 }
 
+/// A TLSRoute rproxy terminates, with a BackendTLSPolicy on its backend: TLS again to the backend with the
+/// policy's name and CA (`tls.routes[].upstream`; the Gateway API's BackendTLSPolicyTLSRouteTerminate).
+#[test]
+fn tls_route_terminated_with_a_backend_tls_policy() {
+	let (crt, key) = crate::pem::tests::pair("tls.example.com");
+	let (ca, _) = crate::pem::tests::pair("ca");
+	let yaml = |validation: &str| {
+		let objects = format!(
+			r#"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TLSRoute
+metadata: {{name: term, namespace: default}}
+spec:
+  parentRefs: [{{name: gw}}]
+  rules: [{{backendRefs: [{{name: tls, port: 443}}]}}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: {{name: btls, namespace: default}}
+spec:
+  targetRefs: [{{group: "", kind: Service, name: tls}}]
+  validation: {validation}
+"#
+		);
+		format!(
+			"{BASE}{L4_BASE}\n---\napiVersion: v1\nkind: Secret\nmetadata: {{name: cert, namespace: default}}\nstringData:\n  tls.crt: |\n{}\n  tls.key: |\n{}\n---\napiVersion: v1\nkind: ConfigMap\nmetadata: {{name: ca, namespace: default}}\ndata:\n  ca.crt: |\n{}\n{}{}",
+			indent(&crt),
+			indent(&key),
+			indent(&ca),
+			gw(
+				r#"  - {name: tls, port: 8443, protocol: TLS, hostname: tls.example.com, tls: {mode: Terminate, certificateRefs: [{name: cert}]}}"#
+			),
+			objects
+		)
+	};
+	let p = plan(&yaml("{caCertificateRefs: [{group: \"\", kind: ConfigMap, name: ca}], hostname: abc.example.com}"));
+	let rules = p.rules_json();
+	let route = &rules[0]["tls"]["routes"][0];
+	assert_eq!(rules[0]["tls"]["mode"], "terminate");
+	assert_eq!(route["upstream"]["tls"], true, "{route}");
+	assert_eq!(route["upstream"]["server_name"], "abc.example.com");
+	assert!(route["upstream"]["ca_file"].as_str().is_some(), "{route}");
+	assert!(route["upstream"].get("subject_alt_names").is_none());
+	assert_eq!(route["targets"][0]["addr"], "10.0.3.1");
+	// the policy gets status for this Gateway
+	assert_eq!(p.backend_tls.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["btls"]);
+	assert!(cond(&p.backend_tls[0].conds, "Accepted").status);
+
+	// an rproxy without tls.routes[].upstream: the route is not served in plain text
+	let w = world(&yaml("{caCertificateRefs: [{group: \"\", kind: ConfigMap, name: ca}], hostname: abc.example.com}"));
+	let old = render_gateway(
+		&w,
+		&w.gateways[0],
+		&Options { features: Features { tls_route_upstream: false, ..Default::default() }, ..Default::default() },
+	);
+	let route = &old.rules_json()[0]["tls"]["routes"][0];
+	assert!(route.get("upstream").is_none());
+	assert_eq!((route["remote_addr"].as_str(), route["remote_port"].as_u64()), (Some("127.0.0.1"), Some(1)), "{route}");
+
+	// subjectAltNames are not checked for L4 backends: refused rather than half verified
+	let p = plan(&yaml(
+		"{caCertificateRefs: [{group: \"\", kind: ConfigMap, name: ca}], hostname: abc.example.com, subjectAltNames: [{type: Hostname, hostname: abc.example.com}]}",
+	));
+	let route = &p.rules_json()[0]["tls"]["routes"][0];
+	assert_eq!((route["remote_addr"].as_str(), route["remote_port"].as_u64()), (Some("127.0.0.1"), Some(1)), "{route}");
+}
+
 #[test]
 fn policies_and_raw_rules() {
 	let yaml = format!(
@@ -1552,6 +1620,14 @@ spec:
       backendRefs: [{{name: secure, port: 443}}]
     - matches: [{{path: {{value: /broken}}}}]
       backendRefs: [{{name: broken, port: 443}}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata: {{name: rpc, namespace: default}}
+spec:
+  parentRefs: [{{name: gw}}]
+  hostnames: [rpc.example.com]
+  rules: [{{backendRefs: [{{name: secure, port: 443}}]}}]
 "#,
 		indent(&crt),
 		indent(&key),
@@ -1578,6 +1654,10 @@ spec:
 	assert_eq!(cond(&no_ca.conds, "Accepted").reason, "NoValidCACertificate");
 	assert_eq!(cond(&no_ca.conds, "ResolvedRefs").reason, "InvalidKind");
 	assert!(cond(&p.parents[0].conds, "ResolvedRefs").status, "the route's references are fine");
+	// gRPC to a backend with a BackendTLSPolicy: HTTP/2 over TLS (h2), not h2c (BackendTLSPolicyGRPCRoute)
+	let rpc = &http["services"]["grpc:default/rpc/r0"];
+	assert_eq!(rpc["protocol"], "h2", "{rpc}");
+	assert_eq!(rpc["servers"][0]["url"], "https://10.0.5.1:8443");
 }
 
 #[test]
