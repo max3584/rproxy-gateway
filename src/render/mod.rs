@@ -220,6 +220,8 @@ pub struct Features {
 	pub client_auth_no_verify: bool,
 	/// `tls.misdirected` (`http_options` `misdirected`, rproxy v0.4.3).
 	pub misdirected: bool,
+	/// `tls.routes[].upstream` (rproxy v0.4.7): a BackendTLSPolicy on a TLSRoute rproxy terminates.
+	pub tls_route_upstream: bool,
 	/// `cors`, `redirect_regex` and `mirror` in `servers[].middlewares`
 	/// (`server_middleware_kinds`, rproxy v0.4.3).
 	pub server_cors: bool,
@@ -256,6 +258,7 @@ impl Default for Features {
 			tls_route_targets: true,
 			client_auth_no_verify: true,
 			misdirected: true,
+			tls_route_upstream: true,
 			server_cors: true,
 			server_redirect: true,
 			server_mirror: true,
@@ -286,6 +289,7 @@ impl Features {
 			tls_route_targets: c.feature("tls_route_targets"),
 			client_auth_no_verify: c.lists("client_auth_modes", "optional_no_verify"),
 			misdirected: opt("misdirected"),
+			tls_route_upstream: c.feature("tls_route_upstream"),
 			server_cors: c.lists("server_middleware_kinds", "cors"),
 			server_redirect: c.lists("server_middleware_kinds", "redirect_regex"),
 			server_mirror: c.lists("server_middleware_kinds", "mirror"),
@@ -314,6 +318,7 @@ impl Features {
 			tls_route_targets: self.tls_route_targets && o.tls_route_targets,
 			client_auth_no_verify: self.client_auth_no_verify && o.client_auth_no_verify,
 			misdirected: self.misdirected && o.misdirected,
+			tls_route_upstream: self.tls_route_upstream && o.tls_route_upstream,
 			server_cors: self.server_cors && o.server_cors,
 			server_redirect: self.server_redirect && o.server_redirect,
 			server_mirror: self.server_mirror && o.server_mirror,
@@ -1124,6 +1129,48 @@ fn http_ctx<'a>(
 	}
 }
 
+/// The BackendTLSPolicy of a TLSRoute's backends (the first backend that has one), as a `tls.routes[].upstream`;
+/// an error when the policy cannot be used. The policies naming its Services get status for this Gateway.
+fn route_backend_tls(
+	world: &World,
+	route: &crate::k8s::gateway::L4Route,
+	index: &backend_tls::Index,
+	used: &mut BTreeSet<world::Key>,
+) -> Option<Result<serde_json::Value, String>> {
+	let ns = route.metadata.namespace.clone().unwrap_or_default();
+	let mut found = None;
+	for b in route.spec.rules.iter().flat_map(|r| &r.backend_refs) {
+		let svc_ns = b.namespace.clone().unwrap_or_else(|| ns.clone());
+		used.extend(index.naming(&svc_ns, &b.name).cloned());
+		if found.is_some() {
+			continue;
+		}
+		let Some(port) = backends::port_name(world, &ns, b) else { continue };
+		found = match index.get(&svc_ns, &b.name, port.as_deref()) {
+			Some((_, backend_tls::Tls::Use(tls))) => Some(route_upstream(tls)),
+			Some((key, backend_tls::Tls::Invalid)) => Some(Err(format!("BackendTLSPolicy {}/{} cannot be used", key.0, key.1))),
+			None => None,
+		};
+	}
+	found
+}
+
+/// A service's `tls` (what a BackendTLSPolicy becomes for HTTP backends) as a `tls.routes[].upstream`: the same
+/// fields but `subject_alt_names`, which rproxy checks for HTTP services only.
+fn route_upstream(tls: &serde_json::Value) -> Result<serde_json::Value, String> {
+	if tls.get("subject_alt_names").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty()) {
+		return Err("subjectAltNames of a BackendTLSPolicy are not supported for TLSRoute backends".into());
+	}
+	let mut up = serde_json::Map::new();
+	up.insert("tls".into(), true.into());
+	for (k, v) in tls.as_object().into_iter().flatten() {
+		if k != "subject_alt_names" {
+			up.insert(k.clone(), v.clone());
+		}
+	}
+	Ok(serde_json::Value::Object(up))
+}
+
 fn l4_route(world: &World, kind: RouteKind, index: usize) -> &crate::k8s::gateway::L4Route {
 	match kind {
 		RouteKind::Tls => &world.tls_routes[index],
@@ -1269,6 +1316,24 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 			let passthrough =
 				listeners[a.listener].family == Some(Family::TlsPassthrough) && (has(Family::Https) || has(Family::TlsTerminate));
 			let mut tr = rp::TlsRoute { server_names: names, passthrough, ..Default::default() };
+			// a TLSRoute rproxy terminates: TLS again to a backend with a BackendTLSPolicy
+			let mut refused = false;
+			if listeners[a.listener].family == Some(Family::TlsTerminate) && !passthrough {
+				let policy = route_backend_tls(world, route, &tls_index, &mut tls_used);
+				match policy {
+					Some(Ok(up)) if opts.features.tls_route_upstream => tr.upstream = Some(up),
+					Some(Ok(_)) => {
+						let e = crate::render::needs(false, "TLS to a TLSRoute's backend (BackendTLSPolicy)", "tls_route_upstream").unwrap_err();
+						entry.1.get_or_insert(e);
+						refused = true;
+					}
+					// a policy that cannot be used (no CA, unsupported validation): nothing may be sent in plain text, and the
+					// policy's own status says why (as for an HTTPRoute's backend)
+					Some(Err(_)) => refused = true,
+					None => {}
+				}
+			}
+			let targets = if refused { vec![] } else { targets };
 			match targets.as_slice() {
 				// no usable backend: connections for its names are accepted and closed (Gateway API
 				// expects a reset, not a refused connection), through a port nothing listens on

@@ -827,6 +827,9 @@ pub fn build(ctx: &Ctx, route: &HttpRoute, hosts: Option<&[String]>, exclusions:
 				} else {
 					None
 				};
+			// HTTP/2 over TLS to the backends when a BackendTLSPolicy applies (h2c is HTTP/2 without TLS; rproxy refuses
+			// https servers with it)
+			let wanted = if wanted == Some("h2c") && svc.tls.is_some() { Some("h2") } else { wanted };
 			if let Some(p) = wanted {
 				match crate::render::needs(ctx.features.service_protocol, "HTTP/2 to backends (h2c)", "services protocol") {
 					Ok(()) => svc.protocol = Some(p),

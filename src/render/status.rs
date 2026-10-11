@@ -35,8 +35,13 @@ pub fn get<'a>(list: &'a [Cond], kind: &str) -> Option<&'a Cond> {
 
 /// Kubernetes conditions. `previous` (the conditions in the current status) keeps
 /// `lastTransitionTime` of a condition whose status did not change.
+/// The condition types this controller writes. Any other type in the previous status belongs to someone
+/// else (another controller, a tool) and is kept as it was (the Gateway API's GatewayPreserveForeignConditions).
+pub const OWN_CONDITION_TYPES: &[&str] =
+	&["Accepted", "Programmed", "ResolvedRefs", "Conflicted", "SupportedVersion", "PartiallyInvalid", "AttachedListenerSets", "Ready"];
+
 pub fn to_k8s(conds: &[Cond], generation: i64, previous: Option<&Value>, now: &str) -> Vec<Value> {
-	conds
+	let mut out: Vec<Value> = conds
 		.iter()
 		.map(|c| {
 			let status = if c.status { "True" } else { "False" };
@@ -51,7 +56,12 @@ pub fn to_k8s(conds: &[Cond], generation: i64, previous: Option<&Value>, now: &s
 				"observedGeneration": generation, "lastTransitionTime": since,
 			})
 		})
-		.collect()
+		.collect();
+	let foreign = previous.and_then(Value::as_array).into_iter().flatten().filter(|p| {
+		p["type"].as_str().is_some_and(|t| !OWN_CONDITION_TYPES.contains(&t) && !conds.iter().any(|c| c.kind == t))
+	});
+	out.extend(foreign.cloned());
+	out
 }
 
 /// The current time as a Kubernetes timestamp (seconds, UTC).
@@ -77,5 +87,22 @@ mod tests {
 		assert_eq!(list.len(), 1);
 		assert!(!get(&list, "A").unwrap().status);
 		assert!(now().ends_with('Z'));
+	}
+
+	// GatewayPreserveForeignConditions (Gateway API v1.7): types another writer owns stay as they were;
+	// our own types we no longer set go away
+	#[test]
+	fn foreign_conditions_are_kept() {
+		let foreign = json!({"type": "conformance.gateway.networking.k8s.io/StaleCondition", "status": "True", "reason": "Seeded",
+			"observedGeneration": 1, "lastTransitionTime": "2026-01-01T00:00:00Z", "message": ""});
+		let prev = json!([
+			{"type": "Accepted", "status": "True", "lastTransitionTime": "2026-01-01T00:00:00Z"},
+			{"type": "Conflicted", "status": "True", "lastTransitionTime": "2026-01-01T00:00:00Z"},
+			foreign,
+		]);
+		let out = to_k8s(&[Cond::ok("Accepted", "Accepted")], 2, Some(&prev), "NOW");
+		assert_eq!(out.len(), 2, "{out:?}");
+		assert_eq!(out[0]["type"], "Accepted");
+		assert_eq!(out[1], foreign);
 	}
 }
