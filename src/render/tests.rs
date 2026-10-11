@@ -808,7 +808,9 @@ fn tls_route_terminated_with_a_backend_tls_policy() {
 			indent(&crt),
 			indent(&key),
 			indent(&ca),
-			gw(r#"  - {name: tls, port: 8443, protocol: TLS, hostname: tls.example.com, tls: {mode: Terminate, certificateRefs: [{name: cert}]}}"#),
+			gw(
+				r#"  - {name: tls, port: 8443, protocol: TLS, hostname: tls.example.com, tls: {mode: Terminate, certificateRefs: [{name: cert}]}}"#
+			),
 			format!(
 				r#"
 ---
@@ -844,7 +846,11 @@ spec:
 
 	// an rproxy without tls.routes[].upstream: the route is not served in plain text
 	let w = world(&yaml("{caCertificateRefs: [{group: \"\", kind: ConfigMap, name: ca}], hostname: abc.example.com}"));
-	let old = render_gateway(&w, &w.gateways[0], &Options { features: Features { tls_route_upstream: false, ..Default::default() }, ..Default::default() });
+	let old = render_gateway(
+		&w,
+		&w.gateways[0],
+		&Options { features: Features { tls_route_upstream: false, ..Default::default() }, ..Default::default() },
+	);
 	let route = &old.rules_json()[0]["tls"]["routes"][0];
 	assert!(route.get("upstream").is_none());
 	assert_eq!((route["remote_addr"].as_str(), route["remote_port"].as_u64()), (Some("127.0.0.1"), Some(1)), "{route}");

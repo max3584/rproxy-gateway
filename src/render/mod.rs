@@ -1323,7 +1323,8 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 				match policy {
 					Some(Ok(up)) if opts.features.tls_route_upstream => tr.upstream = Some(up),
 					Some(Ok(_)) => {
-						let e = crate::render::needs(false, "TLS to a TLSRoute's backend (BackendTLSPolicy)", "tls_route_upstream").unwrap_err();
+						let e = crate::render::needs(false, "TLS to a TLSRoute's backend (BackendTLSPolicy)", "tls_route_upstream")
+							.unwrap_err();
 						entry.1.get_or_insert(e);
 						refused = true;
 					}

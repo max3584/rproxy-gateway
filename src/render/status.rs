@@ -57,9 +57,11 @@ pub fn to_k8s(conds: &[Cond], generation: i64, previous: Option<&Value>, now: &s
 			})
 		})
 		.collect();
-	let foreign = previous.and_then(Value::as_array).into_iter().flatten().filter(|p| {
-		p["type"].as_str().is_some_and(|t| !OWN_CONDITION_TYPES.contains(&t) && !conds.iter().any(|c| c.kind == t))
-	});
+	let foreign = previous
+		.and_then(Value::as_array)
+		.into_iter()
+		.flatten()
+		.filter(|p| p["type"].as_str().is_some_and(|t| !OWN_CONDITION_TYPES.contains(&t) && !conds.iter().any(|c| c.kind == t)));
 	out.extend(foreign.cloned());
 	out
 }
