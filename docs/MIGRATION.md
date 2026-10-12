@@ -6,7 +6,7 @@ English: [en/MIGRATION.md](en/MIGRATION.md)
 
 - Ingress・Traefik のリソースの中身には何も書かない。状態は、Ingress の `status.loadBalancer.ingress` に移行先の Gateway のアドレス（`status.addresses`）を書く（`kubectl get ingress` の ADDRESS、external-dns などが読む）。Traefik の CRD には状態の欄がないので書かない。
 - Traefik の CRD は、コントローラが動き出したあとに入れてもよい（30 秒ごとに API サーバに聞き直し、出てきた種類の watch を始める。再起動は要らない）。Gateway API の CRD も同じ。
-- 変換は rproxy-api の `contrib/traefik2rproxy.py`（docs/MIGRATING-FROM-TRAEFIK.md）と同じ。変換できないものは外して、コントローラのログ（`migration: not converted`、内容が変わったときに 1 回）と `rproxy-gateway render` の `notes` に出す。
+- 変換は rproxy-api の `rproxy-traefik-convert`（docs/MIGRATING-FROM-TRAEFIK.md）と同じ実装（crate `rproxy-traefik`）を使う。ルーターのルールとミドルウェアの対応はファイルプロバイダから移すときと同じで、違うのは Kubernetes の部分（Service・Secret・namespace・ReferenceGrant）だけ。変換できないものは外して、コントローラのログ（`migration: not converted`、内容が変わったときに 1 回）と `rproxy-gateway render` の `notes` に出す。
 - 移行先の Gateway に同じポートのリスナーがあれば、そのルールに足す（`http` どうし・TLS の有無が同じとき）。合わなければ移行するほうを外す。
 - 移行したルートは Traefik と同じ優先（`priority`、なければ `match` の長さ）。Gateway API のルートの `priority` は 1 からの番号なので、同じポートでは移行したルートが先に試されることが多い。
 
@@ -23,7 +23,7 @@ English: [en/MIGRATION.md](en/MIGRATION.md)
 
 | 元 | rproxy |
 |---|---|
-| IngressRoute の `match` | そのまま（rproxy の `match` は Traefik v3 の書き方）。v2 の `Headers`・`HeadersRegexp`・`HostHeader`・`Query(a=b)` は書き直す。v2 のプレースホルダ（`{name:regex}`）とほかの matcher は外す |
+| IngressRoute の `match` | そのまま（rproxy の `match` は Traefik v3 の書き方）。v2 の `Headers`・`HeadersRegexp`・`HostHeader`・`Query(a=b)` は書き直す。v2 のプレースホルダ（`{name:regex}`）は `Host` を `HostRegexp`、`Path`・`PathPrefix` を `PathRegexp` にする。`"..."` の引数は Go の文字列として読む。rproxy にない matcher を使うルートは外す |
 | IngressRoute の `services`（Service、port は番号か名前） | EndpointSlice の Pod の IP の `servers`。`scheme`（なければポート 443・名前が https で始まるものは https）、`weight`、`passHostHeader: false`。`TraefikService` は外す |
 | IngressRoute の `tls.secretName` | 証明書のファイル（Secret のボリューム） |
 | `tls.certResolver` | `{acme: <resolver>, domains: [...]}`（`domains`、なければ `Host()` の名前）。rproxy の設定ファイルの `global.acme` にそのリゾルバが要る |

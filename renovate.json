@@ -53,6 +53,13 @@
         "cargo"
       ],
       "rangeStrategy": "update-lockfile"
+    },
+    {
+      "description": "Traefik からの変換の crate（rproxy-api のタグ）は変換の結果が変わりうるので、自動でマージせず PR で確かめる",
+      "matchPackageNames": [
+        "rproxy-traefik"
+      ],
+      "automerge": false
     }
   ]
 }

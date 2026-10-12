@@ -1,9 +1,11 @@
 //! Migration readers (rproxy-api docs/DESIGN-v0.4.md 3.3, optional): Ingress
 //! (`ingressClassName`, default `rproxy`) and Traefik's IngressRoute,
 //! IngressRouteTCP, IngressRouteUDP, Middleware and TLSOption → rules added to
-//! the rule set of one Gateway (`--migrate-to <namespace>/<name>`). The mapping
-//! follows rproxy-api's `contrib/traefik2rproxy.py`
-//! (docs/MIGRATING-FROM-TRAEFIK.md). Read only: nothing is written back; what
+//! the rule set of one Gateway (`--migrate-to <namespace>/<name>`). Router rules,
+//! middlewares and the TLS mappings are rproxy-api's `rproxy-traefik` crate (the
+//! conversion `rproxy-traefik-convert` does for the file provider,
+//! docs/MIGRATING-FROM-TRAEFIK.md); this module reads the Kubernetes objects
+//! (Services, Secrets, ReferenceGrants). Read only: nothing is written back; what
 //! cannot be converted is left out with a note (the controller logs them,
 //! `rproxy-gateway render` prints them).
 //!
@@ -14,12 +16,14 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::api::networking::v1::Ingress;
+use rproxy_traefik::value::{as_bool, as_int, as_str_list, g};
+use rproxy_traefik::{self as traefik, NoteSink};
 use serde_json::{Value, json};
 
 use crate::k8s::gateway::BackendRef;
 use crate::k8s::traefik::{IngressRoute, IngressRouteTcp, IngressRouteUdp, Middleware, RouteTls, ServiceRef, TlsOption};
 use crate::render::backends::{self, Endpoint};
-use crate::render::traefik_mw::{self, Converted, as_bool, as_list, g};
+use crate::render::traefik_mw::{self, ChainRef, Converted};
 use crate::render::world::{Key, World};
 use crate::render::{Options, cert_files};
 use crate::rproxy::model as rp;
@@ -167,6 +171,12 @@ impl Ctx<'_> {
 	}
 }
 
+impl NoteSink for Ctx<'_> {
+	fn note(&mut self, where_: &str, text: &str) {
+		Ctx::note(self, if where_.is_empty() { text.to_string() } else { format!("{where_}: {text}") })
+	}
+}
+
 impl traefik_mw::Sink for Ctx<'_> {
 	fn note(&mut self, text: String) {
 		Ctx::note(self, text)
@@ -267,11 +277,11 @@ impl Ctx<'_> {
 	}
 
 	/// A Middleware chain → names in `port`'s middlewares (converted once each).
-	fn middleware_chain(&mut self, route_ns: &str, refs: &[(Option<String>, String)], depth: usize) -> Vec<String> {
+	fn middleware_chain(&mut self, route_ns: &str, refs: &[ChainRef], depth: usize) -> Vec<String> {
 		let mut out = vec![];
-		for (ns, name) in refs {
-			let ns = ns.clone().unwrap_or_else(|| route_ns.to_string());
-			let name = name.split('@').next().unwrap_or(name).to_string();
+		for r in refs {
+			let ns = r.namespace.clone().unwrap_or_else(|| route_ns.to_string());
+			let name = r.name.split('@').next().unwrap_or(&r.name).to_string();
 			if !self.cross(route_ns, ("traefik.io", "Middleware", &ns, &name)) {
 				continue;
 			}
@@ -353,20 +363,19 @@ impl Ctx<'_> {
 
 	fn tls_option(&mut self, ns: &str, name: &str, spec: &Value, key: (rp::Protocol, u16)) {
 		let label = format!("TLSOption {ns}/{name}");
+		let spec = traefik::Value::from(spec);
 		let mut options = serde_json::Map::new();
-		match g(spec, &["minVersion"]).and_then(Value::as_str) {
-			Some("VersionTLS12") => {
-				options.insert("min_version".into(), json!("1.2"));
+		if let Some(v) = g(&spec, &["minVersion"]).and_then(traefik::Value::as_str) {
+			match traefik::tls_version(v) {
+				Some(r) => {
+					options.insert("min_version".into(), json!(r));
+				}
+				None => self.note(format!("{label}: minVersion {v}: rproxy supports TLS 1.2 and 1.3 only")),
 			}
-			Some("VersionTLS13") => {
-				options.insert("min_version".into(), json!("1.3"));
-			}
-			Some(v) => self.note(format!("{label}: minVersion {v}: rproxy supports TLS 1.2 and 1.3 only")),
-			None => {}
 		}
 		let mut suites = vec![];
-		for s in as_list(g(spec, &["cipherSuites"])) {
-			match cipher(&s) {
+		for s in as_str_list(g(&spec, &["cipherSuites"])) {
+			match traefik::cipher_suite(&s) {
 				Some(r) => suites.push(r),
 				None => self.note(format!("{label}: cipher suite {s} is not available in rproxy; left out")),
 			}
@@ -374,20 +383,16 @@ impl Ctx<'_> {
 		if !suites.is_empty() {
 			options.insert("cipher_suites".into(), json!(suites));
 		}
-		if g(spec, &["maxVersion"]).is_some() || g(spec, &["curvePreferences"]).is_some() || as_bool(g(spec, &["sniStrict"]), false) {
+		if g(&spec, &["maxVersion"]).is_some() || g(&spec, &["curvePreferences"]).is_some() || as_bool(g(&spec, &["sniStrict"]), false) {
 			self.note(format!("{label}: maxVersion / curvePreferences / sniStrict are not converted"));
 		}
-		let alpn = as_list(g(spec, &["alpnProtocols"]));
+		let alpn = as_str_list(g(&spec, &["alpnProtocols"]));
 		let mut client_auth = None;
-		if let Some(ca) = g(spec, &["clientAuth"]) {
-			let mode = match g(ca, &["clientAuthType"]).and_then(Value::as_str).unwrap_or("NoClientCert") {
-				"RequestClientCert" | "VerifyClientCertIfGiven" => "optional",
-				"RequireAnyClientCert" | "RequireAndVerifyClientCert" => "required",
-				_ => "none",
-			};
+		if let Some(ca) = g(&spec, &["clientAuth"]) {
+			let mode = traefik::client_auth_mode(g(ca, &["clientAuthType"]).and_then(traefik::Value::as_str).unwrap_or("NoClientCert"));
 			if mode != "none" {
 				let mut auth = json!({"mode": mode});
-				let names = as_list(g(ca, &["secretNames"]));
+				let names = as_str_list(g(ca, &["secretNames"]));
 				let mut pem = vec![];
 				for n in &names {
 					let data = self.world.secrets.get(&(ns.to_string(), n.clone())).and_then(|s| s.data.clone()).unwrap_or_default();
@@ -434,149 +439,6 @@ impl Ctx<'_> {
 	}
 }
 
-/// Go (Traefik) cipher suite names → rustls names.
-fn cipher(s: &str) -> Option<String> {
-	Some(
-		match s {
-			"TLS_AES_128_GCM_SHA256" => "TLS13_AES_128_GCM_SHA256",
-			"TLS_AES_256_GCM_SHA384" => "TLS13_AES_256_GCM_SHA384",
-			"TLS_CHACHA20_POLY1305_SHA256" => "TLS13_CHACHA20_POLY1305_SHA256",
-			"TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"
-			| "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"
-			| "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
-			| "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
-			| "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256"
-			| "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256" => s,
-			"TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305" => "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
-			"TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305" => "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
-			_ => return None,
-		}
-		.to_string(),
-	)
-}
-
-const HTTP_MATCHERS: &[&str] =
-	&["Host", "HostRegexp", "Path", "PathPrefix", "PathRegexp", "Method", "Header", "HeaderRegexp", "Query", "QueryRegexp", "ClientIP"];
-
-/// A Traefik v2 / v3 router rule → rproxy's `match` (v3 syntax), or why not.
-pub fn translate_rule(rule: &str) -> Result<String, String> {
-	let mut out = String::new();
-	let chars: Vec<char> = rule.trim().chars().collect();
-	let mut i = 0;
-	while i < chars.len() {
-		let c = chars[i];
-		if c.is_ascii_alphabetic() {
-			let start = i;
-			while i < chars.len() && chars[i].is_ascii_alphanumeric() {
-				i += 1;
-			}
-			let mut name: String = chars[start..i].iter().collect();
-			// the arguments
-			let args_start = i;
-			let mut args: Vec<String> = vec![];
-			let mut j = i;
-			while j < chars.len() && chars[j].is_whitespace() {
-				j += 1;
-			}
-			if j >= chars.len() || chars[j] != '(' {
-				return Err(format!("{name}: expected ("));
-			}
-			j += 1;
-			loop {
-				while j < chars.len() && (chars[j].is_whitespace() || chars[j] == ',') {
-					j += 1;
-				}
-				if j >= chars.len() {
-					return Err("unterminated matcher".into());
-				}
-				if chars[j] == ')' {
-					j += 1;
-					break;
-				}
-				let q = chars[j];
-				if q != '`' && q != '"' {
-					return Err(format!("{name}: arguments are quoted"));
-				}
-				j += 1;
-				let s0 = j;
-				while j < chars.len() && chars[j] != q {
-					if q == '"' && chars[j] == '\\' {
-						j += 1;
-					}
-					j += 1;
-				}
-				if j >= chars.len() {
-					return Err("unterminated string".into());
-				}
-				args.push(chars[s0..j].iter().collect());
-				j += 1;
-			}
-			let _ = args_start;
-			i = j;
-			match name.as_str() {
-				"Headers" => name = "Header".into(),
-				"HeadersRegexp" => name = "HeaderRegexp".into(),
-				"HostHeader" => name = "Host".into(),
-				_ => {}
-			}
-			if name == "Query" && args.len() == 1 && args[0].contains('=') {
-				let (k, v) = args[0].split_once('=').unwrap();
-				args = vec![k.to_string(), v.to_string()];
-			}
-			if !HTTP_MATCHERS.contains(&name.as_str()) {
-				return Err(format!("matcher {name} has no rproxy equivalent"));
-			}
-			if args.iter().any(|a| has_placeholder(a)) {
-				return Err(format!("{name} with v2 placeholders ({{name}} / {{name:regex}}) is not converted"));
-			}
-			let quoted: Vec<String> = args.iter().map(|a| if a.contains('`') { format!("\"{a}\"") } else { format!("`{a}`") }).collect();
-			out.push_str(&format!("{name}({})", quoted.join(", ")));
-			continue;
-		}
-		out.push(c);
-		i += 1;
-	}
-	Ok(out)
-}
-
-/// A Traefik v2 placeholder: `{name}` or `{name:regex}`.
-fn has_placeholder(s: &str) -> bool {
-	let b = s.as_bytes();
-	for i in 0..b.len() {
-		if b[i] != b'{' {
-			continue;
-		}
-		let mut j = i + 1;
-		if j < b.len() && (b[j].is_ascii_alphabetic() || b[j] == b'_') {
-			while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
-				j += 1;
-			}
-			if j < b.len() && (b[j] == b':' || b[j] == b'}') {
-				return true;
-			}
-		}
-	}
-	false
-}
-
-/// `Host(...)` names of a rule (for certResolver domains).
-fn host_names(rule: &str) -> Vec<String> {
-	let mut out = vec![];
-	let mut rest = rule;
-	while let Some(i) = rest.find("Host(") {
-		let after = &rest[i + 5..];
-		let end = after.find(')').unwrap_or(after.len());
-		for part in after[..end].split(',') {
-			let n = part.trim().trim_matches('`').trim_matches('"');
-			if !n.is_empty() && !n.contains('{') {
-				out.push(n.to_ascii_lowercase());
-			}
-		}
-		rest = &after[end..];
-	}
-	out
-}
-
 /// `HostSNI(a, b)` / `HostSNIRegexp(...)` → server names (rproxy syntax); empty for `*`.
 fn sni_names(rule: &str, notes: &mut Vec<String>, what: &str) -> Vec<String> {
 	let mut out = vec![];
@@ -595,7 +457,7 @@ fn sni_names(rule: &str, notes: &mut Vec<String>, what: &str) -> Vec<String> {
 					continue;
 				}
 				if regexp {
-					match sni_regexp(&n) {
+					match traefik::sni_regexp_pattern(&n) {
 						Some(p) => out.push(p),
 						None => notes.push(format!("{what}: HostSNIRegexp `{n}` is not a plain suffix; not converted")),
 					}
@@ -607,27 +469,6 @@ fn sni_names(rule: &str, notes: &mut Vec<String>, what: &str) -> Vec<String> {
 		}
 	}
 	out
-}
-
-/// `^.+\.example\.com$` → `**.example.com`, `^[^.]+\.example\.com$` → `*.example.com`.
-fn sni_regexp(regex: &str) -> Option<String> {
-	let body = regex.trim().trim_start_matches('^').trim_end_matches('$');
-	for (prefixes, wildcard) in [
-		(&[".+", ".*", "(.+)", "(.*)"][..], "**."),
-		(&["[^.]+", "[^\\.]+", "[a-z0-9-]+", "[a-zA-Z0-9-]+", "[0-9a-z-]+", "[-a-z0-9]+"][..], "*."),
-	] {
-		for p in prefixes {
-			if let Some(rest) = body.strip_prefix(&format!("{p}\\.")) {
-				let suffix = rest.replace("\\.", ".");
-				if !suffix.is_empty()
-					&& suffix.split('.').all(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
-				{
-					return Some(format!("{wildcard}{}", suffix.to_ascii_lowercase()));
-				}
-			}
-		}
-	}
-	None
 }
 
 /// Renders the migrated resources.
@@ -651,15 +492,10 @@ pub fn render(world: &World, settings: &Settings, opts: &Options) -> Out {
 		for key in ctx.entry_points(&ir.spec.entry_points, rp::Protocol::Tcp, &what) {
 			ctx.port = key;
 			for (i, r) in ir.spec.routes.iter().enumerate() {
-				let rule = match translate_rule(&r.rule) {
-					Ok(x) => x,
-					Err(e) => {
-						ctx.note(format!("{what} route {i}: {e}; left out"));
-						continue;
-					}
-				};
-				let mws =
-					ctx.middleware_chain(&ns, &r.middlewares.iter().map(|m| (m.namespace.clone(), m.name.clone())).collect::<Vec<_>>(), 0);
+				let Some(rule) = traefik::translate_http_rule(&r.rule, &format!("{what} route {i}"), &mut ctx) else { continue };
+				let refs: Vec<ChainRef> =
+					r.middlewares.iter().map(|m| ChainRef { name: m.name.clone(), namespace: m.namespace.clone() }).collect();
+				let mws = ctx.middleware_chain(&ns, &refs, 0);
 				let answered = mws.iter().any(|n| {
 					ctx.out.ports[&key]
 						.middlewares
@@ -697,7 +533,7 @@ pub fn render(world: &World, settings: &Settings, opts: &Options) -> Out {
 				};
 				match &ir.spec.tls {
 					Some(tls) => {
-						ctx.router_tls(&ns, tls, &host_names(&rule), key);
+						ctx.router_tls(&ns, tls, &traefik::host_names(&r.rule), key);
 						ctx.port(key).tls_routes.push(route);
 					}
 					None => ctx.port(key).routes.push(route),
@@ -826,7 +662,10 @@ pub fn render(world: &World, settings: &Settings, opts: &Options) -> Out {
 					ctx.note(format!("{what} route {i}: no usable service; left out"));
 					continue;
 				}
-				let proxy = r.services.iter().find_map(|s| s.proxy_protocol.as_ref().and_then(|p| traefik_mw::as_int(g(p, &["version"]))));
+				let proxy = r
+					.services
+					.iter()
+					.find_map(|s| s.proxy_protocol.as_ref().and_then(|p| as_int(g(&traefik::Value::from(p), &["version"]), None)));
 				let passthrough = ir.spec.tls.as_ref().map(|t| t.passthrough);
 				if let Some(tls) = ir.spec.tls.as_ref().filter(|t| !t.passthrough) {
 					ctx.router_tls(&ns, tls, &names, key);

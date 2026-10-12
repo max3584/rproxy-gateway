@@ -16,7 +16,13 @@ targets = [
 # vulnerabilities, unmaintained and unsound crates and yanked versions all fail the check
 unmaintained = "all"
 yanked = "deny"
-ignore = []
+ignore = [
+    # unsafe-libyaml (serde_yaml_ng's YAML parser and emitter) is archived. It comes with
+    # rproxy-traefik (rproxy-api's Traefik converter, which reads Traefik's YAML files);
+    # there is no fixed version. Remove when serde_yaml_ng (or a replacement) no longer
+    # uses it (rproxy-api's deny.toml has the same entry).
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is archived; serde_yaml_ng still uses it and has no replacement yet" },
+]
 
 [licenses]
 # what the dependency tree uses today (cargo deny list); all permissive
@@ -41,3 +47,6 @@ allow-wildcard-paths = true
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# rproxy-traefik (the Traefik → rproxy conversion shared with rproxy-api's
+# rproxy-traefik-convert) is not on crates.io; Cargo.toml pins it to a tag of rproxy-api
+allow-git = ["https://github.com/max3584/rproxy-api"]
