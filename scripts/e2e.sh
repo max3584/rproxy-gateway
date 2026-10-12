@@ -243,6 +243,10 @@ ew fqdn | jq -e '.path == "/fqdn" and .headers["X-Via"] == ["rproxy-east-west"]'
 ew externalname | jq -e '.path == "/ext" and .host == "api-ext" and .headers["X-Via"] == ["rproxy-east-west"]' > /dev/null
 # TCP: no header, but only rproxy listens on 9100 (the backend on 3000)
 ew tcp | jq -e '.path == "/tcp" and .namespace == "east-west" and (.headers["X-Via"] == null)' > /dev/null
+# the client's pod IP reaches the backend in X-Forwarded-For (kube-proxy passed once, to rproxy)
+client_ip=$(kubectl -n east-west get pod client -o jsonpath='{.status.podIP}')
+echo "client pod IP: $client_ip"
+ew selector | jq -e --arg ip "$client_ip" '.headers["X-Forwarded-For"] | any(split(", ") | index($ip))' > /dev/null
 kubectl delete namespace east-west --wait=true > /dev/null
 
 if [ -n "${MIGRATE:-}" ]; then
