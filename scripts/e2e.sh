@@ -44,7 +44,14 @@ docker build -q -t rproxy:e2e --build-arg TARGETARCH=amd64 -f Dockerfile.rproxy 
 echo "== cluster"
 kind get clusters | grep -qx "$CLUSTER" || kind create cluster --name "$CLUSTER" ${KIND_NODE_IMAGE:+--image "$KIND_NODE_IMAGE"} --wait 180s
 kind load docker-image --name "$CLUSTER" rproxy-gateway:e2e rproxy:e2e
-kubectl apply --server-side -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/$GATEWAY_API_VERSION/$GATEWAY_API_CHANNEL-install.yaml" > /dev/null
+# GitHub's release downloads sometimes answer 5xx for a moment: try a few times
+crds=$(mktemp)
+for i in 1 2 3 4 5; do
+  curl -fsSL --retry 3 --retry-all-errors -o "$crds" "https://github.com/kubernetes-sigs/gateway-api/releases/download/$GATEWAY_API_VERSION/$GATEWAY_API_CHANNEL-install.yaml" && break
+  [ "$i" = 5 ] && { echo "cannot download the Gateway API CRDs"; exit 1; }
+  sleep $((i * 5))
+done
+kubectl apply --server-side -f "$crds" > /dev/null
 # the runner reaches ClusterIPs (Gateway addresses) through the kind node (kube-proxy there)
 node_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CLUSTER-control-plane")
 svc_cidr=$(kubectl get svc kubernetes -o jsonpath='{.spec.clusterIP}' | awk -F. '{print $1"."$2".0.0/16"}')
