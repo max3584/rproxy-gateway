@@ -300,7 +300,14 @@ kubectl apply -f "https://github.com/cert-manager/cert-manager/releases/download
 for d in cert-manager cert-manager-cainjector cert-manager-webhook; do kubectl -n cert-manager rollout status deploy/$d --timeout=300s; done
 
 log "== Gateway API $GATEWAY_API_VERSION (experimental channel)"
-kubectl apply --server-side -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/$GATEWAY_API_VERSION/experimental-install.yaml" > /dev/null
+# GitHub's release downloads sometimes answer 5xx for a moment: try a few times
+crds=$(mktemp)
+for i in 1 2 3 4 5; do
+  curl -fsSL --retry 3 --retry-all-errors -o "$crds" "https://github.com/kubernetes-sigs/gateway-api/releases/download/$GATEWAY_API_VERSION/experimental-install.yaml" && break
+  [ "$i" = 5 ] && { echo "cannot download the Gateway API CRDs"; exit 1; }
+  sleep $((i * 5))
+done
+kubectl apply --server-side -f "$crds" > /dev/null
 
 # ---------------------------------------------------------------- install
 image_args=()

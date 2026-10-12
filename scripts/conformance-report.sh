@@ -36,7 +36,14 @@ REPORT=$OUT_DIR/$GATEWAY_API_CHANNEL-v$VERSION-default-report.yaml
 echo "== cluster"
 kind get clusters | grep -qx "$CLUSTER" || kind create cluster --name "$CLUSTER" --wait 180s
 kubectl config use-context "kind-$CLUSTER" > /dev/null
-kubectl apply --server-side -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/$GATEWAY_API_VERSION/$GATEWAY_API_CHANNEL-install.yaml" > /dev/null
+# GitHub's release downloads sometimes answer 5xx for a moment: try a few times
+crds=$(mktemp)
+for i in 1 2 3 4 5; do
+  curl -fsSL --retry 3 --retry-all-errors -o "$crds" "https://github.com/kubernetes-sigs/gateway-api/releases/download/$GATEWAY_API_VERSION/$GATEWAY_API_CHANNEL-install.yaml" && break
+  [ "$i" = 5 ] && { echo "cannot download the Gateway API CRDs"; exit 1; }
+  sleep $((i * 5))
+done
+kubectl apply --server-side -f "$crds" > /dev/null
 # the suite (on this host) reaches the Gateways' ClusterIPs through the kind node (kube-proxy there)
 node_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CLUSTER-control-plane")
 svc_cidr=$(kubectl get svc kubernetes -o jsonpath='{.spec.clusterIP}' | awk -F. '{print $1"."$2".0.0/16"}')
@@ -71,6 +78,12 @@ fi
 known=$(grep -ohE '"(GATEWAY|MESH)-[A-Z]+"' "$work/gateway-api/conformance/utils/suite/profiles.go" | tr -d '"' | sort -u)
 PROFILES=$(tr ',' '\n' <<< "$PROFILES" | grep -Fxf <(echo "$known") | paste -sd, -)
 echo "profiles in this suite: $PROFILES"
+# the suite's Go modules first, tried a few times (the module proxy sometimes fails a request)
+for i in 1 2 3 4 5; do
+  (cd "$work/gateway-api" && GOTOOLCHAIN=auto go mod download) && break
+  [ "$i" = 5 ] && { echo "cannot download the suite's Go modules"; exit 1; }
+  sleep $((i * 5))
+done
 status=0
 (
   cd "$work/gateway-api"
