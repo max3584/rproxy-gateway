@@ -444,6 +444,75 @@ spec:
 
 - The Gateway's `status.addresses` is the Service's ClusterIP. To use a name, find the Service (`rproxy-<id>`) with `kubectl -n default get svc -l gateway.networking.k8s.io/gateway-name=web` and use `<Service>.<namespace>.svc`.
 - Failover is the Service's endpoints (kube-proxy, the CNI); replaced pods leave through the readiness gate and `/readyz`.
+- To send in-cluster clients' traffic through rproxy (keeping the original Service name), see "[Sending in-cluster (east-west) traffic through rproxy](#sending-in-cluster-east-west-traffic-through-rproxy)" next.
+
+## Sending in-cluster (east-west) traffic through rproxy
+
+To give in-cluster clients (other pods) rproxy's features too (rate limits, GeoIP, CrowdSec, TLS termination, L7 routing, access logs), create a ClusterIP Gateway as above and route to the real backend Service. Clients call the name of the Gateway's Service. The e2e test (the "east-west" step of `scripts/e2e.sh`) checks this setup (HTTPRoute, TCPRoute, both ways of naming below) from a pod inside the cluster.
+
+### Keeping the original Service name (recommended)
+
+If clients should keep their settings (`http://api`), rename the real backend Service (`api` → `api-backend`) and point the original name `api` at rproxy.
+
+```yaml
+# the real backend (the old api's selector and ports, only renamed)
+apiVersion: v1
+kind: Service
+metadata: {name: api-backend, namespace: shop}
+spec:
+  selector: {app: api}
+  ports: [{name: http, port: 8080, targetPort: 3000}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {name: internal, namespace: shop}
+spec:
+  gatewayClassName: rproxy          # managed.serviceType=ClusterIP (or the RproxyGatewayParameters above)
+  listeners:
+    - {name: http, port: 80, protocol: HTTP}
+    - {name: tcp, port: 9100, protocol: TCP}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: api, namespace: shop}
+spec:
+  parentRefs: [{name: internal, sectionName: http}]
+  # the Host clients send (short name, FQDN); without hostnames, any Host
+  hostnames: [api, api.shop, api.shop.svc, api.shop.svc.cluster.local]
+  rules: [{backendRefs: [{name: api-backend, port: 8080}]}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata: {name: api, namespace: shop}
+spec:
+  parentRefs: [{name: internal, sectionName: tcp}]
+  rules: [{backendRefs: [{name: api-backend, port: 8080}]}]
+---
+# the original name: selects the Gateway's rproxy pods
+apiVersion: v1
+kind: Service
+metadata: {name: api, namespace: shop}
+spec:
+  selector:
+    app.kubernetes.io/name: rproxy
+    gateway.networking.k8s.io/gateway-name: internal
+  ports:
+    - {name: http, port: 80, targetPort: 80}       # targetPort is the listener's port
+    - {name: tcp, port: 9100, targetPort: 9100}
+```
+
+- **Selecting by labels (recommended)**: the controller puts `app.kubernetes.io/name: rproxy` and `gateway.networking.k8s.io/gateway-name: <Gateway name>` (Gateway API's standard label) on a Gateway's rproxy pods. A Service's selector only picks pods in its own namespace, so these two pin the Gateway. It keeps working when the Gateway is created again (and the Service `rproxy-<id>` gets a new name), and `port` and `targetPort` can differ. Through the readiness gate, pods that have not applied their rule set yet and pods shutting down get no traffic. Do not select on `rproxy.max3584.net/gateway` (`<id>`): it contains a hash of the Gateway's uid.
+- **ExternalName**: `spec: {type: ExternalName, externalName: rproxy-<id>.shop.svc.cluster.local}` works too (a DNS CNAME). But `rproxy-<id>` changes when the Gateway is created again, so it must be rewritten, and ports cannot be mapped (clients call the listener's port). The HTTP Host stays the name the client used (`api`).
+- You can also change the original Service's selector to the rproxy pods, but if Helm or Argo CD owns that Service, the next sync puts it back (and it keeps showing as a diff). With a rename, the app's chart or manifests rename their Service to `api-backend` and `api` lives in the rproxy side's manifests, so the owners do not collide.
+- Order of the switch: create `api-backend`, the Gateway and the routes first; once the Gateway is `Programmed`, swap `api` (delete it from the app's chart, create the rproxy side's `api`). Only during the swap can `api` have no endpoints.
+
+### Limits
+
+- One more hop: client → rproxy → backend, through rproxy in userspace once (that much latency and CPU).
+- kube-proxy (the Service's ClusterIP) is passed only once, from the client to rproxy. rproxy sends to pod IPs directly from the route's Service's EndpointSlices. The backend sees the rproxy pod's IP as the source; for HTTP, the client pod's IP arrives in `X-Forwarded-For` (checked by the e2e test). For TCP and UDP the client's IP does not arrive (every connection looks like it comes from rproxy).
+- It does not replace kube-proxy or the CNI: set this up only for the Services you want through rproxy. Services without routes are reached through kube-proxy as before.
+- If rproxy is down, the Service is unreachable. Set `managed.replicas` (or the parameters' `replicas`) to 2 or more.
+- NetworkPolicy: the NetworkPolicy the controller creates lets the listener ports in from anywhere. If the clients' namespace restricts egress, open the listener ports of the rproxy pods.
 
 ## Moving off v0.4.4's `fleet.vip`
 
