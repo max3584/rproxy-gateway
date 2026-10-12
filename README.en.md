@@ -81,18 +81,18 @@ spec:
 
 ### Supported versions
 
-Kubernetes 1.29 or later (the chart's `kubeVersion`) with Gateway API CRDs v1.0 or later (v1.0 and v1.1 with the limits below). The pairings below pass the e2e in the compatibility run (every Monday, or by hand with `gh workflow run e2e.yml -f compat=true`). The pairings are worked out from what is released at run time, so a new Kubernetes (the newest patch and the next minor's beta / rc) or Gateway API is in the next run; v1.5 and v1.6 (the latest two) also pass conformance core.
+Kubernetes 1.26 or later (the chart's `kubeVersion`; 1.26 to 1.37.x are checked, and newer versions are added by the weekly compatibility run) with Gateway API CRDs v1.0 or later (v1.0 and v1.1 with the limits below). The pairings below pass the e2e in the compatibility run (every Monday, or by hand with `gh workflow run e2e.yml -f compat=true`). The pairings are worked out from what is released at run time, so a new Kubernetes (the newest patch and the next minor's beta / rc) or Gateway API is in the next run; v1.5 and v1.6 (the latest two) also pass conformance core.
 
 | Gateway API CRDs | Kubernetes needed (for the CRDs' validation) | Pairings checked |
 |---|---|---|
 | v1.0 | — | k8s 1.37. Gateway `infrastructure.parametersRef` came with v1.1, so per-Gateway RproxyGatewayParameters are not available (the GatewayClass parametersRef is) |
 | v1.1 | — | k8s 1.37. The three GRPC conformance tests fail from a bug in the v1.1 suite (parallel tests share one gRPC connection and the first to finish closes it; fixed in v1.2). The requests reach the right backends ([#61](https://github.com/max3584/rproxy-gateway/issues/61)) |
-| v1.2, v1.3, v1.4 | 1.29 or later | k8s 1.29, 1.30 (v1.4); 1.37 (v1.2-v1.4) |
+| v1.2, v1.3, v1.4 | 1.26 or later (the chart's minimum) | k8s 1.26-1.30 (v1.4; 1.26-1.28 also v1.2); 1.37 (v1.2-v1.4) |
 | v1.5 | 1.31 or later (`isIP`) | k8s 1.31, 1.37 |
 | v1.6 | 1.32 or later (`dns1123Label`) | k8s 1.32-1.37 |
 | v1.7.0-rc.1 | — | k8s 1.37 |
 
-Kubernetes older than the chart allows is checked too, with `kubeVersion` relaxed for those runs only (recorded): 1.26 to 1.28 pass the whole e2e. 1.23 to 1.25 refuse the PodDisruptionBudget's `unhealthyPodEvictionPolicy` (from 1.26), so Gateways with 2 or more replicas get no PodDisruptionBudget (the e2e stops there and the rest is not checked; conformance passes). On 1.22 the Gateway API CRDs do not install.
+Kubernetes older than the chart allows is checked too, with `kubeVersion` relaxed for those runs only (recorded): 1.23 to 1.25 refuse the PodDisruptionBudget's `unhealthyPodEvictionPolicy` (from 1.26), so Gateways with 2 or more replicas get no PodDisruptionBudget (the e2e stops there and the rest is not checked; conformance passes). On 1.22 the Gateway API CRDs do not install.
 
 With older CRDs, TCPRoute and UDPRoute (`v1alpha2` before v1.6), TLSRoute (`v1alpha3` in v1.4) and ReferenceGrant (`v1beta1` in v1.4) are read and written at the version the API server serves. `experimental-install.yaml` is recommended (TCPRoute, UDPRoute and HTTPRoute retries).
 
