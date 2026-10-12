@@ -54,6 +54,16 @@ on:
         description: "stress: requests in all (at least 100000)"
         required: false
         default: "120000"
+      report_gateway_api:
+        description: "report_version: the Gateway API version of the suite and CRDs (upstream keeps reports per minor, e.g. v1.5.1, v1.6.3)"
+        required: false
+        default: v1.6.3
+      report_require:
+        description: "report_version: full (every profile core and extended success) or core (core success; an older suite whose extended tests changed later)"
+        required: false
+        default: full
+        type: choice
+        options: [full, core]
       report_channel:
         description: "report_version: the Gateway API channel of the CRDs (experimental: the claimed HTTPRouteRetry* use experimental fields)"
         required: false
@@ -464,10 +474,12 @@ jobs:
         env:
           VERSION: ${{ inputs.report_version }}
           GATEWAY_API_CHANNEL: ${{ inputs.report_channel }}
+          GATEWAY_API_VERSION: ${{ inputs.report_gateway_api || 'v1.6.3' }}
+          REQUIRE: ${{ inputs.report_require || 'full' }}
           OUT_DIR: ${{ github.workspace }}/conformance-report
         run: scripts/conformance-report.sh
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: conformance-report-v${{ inputs.report_version }}
+          name: conformance-report-v${{ inputs.report_version }}-${{ inputs.report_gateway_api || 'v1.6.3' }}
           path: conformance-report/

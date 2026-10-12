@@ -67,6 +67,10 @@ kubectl wait --for=condition=Accepted gatewayclass/rproxy --timeout=120s
 if [ ! -d "$work/gateway-api" ]; then
   git clone -q --depth 1 --branch "$GATEWAY_API_VERSION" https://github.com/kubernetes-sigs/gateway-api.git "$work/gateway-api"
 fi
+# only the profiles this suite knows (GATEWAY-TCP and GATEWAY-UDP came with v1.6), as scripts/conformance.sh
+known=$(grep -ohE '"(GATEWAY|MESH)-[A-Z]+"' "$work/gateway-api/conformance/utils/suite/profiles.go" | tr -d '"' | sort -u)
+PROFILES=$(tr ',' '\n' <<< "$PROFILES" | grep -Fxf <(echo "$known") | paste -sd, -)
+echo "profiles in this suite: $PROFILES"
 status=0
 (
   cd "$work/gateway-api"
@@ -93,7 +97,7 @@ kubectl -n "$NS" logs -l app.kubernetes.io/name=rproxy-gateway --prefix --tail=-
 # every profile: core and extended success, nothing failed or skipped
 check=$OUT_DIR/check.txt
 if [ -f "$REPORT" ]; then
-  bad=$(python3 - "$REPORT" "$check" <<'PY'
+  bad=$(python3 - "$REPORT" "$check" "${REQUIRE:-full}" <<'PY'
 import sys, yaml
 report = yaml.safe_load(open(sys.argv[1]))
 bad = 0
@@ -104,7 +108,10 @@ with open(sys.argv[2], "w") as out:
         out.write(f"{p['name']}: core {c['result']} (passed {cs.get('Passed', 0)}, failed {cs.get('Failed', 0)}, skipped {cs.get('Skipped', 0)}), "
                   f"extended {e.get('result', '-')} (passed {es.get('Passed', 0)}, failed {es.get('Failed', 0)}, skipped {es.get('Skipped', 0)}), "
                   f"supported features {len(e.get('supportedFeatures', []))}, unsupported: {', '.join(e.get('unsupportedFeatures', [])) or 'none'}\n")
-        if c["result"] != "success" or e.get("result", "success") != "success" or cs.get("Skipped", 0) or es.get("Skipped", 0):
+        core_ok = c["result"] == "success" and not cs.get("Skipped", 0)
+        extended_ok = e.get("result", "success") == "success" and not es.get("Skipped", 0)
+        # REQUIRE=core: an older suite whose extended expectations changed later still makes a core report
+        if not core_ok or (sys.argv[3] != "core" and not extended_ok):
             bad += 1
 print(bad)
 PY
