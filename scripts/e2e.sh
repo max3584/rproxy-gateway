@@ -225,7 +225,8 @@ spec:
   externalName: $gw_svc.east-west.svc.cluster.local
 YAML
 client=$(cat << 'SH'
-get() { for _ in $(seq 60); do curl -sf --max-time 3 "$1" && return 0; sleep 2; done; echo "no answer: $1" >&2; return 1; }
+# one line per answer (the echo backend writes indented JSON)
+get() { for _ in $(seq 60); do r=$(curl -sf --max-time 3 "$1") && { echo "$r" | tr -d '\n'; return 0; }; sleep 2; done; echo "no answer: $1" >&2; return 1; }
 set -e
 echo "selector: $(get http://api/hello)"
 echo "fqdn: $(get http://api.east-west.svc.cluster.local/fqdn)"
