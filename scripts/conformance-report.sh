@@ -78,6 +78,12 @@ fi
 known=$(grep -ohE '"(GATEWAY|MESH)-[A-Z]+"' "$work/gateway-api/conformance/utils/suite/profiles.go" | tr -d '"' | sort -u)
 PROFILES=$(tr ',' '\n' <<< "$PROFILES" | grep -Fxf <(echo "$known") | paste -sd, -)
 echo "profiles in this suite: $PROFILES"
+# the suite's Go modules first, tried a few times (the module proxy sometimes fails a request)
+for i in 1 2 3 4 5; do
+  (cd "$work/gateway-api" && GOTOOLCHAIN=auto go mod download) && break
+  [ "$i" = 5 ] && { echo "cannot download the suite's Go modules"; exit 1; }
+  sleep $((i * 5))
+done
 status=0
 (
   cd "$work/gateway-api"

@@ -46,6 +46,12 @@ add contact https://github.com/max3584/rproxy-gateway/issues
 add cleanup-base-resources false
 add usable-address "${USABLE_ADDRESS:-192.0.2.10}"
 add unusable-address "${UNUSABLE_ADDRESS:-0.0.0.0}"
+# the suite's Go modules first, tried a few times (the module proxy sometimes fails a request)
+for i in 1 2 3 4 5; do
+  (cd "$work/gateway-api" && GOTOOLCHAIN=auto go mod download) && break
+  [ "$i" = 5 ] && { echo "cannot download the suite's Go modules"; exit 1; }
+  sleep $((i * 5))
+done
 status=0
 (
   cd "$work/gateway-api"
