@@ -134,6 +134,8 @@ fi
     echo '```'
   fi
 } >> "${GITHUB_STEP_SUMMARY:-/dev/stdout}"
+# REQUIRE=core: the suite exits 1 for an extended failure; the report itself decides
+if [ "${REQUIRE:-full}" = core ] && [ -f "$REPORT" ]; then status=0; fi
 if [ "$status" != 0 ] || [ "$bad" != 0 ]; then
   echo "conformance report: not a full success (exit $status, $bad profile(s) not success)"
   exit 1

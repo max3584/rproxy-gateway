@@ -6,13 +6,13 @@
 
 | API channel  | Implementation version                                                         | Mode    | Report                                                       |
 |--------------|--------------------------------------------------------------------------------|---------|--------------------------------------------------------------|
-| experimental | [v0.4.5](https://github.com/max3584/rproxy-gateway/releases/tag/v0.4.5)        | default | [v0.4.5 report](./experimental-v0.4.5-default-report.yaml)   |
+| experimental | [v0.4.8](https://github.com/max3584/rproxy-gateway/releases/tag/v0.4.8)        | default | [v0.4.8 report](./experimental-v0.4.8-default-report.yaml)   |
 
 ## Reproduce
 
 The report comes from the released Helm chart and images (nothing is built): the chart
-`oci://ghcr.io/max3584/charts/rproxy-gateway` 0.4.5 with its default images
-`ghcr.io/max3584/rproxy-gateway:0.4.5` (the controller) and `ghcr.io/max3584/rproxy-gateway/rproxy:0.4.3`
+`oci://ghcr.io/max3584/charts/rproxy-gateway` 0.4.8 with its default images
+`ghcr.io/max3584/rproxy-gateway:0.4.8` (the controller) and `ghcr.io/max3584/rproxy-gateway/rproxy:0.4.7`
 (the data plane it provisions per Gateway). The supported features are not passed on the command line:
 the suite reads them from the GatewayClass status that the controller writes.
 
@@ -42,7 +42,7 @@ controller creates for it) through a route to the kind node.
    `GatewayStaticAddresses` test's usable address:
 
    ```shell
-   helm install rproxy-gateway oci://ghcr.io/max3584/charts/rproxy-gateway --version 0.4.5 \
+   helm install rproxy-gateway oci://ghcr.io/max3584/charts/rproxy-gateway --version 0.4.8 \
      --namespace rproxy-gateway-system --create-namespace --wait \
      --set managed.serviceType=ClusterIP \
      --set 'managed.addressCIDRs={192.0.2.0/24}'
@@ -60,13 +60,13 @@ controller creates for it) through a route to the kind node.
      --organization=max3584 \
      --project=rproxy-gateway \
      --url=https://github.com/max3584/rproxy-gateway \
-     --version=v0.4.5 \
+     --version=v0.4.8 \
      --contact=https://github.com/max3584/rproxy-gateway/issues \
-     --report-output="$PWD/experimental-v0.4.5-default-report.yaml" \
+     --report-output="$PWD/experimental-v0.4.8-default-report.yaml" \
      --usable-address=192.0.2.10 \
      --unusable-address=0.0.0.0
    ```
 
 The same steps are automated on the project's main branch: `scripts/conformance-report.sh`, run by hand in
-GitHub Actions as `gh workflow run e2e.yml -f report_version=0.4.5` (the report is the run's artifact,
+GitHub Actions as `gh workflow run e2e.yml -f report_version=0.4.8 -f report_gateway_api=v1.6.3` (the report is the run's artifact,
 together with the suite's log and the image digests).
