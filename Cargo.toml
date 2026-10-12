@@ -26,7 +26,7 @@ rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem
 ring = "0.17"
 # the Traefik → rproxy conversion (router rules, middlewares), shared with rproxy-api's
 # rproxy-traefik-convert; a git tag of rproxy-api (the crate is not on crates.io)
-rproxy-traefik = { git = "https://github.com/max3584/rproxy-api", tag = "v0.4.8" }
+rproxy-traefik = { git = "https://github.com/max3584/rproxy-api", tag = "v0.4.9" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pki-types = { version = "1", features = ["std"] }
 schemars = "1"
