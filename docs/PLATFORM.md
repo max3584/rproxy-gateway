@@ -444,6 +444,75 @@ spec:
 
 - Gateway の `status.addresses` は Service の ClusterIP。名前で使うなら Service（`rproxy-<id>`）を `kubectl -n default get svc -l gateway.networking.k8s.io/gateway-name=web` で調べ、`<Service>.<namespace>.svc` を使う。
 - 切り替えは Service の endpoint（kube-proxy・CNI）で、Pod の入れ替えは readiness gate と `/readyz` で外れる。
+- クラスタの中のクライアントの通信を rproxy に通す（元の Service 名のまま）なら、次の「[クラスタの中の通信（east-west）を rproxy に通す](#クラスタの中の通信east-westを-rproxy-に通す)」。
+
+## クラスタの中の通信（east-west）を rproxy に通す
+
+クラスタの中のクライアント（ほかの Pod）からの通信にも rproxy の機能（流量の制限・GeoIP・CrowdSec・TLS の終端・L7 の振り分け・アクセスログ）を使うには、上の ClusterIP の Gateway を作り、ルートで本物のバックエンドの Service に送る。クライアントは Gateway の Service の名前を呼ぶ。e2e（`scripts/e2e.sh` の「east-west」）がこの形（HTTPRoute・TCPRoute、下の 2 つの名前の付け方）をクラスタの中の Pod から確かめている。
+
+### 元の Service 名のままにする（勧める形）
+
+クライアントの設定（`http://api`）を変えたくないなら、本物のバックエンドの Service を改名し（`api` → `api-backend`）、元の名前 `api` を rproxy に向ける。
+
+```yaml
+# 本物のバックエンド（元の api の selector・ports のまま、名前だけ変える）
+apiVersion: v1
+kind: Service
+metadata: {name: api-backend, namespace: shop}
+spec:
+  selector: {app: api}
+  ports: [{name: http, port: 8080, targetPort: 3000}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {name: internal, namespace: shop}
+spec:
+  gatewayClassName: rproxy          # managed.serviceType=ClusterIP（または上の RproxyGatewayParameters）
+  listeners:
+    - {name: http, port: 80, protocol: HTTP}
+    - {name: tcp, port: 9100, protocol: TCP}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: api, namespace: shop}
+spec:
+  parentRefs: [{name: internal, sectionName: http}]
+  # クライアントが送る Host（短い名前・FQDN）。hostnames を書かなければどの Host でも
+  hostnames: [api, api.shop, api.shop.svc, api.shop.svc.cluster.local]
+  rules: [{backendRefs: [{name: api-backend, port: 8080}]}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata: {name: api, namespace: shop}
+spec:
+  parentRefs: [{name: internal, sectionName: tcp}]
+  rules: [{backendRefs: [{name: api-backend, port: 8080}]}]
+---
+# 元の名前：Gateway の rproxy の Pod を選ぶ
+apiVersion: v1
+kind: Service
+metadata: {name: api, namespace: shop}
+spec:
+  selector:
+    app.kubernetes.io/name: rproxy
+    gateway.networking.k8s.io/gateway-name: internal
+  ports:
+    - {name: http, port: 80, targetPort: 80}       # targetPort は listener の port
+    - {name: tcp, port: 9100, targetPort: 9100}
+```
+
+- **selector で選ぶ（勧める）**：コントローラは Gateway の rproxy の Pod に `app.kubernetes.io/name: rproxy` と `gateway.networking.k8s.io/gateway-name: <Gateway の名前>`（Gateway API の決まったラベル）を付ける。Service の selector は同じ名前空間の Pod だけを選ぶので、この 2 つで Gateway が決まる。Gateway を作り直しても（Service `rproxy-<id>` の名前が変わっても）そのまま使え、`port` と `targetPort` を変えられる。readiness gate で、ルールセットを反映する前の Pod や終わりかけの Pod には送られない。`rproxy.max3584.net/gateway`（`<id>`）のラベルは Gateway の uid のハッシュを含むので selector に使わない。
+- **ExternalName**：`spec: {type: ExternalName, externalName: rproxy-<id>.shop.svc.cluster.local}` でも届く（DNS の CNAME）。ただし Gateway を作り直すと `rproxy-<id>` が変わるので書き直しが要り、ポートは変えられない（クライアントは listener の port を呼ぶ）。HTTP の Host はクライアントが書いた名前（`api`）のまま。
+- 元の Service の selector を書き換えて rproxy の Pod に向ける形もできるが、その Service を Helm・Argo CD が持っているなら次の同期で元に戻される（差分として出続ける）。改名なら、アプリの chart・マニフェストで Service の名前を `api-backend` に変え、`api` は rproxy 側のマニフェストに置くので、持ち主がぶつからない。
+- 切り替えの順：`api-backend` と Gateway・ルートを先に作り、Gateway が `Programmed` になってから `api` を差し替える（アプリの chart の `api` を消し、rproxy 側の `api` を作る）。差し替えの間だけ `api` に endpoint のない時間がありうる。
+
+### 限り
+
+- 1 段増える：クライアント → rproxy → バックエンドで、ユーザー空間の rproxy を 1 回通る（その分の遅れと CPU）。
+- kube-proxy（Service の ClusterIP）を通るのはクライアントから rproxy までの 1 回だけ。rproxy はルートの Service の EndpointSlice から Pod の IP に直接送る。バックエンドから見た接続元は rproxy の Pod の IP で、HTTP ならクライアントの Pod の IP が `X-Forwarded-For` で届く（e2e で確かめている）。TCP・UDP ではクライアントの IP は届かない（バックエンドからはすべて rproxy からの接続に見える）。
+- kube-proxy・CNI の代わりにはならない：rproxy に通したい Service だけをこの形にする。ルートを書いていない Service はこれまでどおり kube-proxy で届く。
+- rproxy が止まればその Service に届かない。`managed.replicas`（または parameters の `replicas`）を 2 以上にする。
+- NetworkPolicy：コントローラが作る NetworkPolicy は listener の port をどこからでも通す。クライアントの名前空間の egress を絞っているなら、rproxy の Pod の listener の port を開ける。
 
 ## v0.4.4 の `fleet.vip` から移る
 
