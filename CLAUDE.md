@@ -20,7 +20,7 @@ scripts/acceptance.sh         # 受け入れテスト（同上。手動の accep
 
 ## 構成
 
-- `src/render/`：変換（純粋な関数。`World` のスナップショット → `GatewayPlan`）。`http.rs`（HTTPRoute）、`l4.rs`（TLS・TCP・UDP）、`policy.rs`（RproxyPolicy・RproxyRule）、`params.rs`（RproxyGatewayParameters の参照・検証・合わせ方。docs/DESIGN-v0.4.x.md の A）、`migrate.rs`・`traefik_mw.rs`（Ingress・Traefik、rproxy-api の `contrib/traefik2rproxy.py` と同じ変換）、`backends.rs`（EndpointSlice）、`hostname.rs`、`status.rs`
+- `src/render/`：変換（純粋な関数。`World` のスナップショット → `GatewayPlan`）。`http.rs`（HTTPRoute）、`l4.rs`（TLS・TCP・UDP）、`policy.rs`（RproxyPolicy・RproxyRule）、`params.rs`（RproxyGatewayParameters の参照・検証・合わせ方。docs/DESIGN-v0.4.x.md の A）、`migrate.rs`・`traefik_mw.rs`（Ingress・Traefik。ルーターのルール・ミドルウェア・TLS の対応づけは rproxy-api の crate `rproxy-traefik`（`rproxy-traefik-convert` と同じ実装。Cargo.toml で rproxy-api の git のタグを指す）を呼び、ここには Kubernetes 側（Secret・Service・namespace・ReferenceGrant）だけを書く。変換そのものを直すときは rproxy-api の crate を直してタグを上げる）、`backends.rs`（EndpointSlice）、`hostname.rs`、`status.rs`
 - `src/controller/`：watch（`cache.rs`）、反映のループと `sync_pod`（`mod.rs`）、状態（`status.rs`）、rproxy の配置（`provision.rs`）、CA・トークンの Secret（`bootstrap.rs`）、UI に見せる発見の Secret と UI 用のトークン（`ui.rs`。`--ui-namespace`）。`tests.rs` は制御 API の文書どおりの偽の rproxy
 - `src/rproxy/`：制御 API のクライアントと形。`src/certsync.rs`：rproxy の Pod の中で証明書をファイルにする
 - `charts/rproxy-gateway/`：Helm chart（`crds/` は `rproxy-gateway crds` の出力。コントローラの設定は ConfigMap `rproxy-gateway-config` の `RPROXY_GATEWAY_*`）。`config/`：chart から描いた Kustomize の base（`default`・`fleet`・`crd`）と `samples/`（手で書く overlay の例）。`Dockerfile`（コントローラ）、`Dockerfile.rproxy`（rproxy）は Alpine で、Alpine のジョブが作った musl のバイナリを入れる
@@ -28,7 +28,7 @@ scripts/acceptance.sh         # 受け入れテスト（同上。手動の accep
 
 ## 約束
 
-- rproxy とは制御 API（rproxy-api の `docs/openapi.json`）だけでつながる。rproxy のコードや DB を直接使わない。制御 API に足りないものがあれば rproxy-api に issue を立てる。
+- rproxy とは制御 API（rproxy-api の `docs/openapi.json`）だけでつながる。rproxy のコードや DB を直接使わない。例外は Traefik からの変換の crate `rproxy-traefik`（rproxy の本体ではなく、rproxy-api のリポジトリにある変換だけのライブラリ。`deny.toml` の `allow-git` もこの 1 つだけ）。制御 API に足りないものがあれば rproxy-api に issue を立てる。
 - `Cargo.lock` はコミットしている。CI・イメージのビルドは `--locked`。依存を変えたら `Cargo.lock` も同じ PR に入れる。Renovate は cargo を `rangeStrategy: update-lockfile` で更新する。
 - `deny.toml` と `.github/workflows/deny.yml`（`cargo deny --locked check`）：RustSec の勧告、ライセンス、取得元を、依存を変える PR と毎日確かめる（必須のチェックではない）。直せない勧告は `advisories.ignore` に理由と外す条件を書いて足す。
 - CI の実行環境：ジョブは Alpine のコンテナ（`container: alpine:3.24`）で動かし、Debian / Ubuntu の重いイメージは使わない（rproxy-api と同じ）。最初のステップで `apk add` する（`actions/checkout` には git、`actions/cache`・`rust-cache` には GNU の tar と zstd、`run:` を bash で動かすには bash が要る）。コンテナの中では `$RUNNER_TEMP`・`$GITHUB_WORKSPACE` を使う。例外は kind を使うジョブ（e2e・conformance）だけで、kind がノードを Docker のコンテナとして作るのでランナーの VM で直接動かす（そこでは Rust をビルドせず、Alpine のジョブが作ったバイナリを使う）。

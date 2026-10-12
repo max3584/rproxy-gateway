@@ -6,7 +6,7 @@ With `--migrate-to <namespace>/<name>`, the controller reads Ingress and Traefik
 
 - Nothing is written to the spec of Ingress or Traefik resources. As status, an Ingress gets the target Gateway's addresses (`status.addresses`) in `status.loadBalancer.ingress` (the ADDRESS of `kubectl get ingress`, read by external-dns and the like). Traefik's CRDs have no status, so nothing is written there.
 - Traefik's CRDs may be installed after the controller started: it asks the API server again every 30 seconds and starts watching kinds that appeared (no restart needed). The same goes for Gateway API's CRDs.
-- The mapping is the one of rproxy-api's `contrib/traefik2rproxy.py` (docs/en/MIGRATING-FROM-TRAEFIK.md). What cannot be converted is left out and reported in the controller's log (`migration: not converted`, once each time the notes change) and in the `notes` of `rproxy-gateway render`.
+- The conversion is the same implementation as rproxy-api's `rproxy-traefik-convert` (docs/en/MIGRATING-FROM-TRAEFIK.md; the crate `rproxy-traefik`): router rules and middlewares map as they do when migrating from the file provider, and only the Kubernetes parts (Services, Secrets, namespaces, ReferenceGrants) differ. What cannot be converted is left out and reported in the controller's log (`migration: not converted`, once each time the notes change) and in the `notes` of `rproxy-gateway render`.
 - When the target Gateway has a listener on the same port, the migrated routes are added to its rule (both `http`, with or without TLS alike). Otherwise the migrated part is left out.
 - Migrated routes keep Traefik's precedence (`priority`, else the length of `match`). Gateway API routes are numbered from 1, so on a shared port the migrated routes are often tried first.
 
@@ -23,7 +23,7 @@ With `--migrate-to <namespace>/<name>`, the controller reads Ingress and Traefik
 
 | From | rproxy |
 |---|---|
-| IngressRoute `match` | as it is (rproxy's `match` is Traefik v3 syntax). v2 `Headers`, `HeadersRegexp`, `HostHeader`, `Query(a=b)` are rewritten. v2 placeholders (`{name:regex}`) and other matchers are left out |
+| IngressRoute `match` | as it is (rproxy's `match` is Traefik v3 syntax). v2 `Headers`, `HeadersRegexp`, `HostHeader`, `Query(a=b)` are rewritten. v2 placeholders (`{name:regex}`) turn `Host` into `HostRegexp` and `Path` / `PathPrefix` into `PathRegexp`. `"..."` arguments are read as Go strings. Routes with a matcher rproxy lacks are left out |
 | IngressRoute `services` (Services; port by number or name) | `servers` with the pod IPs of the EndpointSlices. `scheme` (else https for port 443 or a port name starting with https), `weight`, `passHostHeader: false`. `TraefikService` is left out |
 | IngressRoute `tls.secretName` | certificate files (a mounted Secret) |
 | `tls.certResolver` | `{acme: <resolver>, domains: [...]}` (`domains`, else the `Host()` names). rproxy's settings file needs that resolver in `global.acme` |

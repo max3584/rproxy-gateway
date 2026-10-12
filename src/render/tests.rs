@@ -1160,8 +1160,9 @@ spec:
 	let auth = &secure["http"]["middlewares"]["traefik/default/auth"]["basic_auth"];
 	let file = auth["users_file"].as_str().unwrap().rsplit('/').next().unwrap().to_string();
 	assert_eq!(p.files[&file], b"admin:$apr1$x$y");
-	let second = secure["http"]["routes"].as_array().unwrap().iter().find(|r| r["name"] == "traefik/default/app/r1");
-	assert!(second.is_none(), "v2 placeholders are not converted");
+	// v2 placeholders become a HostRegexp (rproxy-traefik)
+	let second = secure["http"]["routes"].as_array().unwrap().iter().find(|r| r["name"] == "traefik/default/app/r1").unwrap().clone();
+	assert_eq!(second["match"], "HostRegexp(`^(?:(?:[a-z]+)\\.example\\.com)$`) || Header(`X-A`, `1`)");
 	assert!(p.notes.iter().any(|n| n.contains("Weird")), "{:?}", p.notes);
 	assert!(p.notes.iter().any(|n| n.contains("sniStrict")), "{:?}", p.notes);
 	// L4
@@ -1173,11 +1174,13 @@ spec:
 
 #[test]
 fn traefik_rules() {
-	assert_eq!(migrate::translate_rule("Host(`a`) && Headers(`X`, `1`)").unwrap(), "Host(`a`) && Header(`X`, `1`)");
-	assert_eq!(migrate::translate_rule("Query(`a=b`) || HostHeader(\"x\")").unwrap(), "Query(`a`, `b`) || Host(`x`)");
-	assert!(migrate::translate_rule("Host(`{x:.+}`)").is_err());
-	assert!(migrate::translate_rule("Foo(`x`)").is_err());
-	assert_eq!(migrate::translate_rule("!ClientIP(`10.0.0.0/8`)").unwrap(), "!ClientIP(`10.0.0.0/8`)");
+	// the translation is rproxy-traefik's (tested there); what migration relies on
+	let tr = |rule: &str| rproxy_traefik::translate_http_rule(rule, "", &mut rproxy_traefik::Notes::default());
+	assert_eq!(tr("Host(`a`) && Headers(`X`, `1`)").unwrap(), "Host(`a`) && Header(`X`, `1`)");
+	assert_eq!(tr("Query(`a=b`) || HostHeader(\"x\")").unwrap(), "Query(`a`, `b`) || Host(`x`)");
+	assert_eq!(tr("Host(`{x:.+}`)").unwrap(), "HostRegexp(`^(?:(?:.+))$`)");
+	assert!(tr("Foo(`x`)").is_none());
+	assert_eq!(tr("!ClientIP(`10.0.0.0/8`)").unwrap(), "!ClientIP(`10.0.0.0/8`)");
 	assert_eq!(
 		migrate::Settings::parse_entry_points(&["web=8080".into(), "dns=53/udp".into()]).unwrap(),
 		[("dns".to_string(), (rp::Protocol::Udp, 53)), ("web".to_string(), (rp::Protocol::Tcp, 8080))].into()
