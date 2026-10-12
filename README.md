@@ -81,18 +81,18 @@ spec:
 
 ### 対応する版
 
-Kubernetes 1.29 以上（chart の `kubeVersion`）と、Gateway API v1.0 以上の CRD で動きます（v1.0・v1.1 は下の制限つき）。下の組み合わせは、互換性テスト（毎週月曜に自動で、手動では `gh workflow run e2e.yml -f compat=true`）で e2e が通ることを確かめています。組み合わせは実行のたびにその時点のリリースから作るので、新しい Kubernetes（最新のパッチと次のマイナーの beta・rc）と Gateway API が出ると次の実行に入ります。v1.5 と v1.6（直近 2 つ）は conformance の core も通ります。
+Kubernetes 1.26 以上（chart の `kubeVersion`。確かめているのは 1.26〜1.37.x、新しい版は毎週の互換性テストで足していきます）と、Gateway API v1.0 以上の CRD で動きます（v1.0・v1.1 は下の制限つき）。下の組み合わせは、互換性テスト（毎週月曜に自動で、手動では `gh workflow run e2e.yml -f compat=true`）で e2e が通ることを確かめています。組み合わせは実行のたびにその時点のリリースから作るので、新しい Kubernetes（最新のパッチと次のマイナーの beta・rc）と Gateway API が出ると次の実行に入ります。v1.5 と v1.6（直近 2 つ）は conformance の core も通ります。
 
 | Gateway API の CRD | 必要な Kubernetes（CRD の検証の都合） | 確かめた組み合わせ |
 |---|---|---|
 | v1.0 | — | k8s 1.37。Gateway の `infrastructure.parametersRef` が v1.1 からなので、Gateway ごとの RproxyGatewayParameters は使えない（GatewayClass の parametersRef は使える） |
 | v1.1 | — | k8s 1.37。conformance の GRPC の 3 つの試験は、v1.1 の試験の道具の不具合（並べて走る試験で GRPC の接続を共有し、最初に終わった試験が閉じる。v1.2 で直った）で落ちる。要求は正しい転送先に届いている（[#61](https://github.com/max3584/rproxy-gateway/issues/61)） |
-| v1.2・v1.3・v1.4 | 1.29 以上 | k8s 1.29・1.30（v1.4）、1.37（v1.2〜v1.4） |
+| v1.2・v1.3・v1.4 | 1.26 以上（chart の下限） | k8s 1.26〜1.30（v1.4。1.26〜1.28 は v1.2 も）、1.37（v1.2〜v1.4） |
 | v1.5 | 1.31 以上（`isIP`） | k8s 1.31・1.37 |
 | v1.6 | 1.32 以上（`dns1123Label`） | k8s 1.32〜1.37 |
 | v1.7.0-rc.1 | — | k8s 1.37 |
 
-chart の範囲より古い Kubernetes も、試験のときだけ `kubeVersion` を外して確かめています（記録だけ）：1.26〜1.28 は e2e がすべて通ります。1.23〜1.25 は PodDisruptionBudget の `unhealthyPodEvictionPolicy`（1.26 から）を断られ、replicas が 2 以上の Gateway に PodDisruptionBudget ができません（e2e はそこで止まり、その後は確かめていません。conformance は通ります）。1.22 は Gateway API の CRD が入りません。
+chart の範囲より古い Kubernetes も、試験のときだけ `kubeVersion` を外して確かめています（記録だけ）：1.23〜1.25 は PodDisruptionBudget の `unhealthyPodEvictionPolicy`（1.26 から）を断られ、replicas が 2 以上の Gateway に PodDisruptionBudget ができません（e2e はそこで止まり、その後は確かめていません。conformance は通ります）。1.22 は Gateway API の CRD が入りません。
 
 古い CRD では、TCPRoute・UDPRoute（v1.6 より前は `v1alpha2`）、TLSRoute（v1.4 は `v1alpha3`）、ReferenceGrant（v1.4 は `v1beta1`）を、API サーバが出している版で読み書きします。CRD は `experimental-install.yaml` を勧めます（TCPRoute・UDPRoute と HTTPRoute の retry のため）。
 

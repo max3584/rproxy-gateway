@@ -31,10 +31,11 @@ import urllib.request
 CRD_NEEDS = {(1, 0): 23, (1, 1): 23, (1, 2): 25, (1, 3): 25, (1, 4): 25, (1, 5): 31, (1, 6): 32}
 CRD_NEEDS_DEFAULT = 32
 # below the chart's range: (Kubernetes minor, Gateway API minor), what it was paired with when it was
-# current. Found so far: 1.26 passes the e2e, 1.23-1.25 lack a PodDisruptionBudget field, 1.22 does
-# not take the CRDs (README "Supported versions")
-FLOOR = [(22, (1, 0)), (23, (1, 0)), (24, (1, 0)), (25, (1, 2)), (25, (1, 4)), (26, (1, 2)), (26, (1, 4)),
-         (27, (1, 2)), (27, (1, 4)), (28, (1, 2)), (28, (1, 4))]
+# current. Found so far: 1.23-1.25 lack a PodDisruptionBudget field (1.26 is the chart's minimum), 1.22
+# does not take the CRDs (README "Supported versions")
+FLOOR = [(22, (1, 0)), (23, (1, 0)), (24, (1, 0)), (25, (1, 2)), (25, (1, 4))]
+# the oldest minors of the chart's range also get the oldest Gateway API they run with (besides the newest)
+ALSO = [(26, (1, 2)), (27, (1, 2)), (28, (1, 2))]
 NODE_REPO = "ghcr.io/max3584/rproxy-gateway/kind-node"
 SEMVER = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(?:-(alpha|beta|rc)\.(\d+))?$")
 
@@ -154,6 +155,9 @@ def main():
         fits = [m for m in gw_minors if needs(m) <= minor]
         if fits:
             add(k8s[minor], gw[fits[-1]], "strict" if fits[-1] in latest_two else "recorded")
+    for minor, gw_minor in ALSO:
+        if minor >= floor and minor in k8s and gw_minor in gw:
+            add(k8s[minor], gw[gw_minor], "recorded")
     # the next Kubernetes minor (beta / rc), recorded
     if k_next:
         add(k_next, gw[gw_minors[-1]], "recorded")
