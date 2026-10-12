@@ -144,6 +144,107 @@ test "$(kubectl -n e2e get httproute echo -o jsonpath='{.status.parents[0].condi
 test "$(kubectl -n e2e get httproute echo -o jsonpath='{.status.parents[0].conditions[?(@.type=="ResolvedRefs")].status}')" = True
 test "$(kubectl -n e2e get gateway e2e -o jsonpath='{.status.listeners[?(@.name=="https")].conditions[?(@.type=="Programmed")].status}')" = True
 
+echo "== east-west (docs/PLATFORM.md): clients in the cluster call the original Service name, rproxy in between"
+# the real backend renamed (api-backend); the original name (api) selects the Gateway's rproxy pods by the
+# labels the controller puts on them; api-ext is the same as an ExternalName to the Gateway's Service
+cat <<YAML | kubectl apply -f - > /dev/null
+apiVersion: v1
+kind: Namespace
+metadata: {name: east-west}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: api, namespace: east-west}
+spec:
+  selector: {matchLabels: {app: api}}
+  template:
+    metadata: {labels: {app: api}}
+    spec:
+      containers:
+        - name: echo
+          image: registry.k8s.io/gateway-api/echo-basic:v1.5.1
+          env:
+            - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+            - {name: NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: api-backend, namespace: east-west}
+spec:
+  selector: {app: api}
+  ports: [{name: http, port: 8080, targetPort: 3000}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {name: internal, namespace: east-west}
+spec:
+  gatewayClassName: rproxy
+  listeners:
+    - {name: http, port: 80, protocol: HTTP}
+    - {name: tcp, port: 9100, protocol: TCP}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: api, namespace: east-west}
+spec:
+  parentRefs: [{name: internal, sectionName: http}]
+  hostnames: [api, api.east-west, api.east-west.svc, api.east-west.svc.cluster.local, api-ext]
+  rules:
+    - filters:
+        - type: RequestHeaderModifier
+          requestHeaderModifier: {set: [{name: X-Via, value: rproxy-east-west}]}
+      backendRefs: [{name: api-backend, port: 8080}]
+---
+apiVersion: gateway.networking.k8s.io/$tcp_v
+kind: TCPRoute
+metadata: {name: api, namespace: east-west}
+spec:
+  parentRefs: [{name: internal, sectionName: tcp}]
+  rules: [{backendRefs: [{name: api-backend, port: 8080}]}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: api, namespace: east-west}
+spec:
+  selector:
+    app.kubernetes.io/name: rproxy
+    gateway.networking.k8s.io/gateway-name: internal
+  ports:
+    - {name: http, port: 80, targetPort: 80}
+    - {name: tcp, port: 9100, targetPort: 9100}
+YAML
+kubectl -n east-west wait --for=condition=Programmed gateway/internal --timeout=240s
+gw_svc=$(kubectl -n east-west get svc -l gateway.networking.k8s.io/gateway-name=internal,app.kubernetes.io/name=rproxy -o jsonpath='{.items[0].metadata.name}')
+echo "Gateway Service: $gw_svc"
+cat <<YAML | kubectl apply -f - > /dev/null
+apiVersion: v1
+kind: Service
+metadata: {name: api-ext, namespace: east-west}
+spec:
+  type: ExternalName
+  externalName: $gw_svc.east-west.svc.cluster.local
+YAML
+client=$(cat << 'SH'
+get() { for _ in $(seq 60); do curl -sf --max-time 3 "$1" && return 0; sleep 2; done; echo "no answer: $1" >&2; return 1; }
+set -e
+echo "selector: $(get http://api/hello)"
+echo "fqdn: $(get http://api.east-west.svc.cluster.local/fqdn)"
+echo "externalname: $(get http://api-ext/ext)"
+echo "tcp: $(get http://api:9100/tcp)"
+SH
+)
+kubectl -n east-west run client --image=curlimages/curl:8.11.1 --restart=Never --command -- sh -c "$client" > /dev/null
+retry 240 sh -c "kubectl -n east-west get pod client -o jsonpath='{.status.phase}' | grep -qE 'Succeeded|Failed'"
+kubectl -n east-west logs client | tee "$work/east-west.txt"
+test "$(kubectl -n east-west get pod client -o jsonpath='{.status.phase}')" = Succeeded
+ew() { sed -n "s/^$1: //p" "$work/east-west.txt"; }
+ew selector | jq -e '.path == "/hello" and .host == "api" and .headers["X-Via"] == ["rproxy-east-west"] and .namespace == "east-west"' > /dev/null
+ew fqdn | jq -e '.path == "/fqdn" and .headers["X-Via"] == ["rproxy-east-west"]' > /dev/null
+ew externalname | jq -e '.path == "/ext" and .host == "api-ext" and .headers["X-Via"] == ["rproxy-east-west"]' > /dev/null
+# TCP: no header, but only rproxy listens on 9100 (the backend on 3000)
+ew tcp | jq -e '.path == "/tcp" and .namespace == "east-west" and (.headers["X-Via"] == null)' > /dev/null
+kubectl delete namespace east-west --wait=true > /dev/null
+
 if [ -n "${MIGRATE:-}" ]; then
   echo "== migration (Ingress, IngressRoute)"
   retry 60 sh -c "curl -sf -H 'Host: ingress.example.com' http://$addr/i | jq -e '.path == \"/i\"' > /dev/null"
