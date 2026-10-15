@@ -1,5 +1,5 @@
 apiVersion: gateway.networking.k8s.io/v1
-date: "2026-10-12T11:44:03Z"
+date: "2026-10-15T05:36:57Z"
 gatewayAPIChannel: experimental
 gatewayAPIVersion: v1.6.3
 implementation:
@@ -8,10 +8,36 @@ implementation:
   organization: max3584
   project: rproxy-gateway
   url: https://github.com/max3584/rproxy-gateway
-  version: v0.4.8
+  version: v0.4.12
 kind: ConformanceReport
 mode: default
 profiles:
+- core:
+    result: success
+    statistics:
+      Failed: 0
+      Passed: 19
+      Skipped: 0
+  extended:
+    result: success
+    statistics:
+      Failed: 0
+      Passed: 11
+      Skipped: 0
+    supportedFeatures:
+    - GatewayAddressEmpty
+    - GatewayBackendClientCertificate
+    - GatewayFrontendClientCertificateValidation
+    - GatewayFrontendClientCertificateValidationInsecureFallback
+    - GatewayHTTPListenerIsolation
+    - GatewayHTTPSListenerDetectMisdirectedRequests
+    - GatewayInfrastructure
+    - GatewayPort8080
+    - GatewayStaticAddresses
+    - ListenerSet
+    - UDPRoute
+  name: GATEWAY-UDP
+  summary: Core tests succeeded. Extended tests succeeded.
 - core:
     result: success
     statistics:
@@ -142,30 +168,4 @@ profiles:
     - TLSRouteModeMixed
     - TLSRouteModeTerminate
   name: GATEWAY-TLS
-  summary: Core tests succeeded. Extended tests succeeded.
-- core:
-    result: success
-    statistics:
-      Failed: 0
-      Passed: 19
-      Skipped: 0
-  extended:
-    result: success
-    statistics:
-      Failed: 0
-      Passed: 11
-      Skipped: 0
-    supportedFeatures:
-    - GatewayAddressEmpty
-    - GatewayBackendClientCertificate
-    - GatewayFrontendClientCertificateValidation
-    - GatewayFrontendClientCertificateValidationInsecureFallback
-    - GatewayHTTPListenerIsolation
-    - GatewayHTTPSListenerDetectMisdirectedRequests
-    - GatewayInfrastructure
-    - GatewayPort8080
-    - GatewayStaticAddresses
-    - ListenerSet
-    - UDPRoute
-  name: GATEWAY-UDP
   summary: Core tests succeeded. Extended tests succeeded.

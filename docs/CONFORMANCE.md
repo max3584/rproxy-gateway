@@ -18,9 +18,9 @@ CI の `e2e` ワークフローの `Gateway API conformance` ジョブ（`script
 
 ## リリースした成果物でのレポート（Gateway API への提出用）
 
-Gateway API の実装一覧のバッジ（Conformant）は、kubernetes-sigs/gateway-api の `conformance/reports/<v1.x>/<組織>-<プロジェクト>/` に出したレポートで決まる。そのレポートは、リリースした chart とイメージ（ここではなにもビルドしない）から作る：`e2e` ワークフローを `report_version` を付けて手で動かすと（`gh workflow run e2e.yml -f report_version=0.4.8 -f report_gateway_api=v1.6.3`。upstream はレポートを Gateway API のマイナーの版ごとに受け付けるので、`report_gateway_api` で版を選ぶ。古い suite で拡張の試験の期待が後で変わったものは `-f report_require=core`）、`conformance report (published)` のジョブだけが `scripts/conformance-report.sh` を動かす。kind に Gateway API v1.6.3 の experimental channel の CRD を入れ、`oci://ghcr.io/max3584/charts/rproxy-gateway` をその版で入れ（既定のイメージ、`managed.serviceType=ClusterIP`、`managed.addressCIDRs={192.0.2.0/24}`）、Gateway API v1.6.3 の suite を 5 つのプロファイルで動かす。名乗る機能は `--supported-features` で渡さず、suite がコントローラの書いた GatewayClass の `status.supportedFeatures` から読む。成果物 `conformance-report-v<版>-<Gateway API の版>` に、suite が書いたままのレポート（`experimental-v<版>-default-report.yaml`）、suite とコントローラのログ、環境（版、イメージのダイジェスト）が入る。すべてのプロファイルの core と extended が success で、飛ばした試験がないときだけ成功する。
+Gateway API の実装一覧のバッジ（Conformant）は、kubernetes-sigs/gateway-api の `conformance/reports/<v1.x>/<組織>-<プロジェクト>/` に出したレポートで決まる。そのレポートは、リリースした chart とイメージ（ここではなにもビルドしない）から作る：`e2e` ワークフローを `report_version` を付けて手で動かすと（`gh workflow run e2e.yml -f report_version=0.4.12 -f report_gateway_api=v1.6.3`。upstream はレポートを Gateway API のマイナーの版ごとに受け付けるので、`report_gateway_api` で版を選ぶ。古い suite で拡張の試験の期待が後で変わったものは `-f report_require=core`）、`conformance report (published)` のジョブだけが `scripts/conformance-report.sh` を動かす。kind に Gateway API v1.6.3 の experimental channel の CRD を入れ、`oci://ghcr.io/max3584/charts/rproxy-gateway` をその版で入れ（既定のイメージ、`managed.serviceType=ClusterIP`、`managed.addressCIDRs={192.0.2.0/24}`）、Gateway API v1.6.3 の suite を 5 つのプロファイルで動かす。名乗る機能は `--supported-features` で渡さず、suite がコントローラの書いた GatewayClass の `status.supportedFeatures` から読む。成果物 `conformance-report-v<版>-<Gateway API の版>` に、suite が書いたままのレポート（`experimental-v<版>-default-report.yaml`）、suite とコントローラのログ、環境（版、イメージのダイジェスト）が入る。すべてのプロファイルの core と extended が success で、飛ばした試験がないときだけ成功する。
 
-v0.4.8・Gateway API v1.6.3（2026-10-12、chart 0.4.8、`ghcr.io/max3584/rproxy-gateway:0.4.8`、`ghcr.io/max3584/rproxy-gateway/rproxy:0.4.7`、kind v0.33.0、Kubernetes v1.37.0）：
+v0.4.12・Gateway API v1.6.3（2026-10-15、chart 0.4.12、`ghcr.io/max3584/rproxy-gateway:0.4.12`、`ghcr.io/max3584/rproxy-gateway/rproxy:0.4.12`、kind v0.33.0、Kubernetes v1.37.0）：
 
 | プロファイル | core | extended | 名乗る extended の機能 |
 |---|---|---|---|
@@ -32,7 +32,7 @@ v0.4.8・Gateway API v1.6.3（2026-10-12、chart 0.4.8、`ghcr.io/max3584/rproxy
 
 失敗も飛ばしもない（飛ばしたのはプロファイルの外の Mesh だけ）。各プロファイルの extended の機能はすべて名乗っている（`unsupportedFeatures` がない）。
 
-v0.4.8・Gateway API v1.5.1（同じ日・同じ成果物。v1.5 の suite は GATEWAY-TCP・GATEWAY-UDP を持たない）：GATEWAY-HTTP core 33 / 33・extended 52 / 53、GATEWAY-GRPC core 13 / 13・extended 9 / 9、GATEWAY-TLS core 18 / 18・extended 14 / 14。extended の失敗は `HTTPRouteCORS` の「CORS request with credentials should hide auth headers on unauth path」だけで、この試験の期待は v1.6 で変わった（rproxy-gateway は v1.6 の動きで、v1.6.3 の suite では通る）。
+v0.4.12・Gateway API v1.5.1（同じ日・同じ chart とイメージ。v1.5 の suite は GATEWAY-TCP・GATEWAY-UDP を持たない）：GATEWAY-HTTP core 33 / 33・extended 53 / 53、GATEWAY-GRPC core 13 / 13・extended 9 / 9、GATEWAY-TLS core 18 / 18・extended 14 / 14。失敗も飛ばしもない。v0.4.8 では `HTTPRouteCORS` の 1 件（資格情報付きのリクエストへの `Access-Control-Allow-Origin`）が v1.5 の期待と違って失敗していたが、rproxy v0.4.12 で v1.5 と v1.6 の両方の期待を満たすようにした。`unsupportedFeatures` の `GatewayInfrastructurePropagation` は、v1.6 で `GatewayInfrastructure` になった機能の v1.5 の名前（rproxy-gateway は v1.6 の名前で名乗る）。
 
 Gateway API v1.7 は正式版が出たら同じ手順でレポートを作る（v1.7.0-rc.1 の suite は互換性テストで全部通っている）。提出するもの（レポート、手順の README、実装一覧の `details.yaml`、PR の下書き、オーナーがすること）は [conformance/submission/](conformance/submission/)。
 

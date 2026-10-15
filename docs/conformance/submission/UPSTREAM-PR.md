@@ -5,11 +5,11 @@
 | ここ | upstream |
 |---|---|
 | `conformance/reports/v1.6/max3584-rproxy-gateway/README.md` | 同じ（提出の README。必須） |
-| `conformance/reports/v1.6/max3584-rproxy-gateway/experimental-v0.4.8-default-report.yaml` | 同じ（suite が書いたまま。手を入れない） |
-| `conformance/reports/v1.5/max3584-rproxy-gateway/README.md`・`experimental-v0.4.8-default-report.yaml` | 同じ（Gateway API v1.5.1 の suite。core は全部 success、拡張は HTTPRouteCORS の 1 件だけ失敗：試験の期待が v1.6 で変わった。README の最後に説明）
+| `conformance/reports/v1.6/max3584-rproxy-gateway/experimental-v0.4.12-default-report.yaml` | 同じ（suite が書いたまま。手を入れない） |
+| `conformance/reports/v1.5/max3584-rproxy-gateway/README.md`・`experimental-v0.4.12-default-report.yaml` | 同じ（Gateway API v1.5.1 の suite。3 つのプロファイルとも core・extended が success。`GatewayInfrastructurePropagation` は v1.6 の `GatewayInfrastructure` の v1.5 の名前なので unsupported に出る。README に説明）|
 | `conformance/list/implementations/max3584-rproxy-gateway/details.yaml` | 同じ（実装一覧の載せ方。`organization`・`project` はレポートと同じ） |
 
-レポートは `e2e` ワークフローの手動の実行（`report_version=0.4.8`、`report_gateway_api=v1.6.3` と `v1.5.1`）の成果物 `conformance-report-v0.4.8-<Gateway API の版>` から、リリースした chart 0.4.8 とイメージ（`ghcr.io/max3584/rproxy-gateway:0.4.8`、`ghcr.io/max3584/rproxy-gateway/rproxy:0.4.7`）で作った（[docs/CONFORMANCE.md](../../CONFORMANCE.md)）。upstream の `tools/implist`（実装一覧とバッジを作る道具）にこのフォルダを足して動かすと、`Gateway Conformance v1.6.3 — Conformant` のバッジになる。
+レポートは `e2e` ワークフローの手動の実行（`report_version=0.4.12`、`report_gateway_api=v1.6.3` と `v1.5.1`）の成果物 `conformance-report-v0.4.12-<Gateway API の版>` から、リリースした chart 0.4.12 とイメージ（`ghcr.io/max3584/rproxy-gateway:0.4.12`、`ghcr.io/max3584/rproxy-gateway/rproxy:0.4.12`）で作った（[docs/CONFORMANCE.md](../../CONFORMANCE.md)）。upstream の `tools/implist`（実装一覧とバッジを作る道具）にこのフォルダを足して動かすと、`Gateway Conformance v1.6.3 — Conformant` のバッジになる。
 
 ## オーナーがすること
 
@@ -24,15 +24,15 @@
    ```shell
    gh repo fork kubernetes-sigs/gateway-api --clone=true -- --depth 50
    cd gateway-api
-   git fetch upstream main && git checkout -b rproxy-gateway-v0.4.8-conformance upstream/main   # gh の fork の clone：origin が自分の fork、upstream が kubernetes-sigs
+   git fetch upstream main && git checkout -b rproxy-gateway-v0.4.12-conformance upstream/main   # gh の fork の clone：origin が自分の fork、upstream が kubernetes-sigs
    cp -r <rproxy-gateway>/docs/conformance/submission/conformance/. conformance/
    git add conformance/list/implementations/max3584-rproxy-gateway conformance/reports/v1.6/max3584-rproxy-gateway conformance/reports/v1.5/max3584-rproxy-gateway
-   git commit -m "conformance: add rproxy-gateway v0.4.8 report and implementation entry"
-   git push -u origin rproxy-gateway-v0.4.8-conformance
-   gh pr create -R kubernetes-sigs/gateway-api --title "conformance: add rproxy-gateway v0.4.8 report and implementation entry"
+   git commit -m "conformance: add rproxy-gateway v0.4.12 reports and implementation entry"
+   git push -u origin rproxy-gateway-v0.4.12-conformance
+   gh pr create -R kubernetes-sigs/gateway-api --title "conformance: add rproxy-gateway v0.4.12 reports and implementation entry"
    ```
 
-   レポートの YAML は 1 バイトも変えない（upstream の README：「exactly as they have been created by the conformance suite」）。この PR の sha256：`8b40c41c233df807a8394d13b01cf47641372e4af131dbb0c53300ec9c837dbc`。
+   レポートの YAML は 1 バイトも変えない（upstream の README：「exactly as they have been created by the conformance suite」）。sha256：v1.6 のレポート `4a37d4b38436873f70a76e3d450c2d3544e55694e26634537aabd90b9641185e`、v1.5 のレポート `17ffa3e5ac1c476805c99c82ed7bc7cc4cb5e6bd3fa7a3ae3e3dd3b3398d8f2a`。
 4. 初めての人の PR は org のメンバーが `/ok-to-test` を付けるまで CI が動かない。レビュアー（これまでは robscott さんなど）の `/lgtm`・`/approve` でマージされる。
 5. 出したあと：Gateway API の新しい版（v1.7）が出たら、その版のレポートを出し直すと Conformant のまま（upstream の `tools/implist` は直近の 2 つのマイナー版のレポートだけを Conformant にし、それより古いものは Partial にする）。
 
@@ -41,7 +41,7 @@
 タイトル（最近のものに揃える。例：#5332 `conformance: add Portus v0.2.12 report and implementation entry`）：
 
 ```
-conformance: add rproxy-gateway v0.4.8 report and implementation entry
+conformance: add rproxy-gateway v0.4.12 reports and implementation entry
 ```
 
 説明（upstream の PR テンプレートの形）：
@@ -54,11 +54,12 @@ conformance: add rproxy-gateway v0.4.8 report and implementation entry
 
 **What this PR does / why we need it**:
 
-Adds rproxy-gateway to the implementations list, with a conformance report for Gateway API v1.6.3
-(experimental channel) from the v0.4.8 release: all five Gateway profiles (HTTP, GRPC, TLS, TCP, UDP),
-core and extended, no failures and no skipped tests. The supported features were inferred from the
-GatewayClass status (no `--supported-features`). The README has the steps to reproduce it from the
-released Helm chart and images.
+Adds rproxy-gateway to the implementations list, with conformance reports from the v0.4.12 release
+(experimental channel): Gateway API v1.6.3 with all five Gateway profiles (HTTP, GRPC, TLS, TCP, UDP),
+and Gateway API v1.5.1 with the three profiles that suite has (HTTP, GRPC, TLS). Core and extended
+succeed in every profile, with no failures and no skipped tests. The supported features were inferred
+from the GatewayClass status (no `--supported-features`). The READMEs have the steps to reproduce them
+from the released Helm chart and images.
 
 **Which issue(s) this PR fixes**:
 
@@ -76,11 +77,11 @@ NONE
 
 ## 確かめたこと（レビューで聞かれたとき用）
 
-- 2 回動かして同じ結果（https://github.com/max3584/rproxy-gateway/actions/runs/37894639981 （提出するレポート）、https://github.com/max3584/rproxy-gateway/actions/runs/37895657152 ）。成果物は 90 日で消えるので、要るなら早めに落としておく。
-- `implementation.version` は `v0.4.8`（リリースのタグ。ブランチ名ではない）、README の表は semver でリリースのページへのリンク、`gatewayAPIChannel`（experimental）・`mode`（default）・ファイル名（`<channel>-<version>-<mode>-report.yaml`）が揃っている。
-- フォルダは `v1.6`（いまの upstream はマイナー版のフォルダ。`gatewayAPIVersion` v1.6.3 のマイナーと一致すること（`hack/verify-reports.sh`）を満たす）。
-- 5 つのプロファイルとも core・extended が `success`、Failed 0・Skipped 0、`unsupportedFeatures` なし（各プロファイルの extended の機能をすべて名乗る）。provisional の試験は飛ばしていない（`--skip-provisional-tests` なし）。
-- 使ったのは公開した chart とイメージ（環境のファイルにダイジェスト）：コントローラ `ghcr.io/max3584/rproxy-gateway@sha256:51ed1cfd20bf0a709473930ffa32b137053d2988ad3922946ae0750cb33a801b`、rproxy `ghcr.io/max3584/rproxy-gateway/rproxy@sha256:29de180c864017a093fa15c40dc3a11ed8e1bb4906f9c740b46cd0a048e04e24`。
+- 提出するレポートの実行：v1.6.3 は https://github.com/max3584/rproxy-gateway/actions/runs/38686943835 、v1.5.1 は https://github.com/max3584/rproxy-gateway/actions/runs/38687761813 （どちらも 2026-10-15）。v0.4.8 のときは同じ手順を 2 回動かして同じ結果だった。成果物は 90 日で消えるので、要るなら早めに落としておく。
+- `implementation.version` は `v0.4.12`（リリースのタグ。ブランチ名ではない）、README の表は semver でリリースのページへのリンク、`gatewayAPIChannel`（experimental）・`mode`（default）・ファイル名（`<channel>-<version>-<mode>-report.yaml`）が揃っている。
+- フォルダは `v1.6` と `v1.5`（いまの upstream はマイナー版のフォルダ。`gatewayAPIVersion` v1.6.3・v1.5.1 のマイナーと一致すること（`hack/verify-reports.sh`）を満たす）。
+- v1.6.3 は 5 つのプロファイルとも core・extended が `success`、Failed 0・Skipped 0、`unsupportedFeatures` なし（各プロファイルの extended の機能をすべて名乗る）。v1.5.1 は 3 つのプロファイルとも `success`、Failed 0・Skipped 0。`unsupportedFeatures` は `GatewayInfrastructurePropagation` だけ（v1.6 の `GatewayInfrastructure` の v1.5 の名前。README に説明）。provisional の試験は飛ばしていない（`--skip-provisional-tests` なし）。
+- 使ったのは公開した chart とイメージ（環境のファイルにダイジェスト）：コントローラ `ghcr.io/max3584/rproxy-gateway@sha256:ce0aaa3f70b6b7276cd4ed8524e8b756b5784ea297deb5c6e42a3bcc075a7375`、rproxy `ghcr.io/max3584/rproxy-gateway/rproxy@sha256:2d4d0844301f7e72d84c28ac14dd2199526e2fe77420ae1b244d902e575c0e33`。
 - 既定から変えた chart の値は 2 つ：`managed.serviceType=ClusterIP`（kind にロードバランサがない）と `managed.addressCIDRs={192.0.2.0/24}`（`GatewayStaticAddresses` の usable address を許す。既定では静的なアドレスを受け付けない）。README の手順に書いてある。
 - GatewayClass が名乗る `HTTPRouteExternalAuth*` は Gateway API v1.6.3 の suite にない名前なので、レポートには出ない（suite が無視する）。
 - 実装一覧のページの表（`hack/docsy-generate-conformance.py`）が出すのは HTTP・GRPC・TLS のプロファイルと Mesh だけで、TCP・UDP はレポートにあっても表には出ない。バッジ（`tools/implist`）は全プロファイルを見る。
