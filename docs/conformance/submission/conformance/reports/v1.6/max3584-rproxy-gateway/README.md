@@ -6,13 +6,13 @@
 
 | API channel  | Implementation version                                                         | Mode    | Report                                                       |
 |--------------|--------------------------------------------------------------------------------|---------|--------------------------------------------------------------|
-| experimental | [v0.4.8](https://github.com/max3584/rproxy-gateway/releases/tag/v0.4.8)        | default | [v0.4.8 report](./experimental-v0.4.8-default-report.yaml)   |
+| experimental | [v0.4.12](https://github.com/max3584/rproxy-gateway/releases/tag/v0.4.12)      | default | [v0.4.12 report](./experimental-v0.4.12-default-report.yaml) |
 
 ## Reproduce
 
 The report comes from the released Helm chart and images (nothing is built): the chart
-`oci://ghcr.io/max3584/charts/rproxy-gateway` 0.4.8 with its default images
-`ghcr.io/max3584/rproxy-gateway:0.4.8` (the controller) and `ghcr.io/max3584/rproxy-gateway/rproxy:0.4.7`
+`oci://ghcr.io/max3584/charts/rproxy-gateway` 0.4.12 with its default images
+`ghcr.io/max3584/rproxy-gateway:0.4.12` (the controller) and `ghcr.io/max3584/rproxy-gateway/rproxy:0.4.12`
 (the data plane it provisions per Gateway). The supported features are not passed on the command line:
 the suite reads them from the GatewayClass status that the controller writes.
 
@@ -42,7 +42,7 @@ controller creates for it) through a route to the kind node.
    `GatewayStaticAddresses` test's usable address:
 
    ```shell
-   helm install rproxy-gateway oci://ghcr.io/max3584/charts/rproxy-gateway --version 0.4.8 \
+   helm install rproxy-gateway oci://ghcr.io/max3584/charts/rproxy-gateway --version 0.4.12 \
      --namespace rproxy-gateway-system --create-namespace --wait \
      --set managed.serviceType=ClusterIP \
      --set 'managed.addressCIDRs={192.0.2.0/24}'
@@ -60,13 +60,22 @@ controller creates for it) through a route to the kind node.
      --organization=max3584 \
      --project=rproxy-gateway \
      --url=https://github.com/max3584/rproxy-gateway \
-     --version=v0.4.8 \
+     --version=v0.4.12 \
      --contact=https://github.com/max3584/rproxy-gateway/issues \
-     --report-output="$PWD/experimental-v0.4.8-default-report.yaml" \
+     --report-output="$PWD/experimental-v0.4.12-default-report.yaml" \
      --usable-address=192.0.2.10 \
      --unusable-address=0.0.0.0
    ```
 
+`--usable-address` and `--unusable-address` are inputs of the `GatewayStaticAddresses` test, not listen
+addresses: the suite puts both in a Gateway's `spec.addresses` and expects `Programmed: False` with
+`AddressNotUsable`, then removes the unusable one and expects the Gateway programmed with the usable one.
+rproxy-gateway accepts a static address only inside `managed.addressCIDRs`, so `192.0.2.10` (inside the
+range set in step 3) is usable and `0.0.0.0` is not.
+
+The Mesh profiles are not claimed: rproxy-gateway serves traffic sent to its Gateways, and does not
+intercept Pod-to-Service traffic as a service mesh does.
+
 The same steps are automated on the project's main branch: `scripts/conformance-report.sh`, run by hand in
-GitHub Actions as `gh workflow run e2e.yml -f report_version=0.4.8 -f report_gateway_api=v1.6.3` (the report is the run's artifact,
+GitHub Actions as `gh workflow run e2e.yml -f report_version=0.4.12 -f report_gateway_api=v1.6.3` (the report is the run's artifact,
 together with the suite's log and the image digests).
