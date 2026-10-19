@@ -80,6 +80,10 @@ spec:
     shutdown: {delay: 15s, drain: 25s}  # E (6.)
     extraEnv: []                        # the class only; names the controller sets are refused
   ui: {visible: true}                   # C: shown to the UI (a Gateway can only turn the class's default to false)
+  proxyProtocol:                        # 14. (v0.4.13): PROXY protocol headers from the front end, read on TCP ports
+    from: [10.0.0.0/16]
+    required: true
+    listeners: [https]
   policy:                               # only in the class's reference (InvalidParameters from a Gateway)
     gatewayOverrides: [replicas, podDisruptionBudget, pod.labels, pod.annotations, pod.resources,
       pod.topologySpreadConstraints, service.externalTrafficPolicy, service.loadBalancerSourceRanges,
@@ -114,6 +118,7 @@ The default column applies when neither reference sets the field; each is the v0
 | `rproxy.shutdown.delay`, `.drain` | `RPROXY_SHUTDOWN_DELAY`, `RPROXY_SHUTDOWN_DRAIN` and the grace period (6.) | `--shutdown-delay` (15 s), `--shutdown-drain` (25 s) | `0s` to `10m`. Not put on rproxy without `features.graceful_shutdown` (it keeps the preStop) |
 | `rproxy.extraEnv` | the rproxy container | none | `RPROXY_*` only. Names the controller sets (`RPROXY_API_*`, `RPROXY_TOKEN_FILE`, `RPROXY_TLS_*`, `RPROXY_FILES_*`, `RPROXY_CONFIG`, `RPROXY_DATABASE_URL`, `RPROXY_UPDATE*`, `RPROXY_HANDOFF*`, `RPROXY_STATIC_RULES`, `RPROXY_SHUTDOWN_*`, and those of the fields above) are refused |
 | `ui.visible` | whether C's discovery Secret lists the Gateway | the class's value, else `true` | a Gateway cannot make it `true` when the class says `false` (v0.4.3; only with `ui.namespace`) |
+| `proxyProtocol` | `proxy_protocol` of the rule set's tcp rules (14.) | none (no header read) | `from` not empty, at most 64, CIDRs or IPs, no `/0`; `required` defaults to `true`. Replaced as a whole (the Gateway's when both have one) |
 
 ### 2.3 References and merging
 
@@ -140,6 +145,7 @@ The default column applies when neither reference sets the field; each is the v0
 | Service annotations | allowed, but prefixes that pick load balancer addresses (`metallb.universe.tf/`, ...) only through the allow list (`--service-annotation-prefix`); others are `InvalidParameters` | the same line as v0.4's `spec.infrastructure.annotations` (the CVE-2020-8554 pattern). A reference gets an error instead of a silent drop |
 | `service.type`, `loadBalancerClass` | not by default | can take outside addresses (the class's `policy` opens them) |
 | nodeSelector, tolerations, affinity, priorityClassName | not by default | dedicated nodes, the control plane, evicting others (the class's `policy` opens them) |
+| `proxyProtocol` | not by default | decides which peers can claim to be any client through the header (tenants must not make rproxy believe others' headers; the class's `policy` opens it) |
 | `rproxy.image`, `extraEnv` | never (not even through `policy`) | would run any image or setting in a pod holding the Gateway's control API credentials |
 | `policy` | never | the class's reference's |
 
@@ -472,3 +478,27 @@ Measured with v0.4.4's `mode=fleet-vip` (the VIP sidecar is gone in v0.4.5; the 
   - A timeout is a 504 and counts as a gateway failure for `outlier_detection` (ejected after 3).
   - Not for GRPCRoutes: a server stream may hold its headers back until its first message (grpc-go's default), so a watch without events would be cut at 30 s. gRPC deadlines come from `grpc-timeout`. Use RproxyPolicy's `responseTimeout` if needed.
   - What makes the headers wait longer than 30 s (long polling that waits before the headers, heavy work) needs HTTPRoute's `timeouts.backendRequest` or RproxyPolicy's `responseTimeout`.
+
+## 14. PROXY protocol from the front end (v0.4.13, #85)
+
+When the load balancer in front of a Gateway (a cloud NLB, HAProxy in front of node ports, another rproxy) sends PROXY protocol (v1 / v2), rproxy reads the header and uses the real client's address. `proxyProtocol` in `RproxyGatewayParameters` is rendered as rproxy-api v0.4.13's rule `proxy_protocol: {from, required}` (rproxy-api #296, `features.proxy_protocol_in`). How to make each platform's front end send it and how to choose `from`: [PLATFORM.md](PLATFORM.md).
+
+```yaml
+spec:
+  proxyProtocol:
+    from: [10.0.0.0/16]   # peers whose headers are believed (required; not empty, no /0, at most 64)
+    required: true        # default true
+    listeners: [https]    # default: every TCP listener (HTTP, HTTPS, TLS, TCP)
+```
+
+- Which rules: without `listeners`, every tcp rule of the Gateway's rule set (ListenerSets' listeners and migrated Ingress / Traefik ports too: load balancers add the header to the Service port, whichever listener it is for). With `listeners`, the rules of the Gateway's own listeners of those names. RproxyRules stay as written (nothing added).
+- One port is one rproxy rule (listeners on one port go into one rule). Listeners sharing a port with one in `listeners` read headers too (ports are the only unit there is).
+- UDP rules never get it (rproxy takes no PROXY v2 over UDP). A UDP listener or an unknown name in `listeners` is reported in the Gateway's condition and the other listeners still get it (the Gateway stays accepted: a class's defaults naming listeners meet Gateways without those names, so it is not an error).
+- Status: only while `proxyProtocol` is set, the Gateway gets the condition `rproxy.max3584.net/ProxyProtocol` (implementation-specific in Gateway API, so a domain-prefixed type): `True`, `Applied` (the ports and `from`); `False`, `InvalidListeners` (unknown or UDP names; the message names them and the ports reading headers); `False`, `UnsupportedRproxy` (below). Removing `proxyProtocol` removes the condition.
+- An rproxy without `features.proxy_protocol_in` (before v0.4.13) gets nothing (it would refuse the whole set); the condition is `False`, `UnsupportedRproxy`. `Programmed` is left alone (everything else works).
+- Who decides: the peers believed can claim to be any client through the header, so it is the cluster administrator's call. The class's reference can always set it; a Gateway's only with `proxyProtocol` in `policy.gatewayOverrides` (not in the default list; 2.5).
+- Validation (`InvalidParameters`, as 2.4): `from` empty or over 64 entries (the CRD refuses those too), not a CIDR or IP, a `/0` (`0.0.0.0/0`, `::/0` and the like, as rproxy), an empty name in `listeners`.
+- A Gateway whose parameters became invalid (including 2.4's "keeps its last good shape") uses the class reference's `proxyProtocol` (its rule set is still applied: rproxy keeps reading headers behind a front end that keeps sending them; the Gateway's own reference's `proxyProtocol` is not used).
+- fleet: Gateways' references are not used (2.3), but the class reference's `proxyProtocol` goes onto every Gateway's rules.
+- The managed rproxy's pods and Service do not change (the rule set only).
+- Tests: unit (`src/render/tests.rs`: every tcp rule by default, port sharing with names, the condition for UDP and unknown names, an rproxy without `features.proxy_protocol_in`, the `policy` for Gateways' references, the class's on invalid parameters; `src/render/params.rs`: validation and merging), a real rproxy (`tests/rproxy.rs`: the rendered set is taken, the client of a v1 header from `from` reaches `X-Forwarded-For`, no header is refused, a TCP listener not listed reads no header), e2e (kind: another GatewayClass's defaults with the pod range as `from`; the spoofed client a client pod sends with curl's `--haproxy-protocol` reaches the backend's `X-Forwarded-For`).

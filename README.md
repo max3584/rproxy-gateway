@@ -27,7 +27,7 @@ English: [README.en.md](README.en.md)
 | backend | EndpointSlice の Pod の IP（rproxy が振り分けとヘルスチェックをする） |
 | 状態 | Gateway・リスナー・ルートの `Accepted`・`Programmed`・`ResolvedRefs`（rproxy のルールの `conditions` から） |
 | `RproxyMiddleware`・`RproxyPolicy`・`RproxyRule`（`rproxy.max3584.net/v1beta1`。v0.4.4 までの `v1alpha1` も同じ形で使える（非推奨）） | Gateway API にない設定（ミドルウェア、L4 の制限・帯域・GeoIP・受け身のヘルスチェック、ルールそのもの） |
-| `RproxyGatewayParameters`（GatewayClass・Gateway の `parametersRef`） | managed の rproxy の形を Gateway ごとに（replicas、PDB、resources、Pod・Service の設定、rproxy の性能の設定） |
+| `RproxyGatewayParameters`（GatewayClass・Gateway の `parametersRef`） | managed の rproxy の形を Gateway ごとに（replicas、PDB、resources、Pod・Service の設定、rproxy の性能の設定、前段の PROXY protocol を読む `proxyProtocol`（[docs/PLATFORM.md](docs/PLATFORM.md)）） |
 | 移行（`--migrate-to`） | Ingress と Traefik の IngressRoute・IngressRouteTCP・IngressRouteUDP・Middleware・TLSOption を読む（[docs/MIGRATION.md](docs/MIGRATION.md)） |
 
 決めごとと変換の表は [docs/DESIGN.md](docs/DESIGN.md)。Gateway API の conformance の結果は [docs/CONFORMANCE.md](docs/CONFORMANCE.md)。テナントの分け方・既定で止めているもの・権限は [docs/SECURITY.md](docs/SECURITY.md)。v0.4 の系列のパッチで足していく Kubernetes での運用（Gateway ごとの rproxy の設定、Kustomize、UI）の設計は [docs/DESIGN-v0.4.x.md](docs/DESIGN-v0.4.x.md)。Gateway のアドレスをプラットフォーム（MetalLB・kube-vip・Cilium・クラウドのロードバランサ・NodePort + 自前の L4・fleet の keepalived）で用意する書き方は [docs/PLATFORM.md](docs/PLATFORM.md)。
