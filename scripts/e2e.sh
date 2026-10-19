@@ -260,6 +260,92 @@ test -n "$client_ip"
 ew selector | jq -e --arg ip "$client_ip" '.headers["X-Forwarded-For"] | any(split(", ") | index($ip))' > /dev/null
 kubectl delete namespace east-west --wait=true > /dev/null
 
+echo "== PROXY protocol from a front end (parameters proxyProtocol, rproxy v0.4.13): the client in the header reaches the backend"
+# a GatewayClass of its own (its default parameters set proxyProtocol; the class rproxy stays as it is). The
+# front end is a client pod sending a PROXY v1 header with a made-up client (curl --haproxy-clientip); from is
+# that pod's IP alone (what rproxy sees: kube-proxy passes a pod's connection to a ClusterIP without SNAT)
+kubectl create namespace pp --dry-run=client -o yaml | kubectl apply -f - > /dev/null
+kubectl -n pp run front --image=curlimages/curl:8.11.1 --restart=Never --command -- sleep 900 > /dev/null
+kubectl -n pp wait --for=condition=Ready pod/front --timeout=180s > /dev/null
+front_ip=$(kubectl -n pp get pod front -o jsonpath='{.status.podIP}')
+echo "front end pod IP: $front_ip"
+cat <<YAML | kubectl apply -f - > /dev/null
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyGatewayParameters
+metadata: {name: rproxy-pp, namespace: $NS}
+spec:
+  proxyProtocol: {from: ["$front_ip"], listeners: [http]}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: {name: rproxy-pp}
+spec:
+  controllerName: rproxy.max3584.net/gateway-controller
+  parametersRef: {group: rproxy.max3584.net, kind: RproxyGatewayParameters, name: rproxy-pp, namespace: $NS}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: echo, namespace: pp}
+spec:
+  selector: {matchLabels: {app: echo}}
+  template:
+    metadata: {labels: {app: echo}}
+    spec:
+      containers:
+        - name: echo
+          image: registry.k8s.io/gateway-api/echo-basic:v1.5.1
+          env:
+            - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+            - {name: NAMESPACE, valueFrom: {fieldRef: {fieldPath: metadata.namespace}}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: echo, namespace: pp}
+spec:
+  selector: {app: echo}
+  ports: [{name: http, port: 8080, targetPort: 3000}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {name: pp, namespace: pp}
+spec:
+  gatewayClassName: rproxy-pp
+  listeners:
+    - {name: http, port: 80, protocol: HTTP}
+    - {name: tcp, port: 9100, protocol: TCP}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: echo, namespace: pp}
+spec:
+  parentRefs: [{name: pp, sectionName: http}]
+  rules: [{backendRefs: [{name: echo, port: 8080}]}]
+---
+apiVersion: gateway.networking.k8s.io/$tcp_v
+kind: TCPRoute
+metadata: {name: echo, namespace: pp}
+spec:
+  parentRefs: [{name: pp, sectionName: tcp}]
+  rules: [{backendRefs: [{name: echo, port: 8080}]}]
+YAML
+kubectl -n pp rollout status deploy/echo --timeout=180s > /dev/null
+kubectl -n pp wait --for=condition=Programmed gateway/pp --timeout=240s
+pp_addr=$(kubectl -n pp get gateway pp -o jsonpath='{.status.addresses[0].value}')
+retry 60 sh -c "test \"\$(kubectl -n pp get gateway pp -o jsonpath='{.status.conditions[?(@.type==\"rproxy.max3584.net/ProxyProtocol\")].status}')\" = True"
+kubectl -n pp get gateway pp -o jsonpath='{.status.conditions[?(@.type=="rproxy.max3584.net/ProxyProtocol")].message}'; echo
+# the HTTP listener: the client in the header is the one rproxy passes on
+pp_get() { kubectl -n pp exec front -- curl -sf --max-time 5 --haproxy-protocol --haproxy-clientip 203.0.113.7 "http://$pp_addr/pp" > "$work/pp.json"; }
+retry 60 pp_get
+jq -e '.path == "/pp" and (.headers["X-Forwarded-For"] | any(split(", ") | index("203.0.113.7")))' "$work/pp.json" > /dev/null \
+  || { cat "$work/pp.json"; exit 1; }
+# required (the default): the front end without a header is refused (curl: empty reply, no status)
+test "$(kubectl -n pp exec front -- curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://$pp_addr/plain" || true)" = 000
+# the TCP listener is not listed: no header is read there, a plain client is served
+retry 30 sh -c "kubectl -n pp exec front -- curl -sf --max-time 5 http://$pp_addr:9100/tcp | jq -e '.path == \"/tcp\"' > /dev/null"
+kubectl delete namespace pp --wait=true > /dev/null
+kubectl delete gatewayclass rproxy-pp --wait=false > /dev/null
+kubectl -n $NS delete rproxygatewayparameters rproxy-pp > /dev/null
+
 if [ -n "${MIGRATE:-}" ]; then
   echo "== migration (Ingress, IngressRoute)"
   retry 60 sh -c "curl -sf -H 'Host: ingress.example.com' http://$addr/i | jq -e '.path == \"/i\"' > /dev/null"

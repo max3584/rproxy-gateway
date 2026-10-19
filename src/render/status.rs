@@ -37,8 +37,17 @@ pub fn get<'a>(list: &'a [Cond], kind: &str) -> Option<&'a Cond> {
 /// `lastTransitionTime` of a condition whose status did not change.
 /// The condition types this controller writes. Any other type in the previous status belongs to someone
 /// else (another controller, a tool) and is kept as it was (the Gateway API's GatewayPreserveForeignConditions).
-pub const OWN_CONDITION_TYPES: &[&str] =
-	&["Accepted", "Programmed", "ResolvedRefs", "Conflicted", "SupportedVersion", "PartiallyInvalid", "AttachedListenerSets", "Ready"];
+pub const OWN_CONDITION_TYPES: &[&str] = &[
+	"Accepted",
+	"Programmed",
+	"ResolvedRefs",
+	"Conflicted",
+	"SupportedVersion",
+	"PartiallyInvalid",
+	"AttachedListenerSets",
+	"Ready",
+	crate::render::proxy_protocol::CONDITION,
+];
 
 pub fn to_k8s(conds: &[Cond], generation: i64, previous: Option<&Value>, now: &str) -> Vec<Value> {
 	let mut out: Vec<Value> = conds

@@ -554,3 +554,143 @@ endpoints: [{{addresses: [127.0.0.1]}}]
 		}
 	}
 }
+
+/// A backend answering with the client address it was given: `<x-forwarded-for>`.
+async fn forwarded_backend() -> u16 {
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let port = listener.local_addr().unwrap().port();
+	tokio::spawn(async move {
+		loop {
+			let Ok((tcp, _)) = listener.accept().await else { continue };
+			tokio::spawn(async move {
+				let svc = hyper::service::service_fn(|req: hyper::Request<hyper::body::Incoming>| async move {
+					let xff = req.headers().get("x-forwarded-for").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+					Ok::<_, std::convert::Infallible>(hyper::Response::new(http_body_util::Full::new(hyper::body::Bytes::from(xff))))
+				});
+				let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(tcp), svc).await;
+			});
+		}
+	});
+	port
+}
+
+/// `bytes` then an HTTP/1.1 request over a plain connection: the answer (empty when rproxy closes it).
+async fn request_after(port: u16, bytes: &[u8], host: &str) -> String {
+	let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+	let mut req = bytes.to_vec();
+	req.extend_from_slice(format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes());
+	if tcp.write_all(&req).await.is_err() {
+		return String::new();
+	}
+	let mut out = vec![];
+	let _ = tokio::time::timeout(Duration::from_secs(10), tcp.read_to_end(&mut out)).await;
+	String::from_utf8_lossy(&out).to_string()
+}
+
+/// RproxyGatewayParameters `proxyProtocol` (rproxy v0.4.13 `proxy_protocol`): the rendered rules are
+/// taken, the client in a PROXY header from a front end in `from` reaches the backend, a listener left
+/// out reads no header.
+#[tokio::test]
+async fn proxy_protocol_on_a_real_rproxy() {
+	let Some(bin) = rproxy_bin() else { return };
+	let dir = std::env::temp_dir().join(format!("rproxy-gateway-ppin-{}", std::process::id()));
+	let _ = std::fs::remove_dir_all(&dir);
+	std::fs::create_dir_all(&dir).unwrap();
+	let backend = forwarded_backend().await;
+	let [http_port, tcp_port, udp_port, api] = free_ports();
+	let rp = Rproxy::start(&bin, &dir, api);
+	rp.wait().await;
+	let client = Client::new(None, TOKEN).unwrap();
+	let caps = client.capabilities(SocketAddr::from(([127, 0, 0, 1], api))).await.unwrap();
+	if !caps.feature("proxy_protocol_in") {
+		eprintln!("rproxy {} has no proxy_protocol_in (v0.4.13); skipped", caps.version);
+		return;
+	}
+	let yaml = format!(
+		r#"
+apiVersion: v1
+kind: Service
+metadata: {{name: echo, namespace: default}}
+spec: {{ports: [{{name: http, port: 80}}]}}
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata: {{name: echo-1, namespace: default, labels: {{kubernetes.io/service-name: echo}}}}
+addressType: IPv4
+ports: [{{name: http, port: {backend}}}]
+endpoints: [{{addresses: [127.0.0.1]}}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: {{name: rproxy}}
+spec:
+  controllerName: rproxy.max3584.net/gateway-controller
+  parametersRef: {{group: rproxy.max3584.net, kind: RproxyGatewayParameters, name: rproxy-default, namespace: rproxy-gateway-system}}
+---
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyGatewayParameters
+metadata: {{name: rproxy-default, namespace: rproxy-gateway-system}}
+spec:
+  proxyProtocol: {{from: [127.0.0.0/8], listeners: [http, udp]}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {{name: gw, namespace: default, generation: 1}}
+spec:
+  gatewayClassName: rproxy
+  listeners:
+    - {{name: http, port: {http_port}, protocol: HTTP}}
+    - {{name: tcp, port: {tcp_port}, protocol: TCP}}
+    - {{name: udp, port: {udp_port}, protocol: UDP}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {{name: web, namespace: default}}
+spec:
+  parentRefs: [{{name: gw, sectionName: http}}]
+  rules: [{{backendRefs: [{{name: echo, port: 80}}]}}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata: {{name: tcp, namespace: default}}
+spec:
+  parentRefs: [{{name: gw, sectionName: tcp}}]
+  rules: [{{backendRefs: [{{name: echo, port: 80}}]}}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: UDPRoute
+metadata: {{name: udp, namespace: default}}
+spec:
+  parentRefs: [{{name: gw, sectionName: udp}}]
+  rules: [{{backendRefs: [{{name: echo, port: 80}}]}}]
+"#
+	);
+	let mut world = World::default();
+	world.read_manifests(&yaml).unwrap();
+	let opts = render::Options { listen_addrs: vec!["127.0.0.1".into()], features: render::Features::of(&caps), ..Default::default() };
+	let plan = render::render_gateway(&world, &world.gateways[0], &opts);
+	let c = plan.conds.iter().find(|c| c.kind == render::proxy_protocol::CONDITION).expect("the condition");
+	assert!(!c.status && c.message.contains("udp: UDP"), "{c:?}");
+	let ep = Endpoint { pod: "rproxy".into(), uid: "1".into(), ip: "127.0.0.1".into(), api_port: api, ..Default::default() };
+	let mut applied = Applied::new();
+	let mut caps_cache = HashMap::new();
+	let (r, _) = sync_pod(&client, &ep, &plan, &mut applied, &mut caps_cache).await;
+	let PodSync::Synced(views) = r else { panic!("{r:?}\nrules: {}", serde_json::to_string_pretty(&plan.rules_json()).unwrap()) };
+	assert_eq!(views.len(), 3);
+	for v in &views {
+		assert_eq!(v.state, "running", "{} {:?}", v.key(), v.error);
+	}
+	// the client in the header (v1 here; rproxy tells v1 and v2 apart) reaches the backend
+	let body = request_after(http_port, b"PROXY TCP4 203.0.113.7 127.0.0.1 40000 80\r\n", "any").await;
+	assert!(body.starts_with("HTTP/1.1 200") && body.ends_with("203.0.113.7"), "{body}");
+	// required (the default): a front end in from without a header is refused
+	let body = request_after(http_port, b"", "any").await;
+	assert!(!body.starts_with("HTTP/1.1 200"), "{body}");
+	// the TCP listener is not listed: a plain client is served, a header is not read (it reaches the backend as data)
+	let body = request_after(tcp_port, b"", "any").await;
+	assert!(body.starts_with("HTTP/1.1 200"), "{body}");
+	let body = request_after(tcp_port, b"PROXY TCP4 203.0.113.7 127.0.0.1 40000 80\r\n", "any").await;
+	assert!(!body.contains("203.0.113.7"), "{body}");
+	drop(rp);
+	let _ = std::fs::remove_dir_all(&dir);
+}

@@ -19,7 +19,7 @@ use serde_json::Value;
 
 use crate::k8s::crd::{FreeForm, GROUP};
 use crate::k8s::gateway::{Gateway, GatewayClass};
-use crate::k8s::params::{IntOrStr, Performance, RproxyGatewayParametersSpec as Spec};
+use crate::k8s::params::{IntOrStr, Performance, ProxyProtocolParams, RproxyGatewayParametersSpec as Spec};
 use crate::render::world::World;
 
 pub const KIND: &str = "RproxyGatewayParameters";
@@ -68,8 +68,17 @@ pub const DEFAULT_OVERRIDES: &[&str] = &[
 ];
 
 /// What the class's `policy.gatewayOverrides` may open besides the defaults.
-pub const OPENABLE: &[&str] =
-	&["service.type", "service.loadBalancerClass", "pod.nodeSelector", "pod.tolerations", "pod.affinity", "pod.priorityClassName"];
+/// `proxyProtocol` decides whose PROXY headers rproxy believes (whose client addresses it takes): the
+/// administrator's call, so Gateways may set it only where the class opens it.
+pub const OPENABLE: &[&str] = &[
+	"service.type",
+	"service.loadBalancerClass",
+	"pod.nodeSelector",
+	"pod.tolerations",
+	"pod.affinity",
+	"pod.priorityClassName",
+	"proxyProtocol",
+];
 
 /// What only the GatewayClass's parameters may set (never opened to Gateways).
 pub const CLASS_ONLY: &[&str] = &["rproxy.image", "rproxy.extraEnv", "policy"];
@@ -185,6 +194,12 @@ pub fn gateway_parameters(world: &World, gw: &Gateway, o: &ParamsOptions) -> Res
 	Ok(Some(merged))
 }
 
+/// The GatewayClass's `proxyProtocol` alone (when the Gateway's merged parameters cannot be used).
+pub fn class_proxy_protocol(world: &World, gw: &Gateway, o: &ParamsOptions) -> Option<ProxyProtocolParams> {
+	let class = world.classes.iter().find(|c| c.metadata.name.as_deref() == Some(gw.spec.gateway_class_name.as_str()))?;
+	class_parameters(world, class, o).ok().flatten()?.proxy_protocol
+}
+
 /// The fields `spec` sets, by their names in `policy.gatewayOverrides`.
 pub fn set_paths(spec: &Spec) -> Vec<&'static str> {
 	let mut out = vec![];
@@ -222,6 +237,7 @@ pub fn set_paths(spec: &Spec) -> Vec<&'static str> {
 		add(r.extra_env.is_some(), "rproxy.extraEnv");
 	}
 	add(spec.ui.is_some(), "ui");
+	add(spec.proxy_protocol.is_some(), "proxyProtocol");
 	add(spec.policy.is_some(), "policy");
 	out
 }
@@ -414,6 +430,34 @@ fn check_values(spec: &Spec) -> Result<(), String> {
 			if reserved_env(&e.name) {
 				return Err(format!("spec.rproxy.extraEnv[{i}].name: {} is set by the controller", e.name));
 			}
+		}
+	}
+	if let Some(pp) = &spec.proxy_protocol {
+		check_proxy_protocol(pp)?;
+	}
+	Ok(())
+}
+
+/// The most entries of `proxyProtocol.from` (rproxy's limit).
+pub const PROXY_PROTOCOL_FROM_MAX: usize = 64;
+
+/// `proxyProtocol`: the front ends rproxy would take (rproxy-api `net::proxy_in::validate`).
+fn check_proxy_protocol(pp: &ProxyProtocolParams) -> Result<(), String> {
+	if pp.from.is_empty() {
+		return Err("spec.proxyProtocol.from: list the front ends whose PROXY headers are believed (not empty)".into());
+	}
+	if pp.from.len() > PROXY_PROTOCOL_FROM_MAX {
+		return Err(format!("spec.proxyProtocol.from: at most {PROXY_PROTOCOL_FROM_MAX} entries"));
+	}
+	for f in &pp.from {
+		let c: crate::render::Cidr = f.parse().map_err(|_| format!("spec.proxyProtocol.from: {f:?} is not an IP address or CIDR"))?;
+		if c.len == 0 {
+			return Err(format!("spec.proxyProtocol.from: {f} would believe headers from everyone; list the front ends' addresses"));
+		}
+	}
+	for (i, l) in pp.listeners.iter().flatten().enumerate() {
+		if l.is_empty() {
+			return Err(format!("spec.proxyProtocol.listeners[{i}]: empty"));
 		}
 	}
 	Ok(())
@@ -692,6 +736,7 @@ pub fn merge(base: &Spec, over: &Spec) -> Spec {
 			(Some(b), Some(o)) => Some(crate::k8s::params::UiParams { visible: o.visible.or(b.visible) }),
 			(b, o) => o.clone().or_else(|| b.clone()),
 		},
+		proxy_protocol: over.proxy_protocol.clone().or_else(|| base.proxy_protocol.clone()),
 		policy: base.policy.clone(),
 	}
 }
@@ -851,6 +896,20 @@ spec:
 		));
 		let o = ParamsOptions { service_annotations: vec!["metallb.universe.tf/".into()], ..Default::default() };
 		assert!(gateway_parameters(&w, &w.gateways[0], &o).is_ok());
+		// proxyProtocol: closed unless the class opens it (whose headers are believed is the administrator's call)
+		assert!(
+			err("  replicas: 1", "  proxyProtocol: {from: [10.0.0.0/8]}")
+				.contains("spec.proxyProtocol: not allowed by the GatewayClass (policy.gatewayOverrides)")
+		);
+		let p = ok(
+			"  proxyProtocol: {from: [10.0.0.0/8]}\n  policy: {gatewayOverrides: [proxyProtocol]}",
+			"  proxyProtocol: {from: [172.16.0.0/12], required: false}",
+		)
+		.unwrap();
+		assert_eq!(p.proxy_protocol.unwrap().from, vec!["172.16.0.0/12"], "replaced as a whole");
+		let p =
+			ok("  proxyProtocol: {from: [10.0.0.0/8]}\n  policy: {gatewayOverrides: [proxyProtocol, replicas]}", "  replicas: 1").unwrap();
+		assert_eq!(p.proxy_protocol.unwrap().from, vec!["10.0.0.0/8"], "the class's stays");
 		// ui: a Gateway can only hide itself
 		assert!(err("  ui: {visible: false}", "  ui: {visible: true}").contains("spec.ui.visible"));
 		ok("  ui: {visible: true}", "  ui: {visible: false}");
@@ -888,6 +947,19 @@ spec:
 		ok("  replicas: 3\n  podDisruptionBudget: {minAvailable: 2}");
 		ok("  replicas: 3\n  podDisruptionBudget: {maxUnavailable: 34%}");
 		assert!(err("  podDisruptionBudget: {maxUnavailable: half}").contains("a number or a percentage"));
+		// proxyProtocol (checked in the class's parameters too: a Gateway's needs the policy first)
+		let class_err = |spec: &str| resolve(&format!("{CLASS}{}{}", class_params(spec), gateway("  replicas: 1"))).unwrap_err();
+		let class_ok = |spec: &str| resolve(&format!("{CLASS}{}{}", class_params(spec), gateway("  replicas: 1"))).unwrap().unwrap();
+		assert!(class_err("  proxyProtocol: {from: []}").contains("spec.proxyProtocol.from: list the front ends"));
+		assert!(class_err("  proxyProtocol: {from: [0.0.0.0/0]}").contains("believe headers from everyone"));
+		assert!(class_err("  proxyProtocol: {from: ['::/0']}").contains("believe headers from everyone"));
+		assert!(class_err("  proxyProtocol: {from: [10.0.0.0/33]}").contains("not an IP address or CIDR"));
+		assert!(class_err("  proxyProtocol: {from: [lb.example.com]}").contains("not an IP address or CIDR"));
+		assert!(class_err("  proxyProtocol: {from: [10.0.0.1], listeners: ['']}").contains("listeners[0]: empty"));
+		let many: Vec<String> = (0..65).map(|i| format!("10.0.{i}.0/24")).collect();
+		assert!(class_err(&format!("  proxyProtocol: {{from: [{}]}}", many.join(", "))).contains("at most 64"));
+		let p = class_ok("  proxyProtocol: {from: [10.0.0.0/8, 192.0.2.7, '2001:db8::/32'], required: false, listeners: [https]}");
+		assert_eq!(p.proxy_protocol.unwrap().from.len(), 3);
 	}
 
 	#[test]

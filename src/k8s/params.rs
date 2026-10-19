@@ -76,6 +76,11 @@ pub struct RproxyGatewayParametersSpec {
 	/// What the UI is shown (docs/DESIGN-v0.4.x.md, C).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub ui: Option<UiParams>,
+	/// PROXY protocol (v1 / v2) headers from the load balancer in front, read on TCP listeners
+	/// (rproxy's proxy_protocol, v0.4.13). A Gateway's own parameters may set it only when the
+	/// GatewayClass's policy.gatewayOverrides lists proxyProtocol.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub proxy_protocol: Option<ProxyProtocolParams>,
 	/// What Gateways' own parameters may set: only in the GatewayClass's parameters.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub policy: Option<ParamsPolicy>,
@@ -298,6 +303,25 @@ pub struct UiParams {
 	pub visible: Option<bool>,
 }
 
+/// rproxy's `proxy_protocol` on the Gateway's TCP rules (docs/DESIGN-v0.4.x.md, A).
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyProtocolParams {
+	/// The front ends (CIDRs or single IPs, as rproxy sees the TCP peer) whose headers are believed.
+	/// Not empty, at most 64; a /0 (0.0.0.0/0, ::/0) is refused.
+	#[schemars(length(min = 1, max = 64))]
+	pub from: Vec<String>,
+	/// Refuse a connection from a front end in `from` without a header (default true). false: the
+	/// peer's own address is used then.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub required: Option<bool>,
+	/// The Gateway's listeners (by name) whose ports read the headers (default: every HTTP, HTTPS,
+	/// TLS and TCP port of the Gateway). One port is one rproxy rule: the other listeners on a
+	/// listed listener's port read them too. UDP listeners never do.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub listeners: Option<Vec<String>>,
+}
+
 /// What Gateways' own parameters may set (the GatewayClass's parameters only).
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -306,7 +330,8 @@ pub struct ParamsPolicy {
 	/// pod.labels, pod.annotations, pod.resources, pod.topologySpreadConstraints,
 	/// service.externalTrafficPolicy, service.loadBalancerSourceRanges, service.ipFamilyPolicy,
 	/// service.labels, service.annotations, rproxy.logLevel, rproxy.performance, rproxy.shutdown, ui).
-	/// rproxy.image, rproxy.extraEnv and policy cannot be listed.
+	/// Also: service.type, service.loadBalancerClass, pod.nodeSelector, pod.tolerations, pod.affinity,
+	/// pod.priorityClassName, proxyProtocol. rproxy.image, rproxy.extraEnv and policy cannot be listed.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub gateway_overrides: Option<Vec<String>>,
 	/// The most replicas a Gateway's parameters may ask for (10 by default).
