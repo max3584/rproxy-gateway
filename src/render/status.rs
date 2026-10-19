@@ -46,6 +46,8 @@ pub const OWN_CONDITION_TYPES: &[&str] = &[
 	"PartiallyInvalid",
 	"AttachedListenerSets",
 	"Ready",
+	"InsecureFrontendValidationMode",
+	"BackendsHealthy",
 	crate::render::proxy_protocol::CONDITION,
 ];
 
@@ -109,6 +111,9 @@ mod tests {
 		let prev = json!([
 			{"type": "Accepted", "status": "True", "lastTransitionTime": "2026-01-01T00:00:00Z"},
 			{"type": "Conflicted", "status": "True", "lastTransitionTime": "2026-01-01T00:00:00Z"},
+			// set only while AllowInsecureFallback is on / while rproxy reports backend health
+			{"type": "InsecureFrontendValidationMode", "status": "True", "lastTransitionTime": "2026-01-01T00:00:00Z"},
+			{"type": "BackendsHealthy", "status": "False", "lastTransitionTime": "2026-01-01T00:00:00Z"},
 			foreign,
 		]);
 		let out = to_k8s(&[Cond::ok("Accepted", "Accepted")], 2, Some(&prev), "NOW");
