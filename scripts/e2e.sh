@@ -235,6 +235,8 @@ client=$(cat << 'SH'
 # one line per answer (the echo backend writes indented JSON)
 get() { for _ in $(seq 60); do r=$(curl -sf --max-time 3 "$1") && { echo "$r" | tr -d '\n'; return 0; }; sleep 2; done; echo "no answer: $1" >&2; return 1; }
 set -e
+# the pod's own IP (the API clears .status.podIP once a finished pod's sandbox is gone)
+echo "ip: $(hostname -i | cut -d' ' -f1)"
 echo "selector: $(get http://api/hello)"
 echo "fqdn: $(get http://api.east-west.svc.cluster.local/fqdn)"
 echo "externalname: $(get http://api-ext/ext)"
@@ -252,8 +254,9 @@ ew externalname | jq -e '.path == "/ext" and .host == "api-ext" and .headers["X-
 # TCP: no header, but only rproxy listens on 9100 (the backend on 3000)
 ew tcp | jq -e '.path == "/tcp" and .namespace == "east-west" and (.headers["X-Via"] == null)' > /dev/null
 # the client's pod IP reaches the backend in X-Forwarded-For (kube-proxy passed once, to rproxy)
-client_ip=$(kubectl -n east-west get pod client -o jsonpath='{.status.podIP}')
+client_ip=$(ew ip)
 echo "client pod IP: $client_ip"
+test -n "$client_ip"
 ew selector | jq -e --arg ip "$client_ip" '.headers["X-Forwarded-For"] | any(split(", ") | index($ip))' > /dev/null
 kubectl delete namespace east-west --wait=true > /dev/null
 
