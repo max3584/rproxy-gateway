@@ -5,6 +5,7 @@ English: [en/PLATFORM.md](en/PLATFORM.md)
 rproxy-gateway はアドレス（VIP）を自分では持たない。アドレスを用意してノードや Pod に届け、障害のときに移すのはプラットフォーム（MetalLB・kube-vip・Cilium・クラウドのロードバランサ・ノードの keepalived・自前の L4 ロードバランサ）の仕事で、rproxy-gateway は rproxy をそのアドレスで待ち受けさせるだけ。この文書は、よくある形ごとに、プラットフォームの側の書き方（そのまま使えるマニフェスト）と、受け入れテストで測った途切れを並べる。
 
 - v0.4.4 の `fleet.vip`（組み込みの VIP のサイドカー）は v0.4.5 で外した（[DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) の 7.）。移り方は最後の「[v0.4.4 の `fleet.vip` から移る](#v044-の-fleetvip-から移る)」。
+- 前段のロードバランサが PROXY protocol を付けて送るときは「[前段の PROXY protocol でクライアントのアドレスを受け取る](#前段の-proxy-protocol-でクライアントのアドレスを受け取る)」。
 - 例のアドレスは文書用（`192.0.2.0/24`・`198.51.100.0/24`）。プラットフォームのマニフェストの API の版は、それぞれの版のドキュメントで確かめる。
 
 ## 選び方
@@ -513,6 +514,93 @@ spec:
 - kube-proxy・CNI の代わりにはならない：rproxy に通したい Service だけをこの形にする。ルートを書いていない Service はこれまでどおり kube-proxy で届く。
 - rproxy が止まればその Service に届かない。`managed.replicas`（または parameters の `replicas`）を 2 以上にする。
 - NetworkPolicy：コントローラが作る NetworkPolicy は listener の port をどこからでも通す。クライアントの名前空間の egress を絞っているなら、rproxy の Pod の listener の port を開ける。
+
+## 前段の PROXY protocol でクライアントのアドレスを受け取る
+
+Gateway の前に、接続を受け直して送るロードバランサ（AWS の NLB、自前の HAProxy、別の rproxy など）がいると、rproxy から見た接続元はそのロードバランサ（か、kube-proxy が書き換えたノード）のアドレスになる。前段が PROXY protocol（v1 / v2）のヘッダを付けて送るなら、RproxyGatewayParameters の `proxyProtocol` で rproxy にそのヘッダを読ませ、本当のクライアントのアドレスを使わせる（rproxy v0.4.13 の `proxy_protocol`。[DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) の 14.）。
+
+```yaml
+# クラスの既定（chart の managed.parameters）。全 Gateway の TCP のポートで読む
+managed:
+  parameters:
+    proxyProtocol:
+      from: [10.0.0.0/16]     # ヘッダを信じる接続元（rproxy から見た TCP の相手）。空・/0 は書けない
+      required: true          # 既定。from からの接続がヘッダを付けてこなければ断る
+      # listeners: [https]    # 省けば Gateway の HTTP・HTTPS・TLS・TCP のポートすべて（UDP は読まない）
+    # Gateway 自身の parameters で書かせるなら（既定では書けない）
+    # policy: {gatewayOverrides: [replicas, ..., proxyProtocol]}
+```
+
+- ヘッダのクライアントは、HTTP の `X-Forwarded-For`・`X-Real-IP`、RproxyPolicy の `allowFrom`・`geoip`・`crowdsec`・`limits`（送信元ごと）、rproxy のログ、バックエンドへの PROXY protocol（`source_ip`）に使われる。
+- `from` の外からの接続はヘッダを読まずにふつうに扱う（クラスタの中のクライアントなど）。ただし、ヘッダで始まる接続は断る（`from` に前段を書き漏らしたとき気づけるように）。
+- 状態は Gateway の条件 `rproxy.max3584.net/ProxyProtocol`（`True`・`Applied`：読んでいるポート。`False`・`InvalidListeners`：`listeners` に知らない名前・UDP の listener がある。`False`・`UnsupportedRproxy`：rproxy が v0.4.13 より古く、読まない）。
+- 1 つのポートは rproxy の 1 つのルールなので、`listeners` に書いた listener と同じポートの listener も読む。ロードバランサはポート（Service のポート）ごとにヘッダを付けるので、付けるポートと `listeners` を揃える。
+- HTTP/3（UDP）と UDP の listener にはヘッダがない（rproxy は TCP だけ読む）。
+
+### `from` の決め方
+
+`from` には、rproxy の Pod から見た TCP の接続元を書く。クライアントのアドレスではない。
+
+| 届き方 | rproxy から見た接続元 | `from` |
+|---|---|---|
+| `externalTrafficPolicy: Cluster`（NodePort・LoadBalancer） | ノードの IP（kube-proxy が書き換える） | ノードのアドレスの範囲 |
+| `externalTrafficPolicy: Local` | 前段のロードバランサのアドレス | ロードバランサのアドレス（HAProxy のホスト、NLB のサブネット） |
+| Pod の IP をターゲットにするロードバランサ（AWS の `ip`） | ロードバランサのアドレス | ロードバランサのサブネット |
+| 別の rproxy・HAProxy が Pod の IP へ直接 | その rproxy・HAProxy のアドレス | そのアドレス |
+
+- 分からないときは、まず `required: false` で付け、rproxy のログ（`kubectl logs` の `conn.open` の `client` と `proxy_peer`）で前段のアドレスを見る。`from` の外からヘッダが来れば `conn.denied`（`reason: proxy_protocol_untrusted`）にその接続元が出る。
+- `from` を広くしすぎない：`from` の中のアドレスは、ヘッダでどのクライアントにでも成りすませる。Cilium の kube-proxy の代わりや DSR など、CNI によって接続元が変わるので、ログで確かめてから狭める。
+- `required: true` では、`from` の中からヘッダなしで来る接続を断る。`Cluster` でノードの範囲を書いたとき、ノードのネットワークの Pod（`hostNetwork`）やノード自身からヘッダなしで Gateway を呼ぶものがあれば断られる。移す間は `required: false` にし、前段がすべて付けるようになってから `true` に戻す。
+- ヘッダを付けない前段の後ろでは書かない（`required: true` ではすべて断られ、`false` でも意味がない）。
+
+### 前段の書き方
+
+前段の注釈はアドレスを決める注釈と同じくテナントには付けさせないので、管理者がクラスの既定の parameters に `service.annotations` と `proxyProtocol` を一緒に書く。
+
+```yaml
+# AWS（AWS Load Balancer Controller の NLB、Pod の IP をターゲットに）
+managed:
+  parameters:
+    service:
+      loadBalancerClass: service.k8s.aws/nlb
+      annotations:
+        service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+        service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+        service.beta.kubernetes.io/aws-load-balancer-proxy-protocol: "*"   # PROXY v2
+    proxyProtocol:
+      from: [10.0.0.0/16]   # NLB のサブネット（VPC の範囲でもよい）
+```
+
+```yaml
+# DigitalOcean・Hetzner Cloud
+managed:
+  parameters:
+    service:
+      annotations:
+        service.beta.kubernetes.io/do-loadbalancer-enable-proxy-protocol: "true"
+        # load-balancer.hetzner.cloud/uses-proxyprotocol: "true"
+    proxyProtocol:
+      from: [10.0.0.0/8]    # ノード・ロードバランサの私用ネットワーク
+```
+
+- GKE・Azure の Service のロードバランサ（パススルー）はヘッダを付けない。クライアントのアドレスは `externalTrafficPolicy: Local`（既定）でそのまま届くので、`proxyProtocol` は要らない。プロキシ型のロードバランサを前に置くとき（Google Cloud の外部プロキシ ネットワーク ロードバランサのバックエンド サービスの `proxyHeader: PROXY_V1`、Azure の Private Link Service の `service.beta.kubernetes.io/azure-pls-proxy-protocol: "true"`）に使う。
+- MetalLB・kube-vip・Cilium はアドレスを届けるだけでヘッダを付けない（クライアントのアドレスは `Local` で届く）。その前に L4 のプロキシ（HAProxy・nginx の stream・別の rproxy）を置いたときに使う。
+- 自前の HAProxy（上の「NodePort + 自前の L4」）：`server` に `send-proxy-v2` を足す。listener のポートを確かめるなら `check-send-proxy` も（`required: true` ではヘッダのない確かめの接続を断る）。`healthCheckNodePort` の確かめは kube-proxy が答えるのでそのまま。
+
+```haproxy
+backend gw-https
+  balance roundrobin
+  server node1 198.51.100.11:30443 check send-proxy-v2 check-send-proxy
+  server node2 198.51.100.12:30443 check send-proxy-v2 check-send-proxy
+```
+
+- 前段が別の rproxy なら、そのルールに `"source_ip": "proxy_v2"` を書く（Gateway の名前ごとに分けるなら `tls.routes[]` の `source_ip`、rproxy v0.4.13）。
+
+```json
+{"protocol": "tcp", "listen_addr": "0.0.0.0", "listen_port": 443,
+ "targets": [{"addr": "198.51.100.11", "port": 30443}, {"addr": "198.51.100.12", "port": 30443}],
+ "source_ip": "proxy_v2"}
+```
 
 ## v0.4.4 の `fleet.vip` から移る
 

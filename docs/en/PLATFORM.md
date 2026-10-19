@@ -5,6 +5,7 @@
 rproxy-gateway does not hold addresses (VIPs) itself. Providing addresses, bringing them to nodes or pods and moving them on failures is the platform's job (MetalLB, kube-vip, Cilium, cloud load balancers, keepalived on the nodes, your own L4 load balancer); rproxy-gateway only makes rproxy listen on them. This document lists, per common setup, what to write on the platform side (copy-paste manifests) and the outages measured by the acceptance test.
 
 - v0.4.4's `fleet.vip` (the built-in VIP sidecar) was removed in v0.4.5 ([DESIGN-v0.4.x.md](DESIGN-v0.4.x.md), 7.). How to move off it: "[Moving off v0.4.4's `fleet.vip`](#moving-off-v044s-fleetvip)" at the end.
+- When the front load balancer sends PROXY protocol: "[Taking the client address from the front end's PROXY protocol](#taking-the-client-address-from-the-front-ends-proxy-protocol)".
 - Example addresses are documentation ranges (`192.0.2.0/24`, `198.51.100.0/24`). Check the API versions of the platform manifests against the docs of the version you run.
 
 ## Choosing
@@ -513,6 +514,93 @@ spec:
 - It does not replace kube-proxy or the CNI: set this up only for the Services you want through rproxy. Services without routes are reached through kube-proxy as before.
 - If rproxy is down, the Service is unreachable. Set `managed.replicas` (or the parameters' `replicas`) to 2 or more.
 - NetworkPolicy: the NetworkPolicy the controller creates lets the listener ports in from anywhere. If the clients' namespace restricts egress, open the listener ports of the rproxy pods.
+
+## Taking the client address from the front end's PROXY protocol
+
+When a load balancer in front of the Gateway terminates connections and opens new ones (an AWS NLB, your own HAProxy, another rproxy), rproxy sees that load balancer (or the node kube-proxy rewrote it to) as the peer. If the front end sends a PROXY protocol (v1 / v2) header, `proxyProtocol` in RproxyGatewayParameters makes rproxy read it and use the real client's address (rproxy v0.4.13's `proxy_protocol`; [DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) 14.).
+
+```yaml
+# the class's defaults (chart value managed.parameters): read on every TCP port of every Gateway
+managed:
+  parameters:
+    proxyProtocol:
+      from: [10.0.0.0/16]     # peers whose headers are believed (the TCP peer as rproxy sees it); not empty, no /0
+      required: true          # default: a connection from `from` without a header is refused
+      # listeners: [https]    # default: every HTTP, HTTPS, TLS and TCP port of the Gateway (never UDP)
+    # to let Gateways' own parameters set it (they cannot by default)
+    # policy: {gatewayOverrides: [replicas, ..., proxyProtocol]}
+```
+
+- The client in the header is used for HTTP's `X-Forwarded-For` and `X-Real-IP`, RproxyPolicy's `allowFrom`, `geoip`, `crowdsec` and per-source `limits`, rproxy's logs, and PROXY protocol towards backends (`source_ip`).
+- Connections from outside `from` are served as usual without reading a header (clients in the cluster, for example), except that one starting with a header is refused (so a front end missing from `from` is noticed).
+- The Gateway's condition `rproxy.max3584.net/ProxyProtocol` says what happens (`True`, `Applied`: the ports reading headers; `False`, `InvalidListeners`: `listeners` names an unknown or UDP listener; `False`, `UnsupportedRproxy`: rproxy is older than v0.4.13 and reads none).
+- One port is one rproxy rule, so the listeners sharing a port with a listener in `listeners` read headers too. Load balancers add the header per port (Service port): make `listeners` match the ports they add it on.
+- HTTP/3 (UDP) and UDP listeners carry no header (rproxy reads them on TCP only).
+
+### Choosing `from`
+
+`from` lists the TCP peer as the rproxy pod sees it, not the clients.
+
+| How traffic arrives | Peer rproxy sees | `from` |
+|---|---|---|
+| `externalTrafficPolicy: Cluster` (NodePort, LoadBalancer) | a node IP (kube-proxy rewrites it) | the nodes' range |
+| `externalTrafficPolicy: Local` | the front load balancer | the load balancer's addresses (the HAProxy hosts, the NLB's subnets) |
+| A load balancer targeting pod IPs (AWS `ip`) | the load balancer | the load balancer's subnets |
+| Another rproxy or HAProxy sending to pod IPs | that rproxy or HAProxy | its addresses |
+
+- When unsure, start with `required: false` and read the front end's address in rproxy's log (`client` and `proxy_peer` of `conn.open` in `kubectl logs`). A header from outside `from` logs `conn.denied` (`reason: proxy_protocol_untrusted`) with that peer.
+- Keep `from` narrow: an address in `from` can claim to be any client through the header. CNIs change the peer (Cilium's kube-proxy replacement, DSR), so check the log before narrowing it.
+- With `required: true`, a connection from `from` without a header is refused. With `Cluster` and the nodes' range, pods on the node network (`hostNetwork`) or the nodes calling the Gateway without a header are refused. Use `required: false` while moving, and `true` once every front end sends headers.
+- Do not set it behind a front end that sends no header (with `required: true` everything is refused; with `false` it does nothing).
+
+### Front ends
+
+Front-end annotations are kept from tenants like the ones picking addresses, so the administrator writes `service.annotations` and `proxyProtocol` together in the class's default parameters.
+
+```yaml
+# AWS (AWS Load Balancer Controller NLB, targeting pod IPs)
+managed:
+  parameters:
+    service:
+      loadBalancerClass: service.k8s.aws/nlb
+      annotations:
+        service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+        service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+        service.beta.kubernetes.io/aws-load-balancer-proxy-protocol: "*"   # PROXY v2
+    proxyProtocol:
+      from: [10.0.0.0/16]   # the NLB's subnets (or the VPC's range)
+```
+
+```yaml
+# DigitalOcean, Hetzner Cloud
+managed:
+  parameters:
+    service:
+      annotations:
+        service.beta.kubernetes.io/do-loadbalancer-enable-proxy-protocol: "true"
+        # load-balancer.hetzner.cloud/uses-proxyprotocol: "true"
+    proxyProtocol:
+      from: [10.0.0.0/8]    # the private network of the nodes and the load balancer
+```
+
+- GKE's and Azure's Service load balancers (pass-through) add no header. The client address arrives as it is with `externalTrafficPolicy: Local` (the default), so `proxyProtocol` is not needed. Use it with a proxying load balancer in front (Google Cloud's external proxy Network Load Balancer, backend service `proxyHeader: PROXY_V1`; Azure Private Link Service, `service.beta.kubernetes.io/azure-pls-proxy-protocol: "true"`).
+- MetalLB, kube-vip and Cilium only bring the address and add no header (the client address arrives with `Local`). Use it when an L4 proxy (HAProxy, nginx stream, another rproxy) is in front of them.
+- Your own HAProxy ("NodePort + your own L4" above): add `send-proxy-v2` to the `server` lines, and `check-send-proxy` when checking a listener port (with `required: true` a check connection without a header is refused). Checks on `healthCheckNodePort` are answered by kube-proxy and stay as they are.
+
+```haproxy
+backend gw-https
+  balance roundrobin
+  server node1 198.51.100.11:30443 check send-proxy-v2 check-send-proxy
+  server node2 198.51.100.12:30443 check send-proxy-v2 check-send-proxy
+```
+
+- Another rproxy in front: `"source_ip": "proxy_v2"` on its rule (per name: `source_ip` of `tls.routes[]`, rproxy v0.4.13).
+
+```json
+{"protocol": "tcp", "listen_addr": "0.0.0.0", "listen_port": 443,
+ "targets": [{"addr": "198.51.100.11", "port": 30443}, {"addr": "198.51.100.12", "port": 30443}],
+ "source_ip": "proxy_v2"}
+```
 
 ## Moving off v0.4.4's `fleet.vip`
 

@@ -80,6 +80,10 @@ spec:
     shutdown: {delay: 15s, drain: 25s}  # E（6.）
     extraEnv: []                        # クラスだけ。コントローラが決める名前は書けない
   ui: {visible: true}                   # C。UI に見せるか（Gateway はクラスの既定を false にだけできる）
+  proxyProtocol:                        # 14.（v0.4.13）。前段の PROXY protocol のヘッダを TCP のポートで読む
+    from: [10.0.0.0/16]
+    required: true
+    listeners: [https]
   policy:                               # クラスの参照でだけ使える（Gateway から指すと InvalidParameters）
     gatewayOverrides: [replicas, podDisruptionBudget, pod.labels, pod.annotations, pod.resources,
       pod.topologySpreadConstraints, service.externalTrafficPolicy, service.loadBalancerSourceRanges,
@@ -114,6 +118,7 @@ spec:
 | `rproxy.shutdown.delay`・`.drain` | `RPROXY_SHUTDOWN_DELAY`・`RPROXY_SHUTDOWN_DRAIN` と猶予（6.） | `--shutdown-delay`（15 秒）・`--shutdown-drain`（25 秒） | `0s`〜`10m`。`features.graceful_shutdown` のない rproxy には写さない（preStop のまま） |
 | `rproxy.extraEnv` | rproxy のコンテナ | なし | `RPROXY_*` だけ。コントローラが決める名前（`RPROXY_API_*`・`RPROXY_TOKEN_FILE`・`RPROXY_TLS_*`・`RPROXY_FILES_*`・`RPROXY_CONFIG`・`RPROXY_DATABASE_URL`・`RPROXY_UPDATE*`・`RPROXY_HANDOFF*`・`RPROXY_STATIC_RULES`・`RPROXY_SHUTDOWN_*`、上の項目で渡す名前）は誤り |
 | `ui.visible` | C の発見の Secret に載せるか | クラスの値、なければ `true` | Gateway はクラスが `false` のとき `true` にできない（v0.4.3 から。`ui.namespace` のときだけ効く） |
+| `proxyProtocol` | ルールセットの tcp のルールの `proxy_protocol`（14.） | なし（ヘッダを読まない） | `from` は空にできず 64 件まで、CIDR か IP、`/0` は誤り。`required` の既定は `true`。丸ごと置き換え（クラスと Gateway の両方にあれば Gateway のもの） |
 
 ### 2.3 参照と合わせ方
 
@@ -140,6 +145,7 @@ spec:
 | Service の注釈 | 許すが、LB のアドレスを決める接頭辞（`metallb.universe.tf/` など）は許可リスト（`--service-annotation-prefix`）を通ったものだけ。ほかは `InvalidParameters` | v0.4 の `spec.infrastructure.annotations` と同じ線（CVE-2020-8554 の形）。参照では黙って落とさず誤りにする |
 | `service.type`・`loadBalancerClass` | 既定で許さない | 外へのアドレスを取れる（クラスの `policy` で開ける） |
 | nodeSelector・tolerations・affinity・priorityClassName | 既定で許さない | 専用ノード・コントロールプレーンに載る、ほかを追い出す（クラスの `policy` で開ける） |
+| `proxyProtocol` | 既定で許さない | ヘッダでどのクライアントにでも成りすませる接続元を決める（他人のヘッダを信じる設定をテナントが作れないように。クラスの `policy` で開ける） |
 | `rproxy.image`・`extraEnv` | 許さない（`policy` でも開けない） | Gateway の制御 API の資格を持つ Pod で任意のイメージ・設定を動かせる |
 | `policy` | 書けない | クラスの参照のもの |
 
@@ -472,3 +478,27 @@ fleet のルールは `0.0.0.0`（`--listen-addr`）で待ち受けるので、2
   - 時間切れは 504 で、`outlier_detection` の gateway の失敗に数える（3 回で外れる）。
   - GRPCRoute には付けない：サーバのストリームは最初のメッセージまで応答ヘッダを送らないことがある（grpc-go の既定）。そのため、イベントのない watch が 30 秒で切れてしまう。gRPC の期限は `grpc-timeout` で決まる。要るなら RproxyPolicy の `responseTimeout` で付ける。
   - 応答ヘッダを 30 秒より長く待たせるもの（ヘッダの前で待つロングポーリング、重い処理）は、HTTPRoute の `timeouts.backendRequest` か RproxyPolicy の `responseTimeout` で延ばす。
+
+## 14. 前段の PROXY protocol を受け取る（v0.4.13、#85）
+
+Gateway の前のロードバランサ（クラウドの NLB、NodePort の前の HAProxy、別の rproxy）が PROXY protocol（v1 / v2）を付けて送るとき、rproxy にヘッダを読ませ、本当のクライアントのアドレスを使わせる。rproxy-api v0.4.13 のルールの `proxy_protocol: {from, required}`（rproxy-api #296、`features.proxy_protocol_in`）を、`RproxyGatewayParameters` の `proxyProtocol` から描く。プラットフォームごとの前段の書き方と `from` の決め方は [PLATFORM.md](PLATFORM.md)。
+
+```yaml
+spec:
+  proxyProtocol:
+    from: [10.0.0.0/16]   # ヘッダを信じる接続元（必須、空・/0 は不可、64 件まで）
+    required: true        # 既定 true
+    listeners: [https]    # 省けば TCP の listener すべて（HTTP・HTTPS・TLS・TCP）
+```
+
+- 付けるルール：`listeners` を省けば、Gateway のルールセットの tcp のルールすべて（ListenerSet の listener と、移行の Ingress・Traefik のポートも。ロードバランサは Service のポートにヘッダを付け、どの listener 宛てかを見ないため）。`listeners` を書けば、Gateway 自身のその名前の listener のルールだけ。RproxyRule は書かれたまま（足さない）。
+- 1 つのポートは rproxy の 1 つのルール（同じポートの listener は 1 つのルールに入る）。`listeners` に書いた listener と同じポートの listener も読む（ポートの単位でしか分けられない）。
+- UDP のルールには付けない（rproxy は UDP の PROXY v2 を受けない）。`listeners` に UDP の listener や知らない名前があれば、Gateway の条件で知らせ、ほかの listener には付ける（Gateway は受け付けたまま。クラスの既定に listener の名前を書くと、その名前のない Gateway もあるため、誤りにはしない）。
+- 状態：`proxyProtocol` があるときだけ、Gateway に条件 `rproxy.max3584.net/ProxyProtocol` を出す（Gateway API の実装ごとの条件なので、ドメインを付けた型）。`True`・`Applied`（読むポートと `from`）、`False`・`InvalidListeners`（知らない名前・UDP。message に名前と読むポート）、`False`・`UnsupportedRproxy`（下）。`proxyProtocol` を外すと条件も消す。
+- `features.proxy_protocol_in` のない rproxy（v0.4.13 より前）には送らない（組ごと断られるため）。条件は `False`・`UnsupportedRproxy`。`Programmed` は変えない（ほかの設定は動く）。
+- 誰が決めるか：信じる接続元はヘッダでどのクライアントにでも成りすませるので、クラスタの管理者が決める。クラスの参照ではいつでも書け、Gateway の参照では `policy.gatewayOverrides` に `proxyProtocol` があるときだけ（既定のリストにはない。2.5）。
+- 検証（2.4 と同じく `InvalidParameters`）：`from` が空・65 件以上（CRD でも断る）、CIDR か IP でない、`/0`（`0.0.0.0/0`・`::/0` など、rproxy と同じ）、`listeners` の空の名前。
+- parameters が誤りになった Gateway（2.4 の「前の形のまま」を含む）は、クラスの参照の `proxyProtocol` を使う（ルールセットの反映は続くので、ヘッダを付け続ける前段の後ろでヘッダを読むのをやめないように。Gateway 自身の参照の `proxyProtocol` は使わない）。
+- fleet：Gateway の参照は使えない（2.3）が、クラスの参照の `proxyProtocol` は各 Gateway のルールに付く。
+- managed の rproxy の Pod・Service の形は変えない（ルールセットだけ）。
+- 試験：単体（`src/render/tests.rs`：既定ですべての tcp のルール、名前を書いたときのポートの共有、UDP・知らない名前の条件、`features.proxy_protocol_in` のない rproxy、Gateway の参照の `policy`、誤った parameters でクラスのものを使うこと。`src/render/params.rs`：検証と合わせ方）、本物の rproxy（`tests/rproxy.rs`：描いた組が通り、`from` からの v1 のヘッダのクライアントが `X-Forwarded-For` に届き、ヘッダなしは断られ、書いていない TCP の listener はヘッダを読まない）、e2e（kind：別の GatewayClass の既定で Pod の範囲を `from` にし、クライアントの Pod が curl の `--haproxy-protocol` で送った偽のクライアントがバックエンドの `X-Forwarded-For` に届く）。

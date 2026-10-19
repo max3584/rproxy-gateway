@@ -16,6 +16,7 @@ pub mod l4;
 pub mod migrate;
 pub mod params;
 pub mod policy;
+pub mod proxy_protocol;
 pub mod status;
 pub mod traefik_mw;
 pub mod world;
@@ -238,6 +239,8 @@ pub struct Features {
 	pub ext_auth_body: bool,
 	/// `connect_timeout` of L4 tcp rules (rproxy v0.4.3, `features.connect_timeout`).
 	pub connect_timeout: bool,
+	/// `proxy_protocol` of tcp rules: PROXY headers from the front ends (rproxy v0.4.13, `features.proxy_protocol_in`).
+	pub proxy_protocol_in: bool,
 }
 
 impl Default for Features {
@@ -267,6 +270,7 @@ impl Default for Features {
 			ext_auth_grpc: true,
 			ext_auth_body: true,
 			connect_timeout: true,
+			proxy_protocol_in: true,
 		}
 	}
 }
@@ -298,6 +302,7 @@ impl Features {
 			ext_auth_grpc: ["service", "grpc"].iter().all(|n| c.lists("forward_auth", n)),
 			ext_auth_body: c.lists("forward_auth", "forward_body"),
 			connect_timeout: c.feature("connect_timeout"),
+			proxy_protocol_in: c.feature("proxy_protocol_in"),
 		}
 	}
 
@@ -327,6 +332,7 @@ impl Features {
 			ext_auth_grpc: self.ext_auth_grpc && o.ext_auth_grpc,
 			ext_auth_body: self.ext_auth_body && o.ext_auth_body,
 			connect_timeout: self.connect_timeout && o.connect_timeout,
+			proxy_protocol_in: self.proxy_protocol_in && o.proxy_protocol_in,
 		}
 	}
 }
@@ -1592,6 +1598,25 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 	} else {
 		Cond::new("Accepted", false, "ListenersNotValid", "no listener is valid")
 	});
+	// PROXY headers from the load balancer in front: with parameters that cannot be used, the class's
+	// (a Gateway that keeps its rproxy still gets its rule set; its front end keeps sending headers)
+	let pp = match &plan.parameters_error {
+		None => plan.parameters.as_ref().and_then(|p| p.proxy_protocol.clone()),
+		Some(_) => params::class_proxy_protocol(world, gw, &opts.params),
+	};
+	if let Some(pp) = pp {
+		let own: Vec<proxy_protocol::ListenerInfo> = listeners
+			.iter()
+			.enumerate()
+			.filter(|(_, st)| st.owner == Owner::Gateway)
+			.map(|(i, st)| proxy_protocol::ListenerInfo {
+				name: &st.l.name,
+				udp: st.family == Some(Family::Udp),
+				rule_key: listener_keys.get(&i).map(String::as_str),
+			})
+			.collect();
+		plan.conds.push(proxy_protocol::apply(&mut plan.rules, &own, &pp, opts.features.proxy_protocol_in));
+	}
 	if let Ok((ips, unusable)) = addresses {
 		plan.addresses = ips;
 		plan.address_error = unusable;

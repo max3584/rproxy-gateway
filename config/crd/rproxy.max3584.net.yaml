@@ -534,7 +534,8 @@ spec:
                       pod.labels, pod.annotations, pod.resources, pod.topologySpreadConstraints,
                       service.externalTrafficPolicy, service.loadBalancerSourceRanges, service.ipFamilyPolicy,
                       service.labels, service.annotations, rproxy.logLevel, rproxy.performance, rproxy.shutdown, ui).
-                      rproxy.image, rproxy.extraEnv and policy cannot be listed.
+                      Also: service.type, service.loadBalancerClass, pod.nodeSelector, pod.tolerations, pod.affinity,
+                      pod.priorityClassName, proxyProtocol. rproxy.image, rproxy.extraEnv and policy cannot be listed.
                     items:
                       type: string
                     nullable: true
@@ -545,6 +546,40 @@ spec:
                     minimum: 1.0
                     nullable: true
                     type: integer
+                type: object
+              proxyProtocol:
+                description: |-
+                  PROXY protocol (v1 / v2) headers from the load balancer in front, read on TCP listeners
+                  (rproxy's proxy_protocol, v0.4.13). A Gateway's own parameters may set it only when the
+                  GatewayClass's policy.gatewayOverrides lists proxyProtocol.
+                nullable: true
+                properties:
+                  from:
+                    description: |-
+                      The front ends (CIDRs or single IPs, as rproxy sees the TCP peer) whose headers are believed.
+                      Not empty, at most 64; a /0 (0.0.0.0/0, ::/0) is refused.
+                    items:
+                      type: string
+                    maxItems: 64
+                    minItems: 1
+                    type: array
+                  listeners:
+                    description: |-
+                      The Gateway's listeners (by name) whose ports read the headers (default: every HTTP, HTTPS,
+                      TLS and TCP port of the Gateway). One port is one rproxy rule: the other listeners on a
+                      listed listener's port read them too. UDP listeners never do.
+                    items:
+                      type: string
+                    nullable: true
+                    type: array
+                  required:
+                    description: |-
+                      Refuse a connection from a front end in `from` without a header (default true). false: the
+                      peer's own address is used then.
+                    nullable: true
+                    type: boolean
+                required:
+                - from
                 type: object
               replicas:
                 description: rproxy pods per Gateway (1 to policy.maxReplicas, 10 by default).
@@ -823,7 +858,8 @@ spec:
                       pod.labels, pod.annotations, pod.resources, pod.topologySpreadConstraints,
                       service.externalTrafficPolicy, service.loadBalancerSourceRanges, service.ipFamilyPolicy,
                       service.labels, service.annotations, rproxy.logLevel, rproxy.performance, rproxy.shutdown, ui).
-                      rproxy.image, rproxy.extraEnv and policy cannot be listed.
+                      Also: service.type, service.loadBalancerClass, pod.nodeSelector, pod.tolerations, pod.affinity,
+                      pod.priorityClassName, proxyProtocol. rproxy.image, rproxy.extraEnv and policy cannot be listed.
                     items:
                       type: string
                     nullable: true
@@ -834,6 +870,40 @@ spec:
                     minimum: 1.0
                     nullable: true
                     type: integer
+                type: object
+              proxyProtocol:
+                description: |-
+                  PROXY protocol (v1 / v2) headers from the load balancer in front, read on TCP listeners
+                  (rproxy's proxy_protocol, v0.4.13). A Gateway's own parameters may set it only when the
+                  GatewayClass's policy.gatewayOverrides lists proxyProtocol.
+                nullable: true
+                properties:
+                  from:
+                    description: |-
+                      The front ends (CIDRs or single IPs, as rproxy sees the TCP peer) whose headers are believed.
+                      Not empty, at most 64; a /0 (0.0.0.0/0, ::/0) is refused.
+                    items:
+                      type: string
+                    maxItems: 64
+                    minItems: 1
+                    type: array
+                  listeners:
+                    description: |-
+                      The Gateway's listeners (by name) whose ports read the headers (default: every HTTP, HTTPS,
+                      TLS and TCP port of the Gateway). One port is one rproxy rule: the other listeners on a
+                      listed listener's port read them too. UDP listeners never do.
+                    items:
+                      type: string
+                    nullable: true
+                    type: array
+                  required:
+                    description: |-
+                      Refuse a connection from a front end in `from` without a header (default true). false: the
+                      peer's own address is used then.
+                    nullable: true
+                    type: boolean
+                required:
+                - from
                 type: object
               replicas:
                 description: rproxy pods per Gateway (1 to policy.maxReplicas, 10 by default).

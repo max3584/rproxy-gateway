@@ -2034,3 +2034,132 @@ spec:
 	assert!(c.message.contains("responseTimeout"), "{}", c.message);
 	assert_eq!(web["default/web/r0"]["timeouts"]["connect"], "1s", "an invalid policy is not used");
 }
+
+#[test]
+fn proxy_protocol_on_tcp_rules() {
+	let class = |spec: &str| {
+		format!(
+			r#"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: {{name: rproxy}}
+spec:
+  controllerName: rproxy.max3584.net/gateway-controller
+  parametersRef: {{group: rproxy.max3584.net, kind: RproxyGatewayParameters, name: rproxy-default, namespace: rproxy-gateway-system}}
+---
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyGatewayParameters
+metadata: {{name: rproxy-default, namespace: rproxy-gateway-system}}
+spec: {spec}
+"#
+		)
+	};
+	let gateway = gw(r#"  - {name: web, port: 80, protocol: HTTP, hostname: a.example.com}
+  - {name: web2, port: 80, protocol: HTTP, hostname: b.example.com}
+  - {name: pg, port: 5432, protocol: TCP}
+  - {name: other, port: 6000, protocol: TCP}
+  - {name: dns, port: 53, protocol: UDP}"#);
+	let routes = r#"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: web, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  rules: [{backendRefs: [{name: web, port: 80}]}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata: {name: pg, namespace: default}
+spec:
+  parentRefs: [{name: gw, sectionName: pg}]
+  rules: [{backendRefs: [{name: db, port: 5432}]}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata: {name: other, namespace: default}
+spec:
+  parentRefs: [{name: gw, sectionName: other}]
+  rules: [{backendRefs: [{name: db, port: 5432}]}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: UDPRoute
+metadata: {name: dns, namespace: default}
+spec:
+  parentRefs: [{name: gw, sectionName: dns}]
+  rules: [{backendRefs: [{name: db, port: 5432}]}]
+"#;
+	let render = |class_spec: &str, extra: &str, opts: &Options| {
+		let w = world(&format!("{BASE}{L4_BASE}{}{}{routes}{extra}", class(class_spec), gateway));
+		render_gateway(&w, &w.gateways[0], opts)
+	};
+	let pp = |p: &GatewayPlan, proto: &str, port: u16| {
+		p.rules_json().iter().find(|r| r["protocol"] == proto && r["listen_port"] == port).map(|r| r["proxy_protocol"].clone())
+	};
+	let want = json!({"from": ["10.0.0.0/8"], "required": true});
+
+	// every TCP port by default, never UDP
+	let p = render("{proxyProtocol: {from: [10.0.0.0/8]}}", "", &Options::default());
+	assert!(p.accepted(), "{:?}", p.conds);
+	assert_eq!(pp(&p, "tcp", 80), Some(want.clone()));
+	assert_eq!(pp(&p, "tcp", 5432), Some(want.clone()));
+	assert_eq!(pp(&p, "tcp", 6000), Some(want.clone()));
+	assert_eq!(pp(&p, "udp", 53), Some(Value::Null));
+	let c = cond(&p.conds, proxy_protocol::CONDITION);
+	assert!(c.status && c.reason == "Applied" && c.message.contains("80, 5432, 6000"), "{c:?}");
+
+	// named listeners: their ports only (web2 shares web's rule); UDP and unknown names are reported
+	let p = render(
+		"{proxyProtocol: {from: [10.0.0.0/8, 192.0.2.7], required: false, listeners: [web2, pg, dns, nope]}}",
+		"",
+		&Options::default(),
+	);
+	let want2 = json!({"from": ["10.0.0.0/8", "192.0.2.7"], "required": false});
+	assert_eq!(pp(&p, "tcp", 80), Some(want2.clone()), "one port is one rule");
+	assert_eq!(pp(&p, "tcp", 5432), Some(want2));
+	assert_eq!(pp(&p, "tcp", 6000), Some(Value::Null));
+	assert_eq!(pp(&p, "udp", 53), Some(Value::Null));
+	let c = cond(&p.conds, proxy_protocol::CONDITION);
+	assert!(!c.status && c.reason == "InvalidListeners", "{c:?}");
+	assert!(c.message.contains("no listener nope") && c.message.contains("dns: UDP") && c.message.contains("80, 5432"), "{c:?}");
+	assert!(p.accepted(), "the Gateway is still accepted");
+
+	// an rproxy without features.proxy_protocol_in: nothing sent, the condition says so
+	let old = Options { features: Features { proxy_protocol_in: false, ..Default::default() }, ..Default::default() };
+	let p = render("{proxyProtocol: {from: [10.0.0.0/8]}}", "", &old);
+	assert!(p.rules_json().iter().all(|r| r.get("proxy_protocol").is_none()));
+	let c = cond(&p.conds, proxy_protocol::CONDITION);
+	assert!(!c.status && c.reason == "UnsupportedRproxy" && c.message.contains("proxy_protocol_in"), "{c:?}");
+
+	// without proxyProtocol: no condition, nothing sent
+	let p = render("{replicas: 1}", "", &Options::default());
+	assert!(status::get(&p.conds, proxy_protocol::CONDITION).is_none());
+	assert!(p.rules_json().iter().all(|r| r.get("proxy_protocol").is_none()));
+
+	// a Gateway's own proxyProtocol: only where the class's policy opens it
+	let reference = "  infrastructure: {parametersRef: {group: rproxy.max3584.net, kind: RproxyGatewayParameters, name: web}}\n";
+	let own = r#"
+---
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyGatewayParameters
+metadata: {name: web, namespace: default}
+spec: {proxyProtocol: {from: [172.16.0.0/12], listeners: [pg]}}
+"#;
+	let render_own = |class_spec: &str| {
+		let g = gateway.replace("  listeners:\n", &format!("{reference}  listeners:\n"));
+		let w = world(&format!("{BASE}{L4_BASE}{}{g}{routes}{own}", class(class_spec)));
+		render_gateway(&w, &w.gateways[0], &Options::default())
+	};
+	let p = render_own("{proxyProtocol: {from: [10.0.0.0/8]}}");
+	assert!(!p.accepted());
+	assert!(cond(&p.conds, "Accepted").message.contains("spec.proxyProtocol: not allowed by the GatewayClass"), "{:?}", p.conds);
+	// the class's own keeps applying (a Gateway that keeps its rproxy still gets its rule set)
+	assert_eq!(pp(&p, "tcp", 80), Some(want.clone()));
+	let p = render_own("{replicas: 1}");
+	assert!(p.rules_json().iter().all(|r| r.get("proxy_protocol").is_none()), "no class proxyProtocol to fall back on");
+	let p = render_own("{proxyProtocol: {from: [10.0.0.0/8]}, policy: {gatewayOverrides: [proxyProtocol]}}");
+	assert!(p.accepted(), "{:?}", p.conds);
+	assert_eq!(pp(&p, "tcp", 5432), Some(json!({"from": ["172.16.0.0/12"], "required": true})), "the Gateway's replaces the class's");
+	assert_eq!(pp(&p, "tcp", 80), Some(Value::Null));
+}
