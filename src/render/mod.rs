@@ -19,6 +19,7 @@ pub mod policy;
 pub mod proxy_protocol;
 pub mod status;
 pub mod traefik_mw;
+pub mod validate;
 pub mod world;
 
 use std::collections::{BTreeMap, BTreeSet};

@@ -496,6 +496,16 @@ pub fn render(world: &World, settings: &Settings, opts: &Options) -> Out {
 				let refs: Vec<ChainRef> =
 					r.middlewares.iter().map(|m| ChainRef { name: m.name.clone(), namespace: m.namespace.clone() }).collect();
 				let mws = ctx.middleware_chain(&ns, &refs, 0);
+				// what rproxy would refuse leaves this route out, not the port's other routes (#92)
+				let refused = crate::render::validate::expression(&rule).map_err(|e| format!("match {rule}: {e}")).and_then(|()| {
+					mws.iter()
+						.filter_map(|n| ctx.out.ports.get(&key).and_then(|p| p.middlewares.get(n)).map(|v| (n, v)))
+						.try_for_each(|(n, v)| crate::render::validate::middleware(v).map_err(|e| format!("middleware {n}: {e}")))
+				});
+				if let Err(e) = refused {
+					ctx.note(format!("{what} route {i}: {e}; left out"));
+					continue;
+				}
 				let answered = mws.iter().any(|n| {
 					ctx.out.ports[&key]
 						.middlewares
@@ -624,6 +634,10 @@ pub fn render(world: &World, settings: &Settings, opts: &Options) -> Out {
 					}
 					if parts.is_empty() {
 						parts.push("PathPrefix(`/`)".into());
+					}
+					if let Err(e) = crate::render::validate::expression(&parts.join(" && ")) {
+						ctx.note(format!("Ingress {ns}/{iname}: {e}; left out"));
+						continue;
 					}
 					let port = ctx.port(key);
 					port.services.insert(sname.clone(), svc);

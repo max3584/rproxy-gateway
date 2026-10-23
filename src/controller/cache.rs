@@ -5,13 +5,14 @@
 //! whose CRDs are not installed are skipped and looked for again now and then
 //! (`rediscover`): a CRD installed later is watched without a restart.
 
-use std::sync::{Arc, RwLock};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, Mutex, RwLock};
 
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Pod, Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::Ingress;
-use kube::api::{Api, DynamicObject};
+use kube::api::{Api, DynamicObject, PartialObjectMeta};
 use kube::discovery::ApiResource;
 use kube::runtime::reflector::{self, Store};
 use kube::runtime::{WatchStreamExt, watcher};
@@ -19,7 +20,7 @@ use serde::de::DeserializeOwned;
 use tokio::sync::Notify;
 use tracing::{info, warn};
 
-use crate::render::world::World;
+use crate::render::world::{Key, World};
 
 /// A watched dynamic kind.
 struct DynKind {
@@ -70,12 +71,96 @@ where
 	Multi(apis::<K>(client, scope).into_iter().map(|api| spawn_watch(api, changed.clone(), what)).collect())
 }
 
+/// Secrets and ConfigMaps: watched as metadata only (a cluster may hold many large ones, #92); the
+/// ones rendering refers to are read in full (`Cache::load`) and kept while they are referred to.
+struct Bodies<K: kube::Resource + 'static>
+where
+	K::DynamicType: Eq + std::hash::Hash + Clone,
+{
+	meta: Multi<PartialObjectMeta<K>>,
+	/// key → (resourceVersion read at, the object)
+	full: Mutex<BTreeMap<Key, (String, Arc<K>)>>,
+}
+
+/// How many Secrets / ConfigMaps are read at once.
+const LOAD_PARALLEL: usize = 8;
+
+impl<K> Bodies<K>
+where
+	K: kube::Resource<Scope = k8s_openapi::NamespaceResourceScope> + Clone + DeserializeOwned + std::fmt::Debug + Send + Sync + 'static,
+	K::DynamicType: Default + Eq + std::hash::Hash + Clone,
+{
+	fn watch(client: &kube::Client, scope: &Scope, changed: &Arc<Notify>, what: &'static str) -> Self {
+		// an `Api` of `PartialObjectMeta` lists and watches metadata only
+		let meta =
+			Multi(apis::<PartialObjectMeta<K>>(client, scope).into_iter().map(|api| spawn_watch(api, changed.clone(), what)).collect());
+		Bodies { meta, full: Mutex::new(BTreeMap::new()) }
+	}
+
+	/// key → resourceVersion of what exists now.
+	fn versions(&self) -> HashMap<Key, String> {
+		self.meta
+			.state()
+			.iter()
+			.map(|m| (crate::render::world::key(&m.metadata), m.metadata.resource_version.clone().unwrap_or_default()))
+			.collect()
+	}
+
+	/// The objects read in full that still exist.
+	fn current(&self) -> Vec<(Key, Arc<K>)> {
+		let now = self.versions();
+		self.full.lock().unwrap().iter().filter(|(k, _)| now.contains_key(*k)).map(|(k, (_, o))| (k.clone(), o.clone())).collect()
+	}
+
+	/// Reads the `wanted` objects that are not read yet or have changed, and forgets the others.
+	/// Whether anything new was read.
+	async fn load(&self, client: &kube::Client, wanted: &BTreeSet<Key>, what: &'static str) -> bool {
+		let now = self.versions();
+		let todo: Vec<(Key, String)> = {
+			let mut full = self.full.lock().unwrap();
+			full.retain(|k, _| wanted.contains(k) && now.contains_key(k));
+			wanted
+				.iter()
+				.filter_map(|k| now.get(k).map(|rv| (k, rv)))
+				.filter(|(k, rv)| full.get(*k).is_none_or(|(have, _)| have != *rv))
+				.map(|(k, rv)| (k.clone(), rv.clone()))
+				.collect()
+		};
+		if todo.is_empty() {
+			return false;
+		}
+		let read = futures::stream::iter(todo.into_iter().map(|(k, rv)| async move {
+			let api: Api<K> = Api::namespaced(client.clone(), &k.0);
+			(api.get_opt(&k.1).await, k, rv)
+		}))
+		.buffer_unordered(LOAD_PARALLEL)
+		.collect::<Vec<_>>()
+		.await;
+		let mut full = self.full.lock().unwrap();
+		let mut any = false;
+		for (got, k, rv) in read {
+			match got {
+				// kept with the version the watch saw: read again once the watch sees a newer one
+				Ok(Some(o)) => {
+					full.insert(k, (rv, Arc::new(o)));
+					any = true;
+				}
+				Ok(None) => {
+					full.remove(&k);
+				}
+				Err(e) => warn!(kind = what, object = format!("{}/{}", k.0, k.1), error = %e, "cannot read"),
+			}
+		}
+		any
+	}
+}
+
 pub struct Cache {
 	pub changed: Arc<Notify>,
 	services: Multi<Service>,
 	slices: Multi<EndpointSlice>,
-	secrets: Multi<Secret>,
-	config_maps: Multi<ConfigMap>,
+	secrets: Bodies<Secret>,
+	config_maps: Bodies<ConfigMap>,
 	namespaces: Store<Namespace>,
 	pub pods: Multi<Pod>,
 	ingresses: Option<Multi<Ingress>>,
@@ -160,8 +245,8 @@ impl Cache {
 		let cache = Cache {
 			services: watch_all(client, &scope, &changed, "Service"),
 			slices: watch_all(client, &scope, &changed, "EndpointSlice"),
-			secrets: watch_all(client, &scope, &changed, "Secret"),
-			config_maps: watch_all(client, &scope, &changed, "ConfigMap"),
+			secrets: Bodies::watch(client, &scope, &changed, "Secret"),
+			config_maps: Bodies::watch(client, &scope, &changed, "ConfigMap"),
 			namespaces: spawn_watch(Api::all(client.clone()), changed.clone(), "Namespace"),
 			pods: Multi(apis::<Pod>(client, &scope).into_iter().map(|api| spawn_pod_watch(api, changed.clone())).collect()),
 			ingresses: migration.then(|| watch_all(client, &scope, &changed, "Ingress")),
@@ -226,8 +311,8 @@ impl Cache {
 	pub async fn ready(&self) {
 		let _ = self.services.wait_until_ready().await;
 		let _ = self.slices.wait_until_ready().await;
-		let _ = self.secrets.wait_until_ready().await;
-		let _ = self.config_maps.wait_until_ready().await;
+		let _ = self.secrets.meta.wait_until_ready().await;
+		let _ = self.config_maps.meta.wait_until_ready().await;
 		let _ = self.namespaces.wait_until_ready().await;
 		let _ = self.pods.wait_until_ready().await;
 		if let Some(i) = &self.ingresses {
@@ -243,7 +328,15 @@ impl Cache {
 		self.dynamic.read().unwrap().iter().find(|(d, _)| d.kind == kind).map(|(_, ar)| ar.clone())
 	}
 
-	/// Everything as it is now.
+	/// Reads in full the Secrets and ConfigMaps rendering refers to (and forgets the others);
+	/// whether anything new was read (then take the snapshot again).
+	pub async fn load(&self, client: &kube::Client, secrets: &BTreeSet<Key>, config_maps: &BTreeSet<Key>) -> bool {
+		let a = self.secrets.load(client, secrets, "Secret").await;
+		let b = self.config_maps.load(client, config_maps, "ConfigMap").await;
+		a || b
+	}
+
+	/// Everything as it is now (of Secrets and ConfigMaps, the ones read with `load`).
 	pub fn snapshot(&self) -> World {
 		let mut w = World::default();
 		for s in self.services.state() {
@@ -252,16 +345,16 @@ impl Cache {
 		for s in self.slices.state() {
 			w.add_slice((*s).clone());
 		}
-		for s in self.secrets.state() {
-			// only Secrets that can be certificates, to keep the snapshot small
+		for (k, s) in self.secrets.current() {
+			// only Secrets that can be certificates (or users files)
 			if s.data.as_ref().is_some_and(|d| ["tls.crt", "ca.crt", "tls.ca", "users"].iter().any(|k| d.contains_key(*k))) {
-				w.secrets.insert(crate::render::world::key(&s.metadata), (*s).clone());
+				w.secrets.insert(k, (*s).clone());
 			}
 		}
-		for c in self.config_maps.state() {
+		for (k, c) in self.config_maps.current() {
 			// CA certificates (frontend client certificate validation, BackendTLSPolicy)
 			if c.data.as_ref().is_some_and(|d| d.contains_key("ca.crt")) {
-				w.config_maps.insert(crate::render::world::key(&c.metadata), (*c).clone());
+				w.config_maps.insert(k, (*c).clone());
 			}
 		}
 		for i in self.ingresses.iter().flat_map(|s| s.state()) {

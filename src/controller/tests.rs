@@ -28,6 +28,10 @@ struct Fake {
 	tokens_reload: bool,
 	/// Tokens that may read (`GET /rules`): the UI's
 	readers: BTreeSet<String>,
+	/// HTTP routes whose match has `BAD` are refused without naming them (else by name)
+	unnamed: bool,
+	/// dry runs asked for
+	dry_runs: usize,
 }
 
 fn etag(generation: i64, rules: &[Value]) -> String {
@@ -49,6 +53,7 @@ fn view(rule: &Value, failing: &BTreeSet<String>) -> Value {
 async fn handle(fake: Arc<Mutex<Fake>>, req: Request<hyper::body::Incoming>) -> Response<Full<Bytes>> {
 	let method = req.method().clone();
 	let path = req.uri().path().to_string();
+	let dry_run = req.uri().query() == Some("dry_run=true");
 	let if_match = req.headers().get("if-match").and_then(|v| v.to_str().ok()).map(str::to_string);
 	let auth = req.headers().get("authorization").and_then(|v| v.to_str().ok()).map(str::to_string);
 	let body = req.into_body().collect().await.unwrap().to_bytes();
@@ -89,6 +94,22 @@ async fn handle(fake: Arc<Mutex<Fake>>, req: Request<hyper::body::Incoming>) -> 
 			let req: Value = serde_json::from_slice(&body).unwrap();
 			let generation = req["generation"].as_i64().unwrap();
 			let rules = req["rules"].as_array().unwrap().clone();
+			for (i, r) in rules.iter().enumerate() {
+				for route in r["http"]["routes"].as_array().into_iter().flatten() {
+					if route["match"].as_str().is_some_and(|m| m.contains("BAD")) {
+						let error = if f.unnamed {
+							format!("rules[{i}]: http: something is wrong")
+						} else {
+							format!("rules[{i}]: route {}: match: PathRegexp: regex parse error", route["name"].as_str().unwrap())
+						};
+						return reply(400, json!({"error": error, "code": "invalid"}));
+					}
+				}
+			}
+			if dry_run {
+				f.dry_runs += 1;
+				return reply(200, json!({"name": name, "generation": generation, "etag": "dry", "dry_run": true, "results": []}));
+			}
 			f.puts.push((name.clone(), if_match.clone(), generation));
 			if let Some(i) = rules.iter().position(|r| r["remote_addr"] == "bad name") {
 				return reply(400, json!({"error": format!("rules[{i}]: remote_addr: not a host name"), "code": "invalid"}));
@@ -174,13 +195,13 @@ async fn sets_are_put_once_and_again_after_a_restart() {
 
 	let p = plan(80, &[]);
 	let (r, again) = sync_pod(&rp, &ep, &p, &mut applied, &mut caps).await;
-	assert!(matches!(&r, PodSync::Synced(v) if v.len() == 1), "{r:?}");
+	assert!(matches!(&r, PodSync::Synced(v, _) if v.len() == 1), "{r:?}");
 	assert!(!again);
 	assert_eq!(fake.lock().unwrap().puts, vec![("k8s/default/gw".to_string(), None, 3)]);
 
 	// nothing changed: no PUT
 	let (r, _) = sync_pod(&rp, &ep, &p, &mut applied, &mut caps).await;
-	assert!(matches!(r, PodSync::Synced(_)));
+	assert!(matches!(r, PodSync::Synced(..)));
 	assert_eq!(fake.lock().unwrap().puts.len(), 1);
 
 	// a change: PUT with If-Match of the current etag
@@ -192,7 +213,7 @@ async fn sets_are_put_once_and_again_after_a_restart() {
 	// rproxy restarted: the set is gone, PUT again (no If-Match)
 	fake.lock().unwrap().sets.clear();
 	let (r, _) = sync_pod(&rp, &ep, &p2, &mut applied, &mut caps).await;
-	assert!(matches!(r, PodSync::Synced(_)));
+	assert!(matches!(r, PodSync::Synced(..)));
 	assert_eq!(fake.lock().unwrap().puts.last().unwrap().1, None);
 	assert_eq!(fake.lock().unwrap().puts.len(), 3);
 
@@ -205,7 +226,7 @@ async fn sets_are_put_once_and_again_after_a_restart() {
 	let mut p3 = plan(82, &[]);
 	p3.generation = 1;
 	let (r, _) = sync_pod(&rp, &ep, &p3, &mut applied, &mut caps).await;
-	assert!(matches!(r, PodSync::Synced(_)), "{r:?}");
+	assert!(matches!(r, PodSync::Synced(..)), "{r:?}");
 	assert_eq!(fake.lock().unwrap().puts.last().unwrap().2, 3);
 }
 
@@ -377,7 +398,7 @@ async fn a_refused_rule_does_not_stop_the_others() {
 	let mut applied = Applied::new();
 	let mut caps = HashMap::new();
 	let (r, _) = sync_pod(&rp, &ep, &p, &mut applied, &mut caps).await;
-	let PodSync::Synced(views) = r else { panic!("{r:?}") };
+	let PodSync::Synced(views, _) = r else { panic!("{r:?}") };
 	assert_eq!(views.len(), 2);
 	let bad = views.iter().find(|v| v.listen_port == 25).unwrap();
 	assert_eq!(bad.condition("Accepted").reason, "Invalid");
@@ -385,8 +406,79 @@ async fn a_refused_rule_does_not_stop_the_others() {
 	assert_eq!(fake.lock().unwrap().sets["k8s/default/gw"].2.len(), 1, "the good rule is applied");
 	// the next pass: nothing to PUT, the refusal is still reported
 	let (r, _) = sync_pod(&rp, &ep, &p, &mut applied, &mut caps).await;
-	assert!(matches!(&r, PodSync::Synced(v) if v.len() == 2), "{r:?}");
+	assert!(matches!(&r, PodSync::Synced(v, _) if v.len() == 2), "{r:?}");
 	assert_eq!(fake.lock().unwrap().puts.len(), 2);
+}
+
+/// rproxy refuses one tenant's route in the port's HTTP rule: only that route is left out (found by
+/// the name in rproxy's message, or by halving with dry runs), and its status says so (#92).
+#[tokio::test]
+async fn a_refused_route_does_not_stop_the_port() {
+	use crate::render::RouteKind;
+	use crate::rproxy::model::{Http, HttpRoute, Service};
+	for unnamed in [false, true] {
+		let fake = Arc::new(Mutex::new(Fake { unnamed, ..Default::default() }));
+		let port = start(fake.clone()).await;
+		let rp = Client::new(None, "secret").unwrap();
+		let ep = Endpoint {
+			pod: "rproxy-0".into(),
+			uid: "u1".into(),
+			ip: "127.0.0.1".into(),
+			api_port: port,
+			certsync_port: port,
+			..Default::default()
+		};
+		let mut p = plan(443, &[]);
+		let route = |owner: &str, m: &str| HttpRoute {
+			name: format!("{owner}/r0/m0/h0"),
+			rule: m.into(),
+			service: Some(format!("{owner}/r0")),
+			..Default::default()
+		};
+		let owners = ["a/one", "b/two", "c/bad", "d/four", "e/five"];
+		let mut http = Http::default();
+		for o in owners {
+			http.routes.push(route(o, if o == "c/bad" { "PathRegexp(`BAD(`)" } else { "PathPrefix(`/`)" }));
+			http.services.insert(format!("{o}/r0"), Service { servers: vec![Default::default()], ..Default::default() });
+		}
+		p.rules[0].targets = vec![];
+		p.rules[0].http = Some(http);
+		let mut applied = Applied::new();
+		let mut caps = HashMap::new();
+		let (r, _) = sync_pod(&rp, &ep, &p, &mut applied, &mut caps).await;
+		let PodSync::Synced(views, excluded) = &r else { panic!("{unnamed}: {r:?}") };
+		assert_eq!(views.len(), 1, "{unnamed}: the rule runs");
+		assert_eq!(excluded.iter().map(|e| e.owner.as_str()).collect::<Vec<_>>(), ["c/bad"], "{unnamed}");
+		assert_eq!(excluded[0].rule_key, "tcp/0.0.0.0:443");
+		{
+			let f = fake.lock().unwrap();
+			let set = &f.sets["k8s/default/gw"].2[0]["http"];
+			let names: Vec<&str> = set["routes"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect();
+			assert_eq!(names, ["a/one/r0/m0/h0", "b/two/r0/m0/h0", "d/four/r0/m0/h0", "e/five/r0/m0/h0"], "{unnamed}");
+			assert!(set["services"].get("c/bad/r0").is_none());
+			assert_eq!(f.dry_runs > 0, unnamed, "dry runs only when rproxy names no route");
+		}
+		// the route's status; the others keep theirs
+		let parent = |name: &str| crate::render::ParentStatus {
+			kind: RouteKind::Http,
+			namespace: name.split('/').next().unwrap().into(),
+			name: name.split('/').nth(1).unwrap().into(),
+			generation: 1,
+			parent_ref: Default::default(),
+			conds: vec![crate::render::status::Cond::ok("Accepted", "Accepted")],
+			rule_keys: ["tcp/0.0.0.0:443".to_string()].into(),
+		};
+		let pods = [r.clone()];
+		let bad = status::parent_conds(&parent("c/bad"), &pods);
+		let c = crate::render::status::get(&bad, "Accepted").unwrap();
+		assert!(!c.status && c.reason == "UnsupportedValue" && c.message.contains("regex parse error") == !unnamed, "{c:?}");
+		assert!(crate::render::status::get(&status::parent_conds(&parent("a/one"), &pods), "Accepted").unwrap().status);
+		// the next pass: nothing PUT again, the route still left out
+		let puts = fake.lock().unwrap().puts.len();
+		let (r, _) = sync_pod(&rp, &ep, &p, &mut applied, &mut caps).await;
+		assert!(matches!(&r, PodSync::Synced(_, ex) if ex.len() == 1), "{r:?}");
+		assert_eq!(fake.lock().unwrap().puts.len(), puts);
+	}
 }
 
 /// fleet: two Gateways on the same port on two VIPs both keep it; a third on one of those VIPs (or a

@@ -8,11 +8,21 @@ use crate::render::status::{self, Cond, to_k8s};
 use crate::render::{GatewayPlan, ListenerPlan, ListenerSetPlan, ParentStatus};
 use crate::rproxy::model::RuleView;
 
+/// A route left out of a rule rproxy refused, the rule's other routes applied (#92).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Excluded {
+	pub rule_key: String,
+	/// Whose routes (`controller::isolate::owner`).
+	pub owner: String,
+	/// rproxy's answer.
+	pub message: String,
+}
+
 /// What happened on one rproxy pod.
 #[derive(Clone, Debug)]
 pub enum PodSync {
-	/// The set is applied; rproxy's views of its rules.
-	Synced(Vec<RuleView>),
+	/// The set is applied; rproxy's views of its rules, and the routes left out because rproxy refused them.
+	Synced(Vec<RuleView>, Vec<Excluded>),
 	/// Not ready or not reachable.
 	NotReady(String),
 	/// Waiting (certificate files not written yet).
@@ -25,7 +35,7 @@ pub enum PodSync {
 fn rule_cond(pods: &[PodSync], key: &str, kind: &str) -> Option<crate::rproxy::model::RuleCondition> {
 	let mut out = None;
 	for p in pods {
-		if let PodSync::Synced(views) = p {
+		if let PodSync::Synced(views, _) = p {
 			let Some(v) = views.iter().find(|v| v.key() == key) else { continue };
 			let c = v.condition(kind);
 			if c.status != "True" {
@@ -38,7 +48,7 @@ fn rule_cond(pods: &[PodSync], key: &str, kind: &str) -> Option<crate::rproxy::m
 }
 
 fn synced(pods: &[PodSync]) -> usize {
-	pods.iter().filter(|p| matches!(p, PodSync::Synced(_))).count()
+	pods.iter().filter(|p| matches!(p, PodSync::Synced(..))).count()
 }
 
 /// Why nothing is applied yet (the first pod's reason).
@@ -47,7 +57,7 @@ fn waiting(pods: &[PodSync]) -> (bool, String) {
 		match p {
 			PodSync::Rejected(m) => return (true, format!("rproxy refused the rule set: {m}")),
 			PodSync::Pending(m) | PodSync::NotReady(m) => return (false, m.clone()),
-			PodSync::Synced(_) => {}
+			PodSync::Synced(..) => {}
 		}
 	}
 	(false, "no rproxy pod is running".into())
@@ -165,6 +175,22 @@ pub fn listener_set_status(set: &ListenerSetPlan, pods: &[PodSync], previous: Op
 /// A route's conditions for one parent after rproxy's answer.
 pub fn parent_conds(p: &ParentStatus, pods: &[PodSync]) -> Vec<Cond> {
 	let mut conds = p.conds.clone();
+	let owner = match p.kind {
+		crate::render::RouteKind::Grpc => format!("grpc:{}/{}", p.namespace, p.name),
+		_ => format!("{}/{}", p.namespace, p.name),
+	};
+	let excluded = pods.iter().find_map(|s| match s {
+		PodSync::Synced(_, ex) => ex.iter().find(|e| e.owner == owner && p.rule_keys.contains(&e.rule_key)),
+		_ => None,
+	});
+	if let Some(e) = excluded.filter(|_| matches!(p.kind, crate::render::RouteKind::Http | crate::render::RouteKind::Grpc)) {
+		if status::get(&conds, "Accepted").is_some_and(|a| a.status) {
+			status::set(
+				&mut conds,
+				Cond::new("Accepted", false, "UnsupportedValue", format!("rproxy refused the route on {}: {}", e.rule_key, e.message)),
+			);
+		}
+	}
 	for key in &p.rule_keys {
 		if let Some(c) = rule_cond(pods, key, "Accepted") {
 			if c.status != "True" && status::get(&conds, "Accepted").is_some_and(|a| a.status) {
@@ -337,13 +363,13 @@ mod tests {
 	fn gateway_status_from_rproxy() {
 		let p = plan();
 		let addrs = vec![("IPAddress".to_string(), "10.96.0.10".to_string())];
-		let s = gateway_status(&p, &addrs, &[PodSync::Synced(vec![view(80, "True")])], None, "T");
+		let s = gateway_status(&p, &addrs, &[PodSync::Synced(vec![view(80, "True")], vec![])], None, "T");
 		assert_eq!(s["addresses"][0]["value"], "10.96.0.10");
 		assert_eq!(s["conditions"][1]["type"], "Programmed");
 		assert_eq!(s["conditions"][1]["status"], "True");
 		assert_eq!(s["listeners"][0]["conditions"][2]["status"], "True");
 		assert_eq!(s["listeners"][0]["attachedRoutes"], 1);
-		let s = gateway_status(&p, &addrs, &[PodSync::Synced(vec![view(80, "False")])], None, "T");
+		let s = gateway_status(&p, &addrs, &[PodSync::Synced(vec![view(80, "False")], vec![])], None, "T");
 		let c = &s["listeners"][0]["conditions"][2];
 		assert_eq!((c["status"].as_str(), c["reason"].as_str()), (Some("False"), Some("Invalid")));
 		let s = gateway_status(&p, &[], &[PodSync::NotReady("starting".into())], None, "T");
@@ -356,7 +382,7 @@ mod tests {
 		let mut p = plan();
 		p.conds = vec![Cond::new("Accepted", false, "InvalidParameters", "spec.pod.tolerations: not allowed")];
 		let addrs = vec![("IPAddress".to_string(), "10.96.0.10".to_string())];
-		let synced = [PodSync::Synced(vec![view(80, "True")])];
+		let synced = [PodSync::Synced(vec![view(80, "True")], vec![])];
 		let s = gateway_status(&p, &addrs, &synced, None, "T");
 		assert_eq!(s["conditions"][1]["status"], "False", "a new Gateway with invalid parameters is not deployed");
 		p.kept = Some("spec.pod.tolerations: not allowed".into());

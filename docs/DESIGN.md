@@ -101,8 +101,14 @@ rproxy は `RPROXY_API_ADDR=0.0.0.0`、`RPROXY_API_PORT=9443`、`RPROXY_TOKEN_FI
 1. Pod の `GET /capabilities`（`features.rulesets` がなければ「rproxy v0.4.0 以降が要る」として `Programmed: False`）。`features.labels` がなければ `labels` を外して送る。
 2. `GET /readyz` が ready になるまで待つ（`features.readyz` がない rproxy は待たない）。
 3. `GET /rulesets/{name}`。前回 PUT したものと同じ内容・同じ etag なら何もしない。違えば（中身が変わった、rproxy が再起動してセットがない、ほかの誰かが変えた）`PUT /rulesets/{name}`。`generation` は Gateway の `metadata.generation`（rproxy にあるほうが大きければそちら。作り直した Gateway が `stale_generation` にならないように）、`If-Match` は今の etag。
-4. rproxy が 1 つのルールを断ったら（`400`、`rules[i]: ...`）、そのルールを外して残りを PUT し直す（RproxyRule や移行したルートの 1 つの誤りでセット全体を止めない）。断られたルールは `Accepted: False`（`Invalid`）として状態に書く。
+4. rproxy が 1 つのルールを断ったら（`400`、`rules[i]: ...`）、そのルールを外して残りを PUT し直す（RproxyRule や移行したルートの 1 つの誤りでセット全体を止めない）。断られたルールは `Accepted: False`（`Invalid`）として状態に書く。HTTP・HTTPS のポートのルールは、そのポートのすべてのテナントの HTTPRoute・GRPCRoute をまとめているので、ルールごとではなく、rproxy が断ったルートだけを外す（#92）：rproxy の答えが名前を挙げるルート・ミドルウェア・サービス（`route <名前>: ...` など）を使うルートを、それで分からなければルートを半分ずつ dry run（`?dry_run=true`）で試して見つける。外したルートは、そのルートの `Accepted: False`（`UnsupportedValue`、rproxy の答え）になり、ほかのルートはそのまま動く。ルートを外しても断られるとき（ルート以外の誤り）はルールを外す。
 5. PUT のあとの `GET /rulesets/{name}` のルールの `conditions` から状態を書く。`failed` のルールがあれば、少し後にもう一度 PUT する（kubelet が書いたばかりのファイルなど）。
+
+rproxy が断るものは、なるべく描く段階で見つける（`src/render/validate.rs`）：ルートごとに、rproxy と同じ規則で `match` の式（構文、項は 256 まで、括弧と `!` の深さは 32 まで。ListenerSet などのより細かいリスナーのホスト名は `!Host` の項になる）、正規表現（rproxy と同じ `regex` crate、同じ既定のサイズの上限）、ヘッダの名前と値（`http` crate。CR・LF・NUL などの制御文字は通さない）、ミドルウェアの形（RproxyMiddleware はちょうど 1 つの既知の種類、正規表現・パス・CIDR・状態コード・CORS の値）を確かめる。通らないルートは `Accepted: False`（`UnsupportedValue`）にして外し、同じポートのほかのルートは描く。移行した IngressRoute・Ingress のルートも同じ確かめで、通らないものは外して注記する。
+
+## Secret と ConfigMap の読み方
+
+コントローラは Secret と ConfigMap をメタデータだけで watch する（クラスタに大きな ConfigMap がたくさんあっても、中身をメモリに持たない。#92）。中身を読むのは、描くときに参照されたもの（`certificateRefs`、CA の ConfigMap・Secret、移行の Secret、managed の制御 API の Secret）だけ：反映のたびにまず Gateway を描いて参照を集め、まだ読んでいない・変わった（`resourceVersion` が違う）ものを `GET` で読み、参照されなくなったものは忘れる。watch の通知（作る・変える・消す）はこれまでどおり反映のきっかけになる。
 
 ## 変換（Gateway API → rproxy）
 
