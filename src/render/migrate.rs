@@ -132,6 +132,9 @@ struct Ctx<'a> {
 	port: (rp::Protocol, u16),
 	entry_points: BTreeMap<String, (rp::Protocol, u16)>,
 	allow_cross_namespace: bool,
+	/// The Gateway's class's `policy.middlewares` (Traefik Middlewares are tenants' too, #94).
+	/// `None`: the class's parameters are invalid (no migrated middleware is taken then).
+	middleware_policy: Option<crate::k8s::params::MiddlewarePolicy>,
 }
 
 /// Whether a ReferenceGrant in `to_ns` lets Traefik objects of `from_ns` refer to (`to_group`, `to_kind`, `name`).
@@ -480,6 +483,12 @@ pub fn render(world: &World, settings: &Settings, opts: &Options) -> Out {
 		port: (rp::Protocol::Tcp, 0),
 		entry_points: settings.entry_points.clone(),
 		allow_cross_namespace: settings.allow_cross_namespace,
+		middleware_policy: world
+			.gateways
+			.iter()
+			.find(|g| g.metadata.namespace.as_ref() == Some(&settings.gateway.0) && g.metadata.name.as_ref() == Some(&settings.gateway.1))
+			.map(|gw| crate::render::params::class_middleware_policy(world, gw, &opts.params))
+			.unwrap_or_default(),
 	};
 	let m = &world.migration;
 
@@ -498,9 +507,13 @@ pub fn render(world: &World, settings: &Settings, opts: &Options) -> Out {
 				let mws = ctx.middleware_chain(&ns, &refs, 0);
 				// what rproxy would refuse leaves this route out, not the port's other routes (#92)
 				let refused = crate::render::validate::expression(&rule).map_err(|e| format!("match {rule}: {e}")).and_then(|()| {
-					mws.iter()
-						.filter_map(|n| ctx.out.ports.get(&key).and_then(|p| p.middlewares.get(n)).map(|v| (n, v)))
-						.try_for_each(|(n, v)| crate::render::validate::middleware(v).map_err(|e| format!("middleware {n}: {e}")))
+					mws.iter().filter_map(|n| ctx.out.ports.get(&key).and_then(|p| p.middlewares.get(n)).map(|v| (n, v))).try_for_each(
+						|(n, v)| {
+							crate::render::validate::middleware(v)
+								.and_then(|()| crate::render::tenant::check(v, ctx.middleware_policy.as_ref()))
+								.map_err(|e| format!("middleware {n}: {e}"))
+						},
+					)
 				});
 				if let Err(e) = refused {
 					ctx.note(format!("{what} route {i}: {e}; left out"));
@@ -705,6 +718,17 @@ pub fn render(world: &World, settings: &Settings, opts: &Options) -> Out {
 				p.udp = targets;
 			}
 		}
+	}
+	// the middlewares of routes left out (refused, or not allowed by the class) do not go to rproxy
+	for p in ctx.out.ports.values_mut() {
+		let used: std::collections::BTreeSet<String> = p
+			.routes
+			.iter()
+			.chain(&p.tls_routes)
+			.flat_map(|r| r.middlewares.iter().cloned())
+			.chain(p.services.values().flat_map(|s| s.servers.iter().flat_map(|x| x.middlewares.iter().cloned())))
+			.collect();
+		p.middlewares.retain(|n, _| used.contains(n));
 	}
 	ctx.out
 }

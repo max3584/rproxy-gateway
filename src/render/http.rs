@@ -37,6 +37,9 @@ pub struct Ctx<'a> {
 	pub backend_tls: Option<&'a crate::render::backend_tls::Index>,
 	/// (certificate directory, the Gateway's files): the only files RproxyMiddlewares may name.
 	pub files: Option<(&'a str, &'a std::collections::BTreeSet<String>)>,
+	/// What RproxyMiddlewares may use (the GatewayClass's `policy.middlewares`); `None`: the class's
+	/// parameters are invalid, and no RproxyMiddleware is taken.
+	pub middleware_policy: Option<&'a crate::k8s::params::MiddlewarePolicy>,
 }
 
 /// One rproxy route before priorities are given.
@@ -118,8 +121,8 @@ impl Output {
 		self.middlewares = std::mem::take(&mut self.middlewares)
 			.into_iter()
 			.map(|(k, mut v)| {
-				// a mirror and an external auth name their service
-				for at in ["/mirror/service", "/forward_auth/service"] {
+				// a mirror, an external auth and an error page name their service
+				for at in crate::render::tenant::SERVICE_FIELDS {
 					if let Some(svc) = v.pointer_mut(at) {
 						if let Some(s) = svc.as_str() {
 							*svc = Value::String(p(s));
@@ -491,9 +494,17 @@ fn external_auth(
 	Ok(Some(json!({ "forward_auth": v })))
 }
 
-/// The middlewares of one filter, or why it cannot be used. `base`: names for
+/// The middlewares of one filter of `route`, or why it cannot be used. `base`: names for
 /// what the filter adds (a mirror's service).
-fn filter(ctx: &Ctx, ns: &str, f: &HttpRouteFilter, m: &HttpRouteMatch, base: &str, out: &mut Output) -> Result<Filtered, String> {
+fn filter(
+	ctx: &Ctx,
+	ns: &str,
+	route: &HttpRoute,
+	f: &HttpRouteFilter,
+	m: &HttpRouteMatch,
+	base: &str,
+	out: &mut Output,
+) -> Result<Filtered, String> {
 	Ok(Filtered::Middlewares(match f.kind.as_str() {
 		"RequestHeaderModifier" => {
 			vec![
@@ -547,7 +558,7 @@ fn filter(ctx: &Ctx, ns: &str, f: &HttpRouteFilter, m: &HttpRouteMatch, base: &s
 			}
 			match ctx.world.middlewares.get(&(ns.to_string(), r.name.clone())) {
 				Some(mw) => {
-					let v = Value::Object(mw.spec.0.0.clone());
+					let mut v = Value::Object(mw.spec.0.0.clone());
 					if let Some((dir, names)) = ctx.files {
 						if let Some(path) = crate::render::foreign_file(&v, dir, names) {
 							return Err(format!("RproxyMiddleware {}: {path}: only this Gateway's certificate files may be named", r.name));
@@ -555,6 +566,11 @@ fn filter(ctx: &Ctx, ns: &str, f: &HttpRouteFilter, m: &HttpRouteMatch, base: &s
 					}
 					// what the rproxy pods do not take yet would make them refuse the whole set (#95)
 					crate::render::validate::supported(&v, ctx.features).map_err(|e| format!("RproxyMiddleware {}: {e}", r.name))?;
+					// the kinds and URLs out the class allows; services of this route only, never another's on the port (#94)
+					crate::render::tenant::check(&v, ctx.middleware_policy).map_err(|e| format!("RproxyMiddleware {}: {e}", r.name))?;
+					let name = route.metadata.name.as_deref().unwrap_or_default();
+					crate::render::tenant::own_services(&mut v, ns, name, &route.spec.rules, ctx.grpc)
+						.map_err(|e| format!("RproxyMiddleware {}: {e}", r.name))?;
 					vec![v]
 				}
 				None => return Ok(Filtered::Missing),
@@ -570,6 +586,7 @@ fn filter(ctx: &Ctx, ns: &str, f: &HttpRouteFilter, m: &HttpRouteMatch, base: &s
 fn backend_filter(
 	ctx: &Ctx,
 	ns: &str,
+	route: &HttpRoute,
 	f: &HttpRouteFilter,
 	matches: &[HttpRouteMatch],
 	base: &str,
@@ -596,7 +613,7 @@ fn backend_filter(
 				"ExternalAuth" => kind(ctx.features.server_forward_auth, "ExternalAuth", "forward_auth")?,
 				_ => {}
 			}
-			match filter(ctx, ns, f, &first, base, out)? {
+			match filter(ctx, ns, route, f, &first, base, out)? {
 				Filtered::Middlewares(m) => Ok(m),
 				// an auth server that cannot be asked: nothing may reach this backend (its share gets 500)
 				Filtered::Unresolved => Err(UNRESOLVED.into()),
@@ -741,7 +758,7 @@ pub fn build(ctx: &Ctx, route: &HttpRoute, hosts: Option<&[String]>, exclusions:
 					let mut names = vec![];
 					let mut closed = false;
 					for (k, f) in b.filters.iter().enumerate() {
-						match backend_filter(ctx, &ns, f, matches, &format!("{base}/b{bi}/f{k}"), &mut out) {
+						match backend_filter(ctx, &ns, route, f, matches, &format!("{base}/b{bi}/f{k}"), &mut out) {
 							Err(e) if e == UNRESOLVED => closed = true,
 							Ok(mws) => {
 								for (x, mw) in mws.into_iter().enumerate() {
@@ -856,7 +873,7 @@ pub fn build(ctx: &Ctx, route: &HttpRoute, hosts: Option<&[String]>, exclusions:
 			let mut answers = false;
 			let mut broken = false;
 			for (k, f) in rule.filters.iter().enumerate() {
-				match filter(ctx, &ns, f, m, &format!("{base}/f{k}"), &mut out) {
+				match filter(ctx, &ns, route, f, m, &format!("{base}/f{k}"), &mut out) {
 					Ok(Filtered::Middlewares(mws)) => {
 						for (x, mw) in mws.into_iter().enumerate() {
 							answers |= mw.get("redirect_regex").is_some() || mw.get("respond").is_some();
@@ -909,6 +926,30 @@ pub fn build(ctx: &Ctx, route: &HttpRoute, hosts: Option<&[String]>, exclusions:
 						out.unsupported.get_or_insert(format!("rule {i}: {e}"));
 					}
 				}
+			}
+		}
+	}
+	// a rule an RproxyMiddleware names that has no service (no ready backend): rproxy refuses a set
+	// naming a service it does not have, so the name answers 500 (the error page, the mirror, the
+	// auth server fail closed)
+	let named: std::collections::BTreeSet<String> = out
+		.middlewares
+		.values()
+		.flat_map(|v| crate::render::tenant::SERVICE_FIELDS.iter().filter_map(|at| v.pointer(at)?.as_str().map(String::from)))
+		.filter(|n| !out.services.contains_key(n))
+		.collect();
+	for n in named {
+		match crate::render::needs(
+			ctx.features.server_status,
+			&format!("a middleware naming {n}, which has no backend"),
+			"http_options server_status",
+		) {
+			Ok(()) => {
+				let server = rp::Server { status: Some(500), ..Default::default() };
+				out.services.insert(n, rp::Service { servers: vec![server], ..Default::default() });
+			}
+			Err(e) => {
+				out.unsupported.get_or_insert(e);
 			}
 		}
 	}
@@ -982,6 +1023,7 @@ mod tests {
 			grpc: false,
 			backend_tls: None,
 			files: None,
+			middleware_policy: Some(&crate::k8s::params::MiddlewarePolicy::DEFAULT),
 		};
 		let r = RequestRedirect { scheme: Some("https".into()), status_code: Some(301), ..Default::default() };
 		let v = redirect(&ctx, &r, &m(None)).unwrap();
@@ -1001,6 +1043,7 @@ mod tests {
 			grpc: false,
 			backend_tls: None,
 			files: None,
+			middleware_policy: Some(&crate::k8s::params::MiddlewarePolicy::DEFAULT),
 		};
 		let v = redirect(&ctx8080, &r, &m(Some(("PathPrefix", "/old/")))).unwrap();
 		assert_eq!(v.len(), 2);
@@ -1012,8 +1055,17 @@ mod tests {
 		assert_eq!(v[0]["redirect_regex"]["permanent"], false);
 		// an older rproxy: 301 and 302 only
 		let old = crate::render::Features { redirect_status: false, ..Default::default() };
-		let ctx_old =
-			Ctx { world: &world, scheme: "http", port: 80, features: &old, kind: "HTTPRoute", grpc: false, backend_tls: None, files: None };
+		let ctx_old = Ctx {
+			world: &world,
+			scheme: "http",
+			port: 80,
+			features: &old,
+			kind: "HTTPRoute",
+			grpc: false,
+			backend_tls: None,
+			files: None,
+			middleware_policy: Some(&crate::k8s::params::MiddlewarePolicy::DEFAULT),
+		};
 		let e = redirect(&ctx_old, &RequestRedirect { status_code: Some(303), ..Default::default() }, &m(None)).unwrap_err();
 		assert!(e.contains("redirect_status"), "{e}");
 		let v = redirect(&ctx_old, &RequestRedirect { status_code: Some(301), ..Default::default() }, &m(None)).unwrap();
@@ -1041,14 +1093,24 @@ mod tests {
 			grpc: false,
 			backend_tls: None,
 			files: None,
+			middleware_policy: Some(&crate::k8s::params::MiddlewarePolicy::DEFAULT),
 		};
 		let v = rewrite(&ctx, &f, &m(Some(("PathPrefix", "/old")))).unwrap();
 		assert_eq!(v, vec![json!({"replace_path_regex": {"regex": "^/old(/.*)?$", "replacement": "/new${1}"}})]);
 		let host = crate::k8s::gateway::UrlRewrite { hostname: Some("one.example.org".into()), path: None };
 		assert_eq!(rewrite(&ctx, &host, &m(None)).unwrap(), vec![json!({"replace_host": {"host": "one.example.org"}})]);
 		let old = crate::render::Features { replace_host: false, ..Default::default() };
-		let ctx_old =
-			Ctx { world: &world, scheme: "http", port: 80, features: &old, kind: "HTTPRoute", grpc: false, backend_tls: None, files: None };
+		let ctx_old = Ctx {
+			world: &world,
+			scheme: "http",
+			port: 80,
+			features: &old,
+			kind: "HTTPRoute",
+			grpc: false,
+			backend_tls: None,
+			files: None,
+			middleware_policy: Some(&crate::k8s::params::MiddlewarePolicy::DEFAULT),
+		};
 		assert!(rewrite(&ctx_old, &host, &m(None)).is_err());
 		assert_eq!(regex_escape("/a.b$"), "/a\\.b\\$");
 	}

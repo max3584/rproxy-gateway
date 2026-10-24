@@ -19,7 +19,7 @@ use serde_json::Value;
 
 use crate::k8s::crd::{FreeForm, GROUP};
 use crate::k8s::gateway::{Gateway, GatewayClass};
-use crate::k8s::params::{IntOrStr, Performance, ProxyProtocolParams, RproxyGatewayParametersSpec as Spec};
+use crate::k8s::params::{IntOrStr, MiddlewarePolicy, ParamsPolicy, Performance, ProxyProtocolParams, RproxyGatewayParametersSpec as Spec};
 use crate::render::world::World;
 
 pub const KIND: &str = "RproxyGatewayParameters";
@@ -200,6 +200,25 @@ pub fn class_proxy_protocol(world: &World, gw: &Gateway, o: &ParamsOptions) -> O
 	class_parameters(world, class, o).ok().flatten()?.proxy_protocol
 }
 
+/// The GatewayClass's `policy.middlewares` (what tenants' middlewares may use; the default without
+/// class parameters). `None` while the class's parameters are invalid: Gateways keep running then
+/// (2.4), and a mistake elsewhere in the class must not open what its policy closes, so no
+/// middleware of a tenant is taken until they are fixed.
+pub fn class_middleware_policy(world: &World, gw: &Gateway, o: &ParamsOptions) -> Option<MiddlewarePolicy> {
+	class_policy(world, gw, o).map(|p| p.middlewares.unwrap_or_default())
+}
+
+/// The GatewayClass's `policy` (the default without class parameters; `None` while they are invalid).
+pub fn class_policy(world: &World, gw: &Gateway, o: &ParamsOptions) -> Option<ParamsPolicy> {
+	let Some(class) = world.classes.iter().find(|c| c.metadata.name.as_deref() == Some(gw.spec.gateway_class_name.as_str())) else {
+		return Some(ParamsPolicy::default());
+	};
+	match class_parameters(world, class, o) {
+		Ok(p) => Some(p.and_then(|p| p.policy).unwrap_or_default()),
+		Err(_) => None,
+	}
+}
+
 /// The fields `spec` sets, by their names in `policy.gatewayOverrides`.
 pub fn set_paths(spec: &Spec) -> Vec<&'static str> {
 	let mut out = vec![];
@@ -245,6 +264,9 @@ pub fn set_paths(spec: &Spec) -> Vec<&'static str> {
 /// The class's `policy`: only fields that can be opened.
 fn check_policy(spec: &Spec) -> Result<(), String> {
 	let Some(p) = &spec.policy else { return Ok(()) };
+	if let Some(m) = &p.middlewares {
+		crate::render::tenant::check_policy(m)?;
+	}
 	for f in p.gateway_overrides.iter().flatten() {
 		if CLASS_ONLY.contains(&f.as_str()) {
 			return Err(format!("spec.policy.gatewayOverrides: {f} cannot be opened to Gateways"));
