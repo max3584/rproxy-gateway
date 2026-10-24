@@ -773,7 +773,8 @@ spec:
 	let PodSync::Synced(views, excluded) = &r else { panic!("{r:?}\nrules: {}", serde_json::to_string(&plan.rules_json()).unwrap()) };
 	assert!(views.iter().all(|v| v.state == "running"), "{views:?}");
 	assert_eq!(excluded.iter().map(|e| e.owner.as_str()).collect::<Vec<_>>(), ["tenant/evil"], "{excluded:?}");
-	assert!(excluded[0].message.contains("tenant/evil/r0/m0/h0"), "{excluded:?}");
+	// found by the name at the head of rproxy's answer (what the controller trusts)
+	assert!(excluded[0].message.starts_with("route tenant/evil/r0/m0/h0: "), "{excluded:?}");
 	let (status, body) = get(port, "good.example.com", "/x").await;
 	assert_eq!(status, 200, "{body}");
 	assert!(body.ends_with("/x|good.example.com|"), "{body}");

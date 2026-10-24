@@ -16,6 +16,10 @@ pub struct Excluded {
 	pub owner: String,
 	/// rproxy's answer.
 	pub message: String,
+	/// `isolate::content` of the owner's routes when they were left out.
+	pub content: String,
+	/// When they were first left out (they stay out, without asking rproxy again, for a while).
+	pub since: std::time::Instant,
 }
 
 /// What happened on one rproxy pod.

@@ -91,7 +91,9 @@ where
 	K::DynamicType: Default + Eq + std::hash::Hash + Clone,
 {
 	fn watch(client: &kube::Client, scope: &Scope, changed: &Arc<Notify>, what: &'static str) -> Self {
-		// an `Api` of `PartialObjectMeta` lists and watches metadata only
+		// an `Api` of `PartialObjectMeta` lists and watches with the metadata-only Accept header
+		// (`as=PartialObjectMetadataList` / `PartialObjectMetadata`): the API server sends no
+		// `data` (kube 4.2; its deprecated `metadata_watcher` is this same watcher; see the test)
 		let meta =
 			Multi(apis::<PartialObjectMeta<K>>(client, scope).into_iter().map(|api| spawn_watch(api, changed.clone(), what)).collect());
 		Bodies { meta, full: Mutex::new(BTreeMap::new()) }
@@ -420,4 +422,21 @@ async fn discover(client: &kube::Client) -> anyhow::Result<Vec<(String, String, 
 		}
 	}
 	Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+	use k8s_openapi::api::core::v1::{ConfigMap, Secret};
+	use kube::Resource;
+	use kube::api::PartialObjectMeta;
+
+	/// Secrets and ConfigMaps are listed and watched as metadata only (#92): kube sends the
+	/// metadata-only Accept header for an `Api` of `PartialObjectMeta`. A kube upgrade that changes
+	/// this would hold every Secret's and ConfigMap's body again.
+	#[test]
+	fn secrets_and_config_maps_are_watched_as_metadata() {
+		assert!(PartialObjectMeta::<Secret>::metadata_api());
+		assert!(PartialObjectMeta::<ConfigMap>::metadata_api());
+		assert!(!Secret::metadata_api());
+	}
 }

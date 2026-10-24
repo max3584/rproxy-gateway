@@ -32,6 +32,8 @@ struct Fake {
 	unnamed: bool,
 	/// dry runs asked for
 	dry_runs: usize,
+	/// dry runs answer 503
+	dry_run_fails: bool,
 }
 
 fn etag(generation: i64, rules: &[Value]) -> String {
@@ -105,6 +107,13 @@ async fn handle(fake: Arc<Mutex<Fake>>, req: Request<hyper::body::Incoming>) -> 
 						return reply(400, json!({"error": error, "code": "invalid"}));
 					}
 				}
+			}
+			if dry_run && f.dry_run_fails {
+				f.dry_runs += 1;
+				return reply(503, json!({"error": "busy", "code": "unavailable"}));
+			}
+			if rules.iter().any(|r| r["remote_addr"] == "whole") {
+				return reply(400, json!({"error": "invalid body: unknown field `x`", "code": "invalid"}));
 			}
 			if dry_run {
 				f.dry_runs += 1;
@@ -478,7 +487,117 @@ async fn a_refused_route_does_not_stop_the_port() {
 		let (r, _) = sync_pod(&rp, &ep, &p, &mut applied, &mut caps).await;
 		assert!(matches!(&r, PodSync::Synced(_, ex) if ex.len() == 1), "{r:?}");
 		assert_eq!(fake.lock().unwrap().puts.len(), puts);
+		// another tenant's change: the route refused before (unchanged) stays out without asking again
+		let dry = fake.lock().unwrap().dry_runs;
+		let mut p2 = p.clone();
+		p2.rules[0].http.as_mut().unwrap().routes.push(route("f/six", "PathPrefix(`/six`)"));
+		p2.rules[0]
+			.http
+			.as_mut()
+			.unwrap()
+			.services
+			.insert("f/six/r0".into(), Service { servers: vec![Default::default()], ..Default::default() });
+		let (r, _) = sync_pod(&rp, &ep, &p2, &mut applied, &mut caps).await;
+		assert!(matches!(&r, PodSync::Synced(_, ex) if ex.len() == 1 && ex[0].owner == "c/bad"), "{r:?}");
+		let f = fake.lock().unwrap();
+		assert_eq!((f.puts.len(), f.dry_runs), (puts + 1, dry), "one PUT, no dry runs");
 	}
+}
+
+fn http_plan(port: u16, owners: &[(&str, bool)]) -> GatewayPlan {
+	use crate::rproxy::model::{Http, HttpRoute, Service};
+	let mut p = plan(port, &[]);
+	let mut http = Http::default();
+	for (o, bad) in owners {
+		http.routes.push(HttpRoute {
+			name: format!("{o}/r0/m0/h0"),
+			rule: if *bad { "PathRegexp(`BAD(`)".into() } else { "PathPrefix(`/`)".into() },
+			service: Some(format!("{o}/r0")),
+			..Default::default()
+		});
+		http.services.insert(format!("{o}/r0"), Service { servers: vec![Default::default()], ..Default::default() });
+	}
+	p.rules[0].targets = vec![];
+	p.rules[0].http = Some(http);
+	p
+}
+
+fn local(port: u16) -> Endpoint {
+	Endpoint { pod: "rproxy-0".into(), uid: "u1".into(), ip: "127.0.0.1".into(), api_port: port, certsync_port: port, ..Default::default() }
+}
+
+/// Past `MAX_EXCLUDED` refused routes, only that rule is left out (not the set), and the answer is
+/// remembered: nothing is PUT again until something changes.
+#[tokio::test]
+async fn many_refused_routes_leave_out_that_rule_only() {
+	let fake = Arc::new(Mutex::new(Fake::default()));
+	let port = start(fake.clone()).await;
+	let rp = Client::new(None, "secret").unwrap();
+	let ep = local(port);
+	let names: Vec<String> = (0..MAX_EXCLUDED + 6).map(|i| format!("t/r{i}")).collect();
+	let mut owners: Vec<(&str, bool)> = names.iter().map(|n| (n.as_str(), true)).collect();
+	owners.push(("ok/one", false));
+	let mut p = http_plan(443, &owners);
+	p.rules.push(Rule {
+		protocol: Protocol::Tcp,
+		listen_addr: "0.0.0.0".into(),
+		listen_port: 5432,
+		targets: vec![Target { addr: "10.0.0.1".into(), port: 5432, weight: None }],
+		..Default::default()
+	});
+	let mut applied = Applied::new();
+	let mut caps = HashMap::new();
+	let (r, _) = sync_pod(&rp, &ep, &p, &mut applied, &mut caps).await;
+	let PodSync::Synced(views, excluded) = &r else { panic!("{r:?}") };
+	assert!(excluded.is_empty(), "{excluded:?}");
+	let bad = views.iter().find(|v| v.listen_port == 443).unwrap();
+	assert_eq!(bad.state, "failed");
+	assert_eq!(fake.lock().unwrap().sets["k8s/default/gw"].2.len(), 1, "the other rule is applied");
+	let puts = fake.lock().unwrap().puts.len();
+	let (r, _) = sync_pod(&rp, &ep, &p, &mut applied, &mut caps).await;
+	assert!(matches!(r, PodSync::Synced(..)));
+	assert_eq!(fake.lock().unwrap().puts.len(), puts, "remembered");
+}
+
+/// A set rproxy refuses as a whole is remembered too (not PUT again every pass).
+#[tokio::test]
+async fn a_refused_set_is_remembered() {
+	let fake = Arc::new(Mutex::new(Fake::default()));
+	let port = start(fake.clone()).await;
+	let rp = Client::new(None, "secret").unwrap();
+	let ep = local(port);
+	let mut p = plan(80, &[]);
+	p.rules[0].targets = vec![Target { addr: "whole".into(), port: 80, weight: None }];
+	p.raw = vec![json!({"protocol": "tcp", "listen_addr": "0.0.0.0", "listen_port": 25, "remote_addr": "whole", "remote_port": 25})];
+	let mut applied = Applied::new();
+	let mut caps = HashMap::new();
+	let (r, _) = sync_pod(&rp, &ep, &p, &mut applied, &mut caps).await;
+	assert!(matches!(&r, PodSync::Rejected(m) if m.contains("unknown field")), "{r:?}");
+	let puts = fake.lock().unwrap().puts.len();
+	let (r, again) = sync_pod(&rp, &ep, &p, &mut applied, &mut caps).await;
+	assert!(matches!(r, PodSync::Rejected(_)) && !again);
+	assert_eq!(fake.lock().unwrap().puts.len(), puts);
+}
+
+/// A dry run without an answer (5xx, timeout) decides nothing: no rule is left out, nothing is
+/// remembered, the pass is tried again soon.
+#[tokio::test]
+async fn a_failed_dry_run_drops_nothing() {
+	let fake = Arc::new(Mutex::new(Fake { unnamed: true, dry_run_fails: true, ..Default::default() }));
+	let port = start(fake.clone()).await;
+	let rp = Client::new(None, "secret").unwrap();
+	let ep = local(port);
+	let p = http_plan(443, &[("a/one", false), ("b/bad", true)]);
+	let mut applied = Applied::new();
+	let mut caps = HashMap::new();
+	let (r, again) = sync_pod(&rp, &ep, &p, &mut applied, &mut caps).await;
+	assert!(matches!(&r, PodSync::NotReady(m) if m.contains("dry run")) && again, "{r:?}");
+	assert!(applied.is_empty());
+	assert!(fake.lock().unwrap().sets.is_empty(), "no set without the port's rule");
+	// rproxy answers again: only the refused route is left out
+	fake.lock().unwrap().dry_run_fails = false;
+	let (r, _) = sync_pod(&rp, &ep, &p, &mut applied, &mut caps).await;
+	assert!(matches!(&r, PodSync::Synced(v, ex) if v.len() == 1 && ex.len() == 1 && ex[0].owner == "b/bad"), "{r:?}");
 }
 
 /// fleet: two Gateways on the same port on two VIPs both keep it; a third on one of those VIPs (or a

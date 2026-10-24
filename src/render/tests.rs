@@ -2216,6 +2216,20 @@ kind: RproxyMiddleware
 metadata: {name: two, namespace: default}
 spec: {headers: {}, retry: {attempts: 2}}
 ---
+apiVersion: rproxy.max3584.net/v1alpha1
+kind: RproxyMiddleware
+metadata: {name: unknown-field, namespace: default}
+spec: {retry: {attempts: 2, bogus: true}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: field, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  rules:
+    - filters: [{type: ExtensionRef, extensionRef: {group: rproxy.max3584.net, kind: RproxyMiddleware, name: unknown-field}}]
+      backendRefs: [{name: web, port: 80}]
+---
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata: {name: mw, namespace: default}
@@ -2234,7 +2248,7 @@ spec:
 	assert_eq!(names, ["default/good/r0/m0/h0"]);
 	let text = serde_json::to_string(rule).unwrap();
 	assert!(!text.contains("x-evil") && !text.contains("/a("), "{text}");
-	for bad in ["regex", "header", "inject", "mw"] {
+	for bad in ["regex", "header", "inject", "mw", "field"] {
 		let parent = p.parents.iter().find(|x| x.name == bad).unwrap();
 		let c = cond(&parent.conds, "Accepted");
 		assert_eq!((c.status, c.reason.as_str()), (false, "UnsupportedValue"), "{bad}: {c:?}");
