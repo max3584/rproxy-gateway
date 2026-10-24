@@ -92,6 +92,9 @@ spec:
     maxReplicas: 10
     allowedPriorityClasses: []
     allowedLoadBalancerClasses: []
+    middlewares:                        # 15. (v0.4.17): kinds and URLs out tenants' middlewares may use
+      allowedKinds: [headers, rate_limit, forward_auth]   # omitted: all
+      outboundHosts: [auth.example.com]                   # omitted: no URL out
 ```
 
 ### 2.2 Fields
@@ -502,3 +505,18 @@ spec:
 - fleet: Gateways' references are not used (2.3), but the class reference's `proxyProtocol` goes onto every Gateway's rules.
 - The managed rproxy's pods and Service do not change (the rule set only).
 - Tests: unit (`src/render/tests.rs`: every tcp rule by default, port sharing with names, the condition for UDP and unknown names, an rproxy without `features.proxy_protocol_in`, the `policy` for Gateways' references, the class's on invalid parameters; `src/render/params.rs`: validation and merging), a real rproxy (`tests/rproxy.rs`: the rendered set is taken, the client of a v1 header from `from` reaches `X-Forwarded-For`, no header is refused, a TCP listener not listed reads no header), e2e (kind: another GatewayClass's defaults with the pod range as `from`; the spoofed client a client pod sends with curl's `--haproxy-protocol` reaches the backend's `X-Forwarded-For`).
+
+## 15. What tenants' middlewares reach (v0.4.17, #94)
+
+On a shared Gateway one port's rproxy rule holds every tenant's services and middlewares on that port, and service names are predictable (`{namespace}/{route}/r{i}`). RproxyMiddleware JSON went to rproxy as it was, so a tenant writing another tenant's service name in `errors.service`, `mirror.service` or `forward_auth.service` could send requests to that tenant's backends from the Gateway's pods and read the answers (around ReferenceGrants and the victim's NetworkPolicies). `forward_auth.address` and `oidc.issuer` gave requests from the Gateway's pods to any URL (SSRF).
+
+- **Services of the own route only**: fields of an RproxyMiddleware naming a service can only point at the rules of the HTTPRoute (GRPCRoute) using it through `ExtensionRef`: a rule's `name`, `r<i>` (the rule's index), or the route's rproxy name `<namespace>/<route>/r<i>` (the earlier way; for the own route only). The controller rewrites them to that route's rproxy service names (`grpc:`-prefixed for a GRPCRoute). Any other name never reaches rproxy: the route gets `Accepted: False` (`UnsupportedValue`, the message naming the field and the name) and is left out (the other routes on the port are rendered, #92). One RproxyMiddleware used by several routes names each route's own rules.
+- When the named rule has no usable backend (no pod, an invalid backendRef), rproxy would refuse a set naming a service it does not have, so the name becomes a service answering 500 (`servers[].status`, `features.http_options` `server_status`): `forward_auth` lets nothing through, `errors` pages and `mirror` get 500. On an rproxy without `server_status` the route gets `Accepted: False`.
+- The standard filters (`RequestMirror`, `ExternalAuth`) and migrated Traefik `errors` name services the controller builds from Kubernetes Services after checking ReferenceGrants, so they were already the route's own.
+- **URLs out only where the class allows them**: `policy.middlewares.outboundHosts` in the GatewayClass's parameters (default empty: none). Entries: `*` (anywhere), a host name (`auth.example.com`), `*.example.com` (names under it, not `example.com` itself), an IP range (`10.0.0.0/8`, `fd00::/8`; it only matches URLs whose host is an IP address, never a host name, which may resolve anywhere). It covers `forward_auth.address` and `oidc.issuer`. What another parser could read as another host (user info `@`, `%`, `\`, a `:` that is not a port) is refused whatever the list says. Host names are compared as written; take care before opening in-cluster names (`*.svc` and the like).
+- **Kinds allow list**: `policy.middlewares.allowedKinds` (rproxy's kind names; omitted: all). An unknown name makes the class's parameters invalid (`InvalidParameters`).
+- Migrated Traefik Middlewares (from IngressRoutes) are checked the same way against the class's `policy.middlewares` (URLs out, i.e. `forwardAuth.address`, and kinds); routes that fail are left out with a note (never served without their auth), and the middlewares of routes left out do not go into the rule.
+- `policy` belongs to the class's reference only (a Gateway's reference cannot set it), so tenants cannot open it themselves. In fleet mode the class reference's `policy.middlewares` applies too.
+- Where: `src/render/tenant.rs` (rewriting names, URLs, kinds), `src/render/http.rs` (ExtensionRef, rules without a backend), `src/render/migrate.rs` (migration).
+- For existing users: RproxyMiddlewares naming another route's or a missing service, RproxyMiddlewares using `forward_auth.address` or `oidc`, and Traefik `forwardAuth` make their routes `Accepted: False` (migrated ones are left out) until the class opens them. The own route's `<namespace>/<route>/r<i>` keeps working.
+- Tests: unit (`src/render/tenant.rs`; `rproxy_middleware_services_stay_in_the_route` and `middleware_urls_out_follow_the_class` in `src/render/tests.rs`), real rproxy (`rproxy_middleware_services_on_a_real_rproxy` in `tests/rproxy.rs`: rproxy takes the rewritten names, asks the own rule's auth server, and lets nothing through for a rule without a backend).

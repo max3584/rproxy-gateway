@@ -92,6 +92,9 @@ spec:
     maxReplicas: 10
     allowedPriorityClasses: []
     allowedLoadBalancerClasses: []
+    middlewares:                        # 15.（v0.4.17）：テナントのミドルウェアが使える種類と外への URL
+      allowedKinds: [headers, rate_limit, forward_auth]   # 省略：すべて
+      outboundHosts: [auth.example.com]                   # 省略：外への URL なし
 ```
 
 ### 2.2 項目
@@ -502,3 +505,18 @@ spec:
 - fleet：Gateway の参照は使えない（2.3）が、クラスの参照の `proxyProtocol` は各 Gateway のルールに付く。
 - managed の rproxy の Pod・Service の形は変えない（ルールセットだけ）。
 - 試験：単体（`src/render/tests.rs`：既定ですべての tcp のルール、名前を書いたときのポートの共有、UDP・知らない名前の条件、`features.proxy_protocol_in` のない rproxy、Gateway の参照の `policy`、誤った parameters でクラスのものを使うこと。`src/render/params.rs`：検証と合わせ方）、本物の rproxy（`tests/rproxy.rs`：描いた組が通り、`from` からの v1 のヘッダのクライアントが `X-Forwarded-For` に届き、ヘッダなしは断られ、書いていない TCP の listener はヘッダを読まない）、e2e（kind：別の GatewayClass の既定で Pod の範囲を `from` にし、クライアントの Pod が curl の `--haproxy-protocol` で送った偽のクライアントがバックエンドの `X-Forwarded-For` に届く）。
+
+## 15. テナントのミドルウェアが届く先（v0.4.17、#94）
+
+共有の Gateway では、1 ポートの rproxy のルールがそのポートの全テナントのサービスとミドルウェアをまとめて持ち、サービスの名前は `{namespace}/{route}/r{i}` で予測できる。RproxyMiddleware の JSON は rproxy にそのまま渡っていたので、テナントが `errors.service`・`mirror.service`・`forward_auth.service` にほかのテナントのサービスの名前を書くと、Gateway の Pod からそのテナントの転送先に要求を送り、応答も読めた（ReferenceGrant と相手の NetworkPolicy を回り込む）。`forward_auth.address`・`oidc.issuer` では Gateway の Pod から任意の URL への要求（SSRF）になった。
+
+- **サービスは自分のルートのものだけ**：RproxyMiddleware のサービスを名指す項目は、それを `ExtensionRef` で使う HTTPRoute（GRPCRoute）自身のルールだけを指せる。書き方はルールの `name`、`r<i>`（ルールの番号）、ルートの rproxy の名前 `<namespace>/<route>/r<i>`（今までの書き方。自分のルートのときだけ）。コントローラはそのルートの rproxy のサービスの名前に書き換える（GRPCRoute なら `grpc:` が付く）。ほかの名前は rproxy に渡さず、そのルートを `Accepted: False`（`UnsupportedValue`、message に項目と名前）にして外す（同じポートのほかのルートは描く、#92）。1 つの RproxyMiddleware を複数のルートで使えば、名前はそれぞれのルートのルールになる。
+- 名指したルールに使える backend がない（Pod がない・backendRef が誤り）とき、rproxy は持たないサービスを名指すセットを断るので、その名前を 500 を返すサービス（`servers[].status`、`features.http_options` の `server_status`）にする。`forward_auth` は通さず、`errors` のページと `mirror` は 500 になる。`server_status` のない rproxy では、そのルートを `Accepted: False` にする。
+- 標準のフィルタ（`RequestMirror`・`ExternalAuth`）と移行した Traefik の `errors` は、コントローラが ReferenceGrant を確かめた Kubernetes の Service から名前を作るので、もとから自分の分だけ。
+- **外への URL はクラスが許したときだけ**：GatewayClass の parameters の `policy.middlewares.outboundHosts`（既定は空＝なし）。項目は `*`（どこでも）、ホスト名（`auth.example.com`）、`*.example.com`（その下の名前。`example.com` 自身は含まない）、IP の範囲（`10.0.0.0/8`・`fd00::/8`。URL のホストが IP アドレスのときだけに合い、ホスト名には合わない。ホスト名はどこにでも引けるため）。対象は `forward_auth.address`・`oidc.issuer`。ほかのパーサが別のホストと読めるもの（user info の `@`、`%`、`\`、ポートでない `:`）は許可リストと関係なく断る。ホスト名は書いたとおりに比べるので、クラスタの中の名前（`*.svc` など）を開けるときは慎重に。
+- **種類の許可リスト**：`policy.middlewares.allowedKinds`（rproxy の種類の名前、省略ですべて）。知らない名前はクラスの parameters の誤り（`InvalidParameters`）。
+- 移行した Traefik の Middleware（IngressRoute から）も同じく、外への URL（`forwardAuth.address`）と種類をクラスの `policy.middlewares` で確かめ、通らないルートは外して注記する（認証なしで流さない）。外したルートのミドルウェアはルールに入れない。
+- `policy` はクラスの参照だけのもの（Gateway の参照には書けない）なので、テナントは自分で開けられない。fleet でもクラスの参照の `policy.middlewares` が効く。
+- 決まりの場所：`src/render/tenant.rs`（名前の書き換え・URL・種類）、`src/render/http.rs`（ExtensionRef、backend のないルール）、`src/render/migrate.rs`（移行）。
+- 前からの利用者への影響：ほかのルートや存在しないサービスを書いていた RproxyMiddleware、`forward_auth.address`・`oidc` を使う RproxyMiddleware と Traefik の `forwardAuth` は、クラスで開けるまでルートが `Accepted: False`（移行は外れる）になる。自分のルートの `<namespace>/<route>/r<i>` はそのまま使える。
+- 試験：単体（`src/render/tenant.rs`、`src/render/tests.rs` の `rproxy_middleware_services_stay_in_the_route`・`middleware_urls_out_follow_the_class`）、本物の rproxy（`tests/rproxy.rs` の `rproxy_middleware_services_on_a_real_rproxy`：書き換えた名前を rproxy が受け付け、自分のルールの認証サーバに聞き、backend のないルールでは通さない）。

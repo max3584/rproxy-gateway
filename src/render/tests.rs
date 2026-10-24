@@ -2302,7 +2302,7 @@ fn rproxy_middleware_fields_follow_the_pods() {
 apiVersion: rproxy.max3584.net/v1alpha1
 kind: RproxyMiddleware
 metadata: {name: auth, namespace: default}
-spec: {forward_auth: {service: default/web/r0, path: /check}}
+spec: {forward_auth: {service: r0, path: /check}}
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
@@ -2332,4 +2332,179 @@ spec:
 	assert!(cond(&p.parents.iter().find(|p| p.name == "plain").unwrap().conds, "Accepted").status);
 	let text = serde_json::to_string(&p.rules_json()).unwrap();
 	assert!(!text.contains("forward_auth") && text.contains("plain.example.com"), "{text}");
+}
+
+/// The GatewayClass `rproxy` with parameters whose spec is `spec` (in the controller's namespace).
+fn class_with(spec: &str) -> String {
+	format!(
+		r#"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: {{name: rproxy}}
+spec:
+  controllerName: rproxy.max3584.net/gateway-controller
+  parametersRef: {{group: rproxy.max3584.net, kind: RproxyGatewayParameters, name: rproxy-default, namespace: rproxy-gateway-system}}
+---
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyGatewayParameters
+metadata: {{name: rproxy-default, namespace: rproxy-gateway-system}}
+spec: {spec}
+"#
+	)
+}
+
+/// An RproxyMiddleware names services of its own route only: another tenant's service on the shared
+/// port is refused (the route is left out), the route's own rules are rewritten to their rproxy names,
+/// and a rule without a backend answers 500 instead of making rproxy refuse the set (#94).
+#[test]
+fn rproxy_middleware_services_stay_in_the_route() {
+	let yaml = format!(
+		"{BASE}{}{}",
+		gw("  - {name: http, port: 80, protocol: HTTP, allowedRoutes: {namespaces: {from: All}}}"),
+		r#"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: api, namespace: other}
+spec:
+  parentRefs: [{name: gw, namespace: default}]
+  hostnames: [api.example.com]
+  rules: [{backendRefs: [{name: api, port: 8000}]}]
+---
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyMiddleware
+metadata: {name: steal, namespace: default}
+spec: {mirror: {service: other/api/r0}}
+---
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyMiddleware
+metadata: {name: pages, namespace: default}
+spec: {errors: {status: ["500-599"], service: pages, path: /error.html}}
+---
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyMiddleware
+metadata: {name: auth, namespace: default}
+spec: {forward_auth: {service: r1, path: /check}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: thief, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  hostnames: [thief.example.com]
+  rules:
+    - filters: [{type: ExtensionRef, extensionRef: {group: rproxy.max3584.net, kind: RproxyMiddleware, name: steal}}]
+      backendRefs: [{name: web, port: 80}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: site, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  hostnames: [site.example.com]
+  rules:
+    - filters: [{type: ExtensionRef, extensionRef: {group: rproxy.max3584.net, kind: RproxyMiddleware, name: pages}}]
+      backendRefs: [{name: web, port: 80}]
+    - name: pages
+      matches: [{path: {type: PathPrefix, value: /error}}]
+      backendRefs: [{name: web, port: 80}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: guarded, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  hostnames: [guarded.example.com]
+  rules:
+    - filters: [{type: ExtensionRef, extensionRef: {group: rproxy.max3584.net, kind: RproxyMiddleware, name: auth}}]
+      backendRefs: [{name: web, port: 80}]
+    - matches: [{path: {type: PathPrefix, value: /auth}}]
+      backendRefs: [{name: missing, port: 80}]
+"#
+	);
+	let p = plan(&yaml);
+	let accepted = |name: &str| cond(&p.parents.iter().find(|x| x.name == name).unwrap().conds, "Accepted").clone();
+	let c = accepted("thief");
+	assert!(!c.status && c.message.contains("mirror.service \"other/api/r0\": only this route's own rules"), "{c:?}");
+	let http = &p.rules_json()[0]["http"];
+	let text = serde_json::to_string(http).unwrap();
+	assert!(!text.contains("thief.example.com") && text.contains("api.example.com"), "{text}");
+	// the route's own rule, by its name
+	assert!(accepted("site").status);
+	let mws = http["middlewares"].as_object().unwrap();
+	assert!(mws.values().any(|m| m["errors"]["service"] == "default/site/r1"), "{mws:?}");
+	// a rule without a backend: its name answers 500 (the auth fails closed)
+	assert!(accepted("guarded").status);
+	assert!(mws.values().any(|m| m["forward_auth"]["service"] == "default/guarded/r1"), "{mws:?}");
+	assert_eq!(http["services"]["default/guarded/r1"]["servers"], json!([{"status": 500}]));
+}
+
+/// URLs rproxy calls out to (`forward_auth.address`, `oidc.issuer`) and the kinds tenants' middlewares
+/// may use follow the GatewayClass's `policy.middlewares` (by default no URL out), for RproxyMiddlewares
+/// and migrated Traefik Middlewares alike (#94).
+#[test]
+fn middleware_urls_out_follow_the_class() {
+	let routes = format!(
+		"{}{}",
+		gw("  - {name: http, port: 80, protocol: HTTP}"),
+		r#"
+---
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyMiddleware
+metadata: {name: ext, namespace: default}
+spec: {forward_auth: {address: "http://auth.example.com/check"}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: ext, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  hostnames: [ext.example.com]
+  rules:
+    - filters: [{type: ExtensionRef, extensionRef: {group: rproxy.max3584.net, kind: RproxyMiddleware, name: ext}}]
+      backendRefs: [{name: web, port: 80}]
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata: {name: fa, namespace: default}
+spec: {forwardAuth: {address: "http://auth.example.com/verify"}}
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata: {name: legacy, namespace: default}
+spec:
+  entryPoints: [web]
+  routes:
+    - match: Host(`legacy.example.com`)
+      middlewares: [{name: fa}]
+      services: [{name: web, port: 80}]
+"#
+	);
+	let run = |class: &str| {
+		let w = world(&format!("{BASE}{class}{routes}"));
+		render_gateway(&w, &w.gateways[0], &migrate_opts())
+	};
+	let accepted = |p: &GatewayPlan| cond(&p.parents.iter().find(|x| x.name == "ext").unwrap().conds, "Accepted").clone();
+	// by default: refused, and the migrated route is left out (not sent without its auth)
+	let p = run("");
+	let c = accepted(&p);
+	assert!(!c.status && c.message.contains("forward_auth.address") && c.message.contains("outboundHosts"), "{c:?}");
+	let text = serde_json::to_string(&p.rules_json()).unwrap();
+	assert!(!text.contains("auth.example.com") && !text.contains("legacy.example.com"), "{text}");
+	assert!(p.notes.iter().any(|n| n.contains("IngressRoute default/legacy") && n.contains("outboundHosts")), "{:?}", p.notes);
+	// allowed by the class
+	let p = run(&class_with("{policy: {middlewares: {outboundHosts: [auth.example.com]}}}"));
+	assert!(accepted(&p).status, "{:?}", accepted(&p));
+	let text = serde_json::to_string(&p.rules_json()).unwrap();
+	assert!(text.contains("http://auth.example.com/check") && text.contains("legacy.example.com"), "{text}");
+	// another host is not
+	let p = run(&class_with("{policy: {middlewares: {outboundHosts: [\"*.internal\"]}}}"));
+	assert!(!accepted(&p).status);
+	// a kind the class does not allow
+	let p = run(&class_with("{policy: {middlewares: {allowedKinds: [headers], outboundHosts: [\"*\"]}}}"));
+	assert!(accepted(&p).message.contains("allowedKinds"), "{:?}", accepted(&p));
+	// a policy that names no kind of rproxy makes the class's parameters invalid
+	let p = run(&class_with("{policy: {middlewares: {allowedKinds: [nope]}}}"));
+	assert!(cond(&p.conds, "Accepted").message.contains("allowedKinds: nope"), "{:?}", p.conds);
 }

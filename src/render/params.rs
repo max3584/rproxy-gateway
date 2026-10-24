@@ -19,7 +19,7 @@ use serde_json::Value;
 
 use crate::k8s::crd::{FreeForm, GROUP};
 use crate::k8s::gateway::{Gateway, GatewayClass};
-use crate::k8s::params::{IntOrStr, Performance, ProxyProtocolParams, RproxyGatewayParametersSpec as Spec};
+use crate::k8s::params::{IntOrStr, MiddlewarePolicy, Performance, ProxyProtocolParams, RproxyGatewayParametersSpec as Spec};
 use crate::render::world::World;
 
 pub const KIND: &str = "RproxyGatewayParameters";
@@ -200,6 +200,18 @@ pub fn class_proxy_protocol(world: &World, gw: &Gateway, o: &ParamsOptions) -> O
 	class_parameters(world, class, o).ok().flatten()?.proxy_protocol
 }
 
+/// The GatewayClass's `policy.middlewares` (what tenants' middlewares may use; the default when the
+/// class has no usable parameters).
+pub fn class_middleware_policy(world: &World, gw: &Gateway, o: &ParamsOptions) -> MiddlewarePolicy {
+	world
+		.classes
+		.iter()
+		.find(|c| c.metadata.name.as_deref() == Some(gw.spec.gateway_class_name.as_str()))
+		.and_then(|class| class_parameters(world, class, o).ok().flatten())
+		.and_then(|p| p.policy?.middlewares)
+		.unwrap_or_default()
+}
+
 /// The fields `spec` sets, by their names in `policy.gatewayOverrides`.
 pub fn set_paths(spec: &Spec) -> Vec<&'static str> {
 	let mut out = vec![];
@@ -245,6 +257,9 @@ pub fn set_paths(spec: &Spec) -> Vec<&'static str> {
 /// The class's `policy`: only fields that can be opened.
 fn check_policy(spec: &Spec) -> Result<(), String> {
 	let Some(p) = &spec.policy else { return Ok(()) };
+	if let Some(m) = &p.middlewares {
+		crate::render::tenant::check_policy(m)?;
+	}
 	for f in p.gateway_overrides.iter().flatten() {
 		if CLASS_ONLY.contains(&f.as_str()) {
 			return Err(format!("spec.policy.gatewayOverrides: {f} cannot be opened to Gateways"));

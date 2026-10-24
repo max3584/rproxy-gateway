@@ -386,6 +386,11 @@ const KINDS: &[(&str, &[F])] = &[
 	("replace_host", &[F("host", T::Str, P::Req)]),
 ];
 
+/// rproxy's middleware kinds.
+pub fn kind_names() -> Vec<&'static str> {
+	KINDS.iter().map(|(k, _)| *k).collect()
+}
+
 fn type_ok(v: &Value, t: T, at: &str) -> Result<(), String> {
 	let all = |f: fn(&Value) -> bool| v.as_array().is_some_and(|a| a.iter().all(f));
 	let ok = match t {

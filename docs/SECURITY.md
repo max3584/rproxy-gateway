@@ -9,7 +9,7 @@ English: [en/SECURITY.md](en/SECURITY.md)
 | 誰 | できること | できないこと |
 |---|---|---|
 | クラスタの管理者 | chart の値・コントローラのフラグを決める | — |
-| Gateway の持ち主（namespace の編集者） | 自分の namespace に Gateway・ルート・RproxyRule・RproxyMiddleware を書く | ほかの namespace の Service・Secret を、そちらの ReferenceGrant なしに使う。クラスタの IP を自分のものにする。ほかの Gateway の鍵や rproxy を使う |
+| Gateway の持ち主（namespace の編集者） | 自分の namespace に Gateway・ルート・RproxyRule・RproxyMiddleware を書く | ほかの namespace の Service・Secret を、そちらの ReferenceGrant なしに使う。クラスタの IP を自分のものにする。ほかの Gateway の鍵や rproxy を使う。共有の Gateway でほかのルート（ほかのテナント）の rproxy のサービスを RproxyMiddleware から名指しする。クラスが許していない URL へ Gateway の Pod から要求させる |
 | managed の rproxy の Pod | 自分の Gateway の証明書（マウントした Secret）を読む | Kubernetes の API を使う（トークンなし・RBAC なし）。ほかの Gateway の資格を使う |
 | UI の namespace の Secret を読める人（`ui.namespace` のとき） | UI に見せた Gateway の rproxy のルール（宛先・ラベル）と統計を読む | ルールを書く・消す。鍵を読む。見せていない Gateway の rproxy につなぐ |
 
@@ -26,10 +26,13 @@ English: [en/SECURITY.md](en/SECURITY.md)
 | `spec.infrastructure.annotations` の Service への伝わり方 | アドレス・LB を決める注釈（`metallb.universe.tf/`、`lbipam.cilium.io/`、`service.beta.kubernetes.io/` など）は Service に付けない（Pod・ServiceAccount には付ける） | `managed.serviceAnnotationPrefixes` / `--service-annotation-prefix` |
 | ExternalName の Service を backend に | **使えない**（`ResolvedRefs: False`）。API サーバ・ほかの namespace・メタデータの口など、何でも名指しできるため | `controller.allowExternalNameServices` / `--allow-external-name-services` |
 | RproxyRule・RproxyMiddleware が名前を書くファイル（`*_file`・`file`・`*_path`） | その Gateway の証明書のファイル（証明書ディレクトリの中の、その Gateway の分）だけ。ほかは `Accepted: False` / `UnsupportedValue` | — |
+| RproxyMiddleware が名前を書くサービス（`errors.service`・`mirror.service`・`forward_auth.service`） | それを使う HTTPRoute 自身のルールだけ（ルールの `name`、`r<i>`、`<namespace>/<route>/r<i>`。コントローラがそのルートの rproxy のサービスの名前に書き換える）。ほかのルートのサービス（1 ポートの rproxy のルールにはそのポートの全テナントのサービスが入っている）は `Accepted: False` / `UnsupportedValue`。名指したルールに使える backend がなければ、その名前は 500 を返す（`forward_auth` は通さない） | — |
+| RproxyMiddleware・移行した Traefik の Middleware が外へ要求する URL（`forward_auth.address`・`oidc.issuer`） | **使えない**（`Accepted: False` / `UnsupportedValue`。移行したルートは外して注記）。Gateway の Pod からクラスタの中やメタデータの口へ要求させられるため（SSRF） | GatewayClass の parameters の `policy.middlewares.outboundHosts`（`*`、ホスト名、`*.example.com`、IP の範囲。IP の範囲は URL のホストが IP アドレスのときだけに合う） |
+| RproxyMiddleware・移行した Traefik の Middleware の種類 | すべて | GatewayClass の parameters の `policy.middlewares.allowedKinds`（rproxy の種類の名前。ほかは `Accepted: False`） |
 | 移行（Ingress・Traefik）のほかの namespace への参照（Service・Middleware・TLSOption・errors の service） | 参照先の namespace の ReferenceGrant（from `traefik.io` の `IngressRoute*`・`Middleware`）がなければ変換しない（Traefik の `allowCrossNamespace=false` と同じ） | `migration.allowCrossNamespace` / `--migration-allow-cross-namespace` |
 | Ingress の path | バッククォート・引用符・制御文字・`/` で始まらないものは変換しない（`match` の式に埋め込むため） | — |
 | Ingress の `defaultBackend` | 移行先の Gateway の namespace のものだけ | — |
-| Gateway の `RproxyGatewayParameters`（`infrastructure.parametersRef`、同じ namespace のものだけ） | replicas（`policy.maxReplicas`、既定 10 まで）・PDB・resources・Pod と Service のラベル／注釈・topologySpread・externalTrafficPolicy・sourceRanges・ipFamilyPolicy・logLevel・performance だけ。LB のアドレスを決める注釈は上の許可リストを通ったものだけ（ほかは `InvalidParameters`）。`service.type`・`loadBalancerClass`・nodeSelector・tolerations・affinity・priorityClassName・`proxyProtocol`（PROXY protocol のヘッダを信じる接続元。そこからはどのクライアントにでも成りすませる）は既定で使えない。rproxy のイメージ・追加の環境変数・`policy` は使えない。コントローラの接頭辞（`rproxy.max3584.net/` など）のラベル・注釈も使えない | GatewayClass の `RproxyGatewayParameters`（chart の `managed.parameters`）の `policy`（`gatewayOverrides`・`maxReplicas`・`allowedPriorityClasses`・`allowedLoadBalancerClasses`）。イメージと環境変数は開けない（[DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) の 2.5） |
+| Gateway の `RproxyGatewayParameters`（`infrastructure.parametersRef`、同じ namespace のものだけ） | replicas（`policy.maxReplicas`、既定 10 まで）・PDB・resources・Pod と Service のラベル／注釈・topologySpread・externalTrafficPolicy・sourceRanges・ipFamilyPolicy・logLevel・performance だけ。LB のアドレスを決める注釈は上の許可リストを通ったものだけ（ほかは `InvalidParameters`）。`service.type`・`loadBalancerClass`・nodeSelector・tolerations・affinity・priorityClassName・`proxyProtocol`（PROXY protocol のヘッダを信じる接続元。そこからはどのクライアントにでも成りすませる）は既定で使えない。rproxy のイメージ・追加の環境変数・`policy` は使えない。コントローラの接頭辞（`rproxy.max3584.net/` など）のラベル・注釈も使えない | GatewayClass の `RproxyGatewayParameters`（chart の `managed.parameters`）の `policy`（`gatewayOverrides`・`maxReplicas`・`allowedPriorityClasses`・`allowedLoadBalancerClasses`）。イメージと環境変数は開けない（[DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) の 2.5）。`policy.middlewares`（テナントのミドルウェアが届く先）もクラスだけ（同じく 15.） |
 
 ## ほかの namespace の秘密鍵（M7）
 

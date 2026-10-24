@@ -779,3 +779,113 @@ spec:
 	assert_eq!(status, 200, "{body}");
 	assert!(body.ends_with("/x|good.example.com|"), "{body}");
 }
+
+/// RproxyMiddlewares name their own route's rules (#94): rproxy takes the rewritten names, the auth
+/// server of the route's own rule is asked, and a rule without a backend answers 500 (the auth fails
+/// closed) instead of making rproxy refuse the set.
+#[tokio::test]
+async fn rproxy_middleware_services_on_a_real_rproxy() {
+	let Some(bin) = rproxy_bin() else { return };
+	let _ = rustls::crypto::ring::default_provider().install_default();
+	let dir = std::env::temp_dir().join(format!("rproxy-gateway-own-services-{}", std::process::id()));
+	let _ = std::fs::remove_dir_all(&dir);
+	std::fs::create_dir_all(&dir).unwrap();
+	let backend = echo_backend().await;
+	let auth = auth_backend().await;
+	let [port, api] = free_ports();
+	let rp = Rproxy::start(&bin, &dir, api);
+	rp.wait().await;
+	let client = Client::new(None, TOKEN).unwrap();
+	let caps = client.capabilities(SocketAddr::from(([127, 0, 0, 1], api))).await.unwrap();
+	let yaml = format!(
+		r#"
+apiVersion: v1
+kind: Service
+metadata: {{name: echo, namespace: default}}
+spec: {{ports: [{{name: http, port: 80}}]}}
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata: {{name: echo-1, namespace: default, labels: {{kubernetes.io/service-name: echo}}}}
+addressType: IPv4
+ports: [{{name: http, port: {backend}}}]
+endpoints: [{{addresses: [127.0.0.1]}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {{name: authz, namespace: default}}
+spec: {{ports: [{{name: http, port: 80}}]}}
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata: {{name: authz-1, namespace: default, labels: {{kubernetes.io/service-name: authz}}}}
+addressType: IPv4
+ports: [{{name: http, port: {auth}}}]
+endpoints: [{{addresses: [127.0.0.1]}}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {{name: gw, namespace: default, generation: 1}}
+spec:
+  gatewayClassName: rproxy
+  listeners: [{{name: http, port: {port}, protocol: HTTP}}]
+---
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyMiddleware
+metadata: {{name: auth, namespace: default}}
+spec: {{forward_auth: {{service: authz, path: /check}}}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {{name: guarded, namespace: default}}
+spec:
+  parentRefs: [{{name: gw}}]
+  hostnames: [guarded.example.com, broken.example.com]
+  rules:
+    - matches: [{{headers: [{{name: host, value: guarded.example.com}}]}}]
+      filters: [{{type: ExtensionRef, extensionRef: {{group: rproxy.max3584.net, kind: RproxyMiddleware, name: auth}}}}]
+      backendRefs: [{{name: echo, port: 80}}]
+    - name: authz
+      matches: [{{path: {{type: Exact, value: /no-route-here}}, headers: [{{name: x-never, value: "1"}}]}}]
+      backendRefs: [{{name: authz, port: 80}}]
+---
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyMiddleware
+metadata: {{name: closed, namespace: default}}
+spec: {{forward_auth: {{service: r1, path: /check}}}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {{name: closed, namespace: default}}
+spec:
+  parentRefs: [{{name: gw}}]
+  hostnames: [closed.example.com]
+  rules:
+    - filters: [{{type: ExtensionRef, extensionRef: {{group: rproxy.max3584.net, kind: RproxyMiddleware, name: closed}}}}]
+      backendRefs: [{{name: echo, port: 80}}]
+    - matches: [{{path: {{type: Exact, value: /no-route-here}}, headers: [{{name: x-never, value: "1"}}]}}]
+      backendRefs: [{{name: missing, port: 80}}]
+"#
+	);
+	let mut world = World::default();
+	world.read_manifests(&yaml).unwrap();
+	let opts = render::Options { listen_addrs: vec!["127.0.0.1".into()], features: render::Features::of(&caps), ..Default::default() };
+	let plan = render::render_gateway(&world, &world.gateways[0], &opts);
+	for p in &plan.parents {
+		assert!(p.conds.iter().any(|c| c.kind == "Accepted" && c.status), "{}: {:?}", p.name, p.conds);
+	}
+	let ep = Endpoint { pod: "rproxy".into(), uid: "1".into(), ip: "127.0.0.1".into(), api_port: api, ..Default::default() };
+	let mut applied = Applied::new();
+	let mut caps_cache = HashMap::new();
+	let (r, _) = sync_pod(&client, &ep, &plan, &mut applied, &mut caps_cache).await;
+	let PodSync::Synced(views, excluded) = &r else { panic!("{r:?}\nrules: {}", serde_json::to_string(&plan.rules_json()).unwrap()) };
+	assert!(views.iter().all(|v| v.state == "running") && excluded.is_empty(), "{views:?} {excluded:?}");
+	// the route's own rule `authz` is the auth server
+	let (status, body) = get_with(port, "guarded.example.com", "/x", "Authorization: allow\r\n").await;
+	assert_eq!(status, 200, "{body}");
+	let (status, body) = get(port, "guarded.example.com", "/x").await;
+	assert_eq!(status, 403, "{body}");
+	// `r1` has no backend: nothing gets through
+	let (status, body) = get_with(port, "closed.example.com", "/x", "Authorization: allow\r\n").await;
+	assert_ne!(status, 200, "{body}");
+}

@@ -18,6 +18,7 @@ pub mod params;
 pub mod policy;
 pub mod proxy_protocol;
 pub mod status;
+pub mod tenant;
 pub mod traefik_mw;
 pub mod validate;
 pub mod world;
@@ -1137,16 +1138,26 @@ fn http_route(world: &World, kind: RouteKind, index: usize) -> &HttpRoute {
 	if kind == RouteKind::Grpc { &world.grpc_routes[index] } else { &world.http_routes[index] }
 }
 
+/// What a Gateway's HTTP routes are built with.
+#[derive(Clone, Copy)]
+struct HttpInputs<'a> {
+	tls: &'a backend_tls::Index,
+	/// The Gateway's certificate files.
+	files: &'a BTreeSet<String>,
+	/// The GatewayClass's `policy.middlewares`.
+	middleware_policy: &'a crate::k8s::params::MiddlewarePolicy,
+}
+
 /// What `http::build` needs for a route of `kind`.
 fn http_ctx<'a>(
 	world: &'a World,
 	opts: &'a Options,
-	tls: &'a backend_tls::Index,
-	files: &'a BTreeSet<String>,
+	inputs: &HttpInputs<'a>,
 	scheme: &'static str,
 	port: u16,
 	kind: RouteKind,
 ) -> http::Ctx<'a> {
+	let HttpInputs { tls, files, middleware_policy } = *inputs;
 	http::Ctx {
 		world,
 		scheme,
@@ -1156,6 +1167,7 @@ fn http_ctx<'a>(
 		grpc: kind == RouteKind::Grpc,
 		backend_tls: Some(tls),
 		files: Some((&opts.cert_dir, files)),
+		middleware_policy,
 	}
 }
 
@@ -1293,6 +1305,8 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 
 	// the files the Gateway's tenant-written settings may name (its own certificates)
 	let own_files: BTreeSet<String> = files.keys().cloned().collect();
+	let middleware_policy = params::class_middleware_policy(world, gw, &opts.params);
+	let inputs = HttpInputs { tls: &tls_index, files: &own_files, middleware_policy: &middleware_policy };
 	// one rule per (protocol, port)
 	let mut groups: BTreeMap<(rp::Protocol, u16), Vec<usize>> = BTreeMap::new();
 	for (i, st) in listeners.iter().enumerate() {
@@ -1383,7 +1397,7 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 			let mut services = BTreeMap::new();
 			let mut middlewares = BTreeMap::new();
 			for a in attachments.iter().filter(|a| matches!(a.kind, RouteKind::Http | RouteKind::Grpc) && mine(a)) {
-				let ctx = http_ctx(world, opts, &tls_index, &own_files, if https { "https" } else { "http" }, *port, a.kind);
+				let ctx = http_ctx(world, opts, &inputs, if https { "https" } else { "http" }, *port, a.kind);
 				let route: &HttpRoute = http_route(world, a.kind, a.route);
 				let mut out = http::build(&ctx, route, a.hosts.as_deref(), &exclusions(&listeners, a.listener));
 				if a.kind == RouteKind::Grpc {
@@ -1522,7 +1536,7 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 			// not carried by any rule: still check its references
 			let resolved = index.and_then(|i| match p.kind {
 				RouteKind::Http | RouteKind::Grpc => {
-					let ctx = http_ctx(world, opts, &tls_index, &own_files, "http", 80, p.kind);
+					let ctx = http_ctx(world, opts, &inputs, "http", 80, p.kind);
 					http::build(&ctx, http_route(world, p.kind, i), None, &[]).resolved
 				}
 				RouteKind::Tls => l4::destination(world, &world.tls_routes[i]).1,
