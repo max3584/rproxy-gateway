@@ -19,7 +19,8 @@ use crate::render::http::RESPOND_500;
 use crate::rproxy::client::{ApiError, Client};
 
 /// The owner of an rproxy route name (see the module); `None` for names no route of ours has.
-/// Told apart by the names' shapes: an HTTPRoute's `<ns>/<name>/r<i>/m<j>/h<k>[@<listener>]`, an
+/// Told apart by the names' shapes: an HTTPRoute's `<ns>/<name>/r<i>/m<j>/h<k>[@<listener>]` (a
+/// ListenerSet's listener is `<set>/<listener>`), an
 /// IngressRoute's `traefik/<ns>/<name>/r<i>`, an Ingress's `ingress/<ns>/<name>/r<i>/p<j>` (an
 /// HTTPRoute in a namespace called `traefik` or `ingress` keeps its own shape).
 pub fn owner(name: &str) -> Option<String> {
@@ -30,11 +31,10 @@ pub fn owner(name: &str) -> Option<String> {
 		Some(r) => ("grpc:", r),
 		None => ("", name),
 	};
-	let index = |s: &str, c: char| {
-		s.strip_prefix(c)
-			.map(|d| d.split('@').next().unwrap_or_default())
-			.is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
-	};
+	let index = |s: &str, c: char| s.strip_prefix(c).is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()));
+	// `@<listener>` (a route on several listeners of the port); a ListenerSet's listener is
+	// `<set>/<listener>`, so its `/` is not counted (#95)
+	let rest = rest.split_once('@').map_or(rest, |(r, _)| r);
 	let segs: Vec<&str> = rest.split('/').collect();
 	match segs.as_slice() {
 		[ns, n, r, m, h] if index(r, 'r') && index(m, 'm') && index(h, 'h') => Some(format!("{prefix}{ns}/{n}")),
@@ -59,43 +59,52 @@ pub fn owners(rule: &Value) -> Vec<String> {
 	out
 }
 
+/// Where a name is: `services` or `middlewares` (a service and a middleware may have the same name).
+type Used = BTreeSet<(&'static str, String)>;
+
 /// The services and middlewares the given routes use (directly, through a service's servers,
 /// or a middleware's `service`: mirror, forward_auth, errors).
-fn used<'a>(http: &Value, routes: impl Iterator<Item = &'a Value>) -> BTreeSet<String> {
-	let mut out = BTreeSet::new();
-	let mut todo: Vec<String> = vec![];
+fn used<'a>(http: &Value, routes: impl Iterator<Item = &'a Value>) -> Used {
+	let mut out = Used::new();
+	let mut todo: Vec<(&'static str, String)> = vec![];
+	let mws = |v: &Value| -> Vec<(&'static str, String)> {
+		v.as_array().into_iter().flatten().filter_map(|m| m.as_str().map(|m| ("middlewares", m.to_string()))).collect()
+	};
 	for r in routes {
-		todo.extend(r["service"].as_str().map(str::to_string));
-		todo.extend(r["middlewares"].as_array().into_iter().flatten().filter_map(|m| m.as_str().map(str::to_string)));
+		todo.extend(r["service"].as_str().map(|s| ("services", s.to_string())));
+		todo.extend(mws(&r["middlewares"]));
 	}
-	while let Some(n) = todo.pop() {
-		if !out.insert(n.clone()) {
+	while let Some((part, n)) = todo.pop() {
+		if !out.insert((part, n.clone())) {
 			continue;
 		}
-		if let Some(svc) = http["services"].get(&n) {
-			for s in svc["servers"].as_array().into_iter().flatten() {
-				todo.extend(s["middlewares"].as_array().into_iter().flatten().filter_map(|m| m.as_str().map(str::to_string)));
+		if part == "services" {
+			for s in http["services"][&n]["servers"].as_array().into_iter().flatten() {
+				todo.extend(mws(&s["middlewares"]));
 			}
-		}
-		if let Some(mw) = http["middlewares"].get(&n).and_then(Value::as_object) {
-			todo.extend(mw.values().filter_map(|spec| spec["service"].as_str().map(str::to_string)));
+		} else if let Some(mw) = http["middlewares"].get(&n).and_then(Value::as_object) {
+			todo.extend(mw.values().filter_map(|spec| spec["service"].as_str().map(|s| ("services", s.to_string()))));
 		}
 	}
 	out
 }
 
 /// The name at the head of rproxy's message for a rule (`route <name>: ...`, `middleware <name>:
-/// ...`, `service <name>: ...`, the name maybe quoted), after `rules[i]: `.
-fn head(message: &str) -> Option<&str> {
+/// ...`, `service <name>: ...`, the name maybe quoted), after `rules[i]: `: (`routes`,
+/// `middlewares` or `services`, the name).
+fn head(message: &str) -> Option<(&'static str, &str)> {
 	let m = self::message(message);
-	let rest = ["route ", "middleware ", "service "].iter().find_map(|k| m.strip_prefix(k))?;
-	match rest.strip_prefix('"') {
+	let (part, rest) = [("routes", "route "), ("middlewares", "middleware "), ("services", "service ")]
+		.iter()
+		.find_map(|(part, k)| m.strip_prefix(k).map(|r| (*part, r)))?;
+	let name = match rest.strip_prefix('"') {
 		Some(q) => {
 			let (name, after) = q.split_once('"')?;
-			after.starts_with(':').then_some(name)
+			after.starts_with(':').then_some(name)?
 		}
-		None => rest.split_once(": ").map(|(name, _)| name),
-	}
+		None => rest.split_once(": ").map(|(name, _)| name)?,
+	};
+	Some((part, name))
 }
 
 /// The owners whose routes use what the head of rproxy's message names (empty: it names nothing of
@@ -103,20 +112,22 @@ fn head(message: &str) -> Option<&str> {
 /// address, a duration), which could name another tenant's route.
 pub fn named(rule: &Value, message: &str) -> Vec<String> {
 	let http = &rule["http"];
-	let Some(hit) = head(message).filter(|h| *h != RESPOND_500) else {
+	let Some((part, hit)) = head(message).filter(|(_, h)| *h != RESPOND_500) else {
 		return vec![];
 	};
-	let known = routes(rule).any(|r| r["name"] == hit)
-		|| ["services", "middlewares"].iter().any(|part| http[*part].as_object().is_some_and(|m| m.contains_key(hit)));
+	let known = match part {
+		"routes" => routes(rule).any(|r| r["name"] == hit),
+		_ => http[part].as_object().is_some_and(|m| m.contains_key(hit)),
+	};
 	if !known {
 		return vec![];
 	}
+	let wanted = (part, hit.to_string());
 	let mut out: Vec<String> = vec![];
 	for r in routes(rule) {
 		let name = r["name"].as_str().unwrap_or_default();
-		if (name == hit || used(http, std::iter::once(r)).contains(hit))
-			&& let Some(o) = owner(name)
-		{
+		let hits = if part == "routes" { name == hit } else { used(http, std::iter::once(r)).contains(&wanted) };
+		if hits && let Some(o) = owner(name) {
 			if !out.contains(&o) {
 				out.push(o);
 			}
@@ -130,14 +141,9 @@ pub fn named(rule: &Value, message: &str) -> Vec<String> {
 pub fn content(rule: &Value, owner: &str) -> String {
 	let mine: Vec<&Value> = routes(rule).filter(|r| r["name"].as_str().and_then(self::owner).as_deref() == Some(owner)).collect();
 	let http = &rule["http"];
-	let parts: Vec<(&String, &Value)> = used(http, mine.iter().copied())
+	let parts: Vec<(&str, &String, &Value)> = used(http, mine.iter().copied())
 		.iter()
-		.filter_map(|n| {
-			http["services"]
-				.as_object()
-				.and_then(|m| m.get_key_value(n))
-				.or_else(|| http["middlewares"].as_object().and_then(|m| m.get_key_value(n)))
-		})
+		.filter_map(|(part, n)| http[*part].as_object().and_then(|m| m.get_key_value(n)).map(|(k, v)| (*part, k, v)))
 		.collect();
 	crate::pem::sha256_hex(&serde_json::to_vec(&(mine, parts)).unwrap_or_default())
 }
@@ -151,11 +157,11 @@ pub fn without(rule: &Value, owners: &BTreeSet<String>) -> Value {
 	let (dropped, kept): (Vec<&Value>, Vec<&Value>) = list.iter().partition(gone);
 	let http = &rule["http"];
 	let still = used(http, kept.iter().copied().chain(http.get("default")));
-	let unused: BTreeSet<String> = used(http, dropped.into_iter()).difference(&still).cloned().collect();
+	let unused: Used = used(http, dropped.into_iter()).difference(&still).cloned().collect();
 	out["http"]["routes"] = Value::Array(kept.into_iter().cloned().collect());
 	for part in ["services", "middlewares"] {
 		if let Some(m) = out.get_mut("http").and_then(|h| h.get_mut(part)).and_then(Value::as_object_mut) {
-			m.retain(|k, _| !unused.contains(k));
+			m.retain(|k, _| !unused.contains(&(part, k.clone())));
 		}
 	}
 	out
@@ -177,18 +183,29 @@ pub struct Target<'a> {
 /// Most dry runs one pass makes to find refused routes.
 pub const MAX_DRY_RUNS: usize = 24;
 
-/// The owners to leave out of `rules[i]`, which rproxy refused with `message`. `Ok(None)`: the
-/// fault is not in one route, or finding it would take more than the dry runs left (`budget`):
-/// the rule is left out as a whole. `Err`: a dry run got no answer (rproxy not reachable, a
-/// timeout, 5xx): nothing is decided, the pass is tried again.
-pub async fn find(t: &Target<'_>, rules: &[Value], i: usize, message: &str, budget: &mut usize) -> Result<Option<Vec<String>>, String> {
+/// What `find` found.
+#[derive(Debug, PartialEq)]
+pub enum Found {
+	/// The owners to leave out.
+	Owners(Vec<String>),
+	/// The fault is not in one route: the rule is left out as a whole.
+	NotRoutes,
+	/// The dry runs ran out before the route was found (the rule is out for this pass; the next
+	/// goes on, with what was found before left out).
+	OutOfDryRuns,
+}
+
+/// The owners to leave out of `rules[i]`, which rproxy refused with `message`, with at most
+/// `budget` dry runs. `Err`: a dry run got no answer (rproxy not reachable, a timeout, 5xx):
+/// nothing is decided, the pass is tried again.
+pub async fn find(t: &Target<'_>, rules: &[Value], i: usize, message: &str, budget: &mut usize) -> Result<Found, String> {
 	let all = owners(&rules[i]);
 	if all.is_empty() {
-		return Ok(None);
+		return Ok(Found::NotRoutes);
 	}
 	let hit = named(&rules[i], message);
 	if !hit.is_empty() {
-		return Ok(Some(hit));
+		return Ok(Found::Owners(hit));
 	}
 	// is the rule refused with only the routes of `keep`? (`None`: no dry runs left)
 	let fails = async |keep: &[String], budget: &mut usize| -> Result<Option<bool>, String> {
@@ -210,22 +227,24 @@ pub async fn find(t: &Target<'_>, rules: &[Value], i: usize, message: &str, budg
 	// the rule without any of its routes: still refused, so not a route's fault
 	match fails(&[], budget).await? {
 		Some(false) => {}
-		_ => return Ok(None),
+		Some(true) => return Ok(Found::NotRoutes),
+		None => return Ok(Found::OutOfDryRuns),
 	}
 	let mut c = all.clone();
 	while c.len() > 1 {
 		let (a, b) = c.split_at(c.len() / 2);
 		match fails(a, budget).await? {
 			Some(true) => c = a.to_vec(),
-			None => return Ok(None),
+			None => return Ok(Found::OutOfDryRuns),
 			Some(false) => match fails(b, budget).await? {
 				Some(true) => c = b.to_vec(),
+				None => return Ok(Found::OutOfDryRuns),
 				// only some routes together are refused (names clashing): not one route's fault
-				_ => return Ok(None),
+				Some(false) => return Ok(Found::NotRoutes),
 			},
 		}
 	}
-	Ok(Some(c))
+	Ok(Found::Owners(c))
 }
 
 #[cfg(test)]
@@ -269,6 +288,39 @@ mod tests {
 		assert_eq!(owner(RESPOND_500), None);
 		assert_eq!(owner("a/web/r0/mirror"), None);
 		assert_eq!(owners(&rule()), ["a/web", "grpc:a/web", "b/api", "traefik:b/ir"]);
+	}
+
+	/// A route on several listeners of the port gets `@<listener>`; a ListenerSet's listener is
+	/// `<set>/<listener>` (#95).
+	#[test]
+	fn listener_set_names() {
+		assert_eq!(owner("a/web/r0/m0/h0@ls/extra").as_deref(), Some("a/web"));
+		assert_eq!(owner("grpc:a/web/r1/m2/h3@team-ls/https").as_deref(), Some("grpc:a/web"));
+		let r = json!({"http": {"routes": [
+			{"name": "a/web/r0/m0/h0@https", "match": "PathPrefix(`/`)", "service": "a/web/r0"},
+			{"name": "a/web/r0/m0/h0@ls/extra", "match": "PathPrefix(`/`)", "service": "a/web/r0"},
+			{"name": "b/api/r0/m0/h0@ls/extra", "match": "PathPrefix(`/`)", "service": "b/api/r0"}
+		], "services": {"a/web/r0": {"servers": [{"url": "http://10.0.0.1:80"}]}, "b/api/r0": {"servers": [{"url": "http://10.0.0.2:80"}]}}}});
+		assert_eq!(owners(&r), ["a/web", "b/api"]);
+		assert_eq!(named(&r, "rules[0]: route a/web/r0/m0/h0@ls/extra: middleware \"x\" is not defined"), ["a/web"]);
+		let out = without(&r, &["a/web".to_string()].into());
+		assert_eq!(out["http"]["routes"].as_array().unwrap().len(), 1);
+		assert!(out["http"]["services"].get("a/web/r0").is_none());
+	}
+
+	/// A service and a middleware may have the same name: each is followed as what it is.
+	#[test]
+	fn services_and_middlewares_apart() {
+		let r = json!({"http": {"routes": [
+			{"name": "a/web/r0/m0/h0", "match": "PathPrefix(`/`)", "service": "same"},
+			{"name": "b/api/r0/m0/h0", "match": "PathPrefix(`/`)", "service": "b/api/r0", "middlewares": ["same"]}
+		], "services": {"same": {"servers": [{"url": "http://10.0.0.1:80"}]}, "b/api/r0": {"servers": [{"url": "http://10.0.0.2:80"}]}},
+		   "middlewares": {"same": {"headers": {}}}}});
+		assert_eq!(named(&r, "middleware same: bad"), ["b/api"]);
+		assert_eq!(named(&r, "service same: bad"), ["a/web"]);
+		let out = without(&r, &["b/api".to_string()].into());
+		assert!(out["http"]["middlewares"].get("same").is_none());
+		assert!(out["http"]["services"].get("same").is_some(), "a/web still uses the service");
 	}
 
 	#[test]

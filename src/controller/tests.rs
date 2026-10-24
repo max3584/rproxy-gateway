@@ -504,6 +504,82 @@ async fn a_refused_route_does_not_stop_the_port() {
 	}
 }
 
+/// Routes of a ListenerSet's listener (`@<set>/<listener>`): found by halving like any (#95),
+/// not taken for "not a route's fault" (which left the whole port out).
+#[tokio::test]
+async fn listener_set_routes_are_found() {
+	let fake = Arc::new(Mutex::new(Fake { unnamed: true, ..Default::default() }));
+	let port = start(fake.clone()).await;
+	let rp = Client::new(None, "secret").unwrap();
+	let ep = local(port);
+	let mut p = http_plan(443, &[("a/one", false), ("b/bad", true), ("c/three", false)]);
+	for r in &mut p.rules[0].http.as_mut().unwrap().routes {
+		r.name = format!("{}@team/https", r.name);
+	}
+	let mut applied = Applied::new();
+	let mut caps = HashMap::new();
+	let (r, _) = sync_pod(&rp, &ep, &p, &mut applied, &mut caps).await;
+	assert!(matches!(&r, PodSync::Synced(v, ex) if v.len() == 1 && ex.len() == 1 && ex[0].owner == "b/bad"), "{r:?}");
+	assert_eq!(fake.lock().unwrap().sets["k8s/default/gw"].2[0]["http"]["routes"].as_array().unwrap().len(), 2);
+}
+
+/// The dry runs run out: the routes found so far stay out and the next pass goes on (#95), until
+/// all are found and the rule runs.
+#[tokio::test]
+async fn running_out_of_dry_runs_goes_on_next_pass() {
+	let fake = Arc::new(Mutex::new(Fake { unnamed: true, ..Default::default() }));
+	let port = start(fake.clone()).await;
+	let rp = Client::new(None, "secret").unwrap();
+	let ep = local(port);
+	let names: Vec<String> = (0..64).map(|i| format!("t/r{i}")).collect();
+	let owners: Vec<(&str, bool)> = names.iter().enumerate().map(|(i, n)| (n.as_str(), i % 16 == 3)).collect();
+	let p = http_plan(443, &owners);
+	let mut applied = Applied::new();
+	let mut caps = HashMap::new();
+	let (r, again) = sync_pod(&rp, &ep, &p, &mut applied, &mut caps).await;
+	let PodSync::Synced(views, found) = &r else { panic!("{r:?}") };
+	assert!(again, "the next pass comes soon");
+	assert_eq!(views.iter().find(|v| v.listen_port == 443).unwrap().state, "failed", "out for this pass");
+	assert!(!found.is_empty() && found.len() < 4, "{found:?}");
+	let mut passes = 1;
+	let r = loop {
+		let (r, again) = sync_pod(&rp, &ep, &p, &mut applied, &mut caps).await;
+		passes += 1;
+		if !again || passes > 6 {
+			break r;
+		}
+	};
+	let PodSync::Synced(views, excluded) = &r else { panic!("{r:?}") };
+	let mut out: Vec<&str> = excluded.iter().map(|e| e.owner.as_str()).collect();
+	out.sort();
+	assert_eq!(out, ["t/r19", "t/r3", "t/r35", "t/r51"], "after {passes} passes");
+	assert!(views.iter().all(|v| v.state == "running"), "{views:?}");
+}
+
+/// Remembered answers are asked again after `EXCLUDED_FOR` even with the plan unchanged (#95).
+#[tokio::test]
+async fn remembered_routes_are_asked_again() {
+	let fake = Arc::new(Mutex::new(Fake::default()));
+	let port = start(fake.clone()).await;
+	let rp = Client::new(None, "secret").unwrap();
+	let ep = local(port);
+	let p = http_plan(443, &[("a/one", false), ("b/bad", true)]);
+	let mut applied = Applied::new();
+	let mut caps = HashMap::new();
+	sync_pod(&rp, &ep, &p, &mut applied, &mut caps).await;
+	let puts = fake.lock().unwrap().puts.len();
+	sync_pod(&rp, &ep, &p, &mut applied, &mut caps).await;
+	assert_eq!(fake.lock().unwrap().puts.len(), puts, "remembered");
+	for a in applied.values_mut() {
+		for e in &mut a.excluded {
+			e.since = std::time::Instant::now().checked_sub(EXCLUDED_FOR).unwrap();
+		}
+	}
+	let (r, _) = sync_pod(&rp, &ep, &p, &mut applied, &mut caps).await;
+	assert!(fake.lock().unwrap().puts.len() > puts, "asked again");
+	assert!(matches!(&r, PodSync::Synced(_, ex) if ex.len() == 1 && ex[0].since.elapsed() < EXCLUDED_FOR), "{r:?}");
+}
+
 fn http_plan(port: u16, owners: &[(&str, bool)]) -> GatewayPlan {
 	use crate::rproxy::model::{Http, HttpRoute, Service};
 	let mut p = plan(port, &[]);
@@ -592,10 +668,19 @@ async fn a_failed_dry_run_drops_nothing() {
 	let mut caps = HashMap::new();
 	let (r, again) = sync_pod(&rp, &ep, &p, &mut applied, &mut caps).await;
 	assert!(matches!(&r, PodSync::NotReady(m) if m.contains("dry run")) && again, "{r:?}");
-	assert!(applied.is_empty());
+	assert!(applied.values().all(|a| a.hash.is_empty() && a.excluded.is_empty() && a.backoff.is_some_and(|(_, n)| n == 1)));
 	assert!(fake.lock().unwrap().sets.is_empty(), "no set without the port's rule");
+	// the next pass waits before asking again (longer each time)
+	let puts = fake.lock().unwrap().puts.len();
+	let (r, _) = sync_pod(&rp, &ep, &p, &mut applied, &mut caps).await;
+	assert!(matches!(&r, PodSync::NotReady(m) if m.contains("waiting")), "{r:?}");
+	assert_eq!(fake.lock().unwrap().puts.len(), puts);
+	assert!(backoff(1) < backoff(2) && backoff(10) == std::time::Duration::from_secs(60));
 	// rproxy answers again: only the refused route is left out
 	fake.lock().unwrap().dry_run_fails = false;
+	for a in applied.values_mut() {
+		a.backoff = a.backoff.map(|(_, n)| (std::time::Instant::now(), n));
+	}
 	let (r, _) = sync_pod(&rp, &ep, &p, &mut applied, &mut caps).await;
 	assert!(matches!(&r, PodSync::Synced(v, ex) if v.len() == 1 && ex.len() == 1 && ex[0].owner == "b/bad"), "{r:?}");
 }

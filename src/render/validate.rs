@@ -765,6 +765,46 @@ pub fn middleware(v: &Value) -> Result<(), String> {
 	Ok(())
 }
 
+/// Whether the rproxy pods take what an RproxyMiddleware uses, by `GET /capabilities` (an
+/// older rproxy reads a field it does not know as an unknown field and refuses the whole set,
+/// with no `rules[i]`): the kinds and fields added after rproxy v0.4.0 (`HttpSpec::options_used`,
+/// `forward_auth_used`).
+pub fn supported(v: &Value, f: &crate::render::Features) -> Result<(), String> {
+	let Some((kind, spec)) = v.as_object().and_then(|o| o.iter().next()) else { return Ok(()) };
+	let has = |k: &str| spec.get(k).is_some_and(|x| !x.is_null());
+	let nonempty = |k: &str| spec.get(k).and_then(Value::as_array).is_some_and(|a| !a.is_empty());
+	let mut wanted: Vec<(bool, &str, &str)> = vec![];
+	match kind.as_str() {
+		"cors" => wanted.push((f.cors, "the cors middleware", "middlewares cors")),
+		"mirror" => wanted.push((f.mirror, "the mirror middleware", "middlewares mirror")),
+		"replace_host" => wanted.push((f.replace_host, "the replace_host middleware", "middlewares replace_host")),
+		"headers" => {
+			let add = ["request", "response"].iter().any(|s| spec[*s]["add"].as_object().is_some_and(|m| !m.is_empty()));
+			wanted.push((!add || f.headers_add, "headers add", "http_options headers_add"));
+		}
+		"redirect_scheme" | "redirect_regex" => {
+			wanted.push((!has("status") || f.redirect_status, "a redirect's status", "http_options redirect_status"))
+		}
+		"retry" => wanted.push((!nonempty("status") || f.retry_status, "retry status", "http_options retry_status")),
+		"forward_auth" => {
+			let all = strs(&spec["response_headers"]).any(|h| h == "*");
+			wanted.extend([
+				(!(has("service") || has("path")) || f.fa_service, "forward_auth service", "forward_auth service"),
+				(spec["protocol"] != "grpc" || f.fa_grpc, "forward_auth protocol grpc", "forward_auth grpc"),
+				(spec["client_request"] != true || f.fa_client_request, "forward_auth client_request", "forward_auth client_request"),
+				(!nonempty("allow_status") || f.fa_allow_status, "forward_auth allow_status", "forward_auth allow_status"),
+				(!has("forward_body") || f.ext_auth_body, "forward_auth forward_body", "forward_auth forward_body"),
+				(!all || f.fa_all_response_headers, "forward_auth response_headers [\"*\"]", "forward_auth all_response_headers"),
+			]);
+		}
+		_ => {}
+	}
+	for (ok, what, rproxy) in wanted {
+		crate::render::needs(ok, what, rproxy)?;
+	}
+	Ok(())
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;

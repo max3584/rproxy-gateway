@@ -160,8 +160,25 @@ pub struct AppliedSet {
 	pub rejected: Vec<RuleView>,
 	/// The routes left out of rules rproxy refused.
 	pub excluded: Vec<status::Excluded>,
-	/// rproxy refused the whole set (not asked again until the plan or the set changes).
-	pub refused: Option<String>,
+	/// rproxy refused the whole set (not asked again until the plan or the set changes, or
+	/// `EXCLUDED_FOR` has passed), and since when.
+	pub refused: Option<(String, std::time::Instant)>,
+	/// Dry runs got no answer: (not before, failures in a row); the pass waits longer each time.
+	pub backoff: Option<(std::time::Instant, u32)>,
+}
+
+impl AppliedSet {
+	/// Whether something remembered is old enough to ask rproxy again (a file, CrowdSec or the
+	/// GeoIP databases may be there now), even with the plan unchanged.
+	fn stale(&self) -> bool {
+		self.excluded.iter().any(|e| e.since.elapsed() >= EXCLUDED_FOR)
+			|| self.refused.as_ref().is_some_and(|(_, at)| at.elapsed() >= EXCLUDED_FOR)
+	}
+}
+
+/// The wait after dry runs without an answer: 2 s, doubling, at most a minute.
+fn backoff(failures: u32) -> std::time::Duration {
+	std::time::Duration::from_secs((2u64 << failures.saturating_sub(1).min(5)).min(60))
 }
 
 /// How long routes rproxy refused stay out without asking rproxy again while they are unchanged
@@ -1173,8 +1190,8 @@ pub async fn sync_pod(
 	let current_etag = current.as_ref().map(|c| c.etag.clone());
 	let previous = applied.get(&key).cloned();
 	if let Some(prev) = &previous {
-		if prev.hash == hash && prev.etag == current_etag {
-			if let Some(m) = &prev.refused {
+		if prev.hash == hash && prev.etag == current_etag && !prev.stale() {
+			if let Some((m, _)) = &prev.refused {
 				return (PodSync::Rejected(m.clone()), false);
 			}
 			if let Some(cur) = &current {
@@ -1182,6 +1199,12 @@ pub async fn sync_pod(
 				views.extend(prev.rejected.iter().cloned());
 				return (PodSync::Synced(views, prev.excluded.clone()), false);
 			}
+		}
+	}
+	// dry runs got no answer lately: wait (longer each time) before asking again
+	if let Some((until, n)) = previous.as_ref().and_then(|p| p.backoff) {
+		if std::time::Instant::now() < until {
+			return (PodSync::NotReady(format!("pod {}: dry runs got no answer ({n} in a row); waiting", ep.pod)), true);
 		}
 	}
 	let mut if_match = current_etag.clone();
@@ -1206,6 +1229,9 @@ pub async fn sync_pod(
 		}
 	}
 	let mut budget = isolate::MAX_DRY_RUNS;
+	// the dry runs ran out with the refused routes not all found: the rule is out for this pass, the
+	// ones found are kept, and the next pass goes on soon
+	let mut unfinished = false;
 	let answer = loop {
 		debug!(pod = ep.pod, set = plan.ruleset, generation, rules = rules.len(), "PUT rule set");
 		match rp.put_ruleset(addr, &plan.ruleset, generation, &rules, if_match.as_deref()).await {
@@ -1221,14 +1247,28 @@ pub async fn sync_pod(
 							let found = if excluded.len() < MAX_EXCLUDED {
 								match isolate::find(&target, &rules, i, &a.message, &mut budget).await {
 									Ok(f) => f,
-									// no answer to a dry run: nothing is left out on that account; again soon
-									Err(e) => return (PodSync::NotReady(format!("pod {}: {e}", ep.pod)), true),
+									// no answer to a dry run: nothing is left out on that account; again later
+									Err(e) => {
+										let n = previous.as_ref().and_then(|p| p.backoff).map_or(0, |(_, n)| n) + 1;
+										let until = std::time::Instant::now() + backoff(n);
+										let entry = applied.entry(key.clone()).or_insert_with(|| AppliedSet {
+											hash: String::new(),
+											etag: None,
+											rejected: vec![],
+											excluded: vec![],
+											refused: None,
+											backoff: None,
+										});
+										entry.hash.clear();
+										entry.backoff = Some((until, n));
+										return (PodSync::NotReady(format!("pod {}: {e}", ep.pod)), true);
+									}
 								}
 							} else {
-								None
+								isolate::Found::NotRoutes
 							};
 							let rule_key = refused_view(&rules[i], "").key();
-							if let Some(owners) = found {
+							if let isolate::Found::Owners(owners) = found {
 								warn!(pod = ep.pod, set = plan.ruleset, error = %a, routes = owners.join(", "), "rproxy refused routes; applying the others");
 								for o in owners.iter().filter(|o| o.starts_with("traefik:") || o.starts_with("ingress:")) {
 									warn!(set = plan.ruleset, resource = o, error = %a, "migration: route left out (rproxy refused it)");
@@ -1250,10 +1290,15 @@ pub async fn sync_pod(
 								);
 							} else {
 								let rule = rules.remove(i);
-								warn!(pod = ep.pod, set = plan.ruleset, error = %a, "rproxy refused a rule; applying the others");
 								rejected.push(refused_view(&rule, &a.message));
-								// the whole rule is out: its routes' own exclusions say nothing more
-								excluded.retain(|e| e.rule_key != rule_key);
+								if found == isolate::Found::OutOfDryRuns {
+									warn!(pod = ep.pod, set = plan.ruleset, error = %a, "rproxy refused routes; not all found yet, the rule is out until the next pass");
+									unfinished = true;
+								} else {
+									warn!(pod = ep.pod, set = plan.ruleset, error = %a, "rproxy refused a rule; applying the others");
+									// the whole rule is out: its routes' own exclusions say nothing more
+									excluded.retain(|e| e.rule_key != rule_key);
+								}
 							}
 							if_match = None;
 							if let Ok(Some(cur)) = rp.get_ruleset(addr, &plan.ruleset).await {
@@ -1264,7 +1309,14 @@ pub async fn sync_pod(
 							warn!(pod = ep.pod, set = plan.ruleset, error = %a, "rproxy refused the rule set");
 							applied.insert(
 								key.clone(),
-								AppliedSet { hash, etag: current_etag, rejected: vec![], excluded: vec![], refused: Some(a.to_string()) },
+								AppliedSet {
+									hash,
+									etag: current_etag,
+									rejected: vec![],
+									excluded: vec![],
+									refused: Some((a.to_string(), std::time::Instant::now())),
+									backoff: None,
+								},
 							);
 							return (PodSync::Rejected(a.to_string()), false);
 						}
@@ -1279,12 +1331,20 @@ pub async fn sync_pod(
 	}
 	applied.insert(
 		key.clone(),
-		AppliedSet { hash, etag: Some(answer.etag.clone()), rejected: rejected.clone(), excluded: excluded.clone(), refused: None },
+		AppliedSet {
+			// unfinished: PUT again next pass (the routes found so far stay out without dry runs)
+			hash: if unfinished { String::new() } else { hash },
+			etag: Some(answer.etag.clone()),
+			rejected: rejected.clone(),
+			excluded: excluded.clone(),
+			refused: None,
+			backoff: None,
+		},
 	);
 	match rp.get_ruleset(addr, &plan.ruleset).await {
 		Ok(Some(set)) => {
 			// a rule failing on a file the kubelet has just written is tried again soon
-			let again = set.rules.iter().any(|r| r.state == "failed");
+			let again = unfinished || set.rules.iter().any(|r| r.state == "failed");
 			if again {
 				// PUT again next time; the routes left out stay remembered (no dry runs again)
 				if let Some(a) = applied.get_mut(&key) {
