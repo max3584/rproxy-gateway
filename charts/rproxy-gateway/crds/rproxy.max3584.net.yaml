@@ -571,6 +571,13 @@ spec:
                         nullable: true
                         type: array
                     type: object
+                  rproxyRules:
+                    description: |-
+                      Whether RproxyRules may attach to the class's Gateways (default true). An RproxyRule is a whole
+                      rproxy rule (any backend URL, forward_auth address, L4 destination): `policy.middlewares` does
+                      not bound it, so it fully trusts whoever may write one; false turns them off.
+                    nullable: true
+                    type: boolean
                 type: object
               proxyProtocol:
                 description: |-
@@ -920,6 +927,13 @@ spec:
                         nullable: true
                         type: array
                     type: object
+                  rproxyRules:
+                    description: |-
+                      Whether RproxyRules may attach to the class's Gateways (default true). An RproxyRule is a whole
+                      rproxy rule (any backend URL, forward_auth address, L4 destination): `policy.middlewares` does
+                      not bound it, so it fully trusts whoever may write one; false turns them off.
+                    nullable: true
+                    type: boolean
                 type: object
               proxyProtocol:
                 description: |-

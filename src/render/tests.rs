@@ -1795,6 +1795,23 @@ spec:
 	let p3 = render_gateway(&w, &w.gateways[0], &Options { raw_rules: false, ..Default::default() });
 	assert!(p3.raw.is_empty());
 	assert!(p3.raw_status.iter().all(|s| cond(&s.conds, "Accepted").reason == "NotAllowed"));
+	// the class turns them off (policy.middlewares does not bound an RproxyRule), and so do invalid class parameters
+	for (class, why) in [
+		("{policy: {rproxyRules: false}}", "policy.rproxyRules: false"),
+		("{pod: {labels: {app.kubernetes.io/x: v}}}", "parameters are invalid"),
+	] {
+		let w = world(&format!("{yaml}{}", class_with(class)));
+		let p4 = render_gateway(&w, &w.gateways[0], &Options::default());
+		assert!(p4.raw.is_empty(), "{class}");
+		let c = cond(&raw_of(&p4, "plain").conds, "Accepted").clone();
+		assert!(c.reason == "NotAllowed" && c.message.contains(why), "{class}: {c:?}");
+	}
+	let w = world(&format!("{yaml}{}", class_with("{policy: {rproxyRules: true}}")));
+	assert!(render_gateway(&w, &w.gateways[0], &Options::default()).raw.iter().any(|r| r["listen_port"] == 9000));
+}
+
+fn raw_of<'a>(p: &'a GatewayPlan, name: &str) -> &'a policy::RawStatus {
+	p.raw_status.iter().find(|s| s.name == name).unwrap()
 }
 
 #[test]
@@ -2507,4 +2524,115 @@ spec:
 	// a policy that names no kind of rproxy makes the class's parameters invalid
 	let p = run(&class_with("{policy: {middlewares: {allowedKinds: [nope]}}}"));
 	assert!(cond(&p.conds, "Accepted").message.contains("allowedKinds: nope"), "{:?}", p.conds);
+}
+
+/// A GRPCRoute's RproxyMiddleware names its own rules too, written as `r<i>`, a rule's name or the
+/// prefixed rproxy name (`grpc:<ns>/<route>/r<i>`): all become the route's `grpc:` service, apart from
+/// an HTTPRoute of the same name (#94).
+#[test]
+fn grpc_route_middlewares_name_their_own_rules() {
+	let yaml = format!(
+		"{BASE}{}{}",
+		gw("  - {name: http, port: 80, protocol: HTTP}"),
+		r#"
+---
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyMiddleware
+metadata: {name: pages, namespace: default}
+spec: {errors: {status: ["500-599"], service: "grpc:default/grpc/r1", path: /error}}
+---
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyMiddleware
+metadata: {name: copy, namespace: default}
+spec: {mirror: {service: shadow}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata: {name: grpc, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  hostnames: [grpc.example.com]
+  rules:
+    - matches: [{method: {service: echo.Echo}}]
+      filters:
+        - {type: ExtensionRef, extensionRef: {group: rproxy.max3584.net, kind: RproxyMiddleware, name: pages}}
+        - {type: ExtensionRef, extensionRef: {group: rproxy.max3584.net, kind: RproxyMiddleware, name: copy}}
+      backendRefs: [{name: web, port: 80}]
+    - name: shadow
+      matches: [{method: {service: shadow.Shadow}}]
+      backendRefs: [{name: web, port: 80}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: grpc, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  hostnames: [web.example.com]
+  rules:
+    - backendRefs: [{name: web, port: 80}]
+    - backendRefs: [{name: web, port: 80}]
+"#
+	);
+	let p = plan(&yaml);
+	for x in &p.parents {
+		assert!(cond(&x.conds, "Accepted").status, "{}: {:?}", x.name, x.conds);
+	}
+	let http = &p.rules_json()[0]["http"];
+	let mws = http["middlewares"].as_object().unwrap();
+	assert!(mws.values().any(|m| m["errors"]["service"] == "grpc:default/grpc/r1"), "{mws:?}");
+	assert!(mws.values().any(|m| m["mirror"]["service"] == "grpc:default/grpc/r1"), "{mws:?}");
+	assert!(http["services"].get("grpc:default/grpc/r1").is_some());
+	// an HTTPRoute cannot write the GRPCRoute's names
+	let yaml = yaml.replace("kind: GRPCRoute\nmetadata: {name: grpc", "kind: GRPCRoute\nmetadata: {name: other").replace(
+		"rules:\n    - backendRefs: [{name: web, port: 80}]",
+		"rules:\n    - filters: [{type: ExtensionRef, extensionRef: {group: rproxy.max3584.net, kind: RproxyMiddleware, name: pages}}]\n      backendRefs: [{name: web, port: 80}]",
+	);
+	let p = plan(&yaml);
+	let http_route = p.parents.iter().find(|x| x.kind == RouteKind::Http).unwrap();
+	let c = cond(&http_route.conds, "Accepted");
+	assert!(!c.status && c.message.contains("only this route's own rules"), "{c:?}");
+}
+
+/// While the GatewayClass's parameters are invalid (the Gateway keeps running), no RproxyMiddleware or
+/// migrated middleware is taken: a mistake elsewhere in the class must not open its policy (#94).
+#[test]
+fn invalid_class_parameters_refuse_tenant_middlewares() {
+	let yaml = format!(
+		"{BASE}{}{}{}",
+		class_with("{pod: {labels: {app.kubernetes.io/x: v}}, policy: {middlewares: {allowedKinds: [headers]}}}"),
+		gw("  - {name: http, port: 80, protocol: HTTP}"),
+		r#"
+---
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyMiddleware
+metadata: {name: limit, namespace: default}
+spec: {rate_limit: {average: 10}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: limited, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  hostnames: [limited.example.com]
+  rules:
+    - filters: [{type: ExtensionRef, extensionRef: {group: rproxy.max3584.net, kind: RproxyMiddleware, name: limit}}]
+      backendRefs: [{name: web, port: 80}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: plain, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  hostnames: [plain.example.com]
+  rules: [{backendRefs: [{name: web, port: 80}]}]
+"#
+	);
+	let w = world(&yaml);
+	let p = render_gateway(&w, &w.gateways[0], &Options::default());
+	assert!(!cond(&p.conds, "Accepted").status, "the class's parameters are invalid: {:?}", p.conds);
+	let c = cond(&p.parents.iter().find(|x| x.name == "limited").unwrap().conds, "Accepted");
+	assert!(!c.status && c.message.contains("parameters are invalid"), "{c:?}");
+	let text = serde_json::to_string(&p.rules_json()).unwrap();
+	assert!(!text.contains("rate_limit") && !text.contains("limited.example.com"), "{text}");
+	assert!(text.contains("plain.example.com"), "{text}");
 }

@@ -27,7 +27,12 @@ fn field(at: &str) -> String {
 }
 
 /// A tenant's middleware against the class's policy: its kind, and the URLs it calls out to.
-pub fn check(v: &Value, policy: &MiddlewarePolicy) -> Result<(), String> {
+/// `None`: the class's parameters are invalid, and no middleware of a tenant is taken until they
+/// are fixed (a typo elsewhere must not open what the policy closes).
+pub fn check(v: &Value, policy: Option<&MiddlewarePolicy>) -> Result<(), String> {
+	let Some(policy) = policy else {
+		return Err("the GatewayClass's parameters are invalid: tenants' middlewares are refused until they are fixed".into());
+	};
 	if let Some(allowed) = &policy.allowed_kinds {
 		if let Some(kind) = v.as_object().and_then(|o| o.keys().find(|k| !allowed.contains(k))) {
 			return Err(format!("the middleware kind {kind} is not allowed by the GatewayClass (policy.middlewares.allowedKinds)"));
@@ -36,7 +41,7 @@ pub fn check(v: &Value, policy: &MiddlewarePolicy) -> Result<(), String> {
 	let allow = policy.outbound_hosts.as_deref().unwrap_or_default();
 	for at in OUTBOUND_FIELDS {
 		let Some(u) = v.pointer(at).and_then(Value::as_str).filter(|u| !u.is_empty()) else { continue };
-		let host = url_host(u).map_err(|e| format!("{} {u:?}: {e}", field(at)))?;
+		let host = url_host(u, *at == "/oidc/issuer").map_err(|e| format!("{} {u:?}: {e}", field(at)))?;
 		if !outbound_allowed(&host, allow) {
 			return Err(format!(
 				"{} {u:?}: {host} is not allowed by the GatewayClass (policy.middlewares.outboundHosts; by default no URL out)",
@@ -47,33 +52,57 @@ pub fn check(v: &Value, policy: &MiddlewarePolicy) -> Result<(), String> {
 	Ok(())
 }
 
-/// The host of an `http://` / `https://` URL, lower case. Only plain hosts are taken (letters,
-/// digits, `-`, `.`, or an IPv6 address in brackets; a port): user info, percent-encoding and
-/// other characters are refused so that no URL parser reads another host than this one.
-fn url_host(u: &str) -> Result<String, String> {
+/// The host of an `http://` / `https://` URL, lower case, read as strictly as rproxy reads the URLs
+/// it connects to (rproxy-api's `net::url`, #324), so that the controller gives the error and no
+/// URL parser reads another host than this one: visible ASCII only, no `\` or `#`, no user info,
+/// a host name of letters, digits, `-`, `_` and `.` (no empty label, none starting or ending with
+/// `-`, one trailing `.`), IPv4 as `a.b.c.d` only (`127.1` is not), IPv6 in brackets without a zone,
+/// a port of 1-65535. `base`: a URL rproxy appends paths to (`oidc.issuer`) takes no query either.
+fn url_host(u: &str, base: bool) -> Result<String, String> {
 	let rest = u.strip_prefix("http://").or_else(|| u.strip_prefix("https://")).ok_or("must start with http:// or https://")?;
-	let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+	if !u.bytes().all(|b| b.is_ascii_graphic()) || u.contains(['\\', '#']) {
+		return Err("only visible ASCII, without \\ or #".into());
+	}
+	if base && u.contains('?') {
+		return Err("takes no query (?)".into());
+	}
+	let authority = rest.split(['/', '?']).next().unwrap_or_default();
+	let plain = || format!("{authority:?} is not a plain host[:port]");
 	let (host, port, v6) = match authority.strip_prefix('[') {
 		Some(inner) => {
-			let (h, after) = inner.split_once(']').ok_or("no closing ] in the host")?;
-			(h, after.strip_prefix(':').or(if after.is_empty() { None } else { Some("") }), true)
+			let (h, after) = inner.split_once(']').ok_or_else(plain)?;
+			match after {
+				"" => (h, None, true),
+				_ => (h, Some(after.strip_prefix(':').ok_or_else(plain)?), true),
+			}
 		}
 		None => match authority.split_once(':') {
 			Some((h, p)) => (h, Some(p), false),
 			None => (authority, None, false),
 		},
 	};
-	let port_ok = port.is_none_or(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
-	let host_ok = !host.is_empty()
-		&& if v6 {
-			host.parse::<std::net::Ipv6Addr>().is_ok()
-		} else {
-			host.bytes().all(|b| b.is_ascii_alphanumeric() || b"-.".contains(&b))
-		};
-	if !port_ok || !host_ok {
-		return Err(format!("{authority:?} is not a plain host[:port]"));
+	if let Some(p) = port {
+		if !p.bytes().all(|b| b.is_ascii_digit()) || !p.parse::<u32>().is_ok_and(|n| (1..=65535).contains(&n)) {
+			return Err(format!("{authority:?}: the port must be 1-65535"));
+		}
 	}
-	Ok(host.trim_end_matches('.').to_ascii_lowercase())
+	if v6 {
+		host.parse::<std::net::Ipv6Addr>().map_err(|_| plain())?;
+		return Ok(host.to_ascii_lowercase());
+	}
+	let name = host.strip_suffix('.').unwrap_or(host);
+	let labels: Vec<&str> = name.split('.').collect();
+	let label_ok = |l: &&str| {
+		!l.is_empty() && !l.starts_with('-') && !l.ends_with('-') && l.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+	};
+	if name.is_empty() || !labels.iter().all(label_ok) {
+		return Err(plain());
+	}
+	// a last label of digits is an IPv4 address, in the a.b.c.d form only (`127.1`, `010.0.0.1` are not)
+	if labels.last().is_some_and(|l| l.bytes().all(|b| b.is_ascii_digit())) && name.parse::<std::net::Ipv4Addr>().is_err() {
+		return Err(format!("{authority:?}: an IPv4 address is a.b.c.d"));
+	}
+	Ok(name.to_ascii_lowercase())
 }
 
 /// Whether `host` (from [`url_host`]) is in the allow list.
@@ -116,13 +145,15 @@ pub fn check_policy(p: &MiddlewarePolicy) -> Result<(), String> {
 }
 
 /// The services an RproxyMiddleware names, as its route's own: a rule's `name`, `r<i>`, or the
-/// route's full rproxy name of a rule (`<namespace>/<route>/r<i>`), rewritten to the latter.
-/// Anything else (another route's service) is refused.
-pub fn own_services(v: &mut Value, ns: &str, route: &str, rules: &[HttpRouteRule]) -> Result<(), String> {
+/// route's full rproxy name of a rule (`<namespace>/<route>/r<i>`, with `grpc:` for a GRPCRoute),
+/// rewritten to `<namespace>/<route>/r<i>` (a GRPCRoute's names get `grpc:` afterwards, with the
+/// rest of its output). A rule's `name` comes first: a rule named like `r1` is that rule, not the
+/// rule of index 1. Anything else (another route's service) is refused.
+pub fn own_services(v: &mut Value, ns: &str, route: &str, rules: &[HttpRouteRule], grpc: bool) -> Result<(), String> {
 	for at in SERVICE_FIELDS {
 		let Some(slot) = v.pointer_mut(at) else { continue };
 		let Some(s) = slot.as_str() else { continue };
-		let i = rule_index(s, ns, route, rules).ok_or_else(|| {
+		let i = rule_index(s, ns, route, rules, grpc).ok_or_else(|| {
 			format!(
 				"{} {s:?}: only this route's own rules may be named (a rule's name, or r0{})",
 				field(at),
@@ -134,11 +165,14 @@ pub fn own_services(v: &mut Value, ns: &str, route: &str, rules: &[HttpRouteRule
 	Ok(())
 }
 
-fn rule_index(s: &str, ns: &str, route: &str, rules: &[HttpRouteRule]) -> Option<usize> {
+fn rule_index(s: &str, ns: &str, route: &str, rules: &[HttpRouteRule], grpc: bool) -> Option<usize> {
 	if let Some(i) = rules.iter().position(|r| r.name.as_deref() == Some(s)) {
 		return Some(i);
 	}
-	let short = s.strip_prefix(&format!("{ns}/{route}/")).unwrap_or(s);
+	let full = format!("{ns}/{route}/");
+	// a GRPCRoute's rproxy names carry `grpc:` (`Output::prefix_names`)
+	let s = if grpc { s.strip_prefix("grpc:").filter(|r| r.starts_with(&full)).unwrap_or(s) } else { s };
+	let short = s.strip_prefix(&full).unwrap_or(s);
 	let i: usize = short.strip_prefix('r')?.parse().ok()?;
 	(i < rules.len() && short == format!("r{i}")).then_some(i)
 }
@@ -149,6 +183,11 @@ mod tests {
 
 	use super::*;
 
+	/// `check` with the class's parameters valid.
+	fn check(v: &Value, p: &MiddlewarePolicy) -> Result<(), String> {
+		super::check(v, Some(p))
+	}
+
 	fn rules(names: &[Option<&str>]) -> Vec<HttpRouteRule> {
 		names.iter().map(|n| HttpRouteRule { name: n.map(String::from), ..Default::default() }).collect()
 	}
@@ -158,7 +197,7 @@ mod tests {
 		let rs = rules(&[None, Some("pages")]);
 		let own = |v: Value| {
 			let mut v = v;
-			own_services(&mut v, "a", "web", &rs).map(|()| v)
+			own_services(&mut v, "a", "web", &rs, false).map(|()| v)
 		};
 		// a rule's index, its name, or its full name: the route's own service
 		assert_eq!(own(json!({"errors": {"status": ["500"], "service": "r1", "path": "/e"}})).unwrap()["errors"]["service"], "a/web/r1");
@@ -208,9 +247,65 @@ mod tests {
 			"http://auth.example.com:80:80/",
 			"http://auth.example.com:x/",
 			"http://[::1/",
+			// as rproxy reads the URLs it connects to (rproxy-api #324)
+			"http://auth.example.com:0/",
+			"http://auth.example.com:65536/",
+			"http://auth.example.com:/",
+			"http://auth.example.com/#x",
+			"http://auth.example.com/a b",
+			"http://[fe80::1%25eth0]/",
 		] {
 			assert!(check(&fa(u), &p(&["auth.example.com"])).is_err(), "{u}");
 		}
+	}
+
+	#[test]
+	fn strict_hosts() {
+		let any = MiddlewarePolicy { outbound_hosts: Some(vec!["*".into()]), ..Default::default() };
+		let fa = |u: &str| check(&json!({"forward_auth": {"address": u}}), &any);
+		for bad in [
+			"http://127.1/",
+			"http://010.0.0.1/",
+			"http://0x7f.0.0.1/",
+			"http://a..b/",
+			"http://-a.example/",
+			"http://a-.example/",
+			"http://./",
+		] {
+			assert!(fa(bad).is_err(), "{bad}");
+		}
+		for good in ["http://127.0.0.1:65535/x?y=1", "http://auth_1.example./", "https://[2001:db8::1]:8443/p"] {
+			assert!(fa(good).is_ok(), "{good}: {:?}", fa(good));
+		}
+		// a URL rproxy appends paths to takes no query
+		let e = check(&json!({"oidc": {"issuer": "https://id.example/realms/x?a=1"}}), &any).unwrap_err();
+		assert!(e.contains("query"), "{e}");
+		assert!(check(&json!({"oidc": {"issuer": "https://id.example/realms/x"}}), &any).is_ok());
+	}
+
+	/// The class's parameters invalid: nothing is taken (a typo must not open what the policy closes).
+	#[test]
+	fn invalid_class_parameters_refuse_everything() {
+		let e = super::check(&json!({"headers": {"frame_deny": true}}), None).unwrap_err();
+		assert!(e.contains("parameters are invalid"), "{e}");
+	}
+
+	#[test]
+	fn grpc_names() {
+		let rs = rules(&[None, None]);
+		let own = |s: &str, grpc: bool| {
+			let mut v = json!({"mirror": {"service": s}});
+			own_services(&mut v, "a", "svc", &rs, grpc).map(|()| v["mirror"]["service"].clone())
+		};
+		assert_eq!(own("grpc:a/svc/r1", true).unwrap(), "a/svc/r1");
+		assert_eq!(own("r1", true).unwrap(), "a/svc/r1");
+		assert!(own("grpc:a/svc/r1", false).is_err());
+		assert!(own("grpc:b/svc/r0", true).is_err());
+		// a rule's name first: a rule named like an index is that rule
+		let named = rules(&[Some("r1"), None]);
+		let mut v = json!({"mirror": {"service": "r1"}});
+		own_services(&mut v, "a", "svc", &named, false).unwrap();
+		assert_eq!(v["mirror"]["service"], "a/svc/r0");
 	}
 
 	#[test]

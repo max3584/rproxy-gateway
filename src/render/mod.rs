@@ -1145,7 +1145,7 @@ struct HttpInputs<'a> {
 	/// The Gateway's certificate files.
 	files: &'a BTreeSet<String>,
 	/// The GatewayClass's `policy.middlewares`.
-	middleware_policy: &'a crate::k8s::params::MiddlewarePolicy,
+	middleware_policy: Option<&'a crate::k8s::params::MiddlewarePolicy>,
 }
 
 /// What `http::build` needs for a route of `kind`.
@@ -1306,7 +1306,7 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 	// the files the Gateway's tenant-written settings may name (its own certificates)
 	let own_files: BTreeSet<String> = files.keys().cloned().collect();
 	let middleware_policy = params::class_middleware_policy(world, gw, &opts.params);
-	let inputs = HttpInputs { tls: &tls_index, files: &own_files, middleware_policy: &middleware_policy };
+	let inputs = HttpInputs { tls: &tls_index, files: &own_files, middleware_policy: middleware_policy.as_ref() };
 	// one rule per (protocol, port)
 	let mut groups: BTreeMap<(rp::Protocol, u16), Vec<usize>> = BTreeMap::new();
 	for (i, st) in listeners.iter().enumerate() {
@@ -1583,7 +1583,18 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 	opts.backends.apply(&mut plan.rules, &opts.features);
 	let taken: Vec<String> = plan.rules.iter().map(|r| r.key()).collect();
 	let file_names: BTreeSet<String> = files.keys().cloned().collect();
-	let limits = policy::RawLimits { enabled: opts.raw_rules, cert_dir: &opts.cert_dir, files: &file_names };
+	let off = if !opts.raw_rules {
+		Some("RproxyRules are off for this Gateway (fleet mode: --fleet-rproxy-rules)".to_string())
+	} else {
+		match params::class_policy(world, gw, &opts.params) {
+			None => Some("the GatewayClass's parameters are invalid: RproxyRules are refused until they are fixed".to_string()),
+			Some(p) if p.rproxy_rules == Some(false) => {
+				Some("RproxyRules are off for this GatewayClass (its parameters' policy.rproxyRules: false)".to_string())
+			}
+			Some(_) => None,
+		}
+	};
+	let limits = policy::RawLimits { off, cert_dir: &opts.cert_dir, files: &file_names };
 	let (raw, raw_status) = policy::raw_rules(world, gw, &taken, &limits);
 	plan.raw = raw;
 	plan.raw_status = raw_status;

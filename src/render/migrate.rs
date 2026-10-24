@@ -133,7 +133,8 @@ struct Ctx<'a> {
 	entry_points: BTreeMap<String, (rp::Protocol, u16)>,
 	allow_cross_namespace: bool,
 	/// The Gateway's class's `policy.middlewares` (Traefik Middlewares are tenants' too, #94).
-	middleware_policy: crate::k8s::params::MiddlewarePolicy,
+	/// `None`: the class's parameters are invalid (no migrated middleware is taken then).
+	middleware_policy: Option<crate::k8s::params::MiddlewarePolicy>,
 }
 
 /// Whether a ReferenceGrant in `to_ns` lets Traefik objects of `from_ns` refer to (`to_group`, `to_kind`, `name`).
@@ -509,7 +510,7 @@ pub fn render(world: &World, settings: &Settings, opts: &Options) -> Out {
 					mws.iter().filter_map(|n| ctx.out.ports.get(&key).and_then(|p| p.middlewares.get(n)).map(|v| (n, v))).try_for_each(
 						|(n, v)| {
 							crate::render::validate::middleware(v)
-								.and_then(|()| crate::render::tenant::check(v, &ctx.middleware_policy))
+								.and_then(|()| crate::render::tenant::check(v, ctx.middleware_policy.as_ref()))
 								.map_err(|e| format!("middleware {n}: {e}"))
 						},
 					)

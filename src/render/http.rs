@@ -37,8 +37,9 @@ pub struct Ctx<'a> {
 	pub backend_tls: Option<&'a crate::render::backend_tls::Index>,
 	/// (certificate directory, the Gateway's files): the only files RproxyMiddlewares may name.
 	pub files: Option<(&'a str, &'a std::collections::BTreeSet<String>)>,
-	/// What RproxyMiddlewares may use (the GatewayClass's `policy.middlewares`).
-	pub middleware_policy: &'a crate::k8s::params::MiddlewarePolicy,
+	/// What RproxyMiddlewares may use (the GatewayClass's `policy.middlewares`); `None`: the class's
+	/// parameters are invalid, and no RproxyMiddleware is taken.
+	pub middleware_policy: Option<&'a crate::k8s::params::MiddlewarePolicy>,
 }
 
 /// One rproxy route before priorities are given.
@@ -568,7 +569,7 @@ fn filter(
 					// the kinds and URLs out the class allows; services of this route only, never another's on the port (#94)
 					crate::render::tenant::check(&v, ctx.middleware_policy).map_err(|e| format!("RproxyMiddleware {}: {e}", r.name))?;
 					let name = route.metadata.name.as_deref().unwrap_or_default();
-					crate::render::tenant::own_services(&mut v, ns, name, &route.spec.rules)
+					crate::render::tenant::own_services(&mut v, ns, name, &route.spec.rules, ctx.grpc)
 						.map_err(|e| format!("RproxyMiddleware {}: {e}", r.name))?;
 					vec![v]
 				}
@@ -1022,7 +1023,7 @@ mod tests {
 			grpc: false,
 			backend_tls: None,
 			files: None,
-			middleware_policy: &crate::k8s::params::MiddlewarePolicy::DEFAULT,
+			middleware_policy: Some(&crate::k8s::params::MiddlewarePolicy::DEFAULT),
 		};
 		let r = RequestRedirect { scheme: Some("https".into()), status_code: Some(301), ..Default::default() };
 		let v = redirect(&ctx, &r, &m(None)).unwrap();
@@ -1042,7 +1043,7 @@ mod tests {
 			grpc: false,
 			backend_tls: None,
 			files: None,
-			middleware_policy: &crate::k8s::params::MiddlewarePolicy::DEFAULT,
+			middleware_policy: Some(&crate::k8s::params::MiddlewarePolicy::DEFAULT),
 		};
 		let v = redirect(&ctx8080, &r, &m(Some(("PathPrefix", "/old/")))).unwrap();
 		assert_eq!(v.len(), 2);
@@ -1063,7 +1064,7 @@ mod tests {
 			grpc: false,
 			backend_tls: None,
 			files: None,
-			middleware_policy: &crate::k8s::params::MiddlewarePolicy::DEFAULT,
+			middleware_policy: Some(&crate::k8s::params::MiddlewarePolicy::DEFAULT),
 		};
 		let e = redirect(&ctx_old, &RequestRedirect { status_code: Some(303), ..Default::default() }, &m(None)).unwrap_err();
 		assert!(e.contains("redirect_status"), "{e}");
@@ -1092,7 +1093,7 @@ mod tests {
 			grpc: false,
 			backend_tls: None,
 			files: None,
-			middleware_policy: &crate::k8s::params::MiddlewarePolicy::DEFAULT,
+			middleware_policy: Some(&crate::k8s::params::MiddlewarePolicy::DEFAULT),
 		};
 		let v = rewrite(&ctx, &f, &m(Some(("PathPrefix", "/old")))).unwrap();
 		assert_eq!(v, vec![json!({"replace_path_regex": {"regex": "^/old(/.*)?$", "replacement": "/new${1}"}})]);
@@ -1108,7 +1109,7 @@ mod tests {
 			grpc: false,
 			backend_tls: None,
 			files: None,
-			middleware_policy: &crate::k8s::params::MiddlewarePolicy::DEFAULT,
+			middleware_policy: Some(&crate::k8s::params::MiddlewarePolicy::DEFAULT),
 		};
 		assert!(rewrite(&ctx_old, &host, &m(None)).is_err());
 		assert_eq!(regex_escape("/a.b$"), "/a\\.b\\$");

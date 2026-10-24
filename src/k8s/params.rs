@@ -348,6 +348,11 @@ pub struct ParamsPolicy {
 	/// Traefik) may use (#94).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub middlewares: Option<MiddlewarePolicy>,
+	/// Whether RproxyRules may attach to the class's Gateways (default true). An RproxyRule is a whole
+	/// rproxy rule (any backend URL, forward_auth address, L4 destination): `policy.middlewares` does
+	/// not bound it, so it fully trusts whoever may write one; false turns them off.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub rproxy_rules: Option<bool>,
 }
 
 /// What tenants' middlewares may use (the GatewayClass's `policy.middlewares`).
