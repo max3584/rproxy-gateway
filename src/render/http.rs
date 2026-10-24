@@ -910,7 +910,24 @@ pub fn build(ctx: &Ctx, route: &HttpRoute, hosts: Option<&[String]>, exclusions:
 			}
 		}
 	}
+	// what rproxy would refuse: the route is left out (the others on the port go on) (#92)
+	if out.unsupported.is_none() {
+		if let Err(e) = check(&out) {
+			out.unsupported = Some(e);
+		}
+	}
 	out
+}
+
+/// rproxy's checks of the routes' `match` expressions and the middlewares (`validate`).
+fn check(out: &Output) -> Result<(), String> {
+	for e in &out.entries {
+		crate::render::validate::expression(&e.route.rule).map_err(|err| format!("match {}: {err}", e.route.rule))?;
+	}
+	for v in out.middlewares.values() {
+		crate::render::validate::middleware(v)?;
+	}
+	Ok(())
 }
 
 #[cfg(test)]

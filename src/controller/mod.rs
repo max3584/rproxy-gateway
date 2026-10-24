@@ -9,6 +9,7 @@
 
 pub mod bootstrap;
 pub mod cache;
+pub mod isolate;
 pub mod leader;
 pub mod provision;
 pub mod status;
@@ -145,8 +146,31 @@ const PARALLEL: usize = 16;
 /// How many pods of one Gateway are brought up to date at once.
 const POD_PARALLEL: usize = 4;
 
-/// What was last applied to a pod: (pod uid, set) → (hash of what was sent, etag rproxy answered).
-pub type Applied = HashMap<(String, String), (String, String, Vec<RuleView>)>;
+/// What was last applied to a pod: (pod uid, set) → what was sent and what rproxy answered.
+pub type Applied = HashMap<(String, String), AppliedSet>;
+
+/// What was last sent to one pod for one set.
+#[derive(Clone, Debug)]
+pub struct AppliedSet {
+	/// Hash of what was meant to be sent (the plan's rules).
+	pub hash: String,
+	/// The etag rproxy answered (refused: the set's etag before, `None` without a set).
+	pub etag: Option<String>,
+	/// The rules rproxy refused.
+	pub rejected: Vec<RuleView>,
+	/// The routes left out of rules rproxy refused.
+	pub excluded: Vec<status::Excluded>,
+	/// rproxy refused the whole set (not asked again until the plan or the set changes).
+	pub refused: Option<String>,
+}
+
+/// How long routes rproxy refused stay out without asking rproxy again while they are unchanged
+/// (something they need, a file, may turn up).
+const EXCLUDED_FOR: std::time::Duration = std::time::Duration::from_secs(300);
+/// Most routes (owners) left out of one set; past it a refused rule is left out as a whole.
+const MAX_EXCLUDED: usize = 64;
+/// Most rules left out of one set; past it the set is refused.
+const MAX_REJECTED: usize = 32;
 
 /// What the leader remembers between passes (forgotten when it stops leading).
 #[derive(Default)]
@@ -308,6 +332,29 @@ async fn patch_status(api: &Api<DynamicObject>, name: &str, status: Value) -> an
 	Ok(())
 }
 
+/// Everything as it is now, with the Secrets and ConfigMaps rendering refers to read in full: the
+/// cache keeps only their metadata (#92). Which ones are referred to comes from rendering each of
+/// our Gateways once (the references do not depend on the Secrets' contents or on what the rproxy
+/// pods take); those not read yet, or changed, are read, and the snapshot is taken again.
+async fn snapshot(client: &kube::Client, cache: &cache::Cache, cfg: &Config, opts: &render::Options) -> render::world::World {
+	let take = || {
+		let mut w = cache.snapshot();
+		w.allow_external_name = cfg.allow_external_name;
+		w
+	};
+	let world = take();
+	let classes: BTreeSet<&str> =
+		world.classes.iter().filter(|c| c.spec.controller_name == cfg.controller_name).filter_map(|c| c.metadata.name.as_deref()).collect();
+	for gw in world.gateways.iter().filter(|g| classes.contains(g.spec.gateway_class_name.as_str())) {
+		let _ = render::render_gateway(&world, gw, opts);
+		// the control API Secret of a managed Gateway's rproxy (compared before it is written)
+		let (ns, name) = (gw.metadata.namespace.clone().unwrap_or_default(), gw.metadata.name.clone().unwrap_or_default());
+		let id = provision::gateway_id(&ns, &name, gw.metadata.uid.as_deref().unwrap_or_default());
+		let _ = world.secrets.get(&(ns, provision::api_secret_name(&id)));
+	}
+	if cache.load(client, &world.secrets.asked(), &world.config_maps.asked()).await { take() } else { world }
+}
+
 /// One pass over everything; `Ok(true)` asks for another pass soon.
 async fn reconcile_all(
 	client: &kube::Client,
@@ -317,12 +364,6 @@ async fn reconcile_all(
 	boot: &bootstrap::Bootstrap,
 	state: &mut State,
 ) -> anyhow::Result<bool> {
-	let mut world = cache.snapshot();
-	world.allow_external_name = cfg.allow_external_name;
-	let world = world;
-	let now = render::status::now();
-	let mut soon = false;
-
 	let params_opts = render::params::ParamsOptions {
 		controller_namespace: cfg.namespace.clone(),
 		fleet: matches!(cfg.mode, Mode::Fleet(_)),
@@ -332,6 +373,22 @@ async fn reconcile_all(
 		},
 		service_annotations: cfg.service_annotations.clone(),
 	};
+	let opts = render::Options {
+		listen_addrs: cfg.listen_addrs.clone(),
+		listen_freebind: false,
+		cert_dir: provision::CERT_DIR.into(),
+		labels: true,
+		migration: cfg.migration.clone(),
+		features: render::Features::default(),
+		address_cidrs: cfg.address_cidrs.clone(),
+		raw_rules: !matches!(cfg.mode, Mode::Fleet(_)) || cfg.fleet_rproxy_rules,
+		cross_namespace_secrets: cfg.cross_namespace_secrets,
+		params: params_opts.clone(),
+		backends: cfg.backends.clone(),
+	};
+	let world = snapshot(client, cache, cfg, &opts).await;
+	let now = render::status::now();
+	let mut soon = false;
 
 	// GatewayClasses
 	let classes: BTreeSet<String> =
@@ -376,19 +433,6 @@ async fn reconcile_all(
 	let mut keep_ids = vec![];
 	let mut keep_pdb = vec![];
 	let mut pod_done: Vec<(String, bool)> = vec![];
-	let opts = render::Options {
-		listen_addrs: cfg.listen_addrs.clone(),
-		listen_freebind: false,
-		cert_dir: provision::CERT_DIR.into(),
-		labels: true,
-		migration: cfg.migration.clone(),
-		features: render::Features::default(),
-		address_cidrs: cfg.address_cidrs.clone(),
-		raw_rules: !matches!(cfg.mode, Mode::Fleet(_)) || cfg.fleet_rproxy_rules,
-		cross_namespace_secrets: cfg.cross_namespace_secrets,
-		params: params_opts.clone(),
-		backends: cfg.backends.clone(),
-	};
 	let mut rendered: Vec<(&crate::k8s::gateway::Gateway, GatewayPlan)> = vec![];
 	for gw in world.gateways.iter().filter(|g| classes.contains(&g.spec.gateway_class_name)) {
 		// what the Gateway's rproxy pods take (all of rproxy v0.4.0 before they are asked)
@@ -894,7 +938,7 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 		sub.applied.retain(|(uid, _), _| *uid != ep.uid);
 		sub.applied.extend(applied);
 		sub.caps.extend(caps);
-		pod_done.push((ep.uid.clone(), matches!(r, PodSync::Synced(_) | PodSync::Rejected(_))));
+		pod_done.push((ep.uid.clone(), matches!(r, PodSync::Synced(..) | PodSync::Rejected(_))));
 		results.push(r);
 	}
 	// managed: each pod is this Gateway's alone
@@ -1126,14 +1170,21 @@ pub async fn sync_pod(
 		Err(e) => return (PodSync::NotReady(format!("pod {}: {e:#}", ep.pod)), true),
 	};
 	let key = (ep.uid.clone(), plan.ruleset.clone());
-	if let (Some(cur), Some((h, etag, rejected))) = (&current, applied.get(&key)) {
-		if *h == hash && cur.etag == *etag {
-			let mut views = cur.rules.clone();
-			views.extend(rejected.iter().cloned());
-			return (PodSync::Synced(views), false);
+	let current_etag = current.as_ref().map(|c| c.etag.clone());
+	let previous = applied.get(&key).cloned();
+	if let Some(prev) = &previous {
+		if prev.hash == hash && prev.etag == current_etag {
+			if let Some(m) = &prev.refused {
+				return (PodSync::Rejected(m.clone()), false);
+			}
+			if let Some(cur) = &current {
+				let mut views = cur.rules.clone();
+				views.extend(prev.rejected.iter().cloned());
+				return (PodSync::Synced(views, prev.excluded.clone()), false);
+			}
 		}
 	}
-	let mut if_match = current.as_ref().map(|c| c.etag.clone());
+	let mut if_match = current_etag.clone();
 	let mut generation = plan.generation;
 	if let Some(cur) = &current {
 		// a Gateway created again starts at generation 1; rproxy refuses a lower one
@@ -1142,8 +1193,19 @@ pub async fn sync_pod(
 		}
 	}
 	// rules rproxy refuses (`rules[i]: ...`) are left out and the rest is PUT again,
-	// so one bad rule (an RproxyRule, a migrated route) does not stop the whole set
+	// so one bad rule (an RproxyRule, a migrated route) does not stop the whole set; of an HTTP
+	// rule (every tenant's routes on the port) only the routes rproxy refuses are left out (#92)
 	let mut rejected: Vec<RuleView> = vec![];
+	let mut excluded: Vec<status::Excluded> = vec![];
+	// routes refused before and unchanged since stay out without asking rproxy again
+	for prev in previous.iter().flat_map(|p| p.excluded.iter()).filter(|e| e.since.elapsed() < EXCLUDED_FOR) {
+		let Some(i) = rules.iter().position(|r| refused_view(r, "").key() == prev.rule_key) else { continue };
+		if isolate::owners(&rules[i]).contains(&prev.owner) && isolate::content(&rules[i], &prev.owner) == prev.content {
+			rules[i] = isolate::without(&rules[i], &[prev.owner.clone()].into());
+			excluded.push(prev.clone());
+		}
+	}
+	let mut budget = isolate::MAX_DRY_RUNS;
 	let answer = loop {
 		debug!(pod = ep.pod, set = plan.ruleset, generation, rules = rules.len(), "PUT rule set");
 		match rp.put_ruleset(addr, &plan.ruleset, generation, &rules, if_match.as_deref()).await {
@@ -1153,11 +1215,46 @@ pub async fn sync_pod(
 					return (PodSync::Pending(format!("pod {}: {a}", ep.pod)), true);
 				}
 				Some(a) if a.status.is_client_error() => {
-					match refused_index(&a.message).filter(|i| *i < rules.len() && rejected.len() < 32) {
+					match refused_index(&a.message).filter(|i| *i < rules.len() && rejected.len() < MAX_REJECTED) {
 						Some(i) => {
-							let rule = rules.remove(i);
-							warn!(pod = ep.pod, set = plan.ruleset, error = %a, "rproxy refused a rule; applying the others");
-							rejected.push(refused_view(&rule, &a.message));
+							let target = isolate::Target { rp, addr, set: &plan.ruleset, generation };
+							let found = if excluded.len() < MAX_EXCLUDED {
+								match isolate::find(&target, &rules, i, &a.message, &mut budget).await {
+									Ok(f) => f,
+									// no answer to a dry run: nothing is left out on that account; again soon
+									Err(e) => return (PodSync::NotReady(format!("pod {}: {e}", ep.pod)), true),
+								}
+							} else {
+								None
+							};
+							let rule_key = refused_view(&rules[i], "").key();
+							if let Some(owners) = found {
+								warn!(pod = ep.pod, set = plan.ruleset, error = %a, routes = owners.join(", "), "rproxy refused routes; applying the others");
+								for o in owners.iter().filter(|o| o.starts_with("traefik:") || o.starts_with("ingress:")) {
+									warn!(set = plan.ruleset, resource = o, error = %a, "migration: route left out (rproxy refused it)");
+								}
+								let message = isolate::message(&a.message).to_string();
+								for owner in owners {
+									let content = isolate::content(&rules[i], &owner);
+									excluded.push(status::Excluded {
+										rule_key: rule_key.clone(),
+										owner,
+										message: message.clone(),
+										content,
+										since: std::time::Instant::now(),
+									});
+								}
+								rules[i] = isolate::without(
+									&rules[i],
+									&excluded.iter().filter(|e| e.rule_key == rule_key).map(|e| e.owner.clone()).collect(),
+								);
+							} else {
+								let rule = rules.remove(i);
+								warn!(pod = ep.pod, set = plan.ruleset, error = %a, "rproxy refused a rule; applying the others");
+								rejected.push(refused_view(&rule, &a.message));
+								// the whole rule is out: its routes' own exclusions say nothing more
+								excluded.retain(|e| e.rule_key != rule_key);
+							}
 							if_match = None;
 							if let Ok(Some(cur)) = rp.get_ruleset(addr, &plan.ruleset).await {
 								if_match = Some(cur.etag);
@@ -1165,6 +1262,10 @@ pub async fn sync_pod(
 						}
 						None => {
 							warn!(pod = ep.pod, set = plan.ruleset, error = %a, "rproxy refused the rule set");
+							applied.insert(
+								key.clone(),
+								AppliedSet { hash, etag: current_etag, rejected: vec![], excluded: vec![], refused: Some(a.to_string()) },
+							);
 							return (PodSync::Rejected(a.to_string()), false);
 						}
 					}
@@ -1176,17 +1277,23 @@ pub async fn sync_pod(
 	for r in answer.results.iter().filter(|r| r.error.is_some()) {
 		info!(pod = ep.pod, set = plan.ruleset, rule = r.rule, error = r.error.as_deref().unwrap_or(""), "rule not running");
 	}
-	applied.insert(key.clone(), (hash, answer.etag.clone(), rejected.clone()));
+	applied.insert(
+		key.clone(),
+		AppliedSet { hash, etag: Some(answer.etag.clone()), rejected: rejected.clone(), excluded: excluded.clone(), refused: None },
+	);
 	match rp.get_ruleset(addr, &plan.ruleset).await {
 		Ok(Some(set)) => {
 			// a rule failing on a file the kubelet has just written is tried again soon
 			let again = set.rules.iter().any(|r| r.state == "failed");
 			if again {
-				applied.remove(&key);
+				// PUT again next time; the routes left out stay remembered (no dry runs again)
+				if let Some(a) = applied.get_mut(&key) {
+					a.hash.clear();
+				}
 			}
 			let mut views = set.rules;
 			views.extend(rejected);
-			(PodSync::Synced(views), again)
+			(PodSync::Synced(views, excluded), again)
 		}
 		Ok(None) => (PodSync::Pending(format!("pod {}: the rule set disappeared", ep.pod)), true),
 		Err(e) => (PodSync::NotReady(format!("pod {}: {e:#}", ep.pod)), true),

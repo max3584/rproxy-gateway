@@ -2163,3 +2163,129 @@ spec: {proxyProtocol: {from: [172.16.0.0/12], listeners: [pg]}}
 	assert_eq!(pp(&p, "tcp", 5432), Some(json!({"from": ["172.16.0.0/12"], "required": true})), "the Gateway's replaces the class's");
 	assert_eq!(pp(&p, "tcp", 80), Some(Value::Null));
 }
+
+/// One tenant's bad value (a regular expression rproxy cannot compile, a header value with CR/LF,
+/// a malformed RproxyMiddleware) leaves out that route only: the other routes on the shared port go on (#92).
+#[test]
+fn one_route_with_a_bad_value_leaves_the_port_up() {
+	let (crt, key) = crate::pem::tests::pair("example.com");
+	let secret = format!(
+		"\n---\napiVersion: v1\nkind: Secret\nmetadata: {{name: cert, namespace: default}}\ntype: kubernetes.io/tls\nstringData:\n  tls.crt: |\n{}\n  tls.key: |\n{}\n",
+		indent(&crt),
+		indent(&key)
+	);
+	let routes = r#"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: good, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  hostnames: [good.example.com]
+  rules: [{backendRefs: [{name: web, port: 80}]}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: regex, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  rules:
+    - matches: [{path: {type: RegularExpression, value: "/a("}}]
+      backendRefs: [{name: web, port: 80}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: header, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  rules:
+    - matches: [{headers: [{type: RegularExpression, name: x-a, value: "[z"}]}]
+      backendRefs: [{name: web, port: 80}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: inject, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  rules:
+    - filters: [{type: RequestHeaderModifier, requestHeaderModifier: {set: [{name: x-a, value: "1\r\nx-evil: 1"}]}}]
+      backendRefs: [{name: web, port: 80}]
+---
+apiVersion: rproxy.max3584.net/v1alpha1
+kind: RproxyMiddleware
+metadata: {name: two, namespace: default}
+spec: {headers: {}, retry: {attempts: 2}}
+---
+apiVersion: rproxy.max3584.net/v1alpha1
+kind: RproxyMiddleware
+metadata: {name: unknown-field, namespace: default}
+spec: {retry: {attempts: 2, bogus: true}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: field, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  rules:
+    - filters: [{type: ExtensionRef, extensionRef: {group: rproxy.max3584.net, kind: RproxyMiddleware, name: unknown-field}}]
+      backendRefs: [{name: web, port: 80}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: mw, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  rules:
+    - filters: [{type: ExtensionRef, extensionRef: {group: rproxy.max3584.net, kind: RproxyMiddleware, name: two}}]
+      backendRefs: [{name: web, port: 80}]
+"#;
+	let yaml =
+		format!("{BASE}{secret}{}{routes}", gw("  - {name: https, port: 443, protocol: HTTPS, tls: {certificateRefs: [{name: cert}]}}"));
+	let p = plan(&yaml);
+	let rules = p.rules_json();
+	let rule = rules.iter().find(|r| r["listen_port"] == 443).expect("the port is still served");
+	let names: Vec<&str> = rule["http"]["routes"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect();
+	assert_eq!(names, ["default/good/r0/m0/h0"]);
+	let text = serde_json::to_string(rule).unwrap();
+	assert!(!text.contains("x-evil") && !text.contains("/a("), "{text}");
+	for bad in ["regex", "header", "inject", "mw", "field"] {
+		let parent = p.parents.iter().find(|x| x.name == bad).unwrap();
+		let c = cond(&parent.conds, "Accepted");
+		assert_eq!((c.status, c.reason.as_str()), (false, "UnsupportedValue"), "{bad}: {c:?}");
+	}
+	assert!(cond(&p.parents.iter().find(|x| x.name == "good").unwrap().conds, "Accepted").status);
+	assert!(p.listeners[0].conds.iter().all(|c| c.kind != "Accepted" || c.status));
+}
+
+/// Hostnames of more specific listeners (a ListenerSet's) become `!Host` terms: past rproxy's limit
+/// of matchers in one expression the route is left out, not the port.
+#[test]
+fn too_many_terms_leave_out_the_route() {
+	let mut listeners = String::from("  - {name: any, port: 80, protocol: HTTP}\n");
+	for i in 0..300 {
+		listeners.push_str(&format!("  - {{name: h{i}, port: 80, protocol: HTTP, hostname: h{i}.example.com}}\n"));
+	}
+	let routes = r#"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: wide, namespace: default}
+spec:
+  parentRefs: [{name: gw, sectionName: any}]
+  rules: [{backendRefs: [{name: web, port: 80}]}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: narrow, namespace: default}
+spec:
+  parentRefs: [{name: gw, sectionName: h1}]
+  rules: [{backendRefs: [{name: web, port: 80}]}]
+"#;
+	let p = plan(&format!("{BASE}{}{routes}", gw(listeners.trim_end())));
+	let rules = p.rules_json();
+	let names: Vec<&str> = rules[0]["http"]["routes"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect();
+	assert_eq!(names, ["default/narrow/r0/m0/h0"]);
+	let wide = p.parents.iter().find(|x| x.name == "wide").unwrap();
+	let c = cond(&wide.conds, "Accepted");
+	assert!(!c.status && c.message.contains("more than 256"), "{c:?}");
+}

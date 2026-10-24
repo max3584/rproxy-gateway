@@ -359,7 +359,7 @@ spec:
 	let mut applied = Applied::new();
 	let mut caps_cache = HashMap::new();
 	let (r, _) = sync_pod(&client, &ep, &plan, &mut applied, &mut caps_cache).await;
-	let PodSync::Synced(views) = r else { panic!("{r:?}\nrules: {}", serde_json::to_string_pretty(&plan.rules_json()).unwrap()) };
+	let PodSync::Synced(views, _) = r else { panic!("{r:?}\nrules: {}", serde_json::to_string_pretty(&plan.rules_json()).unwrap()) };
 	for v in &views {
 		assert_eq!(v.state, "running", "{} {:?} {:?}", v.key(), v.error, v.conditions);
 		assert_eq!(v.condition("Programmed").status, "True", "{}", v.key());
@@ -456,7 +456,7 @@ spec:
 
 	// nothing changed: no PUT; the set still has the etag of the last PUT
 	let (r, again) = sync_pod(&client, &ep, &plan, &mut applied, &mut caps_cache).await;
-	assert!(matches!(r, PodSync::Synced(_)) && !again);
+	assert!(matches!(r, PodSync::Synced(..)) && !again);
 
 	// rproxy restarts: the set is gone and is PUT again
 	drop(rp);
@@ -464,7 +464,7 @@ spec:
 	rp.wait().await;
 	let mut caps_cache = HashMap::new();
 	let (r, _) = sync_pod(&client, &ep, &plan, &mut applied, &mut caps_cache).await;
-	assert!(matches!(&r, PodSync::Synced(v) if v.iter().all(|v| v.state == "running")), "{r:?}");
+	assert!(matches!(&r, PodSync::Synced(v, _) if v.iter().all(|v| v.state == "running")), "{r:?}");
 	assert_eq!(get(http_port, "web.example.com", "/app/again").await.0, 200);
 	drop(rp);
 	let _ = std::fs::remove_dir_all(&dir);
@@ -542,7 +542,7 @@ endpoints: [{{addresses: [127.0.0.1]}}]
 		};
 		let plan = render::render_gateway(&world, &world.gateways[i], &opts);
 		let (r, _) = sync_pod(&client, &ep, &plan, &mut applied, &mut caps_cache).await;
-		let PodSync::Synced(views) = r else { panic!("{r:?}") };
+		let PodSync::Synced(views, _) = r else { panic!("{r:?}") };
 		let key = format!("tcp/{vip}:{port}");
 		let v = views.iter().find(|v| v.key() == key).unwrap_or_else(|| panic!("{key}: {views:?}"));
 		if i < 2 {
@@ -675,7 +675,7 @@ spec:
 	let mut applied = Applied::new();
 	let mut caps_cache = HashMap::new();
 	let (r, _) = sync_pod(&client, &ep, &plan, &mut applied, &mut caps_cache).await;
-	let PodSync::Synced(views) = r else { panic!("{r:?}\nrules: {}", serde_json::to_string_pretty(&plan.rules_json()).unwrap()) };
+	let PodSync::Synced(views, _) = r else { panic!("{r:?}\nrules: {}", serde_json::to_string_pretty(&plan.rules_json()).unwrap()) };
 	assert_eq!(views.len(), 3);
 	for v in &views {
 		assert_eq!(v.state, "running", "{} {:?}", v.key(), v.error);
@@ -693,4 +693,89 @@ spec:
 	assert!(!body.contains("203.0.113.7"), "{body}");
 	drop(rp);
 	let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// One tenant's bad value does not take the shared port down (#92): a route with a regular
+/// expression rproxy cannot compile is left out while rendering, and a route rproxy refuses
+/// anyway (put into the rule here, past the checks) is left out of the rule rproxy took, the
+/// other routes on the port served.
+#[tokio::test]
+async fn a_bad_route_leaves_the_port_up_on_a_real_rproxy() {
+	let Some(bin) = rproxy_bin() else { return };
+	let _ = rustls::crypto::ring::default_provider().install_default();
+	let dir = std::env::temp_dir().join(format!("rproxy-gateway-isolate-{}", std::process::id()));
+	let _ = std::fs::remove_dir_all(&dir);
+	std::fs::create_dir_all(&dir).unwrap();
+	let backend = echo_backend().await;
+	let [port, api] = free_ports();
+	let rp = Rproxy::start(&bin, &dir, api);
+	rp.wait().await;
+	let client = Client::new(None, TOKEN).unwrap();
+	let caps = client.capabilities(SocketAddr::from(([127, 0, 0, 1], api))).await.unwrap();
+	let yaml = format!(
+		r#"
+apiVersion: v1
+kind: Service
+metadata: {{name: echo, namespace: default}}
+spec: {{ports: [{{name: http, port: 80}}]}}
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata: {{name: echo-1, namespace: default, labels: {{kubernetes.io/service-name: echo}}}}
+addressType: IPv4
+ports: [{{name: http, port: {backend}}}]
+endpoints: [{{addresses: [127.0.0.1]}}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {{name: gw, namespace: default, generation: 1}}
+spec:
+  gatewayClassName: rproxy
+  listeners: [{{name: http, port: {port}, protocol: HTTP}}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {{name: good, namespace: default}}
+spec:
+  parentRefs: [{{name: gw}}]
+  hostnames: [good.example.com]
+  rules: [{{backendRefs: [{{name: echo, port: 80}}]}}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {{name: regex, namespace: tenant}}
+spec:
+  parentRefs: [{{name: gw, namespace: default}}]
+  rules:
+    - matches: [{{path: {{type: RegularExpression, value: "/a("}}}}]
+      backendRefs: [{{name: echo, namespace: default, port: 80}}]
+"#
+	);
+	let mut world = World::default();
+	world.read_manifests(&yaml).unwrap();
+	let opts = render::Options { listen_addrs: vec!["127.0.0.1".into()], features: render::Features::of(&caps), ..Default::default() };
+	let mut plan = render::render_gateway(&world, &world.gateways[0], &opts);
+	let regex = plan.parents.iter().find(|p| p.name == "regex").unwrap();
+	assert!(regex.conds.iter().any(|c| c.kind == "Accepted" && !c.status), "{:?}", regex.conds);
+	// past the checks: rproxy refuses the rule, the controller leaves out this route only
+	let http = plan.rules[0].http.as_mut().unwrap();
+	http.routes.push(rproxy_gateway::rproxy::model::HttpRoute {
+		name: "tenant/evil/r0/m0/h0".into(),
+		rule: "PathRegexp(`(`)".into(),
+		priority: Some(100),
+		service: http.routes[0].service.clone(),
+		..Default::default()
+	});
+	let ep = Endpoint { pod: "rproxy".into(), uid: "1".into(), ip: "127.0.0.1".into(), api_port: api, ..Default::default() };
+	let mut applied = Applied::new();
+	let mut caps_cache = HashMap::new();
+	let (r, _) = sync_pod(&client, &ep, &plan, &mut applied, &mut caps_cache).await;
+	let PodSync::Synced(views, excluded) = &r else { panic!("{r:?}\nrules: {}", serde_json::to_string(&plan.rules_json()).unwrap()) };
+	assert!(views.iter().all(|v| v.state == "running"), "{views:?}");
+	assert_eq!(excluded.iter().map(|e| e.owner.as_str()).collect::<Vec<_>>(), ["tenant/evil"], "{excluded:?}");
+	// found by the name at the head of rproxy's answer (what the controller trusts)
+	assert!(excluded[0].message.starts_with("route tenant/evil/r0/m0/h0: "), "{excluded:?}");
+	let (status, body) = get(port, "good.example.com", "/x").await;
+	assert_eq!(status, 200, "{body}");
+	assert!(body.ends_with("/x|good.example.com|"), "{body}");
 }

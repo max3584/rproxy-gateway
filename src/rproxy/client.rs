@@ -218,6 +218,13 @@ impl Client {
 		Ok(self.json(addr, Method::PUT, &format!("/rulesets/{name}"), &headers, Some(body)).await?.0)
 	}
 
+	/// `PUT /rulesets/{name}?dry_run=true`: whether rproxy would take the set (nothing changes).
+	pub async fn put_ruleset_dry_run(&self, addr: SocketAddr, name: &str, generation: i64, rules: &[Value]) -> anyhow::Result<()> {
+		let body = serde_json::to_vec(&RulesetRequest { generation, rules })?;
+		let (status, _, bytes) = self.send(addr, Method::PUT, &format!("/rulesets/{name}?dry_run=true"), &[], Some(body)).await?;
+		if status.is_success() { Ok(()) } else { bail!(api_error(status, &bytes)) }
+	}
+
 	pub async fn delete_ruleset(&self, addr: SocketAddr, name: &str) -> anyhow::Result<()> {
 		let (status, _, bytes) = self.send(addr, Method::DELETE, &format!("/rulesets/{name}"), &[], None).await?;
 		if status.is_success() || status == StatusCode::NOT_FOUND { Ok(()) } else { bail!(api_error(status, &bytes)) }

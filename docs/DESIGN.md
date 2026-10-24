@@ -101,8 +101,14 @@ rproxy は `RPROXY_API_ADDR=0.0.0.0`、`RPROXY_API_PORT=9443`、`RPROXY_TOKEN_FI
 1. Pod の `GET /capabilities`（`features.rulesets` がなければ「rproxy v0.4.0 以降が要る」として `Programmed: False`）。`features.labels` がなければ `labels` を外して送る。
 2. `GET /readyz` が ready になるまで待つ（`features.readyz` がない rproxy は待たない）。
 3. `GET /rulesets/{name}`。前回 PUT したものと同じ内容・同じ etag なら何もしない。違えば（中身が変わった、rproxy が再起動してセットがない、ほかの誰かが変えた）`PUT /rulesets/{name}`。`generation` は Gateway の `metadata.generation`（rproxy にあるほうが大きければそちら。作り直した Gateway が `stale_generation` にならないように）、`If-Match` は今の etag。
-4. rproxy が 1 つのルールを断ったら（`400`、`rules[i]: ...`）、そのルールを外して残りを PUT し直す（RproxyRule や移行したルートの 1 つの誤りでセット全体を止めない）。断られたルールは `Accepted: False`（`Invalid`）として状態に書く。
+4. rproxy が 1 つのルールを断ったら（`400`、`rules[i]: ...`）、そのルールを外して残りを PUT し直す（RproxyRule や移行したルートの 1 つの誤りでセット全体を止めない）。断られたルールは `Accepted: False`（`Invalid`）として状態に書く。HTTP・HTTPS のポートのルールは、そのポートのすべてのテナントの HTTPRoute・GRPCRoute をまとめているので、ルールごとではなく、rproxy が断ったルートだけを外す（#92）：rproxy の答えの先頭（`rules[i]: ` のすぐ後の `route <名前>:`・`middleware <名前>:`・`service <名前>:`）が挙げるルート・ミドルウェア・サービスを使うルートを、先頭が名前を挙げなければルートを半分ずつ dry run（`?dry_run=true`、1 回の反映で 24 回まで）で試して見つける。答えの先頭より後は信じない（rproxy はテナントが書いた値（アドレス、時間など）をそのまま返すので、ほかのテナントのルートの名前を書けてしまう）。外したルートは、そのルートの `Accepted: False`（`UnsupportedValue`、rproxy の答え）になり、ほかのルートはそのまま動く。移行の IngressRoute・Ingress のルートを外したときは、その資源の名前を warn のログに出す。ルートを外しても断られるとき（ルート以外の誤り）、外すルートが 1 つのセットで 64 を超えるとき、dry run を使い切ったときは、これまでどおりそのルールだけを外す（ルールを外すのは 32 まで。超えたらセットを断られたものとする）。dry run が答えを得られないとき（つながらない、時間切れ、5xx）は何も外さず、少し後にやり直す。外したルートは、その中身（ルートとそれだけが使うもの）が変わらないあいだ 5 分は rproxy に聞き直さずに外したままにし、ほかのテナントの変更のたびに dry run をやり直さない。rproxy がセット全体を断ったときも、計画と rproxy のセットが変わるまで PUT し直さない。
 5. PUT のあとの `GET /rulesets/{name}` のルールの `conditions` から状態を書く。`failed` のルールがあれば、少し後にもう一度 PUT する（kubelet が書いたばかりのファイルなど）。
+
+rproxy が断るものは、なるべく描く段階で見つける（`src/render/validate.rs`）：ルートごとに、rproxy と同じ規則で `match` の式（構文、項は 256 まで、括弧と `!` の深さは 32 まで。ListenerSet などのより細かいリスナーのホスト名は `!Host` の項になる）、正規表現（rproxy と同じ `regex` crate、同じ既定のサイズの上限）、ヘッダの名前と値（`http` crate。CR・LF・NUL などの制御文字は通さない）、ミドルウェアの形と値を確かめる。形は rproxy-api の `MiddlewareSpec` の serde のとおり（ちょうど 1 つの既知の種類、種類ごとの項目と型、知らない項目は通さない。rproxy は読めない本文のセット全体を `rules[i]` なしで断るので、ここで止める）、値は rproxy の `MiddlewareSpec::validate`・`Middleware::compile` のとおり（正規表現・パス・CIDR（64 まで）・状態コード・時間・URL・CORS・rate_limit・in_flight・crowdsec・geoip・forward_auth・oidc・basic_auth など。`headers` の `cors` はヘッダの値としてだけ確かめる）。通らないルートは `Accepted: False`（`UnsupportedValue`）にして外し、同じポートのほかのルートは描く。移行した IngressRoute・Ingress のルートも同じ確かめで、通らないものは外して注記する。
+
+## Secret と ConfigMap の読み方
+
+コントローラは Secret と ConfigMap をメタデータだけで list・watch する（kube の `Api<PartialObjectMeta<K>>`。Accept ヘッダ `as=PartialObjectMetadataList` / `PartialObjectMetadata` で、API サーバは `data` を送らない。クラスタに大きな ConfigMap がたくさんあっても、中身をメモリに持たない。#92）。中身を読むのは、描くときに参照されたもの（`certificateRefs`、CA の ConfigMap・Secret、移行の Secret、managed の制御 API の Secret）だけ：反映のたびにまず Gateway を描いて参照を集め、まだ読んでいない・変わった（`resourceVersion` が違う）ものを `GET` で読み、参照されなくなったものは忘れる。watch の通知（作る・変える・消す）はこれまでどおり反映のきっかけになる。
 
 ## 変換（Gateway API → rproxy）
 

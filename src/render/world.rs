@@ -33,9 +33,11 @@ pub struct World {
 	pub services: BTreeMap<Key, Service>,
 	/// Keyed by (namespace, Service name).
 	pub slices: BTreeMap<Key, Vec<EndpointSlice>>,
-	pub secrets: BTreeMap<Key, Secret>,
-	/// ConfigMaps with a `ca.crt` (CA certificates).
-	pub config_maps: BTreeMap<Key, ConfigMap>,
+	/// Secrets that can be certificates (or users files). In the controller only the ones rendering
+	/// asks for are read in full (`Objects::asked`, #92).
+	pub secrets: Objects<Secret>,
+	/// ConfigMaps with a `ca.crt` (CA certificates); read as the Secrets are.
+	pub config_maps: Objects<ConfigMap>,
 	/// Namespace labels.
 	pub namespaces: BTreeMap<String, BTreeMap<String, String>>,
 	pub middlewares: BTreeMap<Key, RproxyMiddleware>,
@@ -47,6 +49,46 @@ pub struct World {
 	pub allow_external_name: bool,
 	/// Ingress and Traefik resources (only when migration is on).
 	pub migration: MigrationInput,
+}
+
+/// Objects by key that remember which keys were looked up: the controller reads in full only
+/// the Secrets and ConfigMaps something refers to, not every one in the cluster (#92).
+#[derive(Default)]
+pub struct Objects<T> {
+	items: BTreeMap<Key, T>,
+	asked: std::sync::Mutex<std::collections::BTreeSet<Key>>,
+}
+
+impl<T> Objects<T> {
+	pub fn get(&self, key: &Key) -> Option<&T> {
+		if let Ok(mut a) = self.asked.lock() {
+			if !a.contains(key) {
+				a.insert(key.clone());
+			}
+		}
+		self.items.get(key)
+	}
+
+	pub fn insert(&mut self, key: Key, value: T) {
+		self.items.insert(key, value);
+	}
+
+	/// The keys looked up so far (present or not).
+	pub fn asked(&self) -> std::collections::BTreeSet<Key> {
+		self.asked.lock().map(|a| a.clone()).unwrap_or_default()
+	}
+}
+
+impl<T: Clone> Clone for Objects<T> {
+	fn clone(&self) -> Self {
+		Objects { items: self.items.clone(), asked: Default::default() }
+	}
+}
+
+impl<T> std::fmt::Debug for Objects<T> {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_list().entries(self.items.keys()).finish()
+	}
 }
 
 impl World {
