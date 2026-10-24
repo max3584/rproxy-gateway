@@ -2289,3 +2289,47 @@ spec:
 	let c = cond(&wide.conds, "Accepted");
 	assert!(!c.status && c.message.contains("more than 256"), "{c:?}");
 }
+
+/// An RproxyMiddleware using what the rproxy pods do not take yet (an older rproxy) is refused on
+/// its route, not sent: rproxy would refuse the whole set (#95).
+#[test]
+fn rproxy_middleware_fields_follow_the_pods() {
+	let yaml = format!(
+		"{BASE}{}{}",
+		gw("  - {name: http, port: 80, protocol: HTTP}"),
+		r#"
+---
+apiVersion: rproxy.max3584.net/v1alpha1
+kind: RproxyMiddleware
+metadata: {name: auth, namespace: default}
+spec: {forward_auth: {service: default/web/r0, path: /check}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: auth, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  rules:
+    - filters: [{type: ExtensionRef, extensionRef: {group: rproxy.max3584.net, kind: RproxyMiddleware, name: auth}}]
+      backendRefs: [{name: web, port: 80}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: plain, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  hostnames: [plain.example.com]
+  rules: [{backendRefs: [{name: web, port: 80}]}]
+"#
+	);
+	let w = world(&yaml);
+	let new = render_gateway(&w, &w.gateways[0], &Options::default());
+	assert!(cond(&new.parents.iter().find(|p| p.name == "auth").unwrap().conds, "Accepted").status);
+	let old = Options { features: Features { fa_service: false, ..Default::default() }, ..Default::default() };
+	let p = render_gateway(&w, &w.gateways[0], &old);
+	let c = cond(&p.parents.iter().find(|p| p.name == "auth").unwrap().conds, "Accepted");
+	assert!(!c.status && c.message.contains("forward_auth service"), "{c:?}");
+	assert!(cond(&p.parents.iter().find(|p| p.name == "plain").unwrap().conds, "Accepted").status);
+	let text = serde_json::to_string(&p.rules_json()).unwrap();
+	assert!(!text.contains("forward_auth") && text.contains("plain.example.com"), "{text}");
+}

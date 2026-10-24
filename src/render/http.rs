@@ -553,6 +553,8 @@ fn filter(ctx: &Ctx, ns: &str, f: &HttpRouteFilter, m: &HttpRouteMatch, base: &s
 							return Err(format!("RproxyMiddleware {}: {path}: only this Gateway's certificate files may be named", r.name));
 						}
 					}
+					// what the rproxy pods do not take yet would make them refuse the whole set (#95)
+					crate::render::validate::supported(&v, ctx.features).map_err(|e| format!("RproxyMiddleware {}: {e}", r.name))?;
 					vec![v]
 				}
 				None => return Ok(Filtered::Missing),

@@ -238,6 +238,14 @@ pub struct Features {
 	pub ext_auth_grpc: bool,
 	/// ... with the body: `forward_body`.
 	pub ext_auth_body: bool,
+	/// Each field of `forward_auth` rproxy takes (`features.forward_auth`, rproxy v0.4.3), for an
+	/// RproxyMiddleware: `service` (and `path`), `grpc`, `client_request`, `allow_status`,
+	/// `all_response_headers` (`response_headers: ["*"]`).
+	pub fa_service: bool,
+	pub fa_grpc: bool,
+	pub fa_client_request: bool,
+	pub fa_allow_status: bool,
+	pub fa_all_response_headers: bool,
 	/// `connect_timeout` of L4 tcp rules (rproxy v0.4.3, `features.connect_timeout`).
 	pub connect_timeout: bool,
 	/// `proxy_protocol` of tcp rules: PROXY headers from the front ends (rproxy v0.4.13, `features.proxy_protocol_in`).
@@ -270,6 +278,11 @@ impl Default for Features {
 			ext_auth_http: true,
 			ext_auth_grpc: true,
 			ext_auth_body: true,
+			fa_service: true,
+			fa_grpc: true,
+			fa_client_request: true,
+			fa_allow_status: true,
+			fa_all_response_headers: true,
 			connect_timeout: true,
 			proxy_protocol_in: true,
 		}
@@ -302,6 +315,11 @@ impl Features {
 			ext_auth_http: ["service", "client_request", "allow_status", "all_response_headers"].iter().all(|n| c.lists("forward_auth", n)),
 			ext_auth_grpc: ["service", "grpc"].iter().all(|n| c.lists("forward_auth", n)),
 			ext_auth_body: c.lists("forward_auth", "forward_body"),
+			fa_service: c.lists("forward_auth", "service"),
+			fa_grpc: c.lists("forward_auth", "grpc"),
+			fa_client_request: c.lists("forward_auth", "client_request"),
+			fa_allow_status: c.lists("forward_auth", "allow_status"),
+			fa_all_response_headers: c.lists("forward_auth", "all_response_headers"),
 			connect_timeout: c.feature("connect_timeout"),
 			proxy_protocol_in: c.feature("proxy_protocol_in"),
 		}
@@ -332,6 +350,11 @@ impl Features {
 			ext_auth_http: self.ext_auth_http && o.ext_auth_http,
 			ext_auth_grpc: self.ext_auth_grpc && o.ext_auth_grpc,
 			ext_auth_body: self.ext_auth_body && o.ext_auth_body,
+			fa_service: self.fa_service && o.fa_service,
+			fa_grpc: self.fa_grpc && o.fa_grpc,
+			fa_client_request: self.fa_client_request && o.fa_client_request,
+			fa_allow_status: self.fa_allow_status && o.fa_allow_status,
+			fa_all_response_headers: self.fa_all_response_headers && o.fa_all_response_headers,
 			connect_timeout: self.connect_timeout && o.connect_timeout,
 			proxy_protocol_in: self.proxy_protocol_in && o.proxy_protocol_in,
 		}
