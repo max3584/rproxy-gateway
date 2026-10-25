@@ -185,6 +185,14 @@ rbac:
   # a ClusterRole aggregated to namespace admins (not edit): they write RproxyGatewayParameters for
   # their Gateways (bounded by the GatewayClass's parameters' policy)
   aggregateToAdmin: true
+  # a ValidatingAdmissionPolicy (Kubernetes 1.30 or later) narrowing the controller's writes to Services,
+  # Secrets, ServiceAccounts, Deployments, NetworkPolicies, PodDisruptionBudgets and pods to the objects
+  # it made (app.kubernetes.io/managed-by: rproxy-gateway; pods: app.kubernetes.io/name: rproxy). Off by
+  # default; with controller.watchNamespaces it bounds what the ClusterRole/Roles allow (docs/SECURITY.md)
+  admissionPolicy:
+    enabled: false
+    # Deny; [Warn, Audit] to try it first (the API server warns and logs instead of refusing)
+    validationActions: [Deny]
 
 imagePullSecrets: []
 

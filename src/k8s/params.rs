@@ -353,6 +353,11 @@ pub struct ParamsPolicy {
 	/// not bound it, so it fully trusts whoever may write one; false turns them off.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub rproxy_rules: Option<bool>,
+	/// Annotation prefixes this class's Gateways may put on their Service though they pick load balancer
+	/// addresses or DNS names (kept off by default: metallb.io/, external-dns.alpha.kubernetes.io/, ...),
+	/// besides the controller's --service-annotation-prefix. For classes whose tenants are trusted with them.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub service_annotation_prefixes: Option<Vec<String>>,
 }
 
 /// What tenants' middlewares may use (the GatewayClass's `policy.middlewares`).

@@ -156,15 +156,18 @@ pub struct AppliedSet {
 	pub hash: String,
 	/// The etag rproxy answered (refused: the set's etag before, `None` without a set).
 	pub etag: Option<String>,
-	/// The rules rproxy refused.
+	/// The rules rproxy refused (as a whole: not HTTP, an RproxyRule, or past `MAX_EXCLUDED`), and
+	/// since when (asked again after `EXCLUDED_FOR` even with the plan unchanged, #98).
 	pub rejected: Vec<RuleView>,
+	pub rejected_since: Option<std::time::Instant>,
 	/// The routes left out of rules rproxy refused.
 	pub excluded: Vec<status::Excluded>,
 	/// rproxy refused the whole set (not asked again until the plan or the set changes, or
 	/// `EXCLUDED_FOR` has passed), and since when.
 	pub refused: Option<(String, std::time::Instant)>,
-	/// Dry runs got no answer: (not before, failures in a row); the pass waits longer each time.
-	pub backoff: Option<(std::time::Instant, u32)>,
+	/// Dry runs got no answer: (not before, failures in a row, the plan's hash then); the pass waits
+	/// longer each time while the plan is the same (a changed plan is tried at once, #98).
+	pub backoff: Option<(std::time::Instant, u32, String)>,
 }
 
 impl AppliedSet {
@@ -173,6 +176,12 @@ impl AppliedSet {
 	fn stale(&self) -> bool {
 		self.excluded.iter().any(|e| e.since.elapsed() >= EXCLUDED_FOR)
 			|| self.refused.as_ref().is_some_and(|(_, at)| at.elapsed() >= EXCLUDED_FOR)
+			|| (!self.rejected.is_empty() && self.rejected_since.is_some_and(|at| at.elapsed() >= EXCLUDED_FOR))
+	}
+
+	/// The backoff for the plan with `hash` (wait until, failures in a row): none once the plan changed.
+	fn backoff_for(&self, hash: &str) -> Option<(std::time::Instant, u32)> {
+		self.backoff.as_ref().filter(|(_, _, h)| h == hash).map(|(until, n, _)| (*until, *n))
 	}
 }
 
@@ -833,7 +842,11 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 			let mut t = provision::Target::new(&plan);
 			t.labels = infra.labels.clone();
 			t.annotations = infra.annotations.clone();
-			t.service_annotations = p.cfg.service_annotations.clone();
+			// the controller's prefixes and the class's (policy.serviceAnnotationPrefixes)
+			t.service_annotations = render::params::service_annotation_prefixes(
+				&p.cfg.service_annotations,
+				plan.parameters.as_ref().and_then(|s| s.policy.as_ref()),
+			);
 			t.params = plan.parameters.clone().unwrap_or_default();
 			t.graceful = graceful(p.rp, &t.rproxy_image(m), &eps, &mut sub.caps).await;
 			// rproxy v0.4.2 reads a changed token file again: the UI's token does not roll the pods
@@ -1201,8 +1214,8 @@ pub async fn sync_pod(
 			}
 		}
 	}
-	// dry runs got no answer lately: wait (longer each time) before asking again
-	if let Some((until, n)) = previous.as_ref().and_then(|p| p.backoff) {
+	// dry runs got no answer lately: wait (longer each time) before asking again, unless the plan changed
+	if let Some((until, n)) = previous.as_ref().and_then(|p| p.backoff_for(&hash)) {
 		if std::time::Instant::now() < until {
 			return (PodSync::NotReady(format!("pod {}: dry runs got no answer ({n} in a row); waiting", ep.pod)), true);
 		}
@@ -1249,18 +1262,19 @@ pub async fn sync_pod(
 									Ok(f) => f,
 									// no answer to a dry run: nothing is left out on that account; again later
 									Err(e) => {
-										let n = previous.as_ref().and_then(|p| p.backoff).map_or(0, |(_, n)| n) + 1;
+										let n = previous.as_ref().and_then(|p| p.backoff_for(&hash)).map_or(0, |(_, n)| n) + 1;
 										let until = std::time::Instant::now() + backoff(n);
 										let entry = applied.entry(key.clone()).or_insert_with(|| AppliedSet {
 											hash: String::new(),
 											etag: None,
 											rejected: vec![],
+											rejected_since: None,
 											excluded: vec![],
 											refused: None,
 											backoff: None,
 										});
 										entry.hash.clear();
-										entry.backoff = Some((until, n));
+										entry.backoff = Some((until, n, hash.clone()));
 										return (PodSync::NotReady(format!("pod {}: {e}", ep.pod)), true);
 									}
 								}
@@ -1313,6 +1327,7 @@ pub async fn sync_pod(
 									hash,
 									etag: current_etag,
 									rejected: vec![],
+									rejected_since: None,
 									excluded: vec![],
 									refused: Some((a.to_string(), std::time::Instant::now())),
 									backoff: None,
@@ -1336,6 +1351,7 @@ pub async fn sync_pod(
 			hash: if unfinished { String::new() } else { hash },
 			etag: Some(answer.etag.clone()),
 			rejected: rejected.clone(),
+			rejected_since: (!rejected.is_empty()).then(std::time::Instant::now),
 			excluded: excluded.clone(),
 			refused: None,
 			backoff: None,

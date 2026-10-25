@@ -119,7 +119,7 @@ configMapGenerator:
 ```
 
 - `config/` は chart の既定の値を `scripts/render-config.sh` で描いたもの（手で直さない。CI が chart との食い違いを見つける）。
-- RBAC の形が変わる値（`controller.watchNamespaces` の namespace ごとの Role）や、chart がほかの物を足す値（`migration.createIngressClass`）は Helm で入れる。
+- RBAC の形が変わる値（`controller.watchNamespaces` の namespace ごとの Role）や、chart がほかの物を足す値（`migration.createIngressClass`、`rbac.admissionPolicy.enabled` の ValidatingAdmissionPolicy）は Helm で入れる。
 
 ## 可用性（`managed.replicas` が 2 以上）
 

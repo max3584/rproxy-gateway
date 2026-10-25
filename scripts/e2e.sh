@@ -390,6 +390,20 @@ kubectl -n e2e delete gateway steal-dns > /dev/null
 kubectl -n e2e delete rproxyrule steal-key > /dev/null
 test "$(kubectl -n e2e get networkpolicy -l gateway.networking.k8s.io/gateway-name=e2e -o name | wc -l)" = 1
 
+if kubectl get validatingadmissionpolicybinding rproxy-gateway-managed-only > /dev/null 2>&1; then
+  echo "== rbac.admissionPolicy: the controller writes only what it made (labelled managed-by)"
+  as=--as=system:serviceaccount:$NS:rproxy-gateway
+  kubectl -n e2e create secret generic not-ours --from-literal=a=b > /dev/null
+  denied() { ! kubectl "$as" "$@" > "$work/vap.out" 2>&1 && grep -q managed-by "$work/vap.out"; }
+  retry 30 denied -n e2e annotate secret not-ours x=y
+  denied -n e2e label secret not-ours app.kubernetes.io/managed-by=rproxy-gateway
+  denied -n e2e delete secret not-ours
+  denied -n default annotate svc kubernetes x=y
+  # its own: allowed (the rest of this test runs with the policy on)
+  kubectl "$as" -n e2e annotate svc -l rproxy.max3584.net/gateway e2e-vap=1 --overwrite --dry-run=server > /dev/null
+  kubectl -n e2e delete secret not-ours > /dev/null
+fi
+
 echo "== availability: readiness gate, graceful shutdown, grace period"
 rp_json=$(kubectl -n e2e get pods -l gateway.networking.k8s.io/gateway-name=e2e,app.kubernetes.io/name=rproxy -o json)
 jq -e '.items[0].status.conditions[] | select(.type == "rproxy.max3584.net/ruleset-applied") | .status == "True"' <<< "$rp_json" > /dev/null

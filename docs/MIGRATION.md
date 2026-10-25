@@ -9,6 +9,7 @@ English: [en/MIGRATION.md](en/MIGRATION.md)
 - 変換は rproxy-api の `rproxy-traefik-convert`（docs/MIGRATING-FROM-TRAEFIK.md）と同じ実装（crate `rproxy-traefik`）を使う。ルーターのルールとミドルウェアの対応はファイルプロバイダから移すときと同じで、違うのは Kubernetes の部分（Service・Secret・namespace・ReferenceGrant）だけ。変換できないものは外して、コントローラのログ（`migration: not converted`、内容が変わったときに 1 回）と `rproxy-gateway render` の `notes` に出す。
 - 移行先の Gateway に同じポートのリスナーがあれば、そのルールに足す（`http` どうし・TLS の有無が同じとき）。合わなければ移行するほうを外す。
 - 移行したルートは Traefik と同じ優先（`priority`、なければ `match` の長さ）。Gateway API のルートの `priority` は 1 からの番号なので、同じポートでは移行したルートが先に試されることが多い。
+- **移行は Gateway のリスナーの `allowedRoutes` を見ない**。移行するリソース（`--ingress-class` の Ingress、IngressRoute）を書ける人は、大きな `priority` の IngressRoute で、同じポートの HTTPRoute の host への要求を自分の backend に向けられる。移行するリソースを書ける人を移行先の Gateway の持ち主と同じくらい信頼できるときだけ使い、できれば移行のためだけの Gateway（ほかのテナントの HTTPRoute を受けないポート）を移行先にする（[SECURITY.md](SECURITY.md) の「移行（Ingress・Traefik）とルートの優先」）。
 
 ## フラグ
 

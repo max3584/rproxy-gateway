@@ -286,8 +286,13 @@ pub fn policy_ancestors(previous: Option<&Value>, ours: Vec<Value>, controller: 
 		.cloned()
 		.collect();
 	out.extend(ours);
+	// the CRDs allow 16 (GEP-713): more and the API server refuses the whole status
+	out.truncate(MAX_ANCESTORS);
 	out
 }
+
+/// Most entries of a policy's `status.ancestors` (`maxItems` of the Gateway API CRDs).
+pub const MAX_ANCESTORS: usize = 16;
 
 /// GatewayClass `status`.
 /// A GatewayClass's `status`; `invalid`: why its parametersRef cannot be used (`InvalidParameters`).

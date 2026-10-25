@@ -431,7 +431,7 @@ fn external_auth(
 	let svc_ns = b.namespace.clone().unwrap_or_else(|| ns.to_string());
 	let policy = backends::port_name(ctx.world, ns, b)
 		.and_then(|port| ctx.backend_tls.and_then(|i| i.get(&svc_ns, &b.name, port.as_deref())).cloned());
-	if let Some(i) = ctx.backend_tls {
+	if let Some(i) = ctx.backend_tls.filter(|_| backends::referable(ctx.world, ctx.kind, ns, b)) {
 		out.tls_policies.extend(i.naming(&svc_ns, &b.name).cloned());
 	}
 	let tls = match policy {
@@ -723,8 +723,9 @@ pub fn build(ctx: &Ctx, route: &HttpRoute, hosts: Option<&[String]>, exclusions:
 			let svc_ns = b.backend.namespace.clone().unwrap_or_else(|| ns.clone());
 			let policy = backends::port_name(ctx.world, &ns, &b.backend)
 				.and_then(|port| ctx.backend_tls.and_then(|i| i.get(&svc_ns, &b.backend.name, port.as_deref())).cloned());
-			if let Some(i) = ctx.backend_tls {
-				// the policies naming the Service get status for this Gateway (conflicted ones too)
+			if let Some(i) = ctx.backend_tls.filter(|_| backends::referable(ctx.world, ctx.kind, &ns, &b.backend)) {
+				// the policies naming the Service get status for this Gateway (conflicted ones too); not
+				// without a ReferenceGrant to the Service (#101)
 				out.tls_policies.extend(i.naming(&svc_ns, &b.backend.name).cloned());
 			}
 			let resolved = match (&policy, backends::resolve(ctx.world, ctx.kind, &ns, &b.backend)) {

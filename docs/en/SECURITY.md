@@ -23,7 +23,9 @@ What the controller trusts, and what tenants (whoever can write Gateways and rou
 | Item | Default | How to change |
 |---|---|---|
 | `spec.addresses` (managed: the Service's `externalIPs`) | **off** (`Programmed: False`, `AddressNotUsable`). Even within allowed ranges, another Service's ClusterIP, externalIPs or LB IP cannot be taken (the CVE-2020-8554 shape) | `managed.addressCIDRs` / `--address-cidr`; never include the Service or pod ranges |
-| `spec.infrastructure.annotations` onto the Service | annotations that pick addresses or load balancers (`metallb.universe.tf/`, `lbipam.cilium.io/`, `service.beta.kubernetes.io/`, ...) stay off the Service (pods and the ServiceAccount get them) | `managed.serviceAnnotationPrefixes` / `--service-annotation-prefix` |
+| `spec.infrastructure.annotations` onto the Service | annotations that pick addresses, load balancers or DNS names stay off the Service (pods and the ServiceAccount get them). What is refused is a list of known prefixes (MetalLB, Cilium, kube-vip, PureLB, OpenELB, LoxiLB, Calico, Kube-OVN, `service.beta.kubernetes.io/`, `service.kubernetes.io/` and the clouds' own (GKE, Hetzner, OpenStack, OCI, DigitalOcean, Tencent, Huawei, Yandex), external-dns, kops DNS, k8s_gateway (`coredns.io/`), Tailscale; the list is `SERVICE_ANNOTATION_DENY` in `src/render/params.rs`), **not everything**: with a load balancer or DNS controller that reads other annotations, tenants can take addresses or names through them | cluster-wide: `managed.serviceAnnotationPrefixes` / `--service-annotation-prefix`. Per class: `policy.serviceAnnotationPrefixes` of the GatewayClass's parameters (v0.4.18; open it only on classes of trusted tenants) |
+| Status of BackendTLSPolicies in other namespaces | a Service's BackendTLSPolicies get the Gateway in `status.ancestors` only from routes whose backendRef to it a ReferenceGrant allows (v0.4.18; before, a reference that was not allowed was enough). `ancestors` stop at 16, the CRDs' limit | — |
+| Precedence of migrated (Ingress, Traefik) routes | migration does not look at Gateways' `allowedRoutes`. Whoever can write what is migrated (Ingresses of `--ingress-class`, IngressRoutes) can send requests for the host of an HTTPRoute on the same port to their own backend with an IngressRoute's `priority` ("Migration" below) | — |
 | ExternalName Services as backends | **off** (`ResolvedRefs: False`): they can name anything (the API server, other namespaces, metadata endpoints) | `controller.allowExternalNameServices` / `--allow-external-name-services` |
 | Files RproxyRules and RproxyMiddlewares name (`*_file`, `file`, `*_path`) | only the Gateway's own certificate files in the certificate directory; others get `Accepted: False` / `UnsupportedValue` | — |
 | Services RproxyMiddlewares name (`errors.service`, `mirror.service`, `forward_auth.service`) | only the rules of the HTTPRoute using it (a rule's `name`, `r<i>`, `<namespace>/<route>/r<i>`; the controller rewrites them to that route's rproxy service names). Another route's service (one port's rproxy rule holds every tenant's services on that port) gets `Accepted: False` / `UnsupportedValue`. When the named rule has no usable backend, the name answers 500 (`forward_auth` lets nothing through) | — |
@@ -35,7 +37,43 @@ What the controller trusts, and what tenants (whoever can write Gateways and rou
 | Migration (Ingress, Traefik) references to other namespaces (Services, Middlewares, TLSOptions, the errors service) | not converted without a ReferenceGrant in the target namespace (from `traefik.io` `IngressRoute*`, `Middleware`), as Traefik's `allowCrossNamespace=false` | `migration.allowCrossNamespace` / `--migration-allow-cross-namespace` |
 | Ingress paths | not converted with backticks, quotes, control characters, or not starting with `/` (they are embedded in a `match` expression) | — |
 | Ingress `defaultBackend` | only from the target Gateway's namespace | — |
-| A Gateway's `RproxyGatewayParameters` (`infrastructure.parametersRef`, same namespace only) | only replicas (up to `policy.maxReplicas`, 10 by default), PDB, resources, pod and Service labels and annotations, topology spread, externalTrafficPolicy, source ranges, ipFamilyPolicy, logLevel, performance. Annotations that pick load balancer addresses only through the allow list above (others: `InvalidParameters`). `service.type`, `loadBalancerClass`, nodeSelector, tolerations, affinity, priorityClassName, `proxyProtocol` (the peers whose PROXY protocol headers are believed: they can claim to be any client) are off by default. Never rproxy's image, extra environment variables or `policy`; never labels or annotations with the controller's prefixes (`rproxy.max3584.net/`, ...) | `policy` of the GatewayClass's `RproxyGatewayParameters` (the chart's `managed.parameters`): `gatewayOverrides`, `maxReplicas`, `allowedPriorityClasses`, `allowedLoadBalancerClasses`. The image and environment variables cannot be opened ([DESIGN-v0.4.x.md](DESIGN-v0.4.x.md), 2.5). `policy.middlewares` (what tenants' middlewares reach) is the class's only too (15. there) |
+| A Gateway's `RproxyGatewayParameters` (`infrastructure.parametersRef`, same namespace only) | only replicas (up to `policy.maxReplicas`, 10 by default), PDB, resources, pod and Service labels and annotations, topology spread, externalTrafficPolicy, source ranges, ipFamilyPolicy, logLevel, performance. Annotations that pick load balancer addresses only through the allow list above (others: `InvalidParameters`). `service.type`, `loadBalancerClass`, nodeSelector, tolerations, affinity, priorityClassName, `proxyProtocol` (the peers whose PROXY protocol headers are believed: they can claim to be any client) are off by default. Never rproxy's image, extra environment variables or `policy`; never labels or annotations with the controller's prefixes (`rproxy.max3584.net/`, ...) | `policy` of the GatewayClass's `RproxyGatewayParameters` (the chart's `managed.parameters`): `gatewayOverrides`, `maxReplicas`, `allowedPriorityClasses`, `allowedLoadBalancerClasses`, `serviceAnnotationPrefixes`. The image and environment variables cannot be opened ([DESIGN-v0.4.x.md](DESIGN-v0.4.x.md), 2.5). `policy.middlewares` (what tenants' middlewares reach) is the class's only too (15. there) |
+
+## Classes and namespaces
+
+A GatewayClass is cluster-wide, and its `policy` **cannot limit which namespaces' Gateways use the class**. A class with a loose `policy` (wider `gatewayOverrides`, `serviceAnnotationPrefixes` or `middlewares.outboundHosts` opened, `rproxyRules` left on, ...) is open to every tenant that can write a Gateway naming it in `gatewayClassName`. To keep tenants apart, limit the namespaces that may use loose classes with admission (Gatekeeper, Kyverno, or a ValidatingAdmissionPolicy on Kubernetes 1.30 or later). For example, only namespaces labelled `rproxy.example.com/trusted: "true"` may use the class `rproxy-trusted`:
+
+```yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata: {name: rproxy-trusted-class}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - {apiGroups: [gateway.networking.k8s.io], apiVersions: ["*"], operations: [CREATE, UPDATE], resources: [gateways]}
+  validations:
+    - expression: >-
+        object.spec.gatewayClassName != "rproxy-trusted" ||
+        (has(namespaceObject.metadata.labels) && "rproxy.example.com/trusted" in namespaceObject.metadata.labels &&
+         namespaceObject.metadata.labels["rproxy.example.com/trusted"] == "true")
+      message: the GatewayClass rproxy-trusted is for trusted namespaces only
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata: {name: rproxy-trusted-class}
+spec: {policyName: rproxy-trusted-class, validationActions: [Deny]}
+```
+
+Keep tenants from writing namespace labels (do not give them update on namespaces).
+
+## Migration (Ingress, Traefik) and route precedence
+
+With `migration.migrateTo`, Ingress and Traefik routes go into the target Gateway's rule set ([MIGRATION.md](MIGRATION.md)). Migration does not look at the listeners' `allowedRoutes` (which namespaces' routes a Gateway accepts), and migrated routes keep Traefik's precedence (`priority`, else the length of `match`), so they are often tried before Gateway API routes. So **whoever can write what is migrated can take requests for another tenant's HTTPRoute host on the same port (`` Host(`app.example.com`) ``) with an IngressRoute of a high `priority`**.
+
+- Use migration only when the writers of Ingresses and IngressRoutes are trusted as much as the target Gateway's owner.
+- Migrate into a Gateway of its own (listeners and ports that do not take other tenants' HTTPRoutes).
+- Limit with RBAC who can write `traefik.io` CRDs and Ingresses of `--ingress-class`.
 
 ## Keys from other namespaces (M7)
 
@@ -46,7 +84,11 @@ When `certificateRefs` (or `spec.tls.backend.clientCertificateRef`) names a Secr
 
 ## The controller's permissions (M10)
 
-- By default the controller has a ClusterRole over Gateway API kinds, Secrets, Services, Deployments, ServiceAccounts, NetworkPolicies, PodDisruptionBudgets and Pods (patch; `pods/status` patch for rproxy pods' readiness gate) in every namespace (it deploys rproxy into Gateways' namespaces and certificates may be referenced from anywhere). It sets the readiness gate condition only on pods that declare it. A compromised controller can read every Secret in the cluster.
+- By default the controller's ClusterRole has, **in every namespace**, get, list, watch, create, update, patch and delete on Secrets, Services, ServiceAccounts, Deployments, NetworkPolicies and PodDisruptionBudgets, patch on Pods (the certificate annotation) and `pods/status` (the readiness gate), reads of Gateway API kinds and writes of their status (managed mode deploys rproxy into Gateways' namespaces, and certificates may be referenced from anywhere). It sets the readiness gate condition only on pods that declare it.
+- So a compromised controller can read every Secret in the cluster, create Deployments (any pod, any ServiceAccount of that namespace), Services and Secrets in any namespace, and change or delete others. On clusters shared by tenants:
+  - `controller.watchNamespaces` (below) narrows the permissions to Roles in the namespaces that hold Gateways (the only way to narrow reading Secrets).
+  - `rbac.admissionPolicy.enabled: true` (v0.4.18, Kubernetes 1.30 or later, off by default): the chart installs a ValidatingAdmissionPolicy `rproxy-gateway-managed-only` letting the controller's ServiceAccount create, update and delete Services, Secrets, ServiceAccounts, Deployments, NetworkPolicies and PodDisruptionBudgets only when they carry `app.kubernetes.io/managed-by: rproxy-gateway` (before and after the change: adding the label does not take an object over), and only update rproxy's pods (`app.kubernetes.io/name: rproxy`, the fleet's too). Reads, statuses (`pods/status`, Gateway API kinds) and the leader election Lease are not covered, and new labelled objects (a Deployment, say) can still be made, so bound pods' shape too (Pod Security Admission or the like). Try it first with `rbac.admissionPolicy.validationActions: [Warn, Audit]`. A Secret you make by hand for the controller to update (the control API token, say) needs that label.
+  - Together, the controller writes only what it made in the namespaces it watches, and reads only within those namespaces.
 - The chart aggregates a ClusterRole `rproxy-gateway-parameters-edit` (read and write `rproxygatewayparameters`) to namespace admins (`rbac.authorization.k8s.io/aggregate-to-admin`; not to edit; `rbac.aggregateToAdmin: false` turns it off). The class's `policy` bounds what they can set. A GatewayClass's `parametersRef` is used only in the controller's namespace, so tenants cannot change the class's defaults.
 - With `controller.watchNamespaces` (`--watch-namespaces`) it watches only those namespaces (and its own), and the chart makes a Role in each. The ClusterRole keeps only GatewayClasses and namespaces (allowedRoutes selectors).
 

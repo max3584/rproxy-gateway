@@ -180,6 +180,8 @@ jobs:
       - name: scripts/e2e.sh
         env:
           MIGRATE: e2e/e2e
+          # the optional ValidatingAdmissionPolicy (Kubernetes 1.30+) on: the controller works within it
+          HELM_ARGS: --set rbac.admissionPolicy.enabled=true
         run: scripts/e2e.sh
 
   conformance:

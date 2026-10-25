@@ -1183,6 +1183,10 @@ fn route_backend_tls(
 	let mut found = None;
 	for b in route.spec.rules.iter().flat_map(|r| &r.backend_refs) {
 		let svc_ns = b.namespace.clone().unwrap_or_else(|| ns.clone());
+		// no ReferenceGrant to the Service: neither its policy nor status for it (#101)
+		if !backends::referable(world, "TLSRoute", &ns, b) {
+			continue;
+		}
 		used.extend(index.naming(&svc_ns, &b.name).cloned());
 		if found.is_some() {
 			continue;

@@ -97,6 +97,7 @@ spec:
       outboundHosts: [auth.example.com]                   # omitted: no URL out
       applyToMigrated: false                              # true: bind middlewares migrated from Traefik too
     rproxyRules: true                   # 15.: false turns RproxyRules off (policy.middlewares does not bound them)
+    serviceAnnotationPrefixes: []        # address/DNS annotations Gateways may put on the Service (v0.4.18)
 ```
 
 ### 2.2 Fields
@@ -147,7 +148,7 @@ The default column applies when neither reference sets the field; each is the v0
 | Field | From a Gateway's reference (tenant) | Why |
 |---|---|---|
 | replicas, PDB, resources, pod labels and annotations, topology spread, externalTrafficPolicy, source ranges, ipFamilyPolicy, Service labels, logLevel, performance, shutdown, ui | allowed by default | stays in their namespace; amounts are bounded by ResourceQuota, LimitRange and `maxReplicas` |
-| Service annotations | allowed, but prefixes that pick load balancer addresses (`metallb.universe.tf/`, ...) only through the allow list (`--service-annotation-prefix`); others are `InvalidParameters` | the same line as v0.4's `spec.infrastructure.annotations` (the CVE-2020-8554 pattern). A reference gets an error instead of a silent drop |
+| Service annotations | allowed, but prefixes that pick load balancer addresses (`metallb.universe.tf/`, ...) only through the allow lists (`--service-annotation-prefix`, the class's `policy.serviceAnnotationPrefixes`); others are `InvalidParameters` | the same line as v0.4's `spec.infrastructure.annotations` (the CVE-2020-8554 pattern). A reference gets an error instead of a silent drop |
 | `service.type`, `loadBalancerClass` | not by default | can take outside addresses (the class's `policy` opens them) |
 | nodeSelector, tolerations, affinity, priorityClassName | not by default | dedicated nodes, the control plane, evicting others (the class's `policy` opens them) |
 | `proxyProtocol` | not by default | decides which peers can claim to be any client through the header (tenants must not make rproxy believe others' headers; the class's `policy` opens it) |
