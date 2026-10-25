@@ -166,7 +166,8 @@ pub struct AppliedSet {
 	/// `EXCLUDED_FOR` has passed), and since when.
 	pub refused: Option<(String, std::time::Instant)>,
 	/// Dry runs got no answer: (not before, failures in a row, the plan's hash then); the pass waits
-	/// longer each time while the plan is the same (a changed plan is tried at once, #98).
+	/// longer each time while the plan is the same. A changed plan (a route fixed) is tried after
+	/// `PLAN_CHANGED_RETRY` instead (#98), not at once: endpoints changing while scaling change the plan too.
 	pub backoff: Option<(std::time::Instant, u32, String)>,
 }
 
@@ -179,11 +180,22 @@ impl AppliedSet {
 			|| (!self.rejected.is_empty() && self.rejected_since.is_some_and(|at| at.elapsed() >= EXCLUDED_FOR))
 	}
 
-	/// The backoff for the plan with `hash` (wait until, failures in a row): none once the plan changed.
+	/// The backoff for the plan with `hash` (wait until, failures in a row). Another plan waits at most
+	/// `PLAN_CHANGED_RETRY` after the last failure; the failures keep counting.
 	fn backoff_for(&self, hash: &str) -> Option<(std::time::Instant, u32)> {
-		self.backoff.as_ref().filter(|(_, _, h)| h == hash).map(|(until, n, _)| (*until, *n))
+		self.backoff.as_ref().map(|(until, n, h)| {
+			if h == hash {
+				return (*until, *n);
+			}
+			let failed_at = until.checked_sub(backoff(*n)).unwrap_or(*until);
+			((*until).min(failed_at + PLAN_CHANGED_RETRY), *n)
+		})
 	}
 }
+
+/// The least wait after dry runs without an answer when the plan has changed since (a fixed route is
+/// tried soon; endpoints changing on every pass while scaling do not ask every pass).
+const PLAN_CHANGED_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The wait after dry runs without an answer: 2 s, doubling, at most a minute.
 fn backoff(failures: u32) -> std::time::Duration {
@@ -711,9 +723,20 @@ async fn write_ancestors<'a>(
 		if mine.is_empty() && !had {
 			continue;
 		}
-		let new = json!({ "ancestors": status::policy_ancestors(prev.as_ref(), mine, &cfg.controller_name) });
+		let (ancestors, dropped) = status::policy_ancestors(prev.as_ref(), mine, &cfg.controller_name);
+		let new = json!({ "ancestors": ancestors });
 		if prev.as_ref().map(|p| &p["ancestors"]) == Some(&new["ancestors"]) {
 			continue;
+		}
+		// logged when written (not every pass)
+		if dropped > 0 {
+			warn!(
+				kind,
+				policy = format!("{}/{}", key.0, key.1),
+				dropped,
+				max = status::MAX_ANCESTORS,
+				"too many Gateways for the policy's status.ancestors; the last ones (by namespace and name) are left out"
+			);
 		}
 		if let Some(api) = dyn_api(client, cache, kind, Some(&key.0)) {
 			if let Err(e) = patch_status(&api, &key.1, new).await {

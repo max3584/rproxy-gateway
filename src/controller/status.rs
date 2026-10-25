@@ -276,8 +276,9 @@ pub fn policy_entry(p: &crate::render::policy::PolicyStatus, controller: &str, p
 	})
 }
 
-/// The policy's new `status.ancestors`: other controllers' entries kept, ours replaced.
-pub fn policy_ancestors(previous: Option<&Value>, ours: Vec<Value>, controller: &str) -> Vec<Value> {
+/// The policy's new `status.ancestors`: other controllers' entries kept, ours replaced (in a stable order:
+/// by the ancestor's namespace and name), and how many of ours did not fit.
+pub fn policy_ancestors(previous: Option<&Value>, mut ours: Vec<Value>, controller: &str) -> (Vec<Value>, usize) {
 	let mut out: Vec<Value> = previous
 		.and_then(|s| s["ancestors"].as_array())
 		.into_iter()
@@ -285,10 +286,16 @@ pub fn policy_ancestors(previous: Option<&Value>, ours: Vec<Value>, controller: 
 		.filter(|e| e["controllerName"] != controller)
 		.cloned()
 		.collect();
+	let key = |e: &Value| {
+		let r = &e["ancestorRef"];
+		[&r["namespace"], &r["name"], &r["sectionName"]].map(|v| v.as_str().unwrap_or_default().to_string())
+	};
+	ours.sort_by_key(key);
 	out.extend(ours);
 	// the CRDs allow 16 (GEP-713): more and the API server refuses the whole status
+	let dropped = out.len().saturating_sub(MAX_ANCESTORS);
 	out.truncate(MAX_ANCESTORS);
-	out
+	(out, dropped)
 }
 
 /// Most entries of a policy's `status.ancestors` (`maxItems` of the Gateway API CRDs).
@@ -330,6 +337,25 @@ pub fn refused_features(error: &str) -> bool {
 mod tests {
 	use super::*;
 	use crate::render::ListenerPlan;
+
+	/// At most 16 ancestors (the CRDs' limit): other controllers' first, ours sorted by namespace and name,
+	/// so the same ones are left out every time whatever the order they come in (#101).
+	#[test]
+	fn policy_ancestors_are_capped_in_a_stable_order() {
+		let entry = |ns: &str, name: &str, ctl: &str| json!({"ancestorRef": {"namespace": ns, "name": name}, "controllerName": ctl});
+		let prev = json!({"ancestors": [entry("x", "theirs", "other.example.com/c"), entry("a", "old", "me")]});
+		let mut ours: Vec<Value> = (0..20).map(|i| entry("ns", &format!("gw{i:02}"), "me")).collect();
+		let (a, dropped) = policy_ancestors(Some(&prev), ours.clone(), "me");
+		ours.reverse();
+		let (b, _) = policy_ancestors(Some(&prev), ours, "me");
+		assert_eq!(a, b, "the order they come in does not matter");
+		assert_eq!((a.len(), dropped), (MAX_ANCESTORS, 5));
+		assert_eq!(a[0]["controllerName"], "other.example.com/c", "other controllers' entries kept");
+		assert_eq!(a[1]["ancestorRef"]["name"], "gw00");
+		assert_eq!(a[15]["ancestorRef"]["name"], "gw14");
+		let (c, dropped) = policy_ancestors(Some(&prev), vec![entry("ns", "gw", "me")], "me");
+		assert_eq!((c.len(), dropped), (2, 0), "ours replaced");
+	}
 
 	#[test]
 	fn the_status_for_older_crds_has_no_features() {

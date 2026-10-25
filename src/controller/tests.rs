@@ -684,11 +684,18 @@ async fn a_failed_dry_run_drops_nothing() {
 	assert!(matches!(&r, PodSync::NotReady(m) if m.contains("waiting")), "{r:?}");
 	assert_eq!(fake.lock().unwrap().puts.len(), puts);
 	assert!(backoff(1) < backoff(2) && backoff(10) == std::time::Duration::from_secs(60));
-	// the plan changed (the user fixed a route): asked at once, the count starts again (#98)
+	// the plan changed (the user fixed a route, or endpoints moved): not at once, but after
+	// `PLAN_CHANGED_RETRY` rather than the whole wait; the failures keep counting (#98)
 	let p2 = http_plan(443, &[("a/one", false), ("b/bad", true), ("c/new", false)]);
 	let (r, _) = sync_pod(&rp, &ep, &p2, &mut applied, &mut caps).await;
+	assert!(matches!(&r, PodSync::NotReady(m) if m.contains("waiting")), "{r:?}");
+	for a in applied.values_mut() {
+		// the last failure was `PLAN_CHANGED_RETRY` ago; its own wait (a minute) is not over
+		a.backoff = a.backoff.take().map(|(_, _, h)| (std::time::Instant::now() + backoff(10) - PLAN_CHANGED_RETRY, 10, h));
+	}
+	let (r, _) = sync_pod(&rp, &ep, &p2, &mut applied, &mut caps).await;
 	assert!(matches!(&r, PodSync::NotReady(m) if !m.contains("waiting")), "{r:?}");
-	assert!(applied.values().all(|a| a.backoff.as_ref().is_some_and(|(_, n, _)| *n == 1)));
+	assert!(applied.values().all(|a| a.backoff.as_ref().is_some_and(|(_, n, h)| *n == 11 && !h.is_empty())));
 	let puts = fake.lock().unwrap().puts.len();
 	let (r, _) = sync_pod(&rp, &ep, &p2, &mut applied, &mut caps).await;
 	assert!(matches!(&r, PodSync::NotReady(m) if m.contains("waiting")), "{r:?}");

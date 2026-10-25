@@ -155,13 +155,15 @@ pub const SERVICE_ANNOTATION_DENY: &[&str] = &[
 /// Whether a tenant's annotation may go onto the Service (`allow`: prefixes the controller's
 /// `--service-annotation-prefix` and the class's `policy.serviceAnnotationPrefixes` let through).
 pub fn service_annotation_allowed(key: &str, allow: &[String]) -> bool {
-	allow.iter().any(|p| key.starts_with(p.as_str())) || !SERVICE_ANNOTATION_DENY.iter().any(|p| key.starts_with(p))
+	allow.iter().any(|p| !p.trim().is_empty() && key.starts_with(p.as_str())) || !SERVICE_ANNOTATION_DENY.iter().any(|p| key.starts_with(p))
 }
 
 /// The prefixes let through for a Gateway: the controller's and its class's `policy.serviceAnnotationPrefixes`.
 pub fn service_annotation_prefixes(controller: &[String], policy: Option<&crate::k8s::params::ParamsPolicy>) -> Vec<String> {
 	let mut out = controller.to_vec();
 	out.extend(policy.and_then(|p| p.service_annotation_prefixes.clone()).into_iter().flatten());
+	// never an empty prefix (it would let every annotation through)
+	out.retain(|p| !p.trim().is_empty());
 	out
 }
 
@@ -310,6 +312,10 @@ fn check_policy(spec: &Spec) -> Result<(), String> {
 				[DEFAULT_OVERRIDES, OPENABLE].concat().join(", ")
 			));
 		}
+	}
+	// an empty prefix would let every annotation through
+	if p.service_annotation_prefixes.iter().flatten().any(|a| a.trim().is_empty()) {
+		return Err("spec.policy.serviceAnnotationPrefixes: an empty prefix would allow every annotation; name the prefixes".into());
 	}
 	Ok(())
 }
@@ -963,6 +969,7 @@ spec:
 			)
 			.contains("policy.serviceAnnotationPrefixes")
 		);
+		assert!(err("  policy: {serviceAnnotationPrefixes: ['']}", "  replicas: 1").contains("empty prefix"));
 		// proxyProtocol: closed unless the class opens it (whose headers are believed is the administrator's call)
 		assert!(
 			err("  replicas: 1", "  proxyProtocol: {from: [10.0.0.0/8]}")
@@ -1081,6 +1088,9 @@ spec:
 			crate::k8s::params::ParamsPolicy { service_annotation_prefixes: Some(vec!["tailscale.com/".into()]), ..Default::default() };
 		let allow = service_annotation_prefixes(&["metallb.io/".into()], Some(&policy));
 		assert!(service_annotation_allowed("tailscale.com/expose", &allow) && service_annotation_allowed("metallb.io/ip", &allow));
+		// an empty prefix (a flag or a policy) opens nothing
+		let empty = crate::k8s::params::ParamsPolicy { service_annotation_prefixes: Some(vec!["".into()]), ..Default::default() };
+		assert!(!service_annotation_allowed("metallb.io/ip", &service_annotation_prefixes(&[" ".into()], Some(&empty))));
 		assert_eq!(set_paths(&Spec { replicas: Some(1), ..Default::default() }), vec!["replicas"]);
 	}
 }
