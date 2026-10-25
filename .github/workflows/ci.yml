@@ -96,3 +96,10 @@ jobs:
             kustomize build "$d" | kubeconform -strict -summary -ignore-missing-schemas -schema-location default \
               -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
           done
+          # the chart's optional ValidatingAdmissionPolicy (rbac.admissionPolicy, Kubernetes 1.30+)
+          echo "== chart with rbac.admissionPolicy.enabled"
+          helm template t charts/rproxy-gateway -n rproxy-gateway-system --kube-version 1.30.0 --set rbac.admissionPolicy.enabled=true |
+            kubeconform -strict -summary -ignore-missing-schemas -kubernetes-version 1.30.0 -schema-location default
+          if helm template t charts/rproxy-gateway --kube-version 1.29.0 --set rbac.admissionPolicy.enabled=true > /dev/null 2>&1; then
+            echo "::error::rbac.admissionPolicy must stop helm before Kubernetes 1.30"; exit 1
+          fi

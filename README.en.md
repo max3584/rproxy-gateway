@@ -119,7 +119,7 @@ configMapGenerator:
 ```
 
 - `config/` is the chart's defaults rendered by `scripts/render-config.sh` (not edited by hand; CI finds drift from the chart).
-- Values that change the shape of RBAC (`controller.watchNamespaces`: a Role per namespace) or make the chart add objects (`migration.createIngressClass`) need Helm.
+- Values that change the shape of RBAC (`controller.watchNamespaces`: a Role per namespace) or make the chart add objects (`migration.createIngressClass`, the ValidatingAdmissionPolicy of `rbac.admissionPolicy.enabled`) need Helm.
 
 ## Availability (`managed.replicas` 2 or more)
 

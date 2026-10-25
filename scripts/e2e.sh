@@ -390,6 +390,68 @@ kubectl -n e2e delete gateway steal-dns > /dev/null
 kubectl -n e2e delete rproxyrule steal-key > /dev/null
 test "$(kubectl -n e2e get networkpolicy -l gateway.networking.k8s.io/gateway-name=e2e -o name | wc -l)" = 1
 
+if kubectl get validatingadmissionpolicybinding rproxy-gateway-managed-only > /dev/null 2>&1; then
+  echo "== rbac.admissionPolicy: the controller writes only what it made (labelled managed-by)"
+  as=--as=system:serviceaccount:$NS:rproxy-gateway
+  kubectl -n e2e create secret generic not-ours --from-literal=a=b > /dev/null
+  denied() { ! kubectl "$as" "$@" > "$work/vap.out" 2>&1 && grep -q rbac.admissionPolicy "$work/vap.out"; }
+  retry 30 denied -n e2e annotate secret not-ours x=y
+  denied -n e2e label secret not-ours app.kubernetes.io/managed-by=rproxy-gateway
+  denied -n e2e delete secret not-ours
+  denied -n default annotate svc kubernetes x=y
+  # labelled, but not what it makes (dry runs: admission runs, nothing is kept)
+  managed='app.kubernetes.io/managed-by: rproxy-gateway'
+  denied -n e2e create --dry-run=server -f - <<YAML
+apiVersion: v1
+kind: Secret
+metadata: {name: vap-token, labels: {$managed}, annotations: {kubernetes.io/service-account.name: default}}
+type: kubernetes.io/service-account-token
+YAML
+  denied -n e2e create --dry-run=server -f - <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: rproxy-vap, labels: {$managed}}
+spec:
+  selector: {matchLabels: {app: vap}}
+  template:
+    metadata: {labels: {app: vap}}
+    spec:
+      serviceAccountName: rproxy-vap
+      automountServiceAccountToken: false
+      hostNetwork: true
+      securityContext: {runAsNonRoot: true}
+      containers: [{name: x, image: busybox, securityContext: {allowPrivilegeEscalation: false}}]
+YAML
+  denied -n e2e create --dry-run=server -f - <<YAML
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: rproxy-vap, labels: {$managed}}
+spec:
+  selector: {matchLabels: {app: vap}}
+  template:
+    metadata: {labels: {app: vap}}
+    spec:
+      serviceAccountName: default
+      securityContext: {runAsNonRoot: true}
+      containers: [{name: x, image: busybox, securityContext: {allowPrivilegeEscalation: false}}]
+YAML
+  denied -n e2e create secret generic vap-plain --from-literal=a=b --dry-run=server
+  rp_pod=$(kubectl -n e2e get pods -l gateway.networking.k8s.io/gateway-name=e2e,app.kubernetes.io/name=rproxy -o jsonpath='{.items[0].metadata.name}')
+  denied -n e2e patch pod "$rp_pod" --dry-run=server -p '{"spec":{"activeDeadlineSeconds":100}}'
+  # its own: allowed (the rest of this test runs with the policy on)
+  kubectl "$as" -n e2e annotate svc -l rproxy.max3584.net/gateway e2e-vap=1 --overwrite --dry-run=server > /dev/null
+  kubectl "$as" -n e2e annotate pod "$rp_pod" e2e-vap=1 --overwrite --dry-run=server > /dev/null
+  kubectl "$as" -n e2e create --dry-run=server -f - > /dev/null <<YAML
+apiVersion: v1
+kind: Secret
+metadata: {name: vap-opaque, labels: {$managed}}
+type: Opaque
+YAML
+  deploy_json=$(kubectl -n e2e get deploy -l gateway.networking.k8s.io/gateway-name=e2e -o json | jq '.items[0] | del(.metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.managedFields, .metadata.generation, .status) | .metadata.annotations["e2e-vap"] = "1"')
+  kubectl "$as" -n e2e replace --dry-run=server -f - > /dev/null <<< "$deploy_json"
+  kubectl -n e2e delete secret not-ours > /dev/null
+fi
+
 echo "== availability: readiness gate, graceful shutdown, grace period"
 rp_json=$(kubectl -n e2e get pods -l gateway.networking.k8s.io/gateway-name=e2e,app.kubernetes.io/name=rproxy -o json)
 jq -e '.items[0].status.conditions[] | select(.type == "rproxy.max3584.net/ruleset-applied") | .status == "True"' <<< "$rp_json" > /dev/null

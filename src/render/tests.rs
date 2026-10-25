@@ -1663,6 +1663,69 @@ spec:
 	assert_eq!(rpc["servers"][0]["url"], "https://10.0.5.1:8443");
 }
 
+/// A route naming another namespace's Service without a ReferenceGrant does not get that Service's
+/// BackendTLSPolicy status written for the Gateway (#101); with a grant it does.
+#[test]
+fn backend_tls_status_needs_a_reference_grant() {
+	let base = format!(
+		r#"{BASE}
+---
+apiVersion: v1
+kind: Namespace
+metadata: {{name: other}}
+---
+apiVersion: v1
+kind: Service
+metadata: {{name: secure, namespace: other}}
+spec: {{ports: [{{name: https, port: 443}}]}}
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata: {{name: secure-1, namespace: other, labels: {{kubernetes.io/service-name: secure}}}}
+addressType: IPv4
+ports: [{{name: https, port: 8443}}]
+endpoints: [{{addresses: [10.0.5.1]}}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: {{name: theirs, namespace: other}}
+spec:
+  targetRefs: [{{group: "", kind: Service, name: secure}}]
+  validation: {{wellKnownCACertificates: System, hostname: secure.example.com}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {{name: gw, namespace: default}}
+spec:
+  gatewayClassName: rproxy
+  listeners: [{{name: http, port: 80, protocol: HTTP}}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {{name: r, namespace: default}}
+spec:
+  parentRefs: [{{name: gw}}]
+  rules: [{{backendRefs: [{{name: secure, namespace: other, port: 443}}]}}]
+"#
+	);
+	let p = plan(&base);
+	assert!(p.backend_tls.is_empty(), "{:?}", p.backend_tls);
+	assert_eq!(cond(&p.parents[0].conds, "ResolvedRefs").reason, "RefNotPermitted");
+	let granted = format!(
+		r#"{base}
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata: {{name: g, namespace: other}}
+spec:
+  from: [{{group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: default}}]
+  to: [{{group: "", kind: Service}}]
+"#
+	);
+	let p = plan(&granted);
+	assert_eq!(p.backend_tls.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["theirs"]);
+}
+
 #[test]
 fn migration_respects_namespaces() {
 	let yaml = format!(

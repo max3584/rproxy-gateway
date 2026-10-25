@@ -585,6 +585,15 @@ spec:
                       not bound it, so it fully trusts whoever may write one; false turns them off.
                     nullable: true
                     type: boolean
+                  serviceAnnotationPrefixes:
+                    description: |-
+                      Annotation prefixes this class's Gateways may put on their Service though they pick load balancer
+                      addresses or DNS names (kept off by default: metallb.io/, external-dns.alpha.kubernetes.io/, ...),
+                      besides the controller's --service-annotation-prefix. For classes whose tenants are trusted with them.
+                    items:
+                      type: string
+                    nullable: true
+                    type: array
                 type: object
               proxyProtocol:
                 description: |-
@@ -948,6 +957,15 @@ spec:
                       not bound it, so it fully trusts whoever may write one; false turns them off.
                     nullable: true
                     type: boolean
+                  serviceAnnotationPrefixes:
+                    description: |-
+                      Annotation prefixes this class's Gateways may put on their Service though they pick load balancer
+                      addresses or DNS names (kept off by default: metallb.io/, external-dns.alpha.kubernetes.io/, ...),
+                      besides the controller's --service-annotation-prefix. For classes whose tenants are trusted with them.
+                    items:
+                      type: string
+                    nullable: true
+                    type: array
                 type: object
               proxyProtocol:
                 description: |-

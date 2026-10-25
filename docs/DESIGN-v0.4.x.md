@@ -97,6 +97,7 @@ spec:
       outboundHosts: [auth.example.com]                   # 省略：外への URL なし
       applyToMigrated: false                              # true：移行した Traefik の Middleware にも当てる
     rproxyRules: true                   # 15.：false で RproxyRule を切る（policy.middlewares は RproxyRule を縛らない）
+    serviceAnnotationPrefixes: []        # アドレス・DNS を決める注釈で Gateway が Service に付けてよい接頭辞（v0.4.18）
 ```
 
 ### 2.2 項目
@@ -147,7 +148,7 @@ spec:
 | 項目 | Gateway の参照（テナント） | 理由 |
 |---|---|---|
 | replicas・PDB・resources・Pod のラベル／注釈・topologySpread・externalTrafficPolicy・sourceRanges・ipFamilyPolicy・Service のラベル・logLevel・performance・shutdown・ui | 既定で許す | 自分の namespace の中で済む。量は ResourceQuota・LimitRange と `maxReplicas` で抑える |
-| Service の注釈 | 許すが、LB のアドレスを決める接頭辞（`metallb.universe.tf/` など）は許可リスト（`--service-annotation-prefix`）を通ったものだけ。ほかは `InvalidParameters` | v0.4 の `spec.infrastructure.annotations` と同じ線（CVE-2020-8554 の形）。参照では黙って落とさず誤りにする |
+| Service の注釈 | 許すが、LB のアドレスを決める接頭辞（`metallb.universe.tf/` など）は許可リスト（`--service-annotation-prefix`、クラスの `policy.serviceAnnotationPrefixes`）を通ったものだけ。ほかは `InvalidParameters` | v0.4 の `spec.infrastructure.annotations` と同じ線（CVE-2020-8554 の形）。参照では黙って落とさず誤りにする |
 | `service.type`・`loadBalancerClass` | 既定で許さない | 外へのアドレスを取れる（クラスの `policy` で開ける） |
 | nodeSelector・tolerations・affinity・priorityClassName | 既定で許さない | 専用ノード・コントロールプレーンに載る、ほかを追い出す（クラスの `policy` で開ける） |
 | `proxyProtocol` | 既定で許さない | ヘッダでどのクライアントにでも成りすませる接続元を決める（他人のヘッダを信じる設定をテナントが作れないように。クラスの `policy` で開ける） |

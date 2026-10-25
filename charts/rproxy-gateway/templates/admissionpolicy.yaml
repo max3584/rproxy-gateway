@@ -1,0 +1,118 @@
+{{- if .Values.rbac.admissionPolicy.enabled }}
+{{- if semverCompare "<1.30.0-0" .Capabilities.KubeVersion.Version }}
+{{- fail (printf "rbac.admissionPolicy needs Kubernetes 1.30 or later (ValidatingAdmissionPolicy v1); this cluster is %s" .Capabilities.KubeVersion.Version) }}
+{{- end }}
+# The controller's ClusterRole may write Services, Secrets, ServiceAccounts, Deployments, NetworkPolicies,
+# PodDisruptionBudgets and pods in every namespace it watches (what managed mode creates for each Gateway).
+# This policy narrows those writes to the objects the controller made: create, update and delete only what
+# carries app.kubernetes.io/managed-by: rproxy-gateway (before and after the change, so a label cannot be
+# added to take an object over). Pods: only annotations on its own or the fleet's. Secrets: Opaque only.
+# Deployments: rproxy's shape only (its own token-less ServiceAccount, nothing of the node, non-root).
+# Statuses (pods/status, Gateway API objects) and the leader election Lease are not covered (docs/SECURITY.md).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: rproxy-gateway-managed-only
+  labels: {{- include "rproxy-gateway.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["*"]
+        operations: [CREATE, UPDATE, DELETE]
+        resources: [services, secrets, serviceaccounts, pods]
+      - apiGroups: [apps]
+        apiVersions: ["*"]
+        operations: [CREATE, UPDATE, DELETE]
+        resources: [deployments]
+      - apiGroups: [networking.k8s.io]
+        apiVersions: ["*"]
+        operations: [CREATE, UPDATE, DELETE]
+        resources: [networkpolicies]
+      - apiGroups: [policy]
+        apiVersions: ["*"]
+        operations: [CREATE, UPDATE, DELETE]
+        resources: [poddisruptionbudgets]
+  matchConditions:
+    # the controller's ServiceAccount only
+    - name: controller
+      expression: request.userInfo.username == "system:serviceaccount:{{ .Release.Namespace }}:rproxy-gateway"
+  variables:
+    - name: kind
+      expression: request.resource.resource
+    - name: pod
+      expression: request.resource.resource == "pods"
+    # the fleet's pods (the chart's DaemonSet in this namespace; they carry no managed-by label)
+    - name: fleetPod
+      expression: >-
+        variables.pod && request.operation == "UPDATE" && request.namespace == "{{ .Release.Namespace }}" && has(oldObject.metadata.labels) &&
+        "app.kubernetes.io/name" in oldObject.metadata.labels && oldObject.metadata.labels["app.kubernetes.io/name"] == "rproxy" &&
+        "app.kubernetes.io/component" in oldObject.metadata.labels && oldObject.metadata.labels["app.kubernetes.io/component"] == "fleet"
+    # the object after the change (none on DELETE)
+    - name: newOurs
+      expression: >-
+        request.operation == "DELETE" || variables.fleetPod || (has(object.metadata.labels) &&
+          "app.kubernetes.io/managed-by" in object.metadata.labels && object.metadata.labels["app.kubernetes.io/managed-by"] == "rproxy-gateway")
+    # the object before the change (none on CREATE)
+    - name: oldOurs
+      expression: >-
+        request.operation == "CREATE" || variables.fleetPod || (has(oldObject.metadata.labels) &&
+          "app.kubernetes.io/managed-by" in oldObject.metadata.labels && oldObject.metadata.labels["app.kubernetes.io/managed-by"] == "rproxy-gateway")
+    # a Deployment's pod (what managed mode deploys: provision.rs deployment()); read only for Deployments
+    - name: podSpec
+      expression: object.spec.template.spec
+  validations:
+    - expression: variables.newOurs && variables.oldOurs
+      messageExpression: >-
+        "rproxy-gateway may only " + request.operation.lowerAscii() + " " + request.resource.resource +
+        " labelled app.kubernetes.io/managed-by: rproxy-gateway (rbac.admissionPolicy, docs/SECURITY.md)"
+      reason: Forbidden
+    # pods: only annotations (the certificate hash) on rproxy's pods, never their spec; no create or delete
+    - expression: "!variables.pod || (request.operation == 'UPDATE' && object.spec == oldObject.spec)"
+      message: rproxy-gateway only annotates rproxy's pods; it does not create, delete or change their spec (rbac.admissionPolicy)
+      reason: Forbidden
+    # Secrets: Opaque only (not a kubernetes.io/service-account-token Secret, which would get a token)
+    - expression: "variables.kind != 'secrets' || request.operation == 'DELETE' || !has(object.type) || object.type == 'Opaque'"
+      message: rproxy-gateway only makes Opaque Secrets (rbac.admissionPolicy)
+      reason: Forbidden
+    # ServiceAccounts: no token mounted from them
+    - expression: >-
+        variables.kind != "serviceaccounts" || request.operation == "DELETE" ||
+        (has(object.automountServiceAccountToken) && object.automountServiceAccountToken == false)
+      message: rproxy-gateway only makes ServiceAccounts with automountServiceAccountToken false (rbac.admissionPolicy)
+      reason: Forbidden
+    # Deployments: rproxy's shape. Its own ServiceAccount (named as the Deployment), no token, nothing of the
+    # node (host namespaces, hostPath, hostPort), Secret volumes only, non-root, no privilege or added capability
+    - expression: >-
+        variables.kind != "deployments" || request.operation == "DELETE" || (
+          object.metadata.name.startsWith("rproxy-") &&
+          has(variables.podSpec.serviceAccountName) && variables.podSpec.serviceAccountName == object.metadata.name &&
+          has(variables.podSpec.automountServiceAccountToken) && variables.podSpec.automountServiceAccountToken == false &&
+          !(has(variables.podSpec.hostNetwork) && variables.podSpec.hostNetwork) &&
+          !(has(variables.podSpec.hostPID) && variables.podSpec.hostPID) &&
+          !(has(variables.podSpec.hostIPC) && variables.podSpec.hostIPC) &&
+          (!has(variables.podSpec.initContainers) || size(variables.podSpec.initContainers) == 0) &&
+          (!has(variables.podSpec.volumes) || variables.podSpec.volumes.all(v, has(v.secret))) &&
+          has(variables.podSpec.securityContext) && has(variables.podSpec.securityContext.runAsNonRoot) &&
+          variables.podSpec.securityContext.runAsNonRoot == true &&
+          variables.podSpec.containers.all(c,
+            has(c.securityContext) && has(c.securityContext.allowPrivilegeEscalation) && c.securityContext.allowPrivilegeEscalation == false &&
+            !(has(c.securityContext.privileged) && c.securityContext.privileged) &&
+            !(has(c.securityContext.runAsNonRoot) && !c.securityContext.runAsNonRoot) &&
+            !(has(c.securityContext.capabilities) && has(c.securityContext.capabilities.add) && size(c.securityContext.capabilities.add) > 0) &&
+            (!has(c.ports) || c.ports.all(p, !has(p.hostPort) || p.hostPort == 0))))
+      message: >-
+        rproxy-gateway only deploys rproxy's pods: their own ServiceAccount (named as the Deployment) without a token,
+        no host namespaces, hostPath or hostPort, Secret volumes only, non-root, no privilege escalation or added capabilities (rbac.admissionPolicy)
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: rproxy-gateway-managed-only
+  labels: {{- include "rproxy-gateway.labels" . | nindent 4 }}
+spec:
+  policyName: rproxy-gateway-managed-only
+  validationActions: {{ toJson .Values.rbac.admissionPolicy.validationActions }}
+{{- end }}

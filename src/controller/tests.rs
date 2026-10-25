@@ -417,6 +417,14 @@ async fn a_refused_rule_does_not_stop_the_others() {
 	let (r, _) = sync_pod(&rp, &ep, &p, &mut applied, &mut caps).await;
 	assert!(matches!(&r, PodSync::Synced(v, _) if v.len() == 2), "{r:?}");
 	assert_eq!(fake.lock().unwrap().puts.len(), 2);
+	// after `EXCLUDED_FOR` the refused rule is asked again with the plan unchanged (#98)
+	for a in applied.values_mut() {
+		a.rejected_since = Some(std::time::Instant::now().checked_sub(EXCLUDED_FOR).unwrap());
+	}
+	let (r, _) = sync_pod(&rp, &ep, &p, &mut applied, &mut caps).await;
+	assert!(matches!(&r, PodSync::Synced(v, _) if v.len() == 2), "{r:?}");
+	assert_eq!(fake.lock().unwrap().puts.len(), 4, "asked again");
+	assert!(applied.values().all(|a| a.rejected_since.is_some_and(|at| at.elapsed() < EXCLUDED_FOR)));
 }
 
 /// rproxy refuses one tenant's route in the port's HTTP rule: only that route is left out (found by
@@ -668,7 +676,7 @@ async fn a_failed_dry_run_drops_nothing() {
 	let mut caps = HashMap::new();
 	let (r, again) = sync_pod(&rp, &ep, &p, &mut applied, &mut caps).await;
 	assert!(matches!(&r, PodSync::NotReady(m) if m.contains("dry run")) && again, "{r:?}");
-	assert!(applied.values().all(|a| a.hash.is_empty() && a.excluded.is_empty() && a.backoff.is_some_and(|(_, n)| n == 1)));
+	assert!(applied.values().all(|a| a.hash.is_empty() && a.excluded.is_empty() && a.backoff.as_ref().is_some_and(|(_, n, _)| *n == 1)));
 	assert!(fake.lock().unwrap().sets.is_empty(), "no set without the port's rule");
 	// the next pass waits before asking again (longer each time)
 	let puts = fake.lock().unwrap().puts.len();
@@ -676,10 +684,26 @@ async fn a_failed_dry_run_drops_nothing() {
 	assert!(matches!(&r, PodSync::NotReady(m) if m.contains("waiting")), "{r:?}");
 	assert_eq!(fake.lock().unwrap().puts.len(), puts);
 	assert!(backoff(1) < backoff(2) && backoff(10) == std::time::Duration::from_secs(60));
+	// the plan changed (the user fixed a route, or endpoints moved): not at once, but after
+	// `PLAN_CHANGED_RETRY` rather than the whole wait; the failures keep counting (#98)
+	let p2 = http_plan(443, &[("a/one", false), ("b/bad", true), ("c/new", false)]);
+	let (r, _) = sync_pod(&rp, &ep, &p2, &mut applied, &mut caps).await;
+	assert!(matches!(&r, PodSync::NotReady(m) if m.contains("waiting")), "{r:?}");
+	for a in applied.values_mut() {
+		// the last failure was `PLAN_CHANGED_RETRY` ago; its own wait (a minute) is not over
+		a.backoff = a.backoff.take().map(|(_, _, h)| (std::time::Instant::now() + backoff(10) - PLAN_CHANGED_RETRY, 10, h));
+	}
+	let (r, _) = sync_pod(&rp, &ep, &p2, &mut applied, &mut caps).await;
+	assert!(matches!(&r, PodSync::NotReady(m) if !m.contains("waiting")), "{r:?}");
+	assert!(applied.values().all(|a| a.backoff.as_ref().is_some_and(|(_, n, h)| *n == 11 && !h.is_empty())));
+	let puts = fake.lock().unwrap().puts.len();
+	let (r, _) = sync_pod(&rp, &ep, &p2, &mut applied, &mut caps).await;
+	assert!(matches!(&r, PodSync::NotReady(m) if m.contains("waiting")), "{r:?}");
+	assert_eq!(fake.lock().unwrap().puts.len(), puts);
 	// rproxy answers again: only the refused route is left out
 	fake.lock().unwrap().dry_run_fails = false;
 	for a in applied.values_mut() {
-		a.backoff = a.backoff.map(|(_, n)| (std::time::Instant::now(), n));
+		a.backoff = a.backoff.take().map(|(_, n, h)| (std::time::Instant::now(), n, h));
 	}
 	let (r, _) = sync_pod(&rp, &ep, &p, &mut applied, &mut caps).await;
 	assert!(matches!(&r, PodSync::Synced(v, ex) if v.len() == 1 && ex.len() == 1 && ex[0].owner == "b/bad"), "{r:?}");

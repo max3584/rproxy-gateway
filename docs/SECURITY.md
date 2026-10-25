@@ -23,7 +23,9 @@ English: [en/SECURITY.md](en/SECURITY.md)
 | 項目 | 既定 | 変え方 |
 |---|---|---|
 | `spec.addresses`（managed では Service の `externalIPs`） | **使えない**（`Programmed: False`、`AddressNotUsable`）。許した範囲でも、ほかの Service の ClusterIP・externalIPs・LB の IP は取れない（CVE-2020-8554 の形を防ぐ） | `managed.addressCIDRs` / `--address-cidr`。Service や Pod の範囲を入れない |
-| `spec.infrastructure.annotations` の Service への伝わり方 | アドレス・LB を決める注釈（`metallb.universe.tf/`、`lbipam.cilium.io/`、`service.beta.kubernetes.io/` など）は Service に付けない（Pod・ServiceAccount には付ける） | `managed.serviceAnnotationPrefixes` / `--service-annotation-prefix` |
+| `spec.infrastructure.annotations` の Service への伝わり方 | アドレス・LB・DNS の名前を決める注釈は Service に付けない（Pod・ServiceAccount には付ける）。拒むのは知られた接頭辞の一覧（MetalLB・Cilium・kube-vip・PureLB・OpenELB・LoxiLB・Calico・Kube-OVN、`service.beta.kubernetes.io/`・`service.kubernetes.io/` とクラウドごとのもの（GKE・Hetzner・OpenStack・OCI・DigitalOcean・Tencent・Huawei・Yandex）、external-dns・kops の DNS・k8s_gateway（`coredns.io/`）・Tailscale。一覧は `src/render/params.rs` の `SERVICE_ANNOTATION_DENY`）で、**すべてではない**。一覧にない注釈を読むロードバランサ・DNS のコントローラを入れているなら、テナントがその注釈でアドレスや名前を取れる | クラスタ全体：`managed.serviceAnnotationPrefixes` / `--service-annotation-prefix`。クラスごと：GatewayClass の parameters の `policy.serviceAnnotationPrefixes`（v0.4.18。信頼するテナントのクラスだけ開ける） |
+| ほかの namespace の BackendTLSPolicy の状態 | ルートの backendRef が ReferenceGrant で許された Service だけ、その Service の BackendTLSPolicy に Gateway の `status.ancestors` を書く（v0.4.18。それまでは許されていない参照でも書いていた）。`ancestors` は CRD の上限の 16 まで | — |
+| 移行（Ingress・Traefik）のルートの優先 | 移行は Gateway の `allowedRoutes` を見ない。移行するリソース（`--ingress-class` の Ingress、IngressRoute）を書ける人は、IngressRoute の `priority` で、同じポートの HTTPRoute の host への要求を自分の backend に向けられる（下の「移行」） | — |
 | ExternalName の Service を backend に | **使えない**（`ResolvedRefs: False`）。API サーバ・ほかの namespace・メタデータの口など、何でも名指しできるため | `controller.allowExternalNameServices` / `--allow-external-name-services` |
 | RproxyRule・RproxyMiddleware が名前を書くファイル（`*_file`・`file`・`*_path`） | その Gateway の証明書のファイル（証明書ディレクトリの中の、その Gateway の分）だけ。ほかは `Accepted: False` / `UnsupportedValue` | — |
 | RproxyMiddleware が名前を書くサービス（`errors.service`・`mirror.service`・`forward_auth.service`） | それを使う HTTPRoute 自身のルールだけ（ルールの `name`、`r<i>`、`<namespace>/<route>/r<i>`。コントローラがそのルートの rproxy のサービスの名前に書き換える）。ほかのルートのサービス（1 ポートの rproxy のルールにはそのポートの全テナントのサービスが入っている）は `Accepted: False` / `UnsupportedValue`。名指したルールに使える backend がなければ、その名前は 500 を返す（`forward_auth` は通さない） | — |
@@ -35,7 +37,43 @@ English: [en/SECURITY.md](en/SECURITY.md)
 | 移行（Ingress・Traefik）のほかの namespace への参照（Service・Middleware・TLSOption・errors の service） | 参照先の namespace の ReferenceGrant（from `traefik.io` の `IngressRoute*`・`Middleware`）がなければ変換しない（Traefik の `allowCrossNamespace=false` と同じ） | `migration.allowCrossNamespace` / `--migration-allow-cross-namespace` |
 | Ingress の path | バッククォート・引用符・制御文字・`/` で始まらないものは変換しない（`match` の式に埋め込むため） | — |
 | Ingress の `defaultBackend` | 移行先の Gateway の namespace のものだけ | — |
-| Gateway の `RproxyGatewayParameters`（`infrastructure.parametersRef`、同じ namespace のものだけ） | replicas（`policy.maxReplicas`、既定 10 まで）・PDB・resources・Pod と Service のラベル／注釈・topologySpread・externalTrafficPolicy・sourceRanges・ipFamilyPolicy・logLevel・performance だけ。LB のアドレスを決める注釈は上の許可リストを通ったものだけ（ほかは `InvalidParameters`）。`service.type`・`loadBalancerClass`・nodeSelector・tolerations・affinity・priorityClassName・`proxyProtocol`（PROXY protocol のヘッダを信じる接続元。そこからはどのクライアントにでも成りすませる）は既定で使えない。rproxy のイメージ・追加の環境変数・`policy` は使えない。コントローラの接頭辞（`rproxy.max3584.net/` など）のラベル・注釈も使えない | GatewayClass の `RproxyGatewayParameters`（chart の `managed.parameters`）の `policy`（`gatewayOverrides`・`maxReplicas`・`allowedPriorityClasses`・`allowedLoadBalancerClasses`）。イメージと環境変数は開けない（[DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) の 2.5）。`policy.middlewares`（テナントのミドルウェアが届く先）もクラスだけ（同じく 15.） |
+| Gateway の `RproxyGatewayParameters`（`infrastructure.parametersRef`、同じ namespace のものだけ） | replicas（`policy.maxReplicas`、既定 10 まで）・PDB・resources・Pod と Service のラベル／注釈・topologySpread・externalTrafficPolicy・sourceRanges・ipFamilyPolicy・logLevel・performance だけ。LB のアドレスを決める注釈は上の許可リストを通ったものだけ（ほかは `InvalidParameters`）。`service.type`・`loadBalancerClass`・nodeSelector・tolerations・affinity・priorityClassName・`proxyProtocol`（PROXY protocol のヘッダを信じる接続元。そこからはどのクライアントにでも成りすませる）は既定で使えない。rproxy のイメージ・追加の環境変数・`policy` は使えない。コントローラの接頭辞（`rproxy.max3584.net/` など）のラベル・注釈も使えない | GatewayClass の `RproxyGatewayParameters`（chart の `managed.parameters`）の `policy`（`gatewayOverrides`・`maxReplicas`・`allowedPriorityClasses`・`allowedLoadBalancerClasses`・`serviceAnnotationPrefixes`）。イメージと環境変数は開けない（[DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) の 2.5）。`policy.middlewares`（テナントのミドルウェアが届く先）もクラスだけ（同じく 15.） |
+
+## クラスと namespace
+
+GatewayClass はクラスタのもので、その `policy` は **どの namespace の Gateway がそのクラスを使えるかを限れない**。緩い `policy`（`gatewayOverrides` を広げた、`serviceAnnotationPrefixes`・`middlewares.outboundHosts` を開けた、`rproxyRules` を切っていないなど）のクラスは、Gateway を書けるどのテナントでも `gatewayClassName` に書けば使える。テナントで分けるなら、緩いクラスを使える namespace を admission で限る（Gatekeeper・Kyverno、または Kubernetes 1.30 以上の ValidatingAdmissionPolicy）。例：ラベル `rproxy.example.com/trusted: "true"` の namespace だけがクラス `rproxy-trusted` を使える。
+
+```yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata: {name: rproxy-trusted-class}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - {apiGroups: [gateway.networking.k8s.io], apiVersions: ["*"], operations: [CREATE, UPDATE], resources: [gateways]}
+  validations:
+    - expression: >-
+        object.spec.gatewayClassName != "rproxy-trusted" ||
+        (has(namespaceObject.metadata.labels) && "rproxy.example.com/trusted" in namespaceObject.metadata.labels &&
+         namespaceObject.metadata.labels["rproxy.example.com/trusted"] == "true")
+      message: the GatewayClass rproxy-trusted is for trusted namespaces only
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata: {name: rproxy-trusted-class}
+spec: {policyName: rproxy-trusted-class, validationActions: [Deny]}
+```
+
+namespace のラベルはテナントが書けないようにしておく（namespace の更新の権限を渡さない）。
+
+## 移行（Ingress・Traefik）とルートの優先
+
+`migration.migrateTo` を決めると、Ingress と Traefik のルートが移行先の Gateway のルールセットに入る（[MIGRATION.md](MIGRATION.md)）。移行は Gateway のリスナーの `allowedRoutes`（どの namespace のルートを受けるか）を見ず、ルートの優先は Traefik のもの（`priority`、なければ `match` の長さ）で、Gateway API のルートより先に試されることが多い。そのため **移行するリソースを書ける人は、大きな `priority` の IngressRoute で、同じポートのほかのテナントの HTTPRoute の host（`` Host(`app.example.com`) ``）への要求を奪える**。
+
+- 移行は、Ingress・IngressRoute を書ける人を移行先の Gateway の持ち主と同じくらい信頼できるときだけ使う。
+- 移行先には移行のためだけの Gateway（ほかのテナントの HTTPRoute を受けないリスナー・ポート）を使う。
+- `traefik.io` の CRD と `--ingress-class` の Ingress を書ける人を RBAC で限る。
 
 ## ほかの namespace の秘密鍵（M7）
 
@@ -46,7 +84,17 @@ English: [en/SECURITY.md](en/SECURITY.md)
 
 ## コントローラの権限（M10）
 
-- 既定ではすべての namespace の Gateway API の型・Secret・Service・Deployment・ServiceAccount・NetworkPolicy・PodDisruptionBudget・Pod（patch。rproxy の Pod の readiness gate のため `pods/status` の patch も）を扱う ClusterRole を持つ（Gateway の namespace に rproxy を置き、どこの証明書でも参照できるため）。コントローラが乗っ取られると、クラスタ全体の Secret が読める。readiness gate の条件は、その gate を持つ Pod にだけ書く。
+- 既定では ClusterRole で、**すべての namespace の** Secret・Service・ServiceAccount・Deployment・NetworkPolicy・PodDisruptionBudget の get・list・watch・create・update・patch・delete、Pod の patch（証明書の注釈）と `pods/status` の patch（readiness gate）、Gateway API の型の読みと状態の書き込みを持つ（managed は Gateway の namespace に rproxy を置き、証明書はどこからでも参照できるため）。readiness gate の条件は、その gate を持つ Pod にだけ書く。
+- そのためコントローラが乗っ取られると、クラスタ全体の Secret が読め、どの namespace にも Deployment（任意の Pod・その namespace の ServiceAccount）・Service・Secret を作り、ほかのものを書き換え・消せる。テナントを分けるクラスタでは次を勧める：
+  - `controller.watchNamespaces`（下）で、権限を Gateway を置く namespace の Role に限る（Secret の読みを限れるのはこれだけ）。
+  - `rbac.admissionPolicy.enabled: true`（v0.4.18、Kubernetes 1.30 以上、既定 off）：chart が ValidatingAdmissionPolicy `rproxy-gateway-managed-only` を入れ、コントローラの ServiceAccount の書き込みを次に限る。
+    - Service・Secret・ServiceAccount・Deployment・NetworkPolicy・PodDisruptionBudget の作成・更新・削除は、`app.kubernetes.io/managed-by: rproxy-gateway` のラベルのものだけ（変更の前と後の両方。ラベルを足してほかの物を乗っ取れない）。
+    - Secret は `Opaque` だけ（`kubernetes.io/service-account-token` の Secret を作ってほかの ServiceAccount のトークンを得られない）。ServiceAccount は `automountServiceAccountToken: false` のものだけ。
+    - Deployment は rproxy の形だけ：名前が `rproxy-` で始まり、Pod はその名前の ServiceAccount（コントローラが Gateway ごとに作るもの）でトークンを持たず、hostNetwork・hostPID・hostIPC・hostPort・hostPath を使わず（ボリュームは Secret だけ、init container なし）、root でなく（`runAsNonRoot`）、`privileged`・`allowPrivilegeEscalation`・追加の capabilities なし。
+    - Pod は注釈だけ（spec は変えられない）で、相手は自分の作った Pod（managed-by）と chart の fleet の Pod（リリースの namespace の `app.kubernetes.io/component: fleet`）だけ。Pod の作成・削除はできない。
+    - **止めないもの**：読み（Secret は見ている namespace のものすべてが読める。限れるのは `watchNamespaces` だけ）。状態の書き込み（`pods/status`、Gateway API の型）とリーダー選出の Lease。ラベル付きの新しい物の中身のうち上にないもの：Deployment のイメージ・コマンド（任意のコードを、トークンなし・特権なしの Pod として動かせる）、Service の `externalIPs`・`type: LoadBalancer`（`managed.addressCIDRs` の検査はコントローラの中で、policy は見ない）、NetworkPolicy（同じ namespace の Pod の通信を止められる）、PodDisruptionBudget。自分の作った物（ほかの Gateway の rproxy を含む）の書き換え・削除も止めない。
+    - まず `rbac.admissionPolicy.validationActions: [Warn, Audit]` で試せる。コントローラに書き換えさせる Secret を手で作るとき（制御 API のトークンなど）は、そのラベルを付け、`Opaque` にする。
+  - 両方を合わせると、コントローラが書けるのは見ている namespace の、上の形に合う自分の物だけ、読めるのは見ている namespace の中だけになる。それでも乗っ取られたコントローラはその namespace の Secret を読み、そこに rproxy の形の Pod を動かせるので、Gateway を置く namespace を分けるのが前提になる。
 - chart は ClusterRole `rproxy-gateway-parameters-edit`（`rproxygatewayparameters` の読み書き）を namespace の admin に集約する（`rbac.authorization.k8s.io/aggregate-to-admin`。edit には渡さない。`rbac.aggregateToAdmin: false` で切れる）。書ける範囲はクラスの `policy` で抑える。GatewayClass の `parametersRef` はコントローラの namespace のものしか使わないので、テナントはクラスの既定を変えられない。
 - `controller.watchNamespaces`（`--watch-namespaces`）を決めると、そこ（とコントローラの namespace）だけを watch し、chart はその namespace ごとの Role を作る。ClusterRole に残るのは GatewayClass と namespace（allowedRoutes の selector）だけ。
 

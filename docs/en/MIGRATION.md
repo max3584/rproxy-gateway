@@ -9,6 +9,7 @@ With `--migrate-to <namespace>/<name>`, the controller reads Ingress and Traefik
 - The conversion is the same implementation as rproxy-api's `rproxy-traefik-convert` (docs/en/MIGRATING-FROM-TRAEFIK.md; the crate `rproxy-traefik`): router rules and middlewares map as they do when migrating from the file provider, and only the Kubernetes parts (Services, Secrets, namespaces, ReferenceGrants) differ. What cannot be converted is left out and reported in the controller's log (`migration: not converted`, once each time the notes change) and in the `notes` of `rproxy-gateway render`.
 - When the target Gateway has a listener on the same port, the migrated routes are added to its rule (both `http`, with or without TLS alike). Otherwise the migrated part is left out.
 - Migrated routes keep Traefik's precedence (`priority`, else the length of `match`). Gateway API routes are numbered from 1, so on a shared port the migrated routes are often tried first.
+- **Migration does not look at the listeners' `allowedRoutes`.** Whoever can write what is migrated (Ingresses of `--ingress-class`, IngressRoutes) can send requests for the host of an HTTPRoute on the same port to their own backend with an IngressRoute of a high `priority`. Use migration only when those writers are trusted as much as the target Gateway's owner, and preferably migrate into a Gateway of its own (ports that do not take other tenants' HTTPRoutes; [SECURITY.md](SECURITY.md), "Migration (Ingress, Traefik) and route precedence").
 
 ## Flags
 

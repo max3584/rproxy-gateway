@@ -140,6 +140,16 @@ fn condition(c: Option<&k8s_openapi::api::discovery::v1::EndpointConditions>) ->
 	}
 }
 
+/// Whether a route of `route_kind` in `route_ns` may refer to `b` at all: a Service, in its namespace or
+/// with a ReferenceGrant. Only then do the Service's BackendTLSPolicies get status for the Gateway (a
+/// route must not make the controller write to another namespace's policy without a grant, #101).
+pub fn referable(world: &World, route_kind: &str, route_ns: &str, b: &BackendRef) -> bool {
+	let group = b.group.as_deref().unwrap_or("");
+	let kind = b.kind.as_deref().unwrap_or("Service");
+	let ns = b.namespace.as_deref().unwrap_or(route_ns);
+	group.is_empty() && kind == "Service" && world.granted((GROUP, route_kind, route_ns), ("", "Service", ns, &b.name))
+}
+
 /// The name of the Service port a backendRef names (`Some(None)`: an unnamed port; `None`: no such Service or port).
 pub fn port_name(world: &World, route_ns: &str, b: &BackendRef) -> Option<Option<String>> {
 	let ns = b.namespace.as_deref().unwrap_or(route_ns);

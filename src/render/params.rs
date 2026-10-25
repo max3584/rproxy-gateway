@@ -111,25 +111,60 @@ const RESERVED_ENV: &[&str] = &[
 ];
 
 /// Annotation prefixes of `spec.infrastructure` (and of Gateways' parameters) kept off the
-/// Service: they ask load balancers for addresses (a tenant could take an address that is not theirs).
+/// Service: they ask load balancers for addresses, or DNS for names (a tenant could take an address
+/// or a name that is not theirs). A list of what is known, not a guarantee (docs/SECURITY.md): the
+/// controller's `--service-annotation-prefix` and the class's `policy.serviceAnnotationPrefixes` let
+/// some through.
 pub const SERVICE_ANNOTATION_DENY: &[&str] = &[
+	// MetalLB, Cilium, kube-vip, PureLB, OpenELB, LoxiLB, Calico, Kube-OVN
 	"metallb.universe.tf/",
 	"metallb.io/",
 	"lbipam.cilium.io/",
 	"io.cilium/",
+	"service.cilium.io/",
+	"kube-vip.io/",
+	"purelb.io/",
+	"lb.kubesphere.io/",
+	"eip.openelb.kubesphere.io/",
+	"protocol.openelb.kubesphere.io/",
+	"layer2.openelb.kubesphere.io/",
+	"loxilb.io/",
+	"projectcalico.org/",
+	"ovn.kubernetes.io/",
+	// clouds (AWS, Azure, DigitalOcean, Linode, Vultr, Scaleway, OCI, IBM, Alibaba, Tencent, ... under
+	// service.beta.kubernetes.io/ and service.kubernetes.io/)
 	"service.beta.kubernetes.io/",
 	"service.kubernetes.io/",
 	"cloud.google.com/",
 	"networking.gke.io/",
-	"kube-vip.io/",
-	"purelb.io/",
 	"load-balancer.hetzner.cloud/",
 	"loadbalancer.openstack.org/",
+	"oci.oraclecloud.com/",
+	"oci-network-load-balancer.oraclecloud.com/",
+	"kubernetes.digitalocean.com/",
+	"service.cloud.tencent.com/",
+	"kubernetes.io/elb.",
+	"yandex.cloud/",
+	// names and exposure: DNS records (external-dns, kops, k8s_gateway), tailnets
+	"external-dns.alpha.kubernetes.io/",
+	"dns.alpha.kubernetes.io/",
+	"coredns.io/",
+	"tailscale.com/",
 ];
 
-/// Whether a tenant's annotation may go onto the Service.
+/// Whether a tenant's annotation may go onto the Service (`allow`: prefixes the controller's
+/// `--service-annotation-prefix` and the class's `policy.serviceAnnotationPrefixes` let through).
 pub fn service_annotation_allowed(key: &str, allow: &[String]) -> bool {
-	allow.iter().any(|p| key.starts_with(p.as_str())) || !SERVICE_ANNOTATION_DENY.iter().any(|p| key.starts_with(p))
+	allow.iter().any(|p| !p.trim().is_empty() && key.starts_with(p.as_str())) || !SERVICE_ANNOTATION_DENY.iter().any(|p| key.starts_with(p))
+}
+
+/// The prefixes let through for a Gateway: the controller's and its class's `policy.serviceAnnotationPrefixes`.
+pub fn service_annotation_prefixes(controller: &[String], policy: Option<&crate::k8s::params::ParamsPolicy>) -> Vec<String> {
+	let mut out = controller.to_vec();
+	out.extend(policy.and_then(|p| p.service_annotation_prefixes.clone()).into_iter().flatten());
+	// never an empty prefix (it would let every annotation through)
+	out.retain(|p| !p.trim().is_empty());
+	out
 }
 
 fn lookup<'a>(world: &'a World, ns: &str, name: &str) -> Option<&'a Spec> {
@@ -278,6 +313,10 @@ fn check_policy(spec: &Spec) -> Result<(), String> {
 			));
 		}
 	}
+	// an empty prefix would let every annotation through
+	if p.service_annotation_prefixes.iter().flatten().any(|a| a.trim().is_empty()) {
+		return Err("spec.policy.serviceAnnotationPrefixes: an empty prefix would allow every annotation; name the prefixes".into());
+	}
 	Ok(())
 }
 
@@ -311,9 +350,9 @@ fn check_gateway(own: &Spec, class: Option<&Spec>, o: &ParamsOptions) -> Result<
 		}
 	}
 	for k in own.service.as_ref().and_then(|s| s.annotations.as_ref()).into_iter().flatten().map(|(k, _)| k) {
-		if !service_annotation_allowed(k, &o.service_annotations) {
+		if !service_annotation_allowed(k, &service_annotation_prefixes(&o.service_annotations, Some(&policy))) {
 			return Err(format!(
-				"spec.service.annotations: {k} picks load balancer addresses; allowed only with the controller's --service-annotation-prefix"
+				"spec.service.annotations: {k} picks load balancer addresses or DNS names; allowed only with the controller's --service-annotation-prefix or the GatewayClass's policy.serviceAnnotationPrefixes"
 			));
 		}
 	}
@@ -918,6 +957,19 @@ spec:
 		));
 		let o = ParamsOptions { service_annotations: vec!["metallb.universe.tf/".into()], ..Default::default() };
 		assert!(gateway_parameters(&w, &w.gateways[0], &o).is_ok());
+		// the class's own allow list (policy.serviceAnnotationPrefixes, #101); DNS names are kept off too
+		ok(
+			"  policy: {serviceAnnotationPrefixes: [metallb.universe.tf/]}",
+			"  service: {annotations: {metallb.universe.tf/loadBalancerIPs: 10.0.0.1}}",
+		);
+		assert!(
+			err(
+				"  policy: {serviceAnnotationPrefixes: [metallb.universe.tf/]}",
+				"  service: {annotations: {external-dns.alpha.kubernetes.io/hostname: a.example.com}}"
+			)
+			.contains("policy.serviceAnnotationPrefixes")
+		);
+		assert!(err("  policy: {serviceAnnotationPrefixes: ['']}", "  replicas: 1").contains("empty prefix"));
 		// proxyProtocol: closed unless the class opens it (whose headers are believed is the administrator's call)
 		assert!(
 			err("  replicas: 1", "  proxyProtocol: {from: [10.0.0.0/8]}")
@@ -1022,6 +1074,23 @@ spec:
 		assert!(label_key("example.com/a-b_c.d") && !label_key("Example.com/a") && !label_key("a/"));
 		assert!(service_annotation_allowed("note", &[]));
 		assert!(!service_annotation_allowed("metallb.universe.tf/loadBalancerIPs", &[]));
+		for k in [
+			"external-dns.alpha.kubernetes.io/hostname",
+			"projectcalico.org/loadBalancerIPs",
+			"eip.openelb.kubesphere.io/v1alpha2",
+			"lb.kubesphere.io/v1alpha1",
+			"oci.oraclecloud.com/load-balancer-type",
+			"tailscale.com/expose",
+		] {
+			assert!(!service_annotation_allowed(k, &[]), "{k}");
+		}
+		let policy =
+			crate::k8s::params::ParamsPolicy { service_annotation_prefixes: Some(vec!["tailscale.com/".into()]), ..Default::default() };
+		let allow = service_annotation_prefixes(&["metallb.io/".into()], Some(&policy));
+		assert!(service_annotation_allowed("tailscale.com/expose", &allow) && service_annotation_allowed("metallb.io/ip", &allow));
+		// an empty prefix (a flag or a policy) opens nothing
+		let empty = crate::k8s::params::ParamsPolicy { service_annotation_prefixes: Some(vec!["".into()]), ..Default::default() };
+		assert!(!service_annotation_allowed("metallb.io/ip", &service_annotation_prefixes(&[" ".into()], Some(&empty))));
 		assert_eq!(set_paths(&Spec { replicas: Some(1), ..Default::default() }), vec!["replicas"]);
 	}
 }
