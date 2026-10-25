@@ -369,9 +369,14 @@ pub struct MiddlewarePolicy {
 	/// the route `Accepted: False`).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub outbound_hosts: Option<Vec<String>>,
+	/// Apply this policy (outboundHosts, allowedKinds) to middlewares migrated from Traefik too
+	/// (default false: migration is set up by the cluster administrator, and its middlewares keep
+	/// their URLs out as in Traefik).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub apply_to_migrated: Option<bool>,
 }
 
 impl MiddlewarePolicy {
-	/// The default: every kind, no URL out.
-	pub const DEFAULT: MiddlewarePolicy = MiddlewarePolicy { allowed_kinds: None, outbound_hosts: None };
+	/// The default: every kind, no URL out (migrated middlewares unbounded).
+	pub const DEFAULT: MiddlewarePolicy = MiddlewarePolicy { allowed_kinds: None, outbound_hosts: None, apply_to_migrated: None };
 }

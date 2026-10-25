@@ -52,6 +52,17 @@ pub fn check(v: &Value, policy: Option<&MiddlewarePolicy>) -> Result<(), String>
 	Ok(())
 }
 
+/// A middleware migrated from Traefik (set up by the cluster administrator, `--migrate-to`): bound by
+/// the class's policy only with `policy.middlewares.applyToMigrated` (by default its URLs out work as
+/// in Traefik). `None`: the class's parameters are invalid, and nothing is taken (that switch cannot
+/// be read).
+pub fn check_migrated(v: &Value, policy: Option<&MiddlewarePolicy>) -> Result<(), String> {
+	match policy {
+		Some(p) if p.apply_to_migrated != Some(true) => Ok(()),
+		_ => check(v, policy),
+	}
+}
+
 /// The host of an `http://` / `https://` URL, lower case, read as strictly as rproxy reads the URLs
 /// it connects to (rproxy-api's `net::url`, #324), so that the controller gives the error and no
 /// URL parser reads another host than this one: visible ASCII only, no `\` or `#`, no user info,
@@ -308,6 +319,16 @@ mod tests {
 		assert_eq!(v["mirror"]["service"], "a/svc/r0");
 	}
 
+	/// Migrated middlewares (the administrator's): bound only with applyToMigrated.
+	#[test]
+	fn migrated() {
+		let fa = json!({"forward_auth": {"address": "http://auth.example.com/x"}});
+		assert!(check_migrated(&fa, Some(&MiddlewarePolicy::DEFAULT)).is_ok());
+		let on = MiddlewarePolicy { apply_to_migrated: Some(true), ..Default::default() };
+		assert!(check_migrated(&fa, Some(&on)).unwrap_err().contains("outboundHosts"));
+		assert!(check_migrated(&fa, None).unwrap_err().contains("parameters are invalid"));
+	}
+
 	#[test]
 	fn kinds() {
 		let p = MiddlewarePolicy { allowed_kinds: Some(vec!["headers".into()]), ..Default::default() };
@@ -321,6 +342,7 @@ mod tests {
 			check_policy(&MiddlewarePolicy {
 				allowed_kinds: Some(k.iter().map(|s| s.to_string()).collect()),
 				outbound_hosts: Some(h.iter().map(|s| s.to_string()).collect()),
+				apply_to_migrated: None,
 			})
 		};
 		assert!(ok(&["headers", "forward_auth"], &["*", "a.example.com", "*.example.com", "10.0.0.0/8", "fd00::/8"]).is_ok());

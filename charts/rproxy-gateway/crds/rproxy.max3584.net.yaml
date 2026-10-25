@@ -560,6 +560,13 @@ spec:
                           type: string
                         nullable: true
                         type: array
+                      applyToMigrated:
+                        description: |-
+                          Apply this policy (outboundHosts, allowedKinds) to middlewares migrated from Traefik too
+                          (default false: migration is set up by the cluster administrator, and its middlewares keep
+                          their URLs out as in Traefik).
+                        nullable: true
+                        type: boolean
                       outboundHosts:
                         description: |-
                           Where URLs that rproxy calls out to (`forward_auth.address`, `oidc.issuer`) may point: `*`
@@ -916,6 +923,13 @@ spec:
                           type: string
                         nullable: true
                         type: array
+                      applyToMigrated:
+                        description: |-
+                          Apply this policy (outboundHosts, allowedKinds) to middlewares migrated from Traefik too
+                          (default false: migration is set up by the cluster administrator, and its middlewares keep
+                          their URLs out as in Traefik).
+                        nullable: true
+                        type: boolean
                       outboundHosts:
                         description: |-
                           Where URLs that rproxy calls out to (`forward_auth.address`, `oidc.issuer`) may point: `*`

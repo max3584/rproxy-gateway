@@ -2457,9 +2457,9 @@ spec:
 	assert_eq!(http["services"]["default/guarded/r1"]["servers"], json!([{"status": 500}]));
 }
 
-/// URLs rproxy calls out to (`forward_auth.address`, `oidc.issuer`) and the kinds tenants' middlewares
-/// may use follow the GatewayClass's `policy.middlewares` (by default no URL out), for RproxyMiddlewares
-/// and migrated Traefik Middlewares alike (#94).
+/// URLs rproxy calls out to (`forward_auth.address`, `oidc.issuer`) and the kinds tenants' RproxyMiddlewares
+/// may use follow the GatewayClass's `policy.middlewares` (by default no URL out); middlewares migrated from
+/// Traefik (the administrator's) only with `applyToMigrated` (#94).
 #[test]
 fn middleware_urls_out_follow_the_class() {
 	let routes = format!(
@@ -2506,10 +2506,11 @@ spec:
 	// by default: refused, and the migrated route is left out (not sent without its auth)
 	let p = run("");
 	let c = accepted(&p);
+	// by default: a tenant's RproxyMiddleware is refused; the migrated (administrator's) middleware keeps its URL
 	assert!(!c.status && c.message.contains("forward_auth.address") && c.message.contains("outboundHosts"), "{c:?}");
 	let text = serde_json::to_string(&p.rules_json()).unwrap();
-	assert!(!text.contains("auth.example.com") && !text.contains("legacy.example.com"), "{text}");
-	assert!(p.notes.iter().any(|n| n.contains("IngressRoute default/legacy") && n.contains("outboundHosts")), "{:?}", p.notes);
+	assert!(!text.contains("http://auth.example.com/check") && !text.contains("ext.example.com"), "{text}");
+	assert!(text.contains("http://auth.example.com/verify") && text.contains("legacy.example.com"), "{text}");
 	// allowed by the class
 	let p = run(&class_with("{policy: {middlewares: {outboundHosts: [auth.example.com]}}}"));
 	assert!(accepted(&p).status, "{:?}", accepted(&p));
@@ -2518,9 +2519,17 @@ spec:
 	// another host is not
 	let p = run(&class_with("{policy: {middlewares: {outboundHosts: [\"*.internal\"]}}}"));
 	assert!(!accepted(&p).status);
-	// a kind the class does not allow
+	// applyToMigrated: the migrated middleware follows outboundHosts too, and its route is left out (not served without its auth)
+	let p = run(&class_with("{policy: {middlewares: {applyToMigrated: true}}}"));
+	let text = serde_json::to_string(&p.rules_json()).unwrap();
+	assert!(!text.contains("auth.example.com") && !text.contains("legacy.example.com"), "{text}");
+	assert!(p.notes.iter().any(|n| n.contains("IngressRoute default/legacy") && n.contains("outboundHosts")), "{:?}", p.notes);
+	let p = run(&class_with("{policy: {middlewares: {applyToMigrated: true, outboundHosts: [auth.example.com]}}}"));
+	assert!(serde_json::to_string(&p.rules_json()).unwrap().contains("legacy.example.com"));
+	// a kind the class does not allow (tenants only, without applyToMigrated)
 	let p = run(&class_with("{policy: {middlewares: {allowedKinds: [headers], outboundHosts: [\"*\"]}}}"));
 	assert!(accepted(&p).message.contains("allowedKinds"), "{:?}", accepted(&p));
+	assert!(serde_json::to_string(&p.rules_json()).unwrap().contains("legacy.example.com"));
 	// a policy that names no kind of rproxy makes the class's parameters invalid
 	let p = run(&class_with("{policy: {middlewares: {allowedKinds: [nope]}}}"));
 	assert!(cond(&p.conds, "Accepted").message.contains("allowedKinds: nope"), "{:?}", p.conds);
