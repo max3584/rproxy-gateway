@@ -344,4 +344,39 @@ pub struct ParamsPolicy {
 	/// loadBalancerClass values a Gateway's parameters may use (with service.loadBalancerClass allowed).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub allowed_load_balancer_classes: Option<Vec<String>>,
+	/// What the RproxyMiddlewares of routes on the class's Gateways (and middlewares migrated from
+	/// Traefik) may use (#94).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub middlewares: Option<MiddlewarePolicy>,
+	/// Whether RproxyRules may attach to the class's Gateways (default true). An RproxyRule is a whole
+	/// rproxy rule (any backend URL, forward_auth address, L4 destination): `policy.middlewares` does
+	/// not bound it, so it fully trusts whoever may write one; false turns them off.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub rproxy_rules: Option<bool>,
+}
+
+/// What tenants' middlewares may use (the GatewayClass's `policy.middlewares`).
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MiddlewarePolicy {
+	/// rproxy's middleware kinds they may use (e.g. headers, rate_limit, forward_auth; default: all).
+	/// Another kind makes the route `Accepted: False`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub allowed_kinds: Option<Vec<String>>,
+	/// Where URLs that rproxy calls out to (`forward_auth.address`, `oidc.issuer`) may point: `*`
+	/// (anywhere), a host name (`auth.example.com`), `*.example.com` (its subdomains), or an IP
+	/// range (`10.0.0.0/8`, for URLs whose host is an IP address). Default: none (such URLs make
+	/// the route `Accepted: False`).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub outbound_hosts: Option<Vec<String>>,
+	/// Apply this policy (outboundHosts, allowedKinds) to middlewares migrated from Traefik too
+	/// (default false: migration is set up by the cluster administrator, and its middlewares keep
+	/// their URLs out as in Traefik).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub apply_to_migrated: Option<bool>,
+}
+
+impl MiddlewarePolicy {
+	/// The default: every kind, no URL out (migrated middlewares unbounded).
+	pub const DEFAULT: MiddlewarePolicy = MiddlewarePolicy { allowed_kinds: None, outbound_hosts: None, apply_to_migrated: None };
 }

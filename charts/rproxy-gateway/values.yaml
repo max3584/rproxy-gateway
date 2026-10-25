@@ -95,6 +95,10 @@ managed:
   #     policy: {maxReplicas: 5, gatewayOverrides: [replicas, pod.resources, pod.tolerations]}
   #     # PROXY protocol from the load balancer in front, on every TCP port (rproxy 0.4.13; docs/PLATFORM.md)
   #     proxyProtocol: {from: [10.0.0.0/16]}
+  #     # what tenants' RproxyMiddlewares may use: URLs out (forward_auth.address, oidc.issuer; default
+  #     # none) and kinds (default all); applyToMigrated: true binds middlewares migrated from Traefik
+  #     # too (default: they work as in Traefik). Applies in fleet mode too (docs/SECURITY.md)
+  #     # policy: {middlewares: {outboundHosts: [auth.example.com], allowedKinds: [headers, rate_limit, forward_auth]}}
   parameters: {}
 
 # fleet mode: rproxy pods deployed by this chart serve every Gateway (rproxy-api docs/DESIGN-v0.4.md 3.3)

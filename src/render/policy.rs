@@ -228,8 +228,9 @@ pub fn apply(world: &World, gw: &Gateway, rules: &mut [rp::Rule], targets: &Targ
 /// The RproxyRules naming `gw`: rules to add (JSON) and their status.
 /// What RproxyRules may do in a Gateway's set.
 pub struct RawLimits<'a> {
-	/// Whether they are read at all (fleet mode: off unless asked for).
-	pub enabled: bool,
+	/// Why they are not read (`None`: they are): fleet mode unless asked for, the class's
+	/// `policy.rproxyRules: false`, or the class's parameters invalid (fail closed).
+	pub off: Option<String>,
 	/// Files they may name (`*_file`): the Gateway's own, in the certificate directory.
 	pub cert_dir: &'a str,
 	pub files: &'a std::collections::BTreeSet<String>,
@@ -272,13 +273,8 @@ pub fn raw_rules(world: &World, gw: &Gateway, taken: &[String], limits: &RawLimi
 			status.push(st);
 			continue;
 		}
-		if !limits.enabled {
-			st.conds.push(Cond::new(
-				"Accepted",
-				false,
-				"NotAllowed",
-				"RproxyRules are off for this Gateway (fleet mode: --fleet-rproxy-rules)",
-			));
+		if let Some(why) = &limits.off {
+			st.conds.push(Cond::new("Accepted", false, "NotAllowed", why.clone()));
 			status.push(st);
 			continue;
 		}
