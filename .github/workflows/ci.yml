@@ -74,6 +74,13 @@ jobs:
           if helm template t charts/rproxy-gateway --set fleet.enabled=true | grep -q RPROXY_CONFIG; then
             echo "fleet.http {} should write no settings file"; exit 1
           fi
+          # values.schema.json: rproxy's names and shapes only (a value rproxy refuses stops the fleet's pods)
+          for bad in "fleet.http.timeouts.writeStall=2m" "fleet.http.timeouts.write_stall=2 minutes" "fleet.http.timeouts.http2_max_streams=0" \
+            "fleet.http.timeouts.http2_ping_timeout=0s" "fleet.http.other=1"; do
+            if helm template t charts/rproxy-gateway --set fleet.enabled=true --set "$bad" > /dev/null 2>&1; then
+              echo "fleet.http: $bad should be refused"; exit 1
+            fi
+          done
 
   config:
     name: config (kustomize)

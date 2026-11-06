@@ -123,7 +123,7 @@ spec:
 | `rproxy.logLevel` | `RPROXY_LOG_LEVEL` | なし | `error`・`warn`・`info`・`debug`・`trace` |
 | `rproxy.performance` | `RPROXY_WORKERS`・`RPROXY_UDP_SHARDS`・`RPROXY_CPU_AFFINITY`・`RPROXY_BUSY_POLL_USECS`・`RPROXY_SPLICE`・`RPROXY_SPLICE_AFTER`・`RPROXY_SPLICE_FULL_READS`・`RPROXY_SPLICE_PIPE_SIZE` | なし | rproxy の `global.performance` と同じ範囲（環境変数のある項目なので環境変数で渡す） |
 | `rproxy.shutdown.delay`・`.drain` | `RPROXY_SHUTDOWN_DELAY`・`RPROXY_SHUTDOWN_DRAIN` と猶予（6.） | `--shutdown-delay`（15 秒）・`--shutdown-drain`（25 秒） | `0s`〜`10m`。`features.graceful_shutdown` のない rproxy には写さない（preStop のまま） |
-| `rproxy.http` | rproxy の設定ファイル（`global.http.timeouts`）：制御 API の Secret の `config.json` と `RPROXY_CONFIG`（16.2） | なし（rproxy の既定、設定ファイルなし） | 時間は 365 日まで（`0s` は上限なし、`http2PingTimeout` は不可）、`http2MaxStreams` は 1〜10000。`features.http_stream_limits` を持つと分かったイメージにだけ書く |
+| `rproxy.http` | rproxy の設定ファイル（`global.http.timeouts`）：制御 API の Secret の `config.json` と `RPROXY_CONFIG`（16.2） | なし（rproxy の既定、設定ファイルなし） | 時間は 365 日まで（`0s` は上限なし、`http2PingTimeout` は不可）、`http2MaxStreams` は 1〜10000。すべての Pod と入れ替える先のイメージが `features.http_stream_limits` を持つと分かったときだけ書く（16.2） |
 | `rproxy.extraEnv` | rproxy のコンテナ | なし | `RPROXY_*` だけ。コントローラが決める名前（`RPROXY_API_*`・`RPROXY_TOKEN_FILE`・`RPROXY_TLS_*`・`RPROXY_FILES_*`・`RPROXY_CONFIG`・`RPROXY_DATABASE_URL`・`RPROXY_UPDATE*`・`RPROXY_HANDOFF*`・`RPROXY_STATIC_RULES`・`RPROXY_SHUTDOWN_*`、上の項目で渡す名前）は誤り |
 | `ui.visible` | C の発見の Secret に載せるか | クラスの値、なければ `true` | Gateway はクラスが `false` のとき `true` にできない（v0.4.3 から。`ui.namespace` のときだけ効く） |
 | `proxyProtocol` | ルールセットの tcp のルールの `proxy_protocol`（14.） | なし（ヘッダを読まない） | `from` は空にできず 64 件まで、CIDR か IP、`/0` は誤り。`required` の既定は `true`。丸ごと置き換え（クラスと Gateway の両方にあれば Gateway のもの） |
@@ -573,10 +573,25 @@ spec:
   - ファイルに書いた項目はファイルが勝つ（UI の `PATCH /config/global` は `409 static`）。Gateway の持ち主が CRD で決めたものを UI が黙って変えないので、これでよい。
   - ConfigMap でなく Secret に入れるのは、admission policy（`rbac.admissionPolicy`）が managed の Pod のボリュームを Secret だけに絞っていて、コントローラに ConfigMap を書く権限もないため（権限を広げない）。
 - 入れ替え：`config.json` の中身は Pod のテンプレートのハッシュ（`api_hash`）に入れない。rproxy v0.4.20 は設定ファイルが変わると読み直す（10 秒ごと）ので、値を変えても Pod は入れ替わらない（kubelet が Secret のファイルを書き換えるまで 1 分ほど）。`rproxy.http` を初めて付けたとき・すべて外したときは、Pod のテンプレート（`RPROXY_CONFIG` と項目）が変わるので入れ替わる。どれも新しい接続から効く。
-- rproxy の版：`features.http_stream_limits`（v0.4.20）を持つと分かったイメージ（コントローラが出荷するイメージか、そのイメージを動かす Pod が答えたもの。`graceful_shutdown` と同じ `image_feature`）にだけ書く。古い rproxy は `write_stall` などを知らずに起動しない（設定の誤り）ため。古いイメージの Pod（rollout の古い ReplicaSet）は `RPROXY_CONFIG` を持たないので、Secret にファイルがあっても読まない。分からなければ書かない。
+- 外したとき：Secret の `config.json` は消さずに残す（中身もそのまま）。前のテンプレートの Pod はボリュームの `items` でこの項目を名指しているので、消すと kubelet がそのボリューム（トークン・証明書）を更新しなくなり、古い ReplicaSet が作り直す Pod はマウントできない。新しいテンプレートは `RPROXY_CONFIG` を持たないので読まず、ハッシュにも入らないので Pod も入れ替わらない。
+- rproxy の版：`allow_freebind` と同じ決め方（SECURITY.md）で、`features.http_stream_limits`（v0.4.20）を確かめる。v0.4.17〜v0.4.19 は知らない項目のある設定ファイルを誤りとして起動しない（#112 と同じ種類の問題）ため、イメージの名前で覚えたもの（`image_feature`）は信じない：
+  - 今ある Pod の**すべて**が、今動いているコンテナから自分の `/capabilities` で答えたこと、かつ Pod を入れ替える先のイメージが、出荷するもの（`SHIPPED_FEATURES`）か、そのイメージを動かす今の Pod が答えたもの。このとき書く（`Applied`）。
+  - 分からない（コントローラが起動したばかりで、自前のイメージの Pod にまだ届かない、など）が、そのイメージの今の Pod がもう `RPROXY_CONFIG` で読んでいて、どの Pod も「持たない」と答えていないときは、今の形のまま書き続ける（`Applied`、message に「分かるまでそのまま」）。外すと Pod が既定に戻って入れ替わり、分かった後にまた入れ替わる（2 回の rollout と、黙って既定に戻ること）のを避けるため。
+  - どれかの Pod が持たないと答えた（付け直したタグの古い rproxy）、または分からずにまだファイルを読んでいない形：書かない（`UnsupportedRproxy`、rproxy の既定）。
+  - 引き換え：今の形を残す間に、同じタグで古い中身の Pod が新しく立つと、その Pod は起動しない（その Pod が答えないので「持たない」とはまだ分からない）。答えた後の反映で外し、Pod は既定の形に入れ替わる。持たない Pod を一度でも見れば書かないので、続けて起動に失敗し続けることはない。古いイメージの Pod（rollout の古い ReplicaSet）は `RPROXY_CONFIG` を持たないので、Secret にファイルがあっても読まない。
 - 状態：`rproxy.http` が何かを決めているあいだ、Gateway に条件 `rproxy.max3584.net/HTTPSettings` を出す：`True`・`Applied`、`False`・`UnsupportedRproxy`（イメージが分からない・古い。rproxy の既定で動く）。`Programmed` は変えない。外すと条件も消す。
 - 誰が決めるか：自分の Gateway の Pod だけに効くので、`rproxy.performance` と同じく Gateway の参照でも既定で書ける（`policy.gatewayOverrides` の既定に `rproxy.http`）。丸ごと置き換え（クラスと Gateway の両方にあれば Gateway のもの）。
 - 検証（2.4 と同じく `InvalidParameters`）：時間は 365 日まで、`http2PingTimeout: 0s` は不可、`http2MaxStreams` は 1〜10000（CRD でも）。rproxy の `HttpTimeoutsSpec::check` と同じ。
-- parameters が誤りになった Gateway（2.4 の前の形のまま）は、Secret の `config.json` も前のままにする（Deployment が名指しているため）。
-- **fleet**：1 つの rproxy のプロセスがすべての Gateway に仕えるので、プロセス全体の設定は Gateway ごとの CRD ではなく chart で決める。chart の `fleet.http`（rproxy の `global.http` の形のまま、例 `{timeouts: {http2_max_streams: 1000}}`。既定 `{}`）を ConfigMap `rproxy-fleet-config` の `config.json` にし、DaemonSet に `RPROXY_CONFIG` を足す（`{}` なら何も描かない）。fleet の DaemonSet は chart のものでコントローラは作らないので、コントローラで描く理由がない。版の確かめはできないので v0.4.20 以上で使う（rproxy が断る値では新しい Pod が起動しない）。
-- 試験：単体（`src/render/params.rs` の `http_settings`：ファイルの形・単位・検証・合わせ方・`policy`、`src/controller/provision.rs` の `rproxy_settings_file`：Secret の項目・`RPROXY_CONFIG`・ハッシュに入れないこと）、本物の rproxy（`tests/rproxy.rs`：コントローラの書くファイルで rproxy が起動し、`firstByte: 1s` が HTTP のリスナーで効く）、CI の `helm template`（`fleet.http`）。
+- parameters が誤りになった Gateway（2.4 の前の形のまま）は、Secret の `config.json` も前のままにし（上の「外したとき」と同じ）、今の Pod がファイルを読んでいれば Gateway の条件 `rproxy.max3584.net/HTTPSettings` を `True`・`Kept` にする。
+- **fleet**：1 つの rproxy のプロセスがすべての Gateway に仕えるので、プロセス全体の設定は Gateway ごとの CRD ではなく chart で決める。chart の `fleet.http`（rproxy の `global.http` の形のまま。既定 `{}`）を ConfigMap `rproxy-fleet-config` の `config.json` にし、DaemonSet に `RPROXY_CONFIG` を足す（`{}` なら何も描かない）。fleet の DaemonSet は chart のものでコントローラは作らないので、コントローラで描く理由がない。
+  - 同じ設定を managed と fleet で書くと（managed は Kubernetes の camelCase、fleet は rproxy の名前のまま）：
+
+    ```yaml
+    # managed：RproxyGatewayParameters
+    spec: {rproxy: {http: {http2MaxStreams: 1000, timeouts: {writeStall: 2m}}}}
+    # fleet：chart の values
+    fleet: {http: {timeouts: {http2_max_streams: 1000, write_stall: 2m}}}
+    ```
+
+  - chart の `values.schema.json` が `fleet.http` の名前と形（時間は `10s`・`500ms`・`5m`・`2h` の形、`http2_ping_timeout` は `0s` 以外、`http2_max_streams` は 1〜10000）を確かめ、`writeStall` のような書き間違いは helm が断る（rproxy が断る値では、そのノードの rproxy が起動せず DaemonSet の rollout が止まるため）。365 日の上限など、残りは rproxy が確かめる。版の確かめもできないので v0.4.20 以上で使い、入れる前に同じイメージで `rproxy-api --check-config config.json` を通す（`helm template` の ConfigMap の `config.json` をファイルにして）。
+- 試験：単体（`src/render/params.rs` の `http_settings`：ファイルの形・単位・検証・合わせ方・`policy`、`src/controller/provision.rs` の `rproxy_settings_file`：Secret の項目・`RPROXY_CONFIG`・ハッシュに入れないこと・外しても項目を残すこと・今の Pod の形、`src/controller/tests.rs` の `the_settings_file_needs_every_pod_or_keeps_the_current_form`：Pod ごとの答え・名前で覚えない・分からないときに残すこと・付け直したタグ）、本物の rproxy（`tests/rproxy.rs`：コントローラの書くファイルで rproxy が起動し、`firstByte: 1s` が HTTP のリスナーで効き、ファイルを書き換えると再起動なしで効く）、CI の `helm template`（`fleet.http` と `values.schema.json` が断るもの）。

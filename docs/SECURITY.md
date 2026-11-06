@@ -129,7 +129,7 @@ namespace のラベルはテナントが書けないようにしておく（name
 
 rproxy はルールセットを、作ったトークンの名前のものにする（ほかの admin でないトークンは変えられない）。コントローラのトークンは値が変わっても名前はいつも `rproxy-gateway` なので、トークンを入れ替えても（rproxy の再起動のあとの PUT し直しも）同じ持ち主のまま。トークンの `allow_rulesets` は、fleet のものが `k8s/`、managed の Gateway ごとのものがその Gateway のルールセット（`k8s/<namespace>/<name>`。長い名前では後ろがハッシュ、[DESIGN.md](DESIGN.md) の「全体」）だけ。
 
-コントローラのトークンに `admin` のスコープは付けない。rproxy の `global` の設定（RproxyGatewayParameters の `rproxy.http`、v0.4.21）は `admin` の要る `PATCH /config/global` で送らず、Gateway の制御 API の Secret に入れた rproxy の設定ファイル（`config.json`、`RPROXY_CONFIG`）で渡す（[DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) の 16.2）。
+コントローラのトークンに `admin` のスコープは付けない。rproxy の `global` の設定（RproxyGatewayParameters の `rproxy.http`、v0.4.21）は `admin` の要る `PATCH /config/global` で送らず、Gateway の制御 API の Secret に入れた rproxy の設定ファイル（`config.json`、`RPROXY_CONFIG`）で渡す（[DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) の 16.2）。ファイルを書くかは下の `allow_freebind` と同じく、Pod ごとの答えで決める（v0.4.19 以前は知らない項目で起動しない）。`rproxy.http` は既定で Gateway の参照（テナント）も書ける（自分の Gateway の Pod の接続の上限だけで、`rproxy.performance` と同じ）。テナントに決めさせないクラスでは、クラスの parameters の `policy.gatewayOverrides` に `rproxy.http` を書かない（リストを書くと既定と置き換わる）。
 
 rproxy が `features.control_limits`（rproxy v0.4.20）を持つと分かっているときは、トークンファイルに `allow_freebind: true` も書く（#105）。fleet の `listen: addresses` は Gateway の `spec.addresses` で `listen_freebind` を使って待ち受け、rproxy v0.4.20 は `listen_freebind` のルールを `admin` のトークン、`allow_freebind: true` のトークン、ルールセットの `PUT` では `allow_rulesets` のあるトークンにだけ許す。コントローラのトークンは 3 つ目でも通るが、ファイルに書かないとトークンごとに 1 回 `token.freebind` の警告が出るので、意図して使うことをファイルで示す。managed の Gateway ごとのトークンも同じ決め方で書く（managed は `listen_freebind` を使わず、`allow_rulesets` で許される範囲も変わらない）。
 

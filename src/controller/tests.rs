@@ -28,6 +28,8 @@ struct Fake {
 	tokens_reload: bool,
 	/// `features.control_limits` (rproxy v0.4.20)
 	control_limits: bool,
+	/// `features.http_stream_limits` (rproxy v0.4.20)
+	http_stream_limits: bool,
 	/// Tokens that may read (`GET /rules`): the UI's
 	readers: BTreeSet<String>,
 	/// HTTP routes whose match has `BAD` are refused without naming them (else by name)
@@ -77,10 +79,10 @@ async fn handle(fake: Arc<Mutex<Fake>>, req: Request<hyper::body::Incoming>) -> 
 			reply(200, json!(asked.into_iter().filter(|n| f.files.contains(n)).collect::<Vec<_>>()))
 		}
 		("GET", "/capabilities") => {
-			let (graceful, reload, limits) = (f.graceful, f.tokens_reload, f.control_limits);
+			let (graceful, reload, limits, streams) = (f.graceful, f.tokens_reload, f.control_limits, f.http_stream_limits);
 			reply(
 				200,
-				json!({"version": "0.4.0", "features": {"rulesets": true, "labels": true, "conditions": true, "readyz": true, "graceful_shutdown": graceful, "tokens_reload": reload, "control_limits": limits}}),
+				json!({"version": "0.4.0", "features": {"rulesets": true, "labels": true, "conditions": true, "readyz": true, "graceful_shutdown": graceful, "tokens_reload": reload, "control_limits": limits, "http_stream_limits": streams}}),
 			)
 		}
 		("GET", p) if p.starts_with("/rulesets/") => {
@@ -421,6 +423,51 @@ async fn freebind_needs_every_pod_to_have_answered() {
 	fake.lock().unwrap().control_limits = false;
 	assert!(!freebind_known(&rp, std::slice::from_ref(&n2), &uids(&[&n2]), Some(new), &mut caps).await, "a reused tag");
 	assert!(!freebind_known(&rp, &[n1.clone(), n2.clone()], &uids(&[&n1, &n2]), None, &mut caps).await);
+}
+
+/// #109: rproxy's settings file is written as `allow_freebind` is (each pod's own answer, the target image
+/// known), never for an image remembered by name; while not known (a pod not answering), a form already
+/// reading a file is kept, unless a pod answered without the feature.
+#[tokio::test]
+async fn the_settings_file_needs_every_pod_or_keeps_the_current_form() {
+	let fake = Arc::new(Mutex::new(Fake::default()));
+	let port = start(fake.clone()).await;
+	let rp = Client::new(None, "secret").unwrap();
+	let ep = |uid: &str, image: &str, port: u16| Endpoint {
+		pod: format!("rproxy-{uid}"),
+		uid: uid.into(),
+		ip: "127.0.0.1".into(),
+		api_port: port,
+		rproxy_image: Some(image.into()),
+		..Default::default()
+	};
+	let custom = "example/rproxy:settings";
+	let mut caps = HashMap::new();
+	// a new Gateway of the shipped image (v0.4.20): written
+	assert_eq!(settings_known(&rp, &[], &[], provision::RPROXY_IMAGE, false, &mut caps).await, SettingsKnown::Yes);
+	// another image without pods: not by its name
+	assert_eq!(settings_known(&rp, &[], &[], custom, false, &mut caps).await, SettingsKnown::No);
+	// its pod answers with the feature
+	fake.lock().unwrap().http_stream_limits = true;
+	let a = ep("s-a", custom, port);
+	assert_eq!(settings_known(&rp, std::slice::from_ref(&a), &[a.caps_key()], custom, false, &mut caps).await, SettingsKnown::Yes);
+	// a pod that does not answer (the controller just started, the pod out of reach): not known; kept
+	// when the pods of that image already read a file, else not written
+	let gone = ep("s-gone", custom, 1);
+	let keys = [gone.caps_key()];
+	assert_eq!(settings_known(&rp, std::slice::from_ref(&gone), &keys, custom, true, &mut caps).await, SettingsKnown::Kept);
+	assert_eq!(settings_known(&rp, std::slice::from_ref(&gone), &keys, custom, false, &mut caps).await, SettingsKnown::No);
+	// a tag pushed again with an older rproxy: its pod answers without it; not kept
+	fake.lock().unwrap().http_stream_limits = false;
+	let b = ep("s-b", custom, port);
+	assert_eq!(settings_known(&rp, std::slice::from_ref(&b), &[b.caps_key()], custom, true, &mut caps).await, SettingsKnown::No);
+	// a rollout with such a pod still there: not written, whatever the target
+	assert_eq!(
+		settings_known(&rp, &[a.clone(), b.clone()], &[a.caps_key(), b.caps_key()], provision::RPROXY_IMAGE, false, &mut caps).await,
+		SettingsKnown::No
+	);
+	assert!(!http_settings_condition(SettingsKnown::No, custom).status);
+	assert!(http_settings_condition(SettingsKnown::Kept, custom).status);
 }
 
 /// A pod's `/capabilities` answer is its container's (#112): a container that restarts in the same pod

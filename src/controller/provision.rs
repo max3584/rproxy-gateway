@@ -432,8 +432,18 @@ pub fn api_secret(t: &Target, current: Option<&Secret>, boot: &bootstrap::Bootst
 		("tokens.yaml".to_string(), tokens.into_bytes()),
 	]
 	.into();
-	if let Some(f) = &t.settings {
-		data.insert(crate::render::params::SETTINGS_FILE.to_string(), f.clone().into_bytes());
+	// a settings file no longer wanted stays (as it was): pods of the template before still name it in
+	// the volume's items, and the kubelet would stop updating the volume (tokens, certificate) and fail
+	// to mount it in a pod made again from that template. The new template does not read it (no
+	// RPROXY_CONFIG), and it is kept out of the pods' hash (`api_hash`)
+	match (&t.settings, have.get(crate::render::params::SETTINGS_FILE)) {
+		(Some(f), _) => {
+			data.insert(crate::render::params::SETTINGS_FILE.to_string(), f.clone().into_bytes());
+		}
+		(None, Some(f)) => {
+			data.insert(crate::render::params::SETTINGS_FILE.to_string(), f.clone());
+		}
+		(None, None) => {}
 	}
 	let mut meta = t.meta(&api_secret_name(&t.id), t.secret_labels());
 	meta.labels.get_or_insert_default().remove(LABEL_CERTS_FOR);
@@ -1193,6 +1203,21 @@ pub fn pod_keys(store: &[std::sync::Arc<Pod>], ns: &str, selector: &BTreeMap<Str
 		.collect()
 }
 
+/// Whether pods `selector` picks in `ns` run `image` with rproxy's settings file (`RPROXY_CONFIG`): the
+/// Deployment's current form, kept when whether the image takes the file is not known for a while
+/// (`controller::settings_known`).
+pub fn settings_in_use(store: &[std::sync::Arc<Pod>], ns: &str, selector: &BTreeMap<String, String>, image: Option<&str>) -> bool {
+	store.iter().filter(|p| p.metadata.deletion_timestamp.is_none() && selected(p, ns, selector)).any(|p| {
+		p.spec.as_ref().is_some_and(|s| {
+			s.containers.iter().any(|c| {
+				c.name == "rproxy"
+					&& image.is_none_or(|i| c.image.as_deref() == Some(i))
+					&& c.env.iter().flatten().any(|e| e.name == "RPROXY_CONFIG")
+			})
+		})
+	})
+}
+
 /// Whether `p` is one of the pods `selector` picks in `ns`: a managed pod belongs to its Gateway's
 /// Deployment (a ReplicaSet `rproxy-<id>-...`); a pod someone else made with the same labels is not
 /// talked to.
@@ -1700,6 +1725,31 @@ mod tests {
 			assert_eq!(api_hash(&d_on, reload), api_hash(&d_off, reload));
 		}
 		assert_eq!(api_hash(&d_off, false), content_hash(&d_off), "without it: the same hash as before");
+		// no longer wanted: the Secret keeps it (pods of the template before name it), the new template does not read it
+		t.settings = None;
+		let after = data_of(Some(&api_secret(&t, Some(&on), &b).unwrap()));
+		assert_eq!(after.get(crate::render::params::SETTINGS_FILE), d_on.get(crate::render::params::SETTINGS_FILE));
+		let pod = deployment(&t, &Managed::default(), "h").spec.unwrap().template.spec.unwrap();
+		assert_eq!(env(&pod, "RPROXY_CONFIG"), None);
+		assert_eq!(items(&pod), ["tokens.yaml", "tls.crt", "tls.key"]);
+		assert_eq!(api_hash(&after, true), api_hash(&d_off, true), "no roll for what stays");
+		// the pods' current form: rproxy with RPROXY_CONFIG on that image
+		let running = |image: &str, config: bool| {
+			let env = if config { serde_json::json!([{"name": "RPROXY_CONFIG", "value": "/x"}]) } else { serde_json::json!([]) };
+			std::sync::Arc::new(
+				serde_json::from_value::<Pod>(serde_json::json!({
+					"metadata": {"name": "p", "namespace": "web", "uid": "u", "labels": {LABEL_GATEWAY: "web-gw-1"}},
+					"spec": {"containers": [{"name": "rproxy", "image": image, "env": env}]},
+				}))
+				.unwrap(),
+			)
+		};
+		let sel: BTreeMap<String, String> = [(LABEL_GATEWAY.to_string(), "web-gw-1".to_string())].into();
+		assert!(settings_in_use(&[running("a:1", true)], "web", &sel, Some("a:1")));
+		assert!(settings_in_use(&[running("a:1", true)], "web", &sel, None));
+		assert!(!settings_in_use(&[running("a:1", true)], "web", &sel, Some("a:2")), "another image");
+		assert!(!settings_in_use(&[running("a:1", false)], "web", &sel, Some("a:1")));
+		assert!(!settings_in_use(&[running("a:1", true)], "other", &sel, None));
 	}
 
 	#[test]

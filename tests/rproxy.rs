@@ -1031,7 +1031,19 @@ async fn relay_timeouts_and_http_settings_on_a_real_rproxy() {
 	std::fs::create_dir_all(&dir).unwrap();
 	let backend = echo_backend().await;
 	let tcp_backend = tcp_echo().await;
-	let [http_port, tcp_port, tcp2_port, api] = free_ports();
+	let [http_port, tcp_port, tcp2_port, api, probe_api] = free_ports();
+	// an older rproxy would not start with the settings file: ask a plain one first
+	{
+		let probe = Rproxy::start(&bin, &dir, probe_api);
+		probe.wait().await;
+		let caps = Client::new(None, TOKEN).unwrap().capabilities(SocketAddr::from(([127, 0, 0, 1], probe_api))).await.unwrap();
+		if !caps.feature("tcp_idle_timeout") || !caps.feature("http_stream_limits") {
+			eprintln!("rproxy {} has no tcp_idle_timeout / http_stream_limits (v0.4.20); skipped", caps.version);
+			drop(probe);
+			let _ = std::fs::remove_dir_all(&dir);
+			return;
+		}
+	}
 	let params = r#"
 ---
 apiVersion: gateway.networking.k8s.io/v1
@@ -1120,17 +1132,21 @@ spec:
 	let mut world = World::default();
 	world.read_manifests(&yaml).unwrap();
 	// the settings file as the controller writes it into the control API Secret
-	let spec = render::params::gateway_parameters(&world, &world.gateways[0], &render::params::ParamsOptions::default()).unwrap().unwrap();
+	let spec = spec_with(&yaml, "", "");
 	let file = dir.join(render::params::SETTINGS_FILE);
 	std::fs::write(&file, render::params::settings_file(&spec).unwrap()).unwrap();
-	let rp = Rproxy::start_env(&bin, &dir, api, rproxy_gateway::controller::bootstrap::FLEET_RULESETS, false, &[("RPROXY_CONFIG", &file)]);
+	// the settings file is checked every second here (10 s by default)
+	let rp = Rproxy::start_env(
+		&bin,
+		&dir,
+		api,
+		rproxy_gateway::controller::bootstrap::FLEET_RULESETS,
+		false,
+		&[("RPROXY_CONFIG", &file), ("RPROXY_CONFIG_CHECK_SECS", Path::new("1"))],
+	);
 	rp.wait().await;
 	let client = Client::new(None, TOKEN).unwrap();
 	let caps = client.capabilities(SocketAddr::from(([127, 0, 0, 1], api))).await.unwrap();
-	if !caps.feature("tcp_idle_timeout") || !caps.feature("http_stream_limits") {
-		eprintln!("rproxy {} has no tcp_idle_timeout / http_stream_limits (v0.4.20); skipped", caps.version);
-		return;
-	}
 	let opts = render::Options { listen_addrs: vec!["127.0.0.1".into()], features: render::Features::of(&caps), ..Default::default() };
 	let plan = render::render_gateway(&world, &world.gateways[0], &opts);
 	let st = &plan.policies[0];
@@ -1160,6 +1176,26 @@ spec:
 	assert!(status == 200 && body.ends_with("/x|any|"), "{body}");
 	let mut idle = tokio::net::TcpStream::connect(("127.0.0.1", http_port)).await.unwrap();
 	assert!(closed_within(&mut idle, Duration::from_secs(5)).await, "global.http.timeouts.first_byte 1s");
+	// a changed file (the kubelet updating the Secret's file) is read again without a restart
+	let longer = spec_with(&yaml, "firstByte: 1s", "firstByte: 30s");
+	std::fs::write(&file, render::params::settings_file(&longer).unwrap()).unwrap();
+	let mut taken = false;
+	for _ in 0..20 {
+		tokio::time::sleep(Duration::from_millis(500)).await;
+		let mut idle = tokio::net::TcpStream::connect(("127.0.0.1", http_port)).await.unwrap();
+		if !closed_within(&mut idle, Duration::from_secs(3)).await {
+			taken = true;
+			break;
+		}
+	}
+	assert!(taken, "firstByte 30s after the file changed");
 	drop(rp);
 	let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The Gateway's merged parameters of `yaml` with `from` replaced by `to`.
+fn spec_with(yaml: &str, from: &str, to: &str) -> rproxy_gateway::k8s::params::RproxyGatewayParametersSpec {
+	let mut world = World::default();
+	world.read_manifests(&if from.is_empty() { yaml.to_string() } else { yaml.replace(from, to) }).unwrap();
+	render::params::gateway_parameters(&world, &world.gateways[0], &render::params::ParamsOptions::default()).unwrap().unwrap()
 }

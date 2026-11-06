@@ -127,7 +127,7 @@ fn timeouts(p: &RproxyPolicy) -> Result<Timeouts, String> {
 /// Puts a policy's timeouts on a rule: an L4 tcp rule's `connect_timeout` (and with `relay`, its
 /// `idle_timeout` and `half_close_timeout`), or the `http` services `service` picks: `timeouts.connect`,
 /// and `timeouts.response` unless the route rule set its own. What is set already (an older policy)
-/// stays. Returns whether an L4 tcp rule got a relay timeout.
+/// stays. Returns whether an L4 tcp rule got a relay timeout of this policy.
 fn put_timeouts(r: &mut rp::Rule, t: &Timeouts, relay: bool, service: impl Fn(&str) -> bool) -> bool {
 	match r.http.as_mut() {
 		Some(http) => {
@@ -148,12 +148,14 @@ fn put_timeouts(r: &mut rp::Rule, t: &Timeouts, relay: bool, service: impl Fn(&s
 			if !relay {
 				return false;
 			}
+			// an older policy's value stays: this one is applied only where it set one
+			let mut set = false;
 			for (k, v) in [("idle_timeout", &t.idle), ("half_close_timeout", &t.half_close)] {
 				if let Some(v) = v {
-					set_once(&mut r.extra, k, &Value::String(v.clone()));
+					set |= set_once(&mut r.extra, k, &Value::String(v.clone()));
 				}
 			}
-			t.relay()
+			set
 		}
 		None => false,
 	}
@@ -163,10 +165,13 @@ fn put_timeouts(r: &mut rp::Rule, t: &Timeouts, relay: bool, service: impl Fn(&s
 /// reaches an L4 tcp rule).
 pub const RELAY_CONDITION: &str = "rproxy.max3584.net/RelayTimeouts";
 
-fn set_once(map: &mut serde_json::Map<String, Value>, key: &str, value: &Value) {
-	if !map.contains_key(key) {
-		map.insert(key.to_string(), value.clone());
+/// Sets `key` unless it is set; whether it was.
+fn set_once(map: &mut serde_json::Map<String, Value>, key: &str, value: &Value) -> bool {
+	if map.contains_key(key) {
+		return false;
 	}
+	map.insert(key.to_string(), value.clone());
+	true
 }
 
 /// Applies the policies of `gw`'s namespace to its rules; returns their status for this Gateway.

@@ -2322,6 +2322,27 @@ spec:
 	assert!(sni.get("idle_timeout").is_none() && web.get("idle_timeout").is_none());
 	let web_st = st.iter().find(|s| s.name == "web").unwrap();
 	assert!(web_st.conds.iter().all(|c| c.kind != policy::RELAY_CONDITION), "{:?}", web_st.conds);
+	// two policies on the listener: the older one wins, the newer one is not said to be applied
+	let two = r#"
+---
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyPolicy
+metadata: {name: first, namespace: default, creationTimestamp: "2026-01-01T00:00:00Z"}
+spec:
+  targetRefs: [{group: gateway.networking.k8s.io, kind: Gateway, name: gw, sectionName: pg}]
+  idleTimeout: 2h
+---
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyPolicy
+metadata: {name: second, namespace: default, creationTimestamp: "2026-02-01T00:00:00Z"}
+spec:
+  targetRefs: [{group: gateway.networking.k8s.io, kind: Gateway, name: gw, sectionName: pg}]
+  idleTimeout: 3h
+"#;
+	let ([_, pg, _, _], st) = render(two, Features::default());
+	assert_eq!(pg["idle_timeout"], "7200s");
+	let relay = |name: &str| st.iter().find(|s| s.name == name).unwrap().conds.iter().any(|c| c.kind == policy::RELAY_CONDITION);
+	assert!(relay("first") && !relay("second"));
 	// an rproxy before v0.4.20: not sent (it would refuse the rule set), the rest of the policy applies
 	let old = Features { tcp_idle_timeout: false, ..Features::default() };
 	let ([_, pg, sni, _], st) = render(policy, old);
