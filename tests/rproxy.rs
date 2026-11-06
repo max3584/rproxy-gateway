@@ -50,9 +50,15 @@ struct Rproxy {
 
 impl Rproxy {
 	fn start(bin: &Path, dir: &Path, api: u16) -> Rproxy {
+		Rproxy::start_with(bin, dir, api, false)
+	}
+
+	/// `freebind`: the token file says `allow_freebind: true` (rproxy v0.4.20, `features.control_limits`).
+	fn start_with(bin: &Path, dir: &Path, api: u16, freebind: bool) -> Rproxy {
 		let tokens = dir.join("tokens.yaml");
 		use rproxy_gateway::controller::bootstrap;
-		std::fs::write(&tokens, bootstrap::token_file(TOKEN, bootstrap::FLEET_RULESETS) + &bootstrap::ui_token_entry(UI_TOKEN)).unwrap();
+		std::fs::write(&tokens, bootstrap::token_file(TOKEN, bootstrap::FLEET_RULESETS, freebind) + &bootstrap::ui_token_entry(UI_TOKEN))
+			.unwrap();
 		let log = std::fs::File::create(dir.join(format!("rproxy-{api}.log"))).unwrap();
 		let child = Command::new(bin)
 			.env("RPROXY_API_ADDR", "127.0.0.1")
@@ -481,14 +487,18 @@ async fn two_gateways_on_one_port_on_two_addresses() {
 	std::fs::create_dir_all(&dir).unwrap();
 	let backend = echo_backend().await;
 	let [port, api] = free_ports();
-	let rp = Rproxy::start(&bin, &dir, api);
+	let mut rp = Rproxy::start(&bin, &dir, api);
 	rp.wait().await;
 	let client = Client::new(None, TOKEN).unwrap();
 	let caps = client.capabilities(SocketAddr::from(([127, 0, 0, 1], api))).await.unwrap();
 	if !caps.feature("listen_freebind") {
 		eprintln!("rproxy {} has no listen_freebind (v0.4.3); skipped", caps.version);
+		drop(rp);
+		let _ = std::fs::remove_dir_all(&dir);
 		return;
 	}
+	let limits = caps.feature("control_limits");
+	let log = || std::fs::read_to_string(dir.join(format!("rproxy-{api}.log"))).unwrap();
 	let gateways: String = ["a", "b", "c"]
 		.iter()
 		.map(|n| {
@@ -530,17 +540,30 @@ endpoints: [{{addresses: [127.0.0.1]}}]
 	let mut world = World::default();
 	world.read_manifests(&yaml).unwrap();
 	let ep = Endpoint { pod: "rproxy".into(), uid: "1".into(), ip: "127.0.0.1".into(), api_port: api, ..Default::default() };
+	let opts = |vip: &str| render::Options {
+		listen_addrs: vec![vip.to_string()],
+		listen_freebind: true,
+		features: render::Features::of(&caps),
+		..Default::default()
+	};
+	if limits {
+		// a token file without the field (before the controller knows every pod has control_limits):
+		// rproxy v0.4.20 sets listen_freebind for the token's rule sets anyway (allow_rulesets), and warns
+		let plan = render::render_gateway(&world, &world.gateways[0], &opts("203.0.113.20"));
+		let (r, _) = sync_pod(&client, &ep, &plan, &mut Applied::new(), &mut HashMap::new()).await;
+		assert!(matches!(r, PodSync::Synced(..)), "{r:?}");
+		assert!(log().contains("token.freebind"), "{}", log());
+		// the controller's file once it knows (#105): started again with it
+		drop(rp);
+		std::fs::remove_file(dir.join(format!("rproxy-{api}.log"))).unwrap();
+		rp = Rproxy::start_with(&bin, &dir, api, true);
+		rp.wait().await;
+	}
 	let mut applied = Applied::new();
 	let mut caps_cache = HashMap::new();
 	// TEST-NET-3 addresses: on no interface of the test host
 	for (i, vip) in ["203.0.113.20", "203.0.113.21", "203.0.113.20"].iter().enumerate() {
-		let opts = render::Options {
-			listen_addrs: vec![vip.to_string()],
-			listen_freebind: true,
-			features: render::Features::of(&caps),
-			..Default::default()
-		};
-		let plan = render::render_gateway(&world, &world.gateways[i], &opts);
+		let plan = render::render_gateway(&world, &world.gateways[i], &opts(vip));
 		let (r, _) = sync_pod(&client, &ep, &plan, &mut applied, &mut caps_cache).await;
 		let PodSync::Synced(views, _) = r else { panic!("{r:?}") };
 		let key = format!("tcp/{vip}:{port}");
@@ -553,6 +576,12 @@ endpoints: [{{addresses: [127.0.0.1]}}]
 			assert!(v.error.as_deref().unwrap_or("").contains("k8s/default/a"), "{:?}", v.error);
 		}
 	}
+	// with `allow_freebind: true` in the file: no warning
+	if limits {
+		assert!(!log().contains("token.freebind"), "{}", log());
+	}
+	drop(rp);
+	let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A backend answering with the client address it was given: `<x-forwarded-for>`.

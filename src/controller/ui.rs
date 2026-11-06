@@ -243,11 +243,13 @@ pub async fn apply(client: &kube::Client, ns: &str, groups: &[Group], ca_pem: &[
 	Ok(())
 }
 
-/// Fleet: the UI's token entry in the fleet's token file (`rproxy-gateway-token`), added or removed.
-pub async fn apply_fleet_token(client: &kube::Client, ns: &str, master: &str, shown: bool) -> anyhow::Result<()> {
+/// Fleet: the UI's token entry in the fleet's token file (`rproxy-gateway-token`), added or removed;
+/// `freebind`: every fleet pod's rproxy is known to have `features.control_limits` (the file says
+/// `allow_freebind: true`, which rproxy v0.4.19 and earlier refuse).
+pub async fn apply_fleet_token(client: &kube::Client, ns: &str, master: &str, shown: bool, freebind: bool) -> anyhow::Result<()> {
 	let api: Api<Secret> = Api::namespaced(client.clone(), ns);
 	let Some(s) = api.get_opt(bootstrap::TOKEN_SECRET).await? else { return Ok(()) };
-	let mut want = bootstrap::token_file(master, bootstrap::FLEET_RULESETS);
+	let mut want = bootstrap::token_file(master, bootstrap::FLEET_RULESETS, freebind);
 	if shown {
 		want.push_str(&bootstrap::ui_token_entry(&bootstrap::derive_ui_token(master, "fleet")));
 	}
@@ -255,7 +257,12 @@ pub async fn apply_fleet_token(client: &kube::Client, ns: &str, master: &str, sh
 	if have.as_deref() == Some(want.as_bytes()) {
 		return Ok(());
 	}
-	info!(secret = bootstrap::TOKEN_SECRET, ui = shown, "writing the fleet's token file (the UI's read-only token)");
+	info!(
+		secret = bootstrap::TOKEN_SECRET,
+		ui = shown,
+		freebind,
+		"writing the fleet's token file (the UI's read-only token, allow_freebind)"
+	);
 	let patch = serde_json::json!({"data": {"tokens.yaml": base64::engine::general_purpose::STANDARD.encode(want.as_bytes())}});
 	api.patch(bootstrap::TOKEN_SECRET, &PatchParams::default(), &Patch::Merge(&patch)).await?;
 	Ok(())

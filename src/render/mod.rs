@@ -711,6 +711,18 @@ struct ListenerState<'a> {
 	attached: i32,
 }
 
+/// rproxy's longest route, middleware or service name (rproxy-api v0.4.20, `l7::MAX_NAME`): it
+/// refuses a longer one sent to the control API (`400 invalid`).
+pub const MAX_NAME: usize = 512;
+
+/// A route's name on one of several listeners of its port (`<name>@<listener>`). A ListenerSet's
+/// listener is `<set>/<listener>`, so a long set and route name (253 bytes each) go past `MAX_NAME`:
+/// then the listener is its hash (still apart per listener; `isolate::owner` reads up to the `@`).
+pub fn on_listener(name: &str, label: &str) -> String {
+	let full = format!("{name}@{label}");
+	if full.len() <= MAX_NAME { full } else { format!("{name}@{}", crate::pem::short_hash(label.as_bytes())) }
+}
+
 /// The ruleset name of a Gateway.
 pub fn ruleset_name(namespace: &str, name: &str) -> String {
 	format!("k8s/{namespace}/{name}")
@@ -1412,7 +1424,7 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 				if several {
 					// one rproxy route per listener: names stay unique
 					for e in &mut out.entries {
-						e.route.name = format!("{}@{}", e.route.name, listeners[a.listener].label);
+						e.route.name = on_listener(&e.route.name, &listeners[a.listener].label);
 					}
 				}
 				let entry = results.entry((a.kind, a.route)).or_insert((None, None));
