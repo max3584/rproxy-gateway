@@ -277,6 +277,7 @@ rproxy-api adds `--shutdown-delay` / `RPROXY_SHUTDOWN_DELAY` (after SIGTERM, `/r
 
 - rproxy-api v0.4.1 has them. The chart's rproxy image (`rproxy.image.tag`, the default of `--rproxy-image`, `RPROXY_VERSION` in release.yml) moved to 0.4.1.
 - An older rproxy image through `rproxy.image` ignores `RPROXY_SHUTDOWN_*` and stops at once on SIGTERM. So the new shape (no preStop, `/readyz`) is used only once the pod's rproxy is known to have `features.graceful_shutdown`: the image the controller ships (`--rproxy-image`'s default) at once, another image once a pod running it answers in `/capabilities` (its pods roll once more; the controller remembers such images while it runs). While unknown, v0.4.1's shape (preStop, `/healthz`, no `RPROXY_SHUTDOWN_*`).
+- The token file's `allow_freebind: true` (rproxy v0.4.20's `features.control_limits`, #105) is decided the same way: at once for the shipped image, for another image once a pod's `/capabilities` answers; for the fleet, only when every pod's image is known. v0.4.19 and earlier refuse a token file with the field, so it is left out while unknown ([SECURITY.md](SECURITY.md), "Owners of rproxy's rule sets"). rproxy v0.4.20 reads its token file again, so adding it does not roll the pods.
 
 ### 6.2 Shape
 

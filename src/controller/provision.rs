@@ -257,6 +257,9 @@ pub struct Target<'a> {
 	/// The rproxy image reads a changed token file again (`features.tokens_reload`, rproxy v0.4.2):
 	/// adding or removing the UI's token does not roll the pods (`api_hash`).
 	pub tokens_reload: bool,
+	/// The rproxy image has `features.control_limits` (rproxy v0.4.20): the token file says
+	/// `allow_freebind: true` (`bootstrap::token_file`; older rproxy refuses the field).
+	pub control_limits: bool,
 	/// The UI reads this Gateway's rproxy (`--ui-namespace` set and the parameters' `ui.visible`
 	/// not false): its read-only token in the token file (rproxy before v0.4.2 reads the file at
 	/// start: the pods roll), the UI's pods let through the NetworkPolicy.
@@ -278,6 +281,7 @@ impl<'a> Target<'a> {
 			params: Params::default(),
 			graceful: false,
 			tokens_reload: false,
+			control_limits: false,
 			ui: None,
 		}
 	}
@@ -411,7 +415,7 @@ pub fn api_secret(t: &Target, current: Option<&Secret>, boot: &bootstrap::Bootst
 		(c.into_bytes(), k.into_bytes())
 	};
 	let token = bootstrap::derive_token(&boot.token, &t.id);
-	let mut tokens = bootstrap::token_file(&token, &t.plan.ruleset);
+	let mut tokens = bootstrap::token_file(&token, &t.plan.ruleset, t.control_limits);
 	if t.ui.is_some() {
 		tokens.push_str(&bootstrap::ui_token_entry(&bootstrap::derive_ui_token(&boot.token, &t.id)));
 	}
@@ -939,14 +943,16 @@ pub async fn apply_secrets(
 /// The hash of a control API Secret's content in the pod template (`ANNOTATION_API`): a change rolls
 /// the pods. rproxy before v0.4.2 reads its token file only at start (and on SIGHUP), so the UI's token
 /// is part of it (adding or removing it rolls the pods once); an rproxy that reads a changed token file
-/// again (`tokens_reload`, max3584/rproxy-api#253) takes it without a roll.
+/// again (`tokens_reload`, max3584/rproxy-api#253) takes it without a roll. The same goes for the
+/// controller's `allow_freebind` (rproxy v0.4.20, which reads the file again): learning that a pod's
+/// image has `features.control_limits` does not roll the pods.
 pub fn api_hash(data: &BTreeMap<String, Vec<u8>>, tokens_reload: bool) -> String {
 	if !tokens_reload {
 		return content_hash(data);
 	}
 	let mut d = data.clone();
 	if let Some(f) = d.get_mut("tokens.yaml") {
-		*f = bootstrap::without_ui_entry(&String::from_utf8_lossy(f)).as_bytes().to_vec();
+		*f = bootstrap::without_freebind(bootstrap::without_ui_entry(&String::from_utf8_lossy(f))).into_bytes();
 	}
 	content_hash(&d)
 }
@@ -1558,6 +1564,15 @@ mod tests {
 		assert!(String::from_utf8_lossy(&d["tokens.yaml"]).contains(&crate::pem::sha256_hex(token.as_bytes())));
 		assert!(!String::from_utf8_lossy(&d["tokens.yaml"]).contains(&crate::pem::sha256_hex(b"master")), "not the master token");
 		assert!(String::from_utf8_lossy(&d["tokens.yaml"]).contains("allow_rulesets: [\"k8s/default/web\"]"), "its own rule set only");
+		// allow_freebind only for an rproxy with control_limits (v0.4.19 and earlier refuse the field, #105)
+		assert!(!String::from_utf8_lossy(&d["tokens.yaml"]).contains("allow_freebind"));
+		let mut t2 = Target::new(&p);
+		t2.control_limits = true;
+		let d2 = data_of(Some(&api_secret(&t2, Some(&first), &b).unwrap()));
+		assert!(String::from_utf8_lossy(&d2["tokens.yaml"]).contains(bootstrap::FREEBIND_LINE));
+		// rproxy v0.4.20 reads the token file again: learning control_limits does not roll the pods
+		assert_eq!(api_hash(&d2, true), api_hash(&d, true));
+		assert_eq!(api_hash(&d, true), content_hash(&d), "without it: the same hash as before");
 		crate::pem::check_pair(&d["tls.crt"], &d["tls.key"]).unwrap();
 		let again = api_secret(&t, Some(&first), &b).unwrap();
 		assert_eq!(data_of(Some(&again)), d, "the certificate is kept");

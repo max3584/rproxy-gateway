@@ -604,7 +604,9 @@ async fn reconcile_all(
 	// fleet: the UI reads the fleet's pods only if it may see every Gateway on them
 	if let Mode::Fleet(f) = &cfg.mode {
 		let shown = cfg.ui.is_some() && plans.iter().filter(|(p, _)| p.accepted()).all(|(p, _)| ui::visible(p));
-		if let Err(e) = ui::apply_fleet_token(client, &cfg.namespace, &boot.token, shown).await {
+		// rproxy v0.4.20 takes `allow_freebind` in the token file; older rproxy refuses the file with it
+		let freebind = pods_have(rp, &fleet_pods, "control_limits", &mut state.caps).await;
+		if let Err(e) = ui::apply_fleet_token(client, &cfg.namespace, &boot.token, shown, freebind).await {
 			warn!(error = %e, "cannot write the fleet's token file");
 			soon = true;
 		}
@@ -874,6 +876,8 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 			t.graceful = graceful(p.rp, &t.rproxy_image(m), &eps, &mut sub.caps).await;
 			// rproxy v0.4.2 reads a changed token file again: the UI's token does not roll the pods
 			t.tokens_reload = image_feature(p.rp, &t.rproxy_image(m), "tokens_reload", &eps, &mut sub.caps).await;
+			// rproxy v0.4.20 takes `allow_freebind` in the token file; older rproxy refuses the file with it
+			t.control_limits = image_feature(p.rp, &t.rproxy_image(m), "control_limits", &eps, &mut sub.caps).await;
 			// the UI reads it (its token in the token file, its pods through the NetworkPolicy)
 			t.ui = p.cfg.ui.clone().filter(|_| ui::visible(&plan));
 			t.owner = match (&p.gateway_api_version, &gw.metadata.uid) {
@@ -1425,6 +1429,26 @@ async fn image_feature(rp: &Client, image: &str, feature: &str, eps: &[Endpoint]
 		FEATURE_IMAGES.lock().unwrap().insert(key);
 	}
 	known
+}
+
+/// Whether every pod in `eps` runs an image with `feature` (`image_feature`): none, or one whose image
+/// is not known, is no (the fleet's token file says `allow_freebind` only for rproxy that takes it).
+async fn pods_have(rp: &Client, eps: &[Endpoint], feature: &str, caps: &mut HashMap<String, Capabilities>) -> bool {
+	let mut images = BTreeSet::new();
+	for ep in eps {
+		match &ep.rproxy_image {
+			Some(image) => {
+				images.insert(image.clone());
+			}
+			None => return false,
+		}
+	}
+	for image in &images {
+		if !image_feature(rp, image, feature, eps, caps).await {
+			return false;
+		}
+	}
+	!images.is_empty()
 }
 
 /// Whether `image` has a graceful shutdown (`features.graceful_shutdown`, rproxy v0.4.1): if not

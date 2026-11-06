@@ -68,7 +68,7 @@ rproxy の Pod が入れ替わる（削除、`kubectl rollout restart`、ノー�
 |---|---|---|
 | `rproxy-gateway-ca` | CA の証明書と鍵 | コントローラ（rproxy の Pod は読めない） |
 | `rproxy-gateway-api-tls` | rproxy の制御 API の証明書（CA が `rproxy-api.rproxy-gateway.internal` に出す。Pod へは IP でつなぐので名前は固定） | rproxy（ボリューム） |
-| `rproxy-gateway-token` | コントローラのトークン（`token`）と、rproxy が読むトークンファイル（`tokens.yaml`、SHA-256 だけ。スコープは `rules:read`・`rules:write`・`acme:write`、`allow_rulesets: ["k8s/"]`・`allow_freebind: true`。[SECURITY.md](SECURITY.md) の「rproxy のルールセットの持ち主」） | `token` はコントローラ、`tokens.yaml` は rproxy（ボリュームでその項目だけ） |
+| `rproxy-gateway-token` | コントローラのトークン（`token`）と、rproxy が読むトークンファイル（`tokens.yaml`、SHA-256 だけ。スコープは `rules:read`・`rules:write`・`acme:write`、`allow_rulesets: ["k8s/"]`、rproxy が `features.control_limits` を持つと分かっていれば `allow_freebind: true`。[SECURITY.md](SECURITY.md) の「rproxy のルールセットの持ち主」） | `token` はコントローラ、`tokens.yaml` は rproxy（ボリュームでその項目だけ） |
 
 managed の rproxy は、それぞれ Gateway の namespace の `rproxy-<id>-api` を使う：CA が `<id>.rproxy-api.rproxy-gateway.internal` に出した制御 API の証明書と、マスタートークンから導いたトークン（HMAC-SHA256、鍵がマスタートークンで中身が Gateway の id）のトークンファイル（`tokens.yaml`、SHA-256 だけ）。コントローラは Pod ごとにその名前とトークンでつなぐ。ある Gateway の namespace の Secret を読めても、ほかの Gateway の rproxy にもコントローラにもつなげない（マスタートークンと CA の鍵はコントローラの namespace だけ）。
 

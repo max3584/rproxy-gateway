@@ -129,9 +129,13 @@ namespace のラベルはテナントが書けないようにしておく（name
 
 rproxy はルールセットを、作ったトークンの名前のものにする（ほかの admin でないトークンは変えられない）。コントローラのトークンは値が変わっても名前はいつも `rproxy-gateway` なので、トークンを入れ替えても（rproxy の再起動のあとの PUT し直しも）同じ持ち主のまま。トークンの `allow_rulesets` は、fleet のものが `k8s/`、managed の Gateway ごとのものがその Gateway のルールセット（`k8s/<namespace>/<name>`）だけ。
 
-トークンファイルには `allow_freebind: true` も書く（v0.4.20、#105）。fleet の `listen: addresses` は Gateway の `spec.addresses` で `listen_freebind` を使って待ち受け、rproxy v0.4.20 は `listen_freebind` のルールを `admin` のトークン、`allow_freebind: true` のトークン、組の `PUT` では `allow_rulesets` のあるトークンにだけ許す。コントローラのトークンは 3 つ目でも通るが、ファイルに書かないとトークンごとに 1 回 `token.freebind` の警告が出るので、意図して使うことをファイルで示す。managed の Gateway ごとのトークンも同じ形で書く（managed は `listen_freebind` を使わず、`allow_rulesets` で許される範囲も変わらない）。
+rproxy が `features.control_limits`（rproxy v0.4.20）を持つと分かっているときは、トークンファイルに `allow_freebind: true` も書く（#105）。fleet の `listen: addresses` は Gateway の `spec.addresses` で `listen_freebind` を使って待ち受け、rproxy v0.4.20 は `listen_freebind` のルールを `admin` のトークン、`allow_freebind: true` のトークン、組の `PUT` では `allow_rulesets` のあるトークンにだけ許す。コントローラのトークンは 3 つ目でも通るが、ファイルに書かないとトークンごとに 1 回 `token.freebind` の警告が出るので、意図して使うことをファイルで示す。managed の Gateway ごとのトークンも同じ決め方で書く（managed は `listen_freebind` を使わず、`allow_rulesets` で許される範囲も変わらない）。
 
-**rproxy v0.4.19 以前はこの項目を知らず、トークンファイルを誤りとして断る**。コントローラが出荷する rproxy（chart の `rproxy.image` の既定、`--rproxy-image` の既定）は v0.4.20 以上。chart の `rproxy.image`（managed の既定と fleet の DaemonSet）・GatewayClass の parameters の `rproxy.image`・`--rproxy-image` で v0.4.19 以前のイメージに固定しているなら、コントローラを v0.4.20 に上げる前に rproxy のイメージも v0.4.20 以上にする。動いている古い rproxy は読み直しに失敗しても今のトークンを使い続ける（`reload.tokens` の警告）が、再起動した Pod・新しい Pod は起動できない。コントローラを v0.4.19 以前に戻すときは、コントローラがトークンファイルを書き直す（`allow_freebind` が外れる）ので、rproxy はそのままでよい。
+rproxy v0.4.19 以前はこの項目を知らず、書いたトークンファイルを誤りとして断るので、分かっているときだけ書く（`features.graceful_shutdown` と同じ決め方。[DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) の 6.1）：
+
+- managed：Gateway の rproxy のイメージが、コントローラが出荷するもの（`--rproxy-image` の既定）か、そのイメージを動かす Pod の `/capabilities` が `control_limits` を返したもの（分かったイメージはコントローラが動いている間覚える）。分からない間は書かない。後から分かって書き足しても、rproxy v0.4.20 はトークンファイルを読み直すので Pod は入れ替わらない（Pod のテンプレートの注釈のハッシュに入れない）。
+- fleet：`rproxy-gateway-token` の `tokens.yaml` はコントローラが毎回書くので、fleet の Pod の**すべて**のイメージが上と同じ意味で分かっているときだけ書く。Pod がない、イメージの分からない Pod がある（古いイメージへの rollout の途中など）ときは外す。コントローラの起動時の確かめでは書かない（次の反映で足す）。
+- 古い rproxy のイメージ（chart の `rproxy.image`、GatewayClass の parameters の `rproxy.image`、`--rproxy-image`）を使い続けても、トークンファイルは今までどおりで、rproxy は動く。v0.4.20 以上の rproxy で、まだ分かっていない間だけ `token.freebind` の警告が出る。
 
 ## rproxy のファイルの所有者の確認
 

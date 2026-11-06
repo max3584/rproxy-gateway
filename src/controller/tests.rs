@@ -26,6 +26,8 @@ struct Fake {
 	graceful: bool,
 	/// `features.tokens_reload` (rproxy v0.4.2)
 	tokens_reload: bool,
+	/// `features.control_limits` (rproxy v0.4.20)
+	control_limits: bool,
 	/// Tokens that may read (`GET /rules`): the UI's
 	readers: BTreeSet<String>,
 	/// HTTP routes whose match has `BAD` are refused without naming them (else by name)
@@ -75,10 +77,10 @@ async fn handle(fake: Arc<Mutex<Fake>>, req: Request<hyper::body::Incoming>) -> 
 			reply(200, json!(asked.into_iter().filter(|n| f.files.contains(n)).collect::<Vec<_>>()))
 		}
 		("GET", "/capabilities") => {
-			let (graceful, reload) = (f.graceful, f.tokens_reload);
+			let (graceful, reload, limits) = (f.graceful, f.tokens_reload, f.control_limits);
 			reply(
 				200,
-				json!({"version": "0.4.0", "features": {"rulesets": true, "labels": true, "conditions": true, "readyz": true, "graceful_shutdown": graceful, "tokens_reload": reload}}),
+				json!({"version": "0.4.0", "features": {"rulesets": true, "labels": true, "conditions": true, "readyz": true, "graceful_shutdown": graceful, "tokens_reload": reload, "control_limits": limits}}),
 			)
 		}
 		("GET", p) if p.starts_with("/rulesets/") => {
@@ -360,6 +362,39 @@ async fn tokens_reload_is_known_from_the_image_or_the_pods() {
 	assert!(image_feature(&rp, "example/rproxy:reload", "tokens_reload", &[ep("r1"), ep("r2")], &mut caps).await);
 	assert!(image_feature(&rp, "example/rproxy:reload", "tokens_reload", &[], &mut HashMap::new()).await, "remembered");
 	assert!(!graceful(&rp, "example/rproxy:reload", &[], &mut HashMap::new()).await, "per feature");
+}
+
+/// The token file says `allow_freebind: true` only for rproxy known to have `features.control_limits`
+/// (rproxy v0.4.20; older rproxy refuses the file with it, #105): the shipped image, or an image a pod
+/// running it said so of. The fleet's: every fleet pod's image.
+#[tokio::test]
+async fn control_limits_is_known_from_the_image_or_the_pods() {
+	let fake = Arc::new(Mutex::new(Fake::default()));
+	let port = start(fake.clone()).await;
+	let rp = Client::new(None, "secret").unwrap();
+	let ep = |uid: &str, image: Option<&str>| Endpoint {
+		pod: format!("rproxy-{uid}"),
+		uid: uid.into(),
+		ip: "127.0.0.1".into(),
+		api_port: port,
+		rproxy_image: image.map(String::from),
+		..Default::default()
+	};
+	let (new, old) = ("example/rproxy:limits", "example/rproxy:before-limits");
+	let mut caps = HashMap::new();
+	// not known yet: left out (an older rproxy keeps working, with rproxy v0.4.20's warning only)
+	assert!(!image_feature(&rp, new, "control_limits", &[], &mut caps).await, "no pods yet");
+	assert!(!pods_have(&rp, &[], "control_limits", &mut caps).await, "no fleet pods");
+	assert!(!pods_have(&rp, &[ep("c1", Some(old))], "control_limits", &mut caps).await, "rproxy v0.4.19");
+	assert!(!image_feature(&rp, old, "control_limits", &[ep("c1", Some(old))], &mut caps).await);
+	// a pod of another image that has it
+	fake.lock().unwrap().control_limits = true;
+	assert!(image_feature(&rp, new, "control_limits", &[ep("c2", Some(new))], &mut caps).await);
+	assert!(image_feature(&rp, new, "control_limits", &[], &mut HashMap::new()).await, "remembered");
+	assert!(pods_have(&rp, &[ep("c2", Some(new))], "control_limits", &mut caps).await);
+	// every fleet pod: one of an image not known (c1 answered before), or without an image, says no
+	assert!(!pods_have(&rp, &[ep("c2", Some(new)), ep("c1", Some(old))], "control_limits", &mut caps).await);
+	assert!(!pods_have(&rp, &[ep("c2", Some(new)), ep("c3", None)], "control_limits", &mut caps).await);
 }
 
 #[tokio::test]

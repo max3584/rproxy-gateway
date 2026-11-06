@@ -50,9 +50,15 @@ struct Rproxy {
 
 impl Rproxy {
 	fn start(bin: &Path, dir: &Path, api: u16) -> Rproxy {
+		Rproxy::start_with(bin, dir, api, false)
+	}
+
+	/// `freebind`: the token file says `allow_freebind: true` (rproxy v0.4.20, `features.control_limits`).
+	fn start_with(bin: &Path, dir: &Path, api: u16, freebind: bool) -> Rproxy {
 		let tokens = dir.join("tokens.yaml");
 		use rproxy_gateway::controller::bootstrap;
-		std::fs::write(&tokens, bootstrap::token_file(TOKEN, bootstrap::FLEET_RULESETS) + &bootstrap::ui_token_entry(UI_TOKEN)).unwrap();
+		std::fs::write(&tokens, bootstrap::token_file(TOKEN, bootstrap::FLEET_RULESETS, freebind) + &bootstrap::ui_token_entry(UI_TOKEN))
+			.unwrap();
 		let log = std::fs::File::create(dir.join(format!("rproxy-{api}.log"))).unwrap();
 		let child = Command::new(bin)
 			.env("RPROXY_API_ADDR", "127.0.0.1")
@@ -481,13 +487,20 @@ async fn two_gateways_on_one_port_on_two_addresses() {
 	std::fs::create_dir_all(&dir).unwrap();
 	let backend = echo_backend().await;
 	let [port, api] = free_ports();
-	let rp = Rproxy::start(&bin, &dir, api);
+	let mut rp = Rproxy::start(&bin, &dir, api);
 	rp.wait().await;
 	let client = Client::new(None, TOKEN).unwrap();
 	let caps = client.capabilities(SocketAddr::from(([127, 0, 0, 1], api))).await.unwrap();
 	if !caps.feature("listen_freebind") {
 		eprintln!("rproxy {} has no listen_freebind (v0.4.3); skipped", caps.version);
 		return;
+	}
+	// the controller says `allow_freebind: true` once it knows the rproxy has control_limits (v0.4.20)
+	let limits = caps.feature("control_limits");
+	if limits {
+		drop(rp);
+		rp = Rproxy::start_with(&bin, &dir, api, true);
+		rp.wait().await;
 	}
 	let gateways: String = ["a", "b", "c"]
 		.iter()
@@ -555,7 +568,7 @@ endpoints: [{{addresses: [127.0.0.1]}}]
 	}
 	// rproxy v0.4.20 (`features.control_limits`) warns `token.freebind` for a token whose file does not
 	// say `allow_freebind: true`; the controller's says it (#105)
-	if caps.feature("control_limits") {
+	if limits {
 		let log = std::fs::read_to_string(dir.join(format!("rproxy-{api}.log"))).unwrap();
 		assert!(!log.contains("token.freebind"), "{log}");
 	}

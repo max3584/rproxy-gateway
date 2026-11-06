@@ -125,7 +125,7 @@ pub fn new_token() -> anyhow::Result<(String, String)> {
 	let mut bytes = [0u8; 32];
 	ring::rand::SystemRandom::new().fill(&mut bytes).map_err(|_| anyhow::anyhow!("no randomness"))?;
 	let token = crate::pem::hex(&bytes);
-	Ok((token.clone(), token_file(&token, FLEET_RULESETS)))
+	Ok((token.clone(), token_file(&token, FLEET_RULESETS, false)))
 }
 
 /// The token of one target (a managed Gateway's id): HMAC-SHA256 of the master token.
@@ -138,16 +138,27 @@ pub fn derive_token(master: &str, target: &str) -> String {
 /// The token is named `rproxy-gateway` whatever its value: rproxy makes the token's name
 /// the owner of the rule sets it creates, so a rotated token (same name) still owns them.
 /// `allow_rulesets`: the rule set name prefixes it may change (`k8s/`; a managed Gateway's
-/// own set). `allow_freebind: true`: the fleet's rules listen on Gateways' `spec.addresses` with
-/// `listen_freebind` (rproxy v0.4.20 lets a rule set's `PUT` from a token with `allow_rulesets`
-/// do it anyway, but warns `token.freebind` unless the token file says so, #105). rproxy v0.4.19
-/// and earlier refuse the field: the controller ships rproxy v0.4.20 or later.
-pub fn token_file(token: &str, allow_rulesets: &str) -> String {
+/// own set). `freebind`: the rproxy is known to have `features.control_limits` (rproxy v0.4.20),
+/// so the file also says `allow_freebind: true` (`FREEBIND_LINE`): the fleet's rules listen on
+/// Gateways' `spec.addresses` with `listen_freebind`, which rproxy v0.4.20 lets a rule set's `PUT`
+/// from a token with `allow_rulesets` do anyway, but with a `token.freebind` warning unless the file
+/// says so (#105). rproxy v0.4.19 and earlier refuse the field, so it is left out for them.
+pub fn token_file(token: &str, allow_rulesets: &str, freebind: bool) -> String {
 	format!(
-		"# written by rproxy-gateway: the controller's token (rule sets; ACME certificates for Traefik certResolver)\ntokens:\n  - name: rproxy-gateway\n    sha256: {}\n    scopes: [rules:read, rules:write, acme:write]\n    allow_rulesets: [\"{}\"]\n    allow_freebind: true\n",
+		"# written by rproxy-gateway: the controller's token (rule sets; ACME certificates for Traefik certResolver)\ntokens:\n  - name: rproxy-gateway\n    sha256: {}\n    scopes: [rules:read, rules:write, acme:write]\n    allow_rulesets: [\"{}\"]\n{}",
 		crate::pem::sha256_hex(token.as_bytes()),
-		allow_rulesets
+		allow_rulesets,
+		if freebind { FREEBIND_LINE } else { "" }
 	)
+}
+
+/// The controller's token's `allow_freebind` (rproxy v0.4.20, `features.control_limits`).
+pub const FREEBIND_LINE: &str = "    allow_freebind: true\n";
+
+/// A token file without the controller's `allow_freebind` (what is compared or hashed where whether
+/// the rproxy has it is not known: the fleet's check at start, `provision::api_hash`).
+pub fn without_freebind(file: &str) -> String {
+	file.replacen(FREEBIND_LINE, "", 1)
 }
 
 /// The rule sets the fleet's token may change: every Gateway's.
@@ -208,17 +219,17 @@ pub async fn ensure(client: &kube::Client, ns: &str) -> anyhow::Result<Bootstrap
 		Some(s) => s,
 		None => {
 			let (token, _) = new_token()?;
-			let file = token_file(&token, FLEET_RULESETS);
+			let file = token_file(&token, FLEET_RULESETS, false);
 			info!(secret = TOKEN_SECRET, "creating the controller's token");
 			create_or_get(&api, &pp, secret(TOKEN_SECRET, ns, &[("token", token.into_bytes()), ("tokens.yaml", file.into_bytes())])).await?
 		}
 	};
 	let token = String::from_utf8(field(&tok, "token").context("the token Secret has no token")?)?;
 	// the token file follows the controller's version (a rotated token is a new Secret); the UI's
-	// entry (the UI namespace) is kept here and set by each pass
-	let file = token_file(token.trim(), FLEET_RULESETS);
+	// entry (the UI namespace) and `allow_freebind` (the fleet's rproxy) are kept here and set by each pass
+	let file = token_file(token.trim(), FLEET_RULESETS, false);
 	let have = field(&tok, "tokens.yaml").map(|f| String::from_utf8_lossy(&f).into_owned());
-	if have.as_deref().map(without_ui_entry) != Some(file.as_str()) {
+	if have.as_deref().map(|h| without_freebind(without_ui_entry(h))).as_deref() != Some(file.as_str()) {
 		let mut s = tok.clone();
 		s.data.get_or_insert_default().insert("tokens.yaml".into(), ByteString(file.into_bytes()));
 		info!(secret = TOKEN_SECRET, "writing the fleet's token file again");
@@ -289,11 +300,23 @@ mod tests {
 		assert!(file.contains(&crate::pem::sha256_hex(token.as_bytes())));
 		assert!(file.contains("rules:write"));
 		assert!(file.contains("allow_rulesets: [\"k8s/\"]"), "{file}");
-		assert!(token_file(&token, "k8s/default/web").contains("allow_rulesets: [\"k8s/default/web\"]"));
-		// the fleet listens on Gateways' addresses (listen_freebind): said in the file (rproxy v0.4.20, #105)
+		assert!(token_file(&token, "k8s/default/web", false).contains("allow_rulesets: [\"k8s/default/web\"]"));
+		// an rproxy not known to have control_limits (v0.4.19 and earlier refuse the field): left out
 		let doc: serde_json::Value = serde_saphyr::from_str(&file).unwrap();
-		assert_eq!(doc["tokens"][0]["allow_freebind"], serde_json::json!(true), "{file}");
 		assert_eq!(doc["tokens"][0]["allow_rulesets"], serde_json::json!(["k8s/"]));
+		assert!(doc["tokens"][0].get("allow_freebind").is_none(), "{file}");
+		// one known to have it (rproxy v0.4.20): the fleet's listen_freebind is said in the file (#105)
+		let with = token_file(&token, FLEET_RULESETS, true);
+		let doc: serde_json::Value = serde_saphyr::from_str(&with).unwrap();
+		assert_eq!(doc["tokens"][0]["allow_freebind"], serde_json::json!(true), "{with}");
+		assert_eq!(doc["tokens"][0]["allow_rulesets"], serde_json::json!(["k8s/"]));
+		assert_eq!(without_freebind(&with), file);
+		assert_eq!(without_freebind(&file), file);
+		// with the UI's entry after it, the file stays valid YAML
+		let both = format!("{with}{}", ui_token_entry("ui"));
+		let doc: serde_json::Value = serde_saphyr::from_str(&both).unwrap();
+		assert_eq!(doc["tokens"].as_array().unwrap().len(), 2);
+		assert_eq!(without_freebind(without_ui_entry(&both)), file);
 	}
 
 	#[test]
@@ -308,7 +331,7 @@ mod tests {
 		assert!(entry.contains("scopes: [rules:read, metrics:read]\n"), "{entry}");
 		assert!(!entry.contains("write") && !entry.contains("admin"));
 		assert!(entry.contains(&crate::pem::sha256_hex(ui.as_bytes())) && !entry.contains(&ui), "only its SHA-256");
-		let base = token_file("tok", "k8s/");
+		let base = token_file("tok", "k8s/", false);
 		let file = format!("{base}{entry}");
 		// the file stays valid YAML with both tokens
 		let doc: serde_json::Value = serde_saphyr::from_str(&file).unwrap();
