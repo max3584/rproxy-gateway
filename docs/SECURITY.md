@@ -133,7 +133,7 @@ rproxy が `features.control_limits`（rproxy v0.4.20）を持つと分かって
 
 rproxy v0.4.19 以前はこの項目を知らず、書いたトークンファイルを誤りとして断る（その Pod は起動し直せない）ので、分かっているときだけ書く（[DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) の 6.1）。`features.graceful_shutdown` と違い、イメージの名前で覚えたものは信じない（タグは付け直せ、`IfNotPresent` ではノードごとに違う中身を引くことがあり、誤って「持つ」とすると Pod が起動しない）：
 
-- 今ある Pod の**すべて**（Pending のもの、IP のまだないものも。終わった Pod（Evicted などの `Failed`、`Succeeded`）は数えない）が、それぞれ自分の `/capabilities` で `control_limits` を返したこと。答えていない Pod が 1 つでもあれば書かない。rollout の途中で古いイメージの Pod が残っていれば書かない（再起動すると新しいファイルを読むため）。
+- 今ある Pod の**すべて**（Pending のもの、IP のまだないものも。終わった Pod（Evicted などの `Failed`、`Succeeded`）は数えない）が、それぞれ自分の `/capabilities` で `control_limits` を返したこと。答えていない Pod が 1 つでもあれば書かない。rollout の途中で古いイメージの Pod が残っていれば書かない（再起動すると新しいファイルを読むため）。答えは Pod の rproxy のコンテナごとに覚える（v0.4.21、#112）：コンテナが再起動した・`imageID` が変わった（`containerStatuses` の再起動の回数・`imageID`・`containerID`）ら聞き直し、なくなった Pod の答えは捨てる。`imagePullPolicy: Always` でタグを古い中身に付け直した後、同じ Pod の中でコンテナが再起動しても、前の答えのまま書き続けない（聞き直して `control_limits` がなければ外す。CrashLoop の間は答えないので外れ、Secret が同期されると起動する）。
 - managed：そのうえで、Pod を入れ替える先のイメージ（Gateway の rproxy のイメージ）が分かっていること：コントローラが出荷するもの（`--rproxy-image` の既定）か、そのイメージを動かす今の Pod が答えたもの。Pod がまだない新しい Gateway は、出荷するイメージのときだけ書く。後から分かって書き足しても、rproxy が `tokens_reload` を持つ（v0.4.20 はトークンファイルを読み直す）ので、この項目を Pod のテンプレートの注釈のハッシュに入れず、Pod は入れ替わらない。
 - fleet：`rproxy-gateway-token` の `tokens.yaml` はコントローラが毎回書く。fleet の Pod が 1 つ以上あり、すべてが答えたときだけ書く。コントローラの起動時の確かめでは書かない（次の反映で足す）。DaemonSet を v0.4.19 以前に戻すと、新しい Pod は一度起動に失敗するが、コントローラが項目を外し、kubelet が Secret を同期すると（1 分ほど）起動する。
 - 古い rproxy のイメージ（chart の `rproxy.image`、GatewayClass の parameters の `rproxy.image`、`--rproxy-image`）を使い続けても、トークンファイルは今までどおりで、rproxy は動く。v0.4.20 以上の rproxy で、まだ分かっていない間だけ `token.freebind` の警告が出る。

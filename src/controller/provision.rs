@@ -1122,6 +1122,38 @@ pub struct Endpoint {
 	pub target: Option<String>,
 	/// The image of the pod's `rproxy` container.
 	pub rproxy_image: Option<String>,
+	/// What the `rproxy` container runs now (`container_run`); `None` before the kubelet says.
+	pub rproxy_run: Option<String>,
+}
+
+impl Endpoint {
+	/// The key its `/capabilities` answer is remembered by (`caps_key`).
+	pub fn caps_key(&self) -> String {
+		caps_key(&self.uid, self.rproxy_run.as_deref())
+	}
+}
+
+/// What a pod's `rproxy` container runs: its restart count, image ID and container ID (the
+/// kubelet's `containerStatuses`). Another value is another process: restarted in the same pod,
+/// maybe with other contents under the same tag (`imagePullPolicy: Always` after a tag was pushed
+/// again), so its `/capabilities` are asked again (#112).
+pub fn container_run(p: &Pod) -> Option<String> {
+	let c = p.status.as_ref()?.container_statuses.as_ref()?.iter().find(|c| c.name == "rproxy")?;
+	Some(format!("{}/{}/{}", c.restart_count, c.image_id, c.container_id.as_deref().unwrap_or_default()))
+}
+
+/// The key of a pod's `/capabilities` answer: its uid and, once known, its `container_run`.
+pub fn caps_key(uid: &str, run: Option<&str>) -> String {
+	match run {
+		Some(r) => format!("{uid}#{r}"),
+		None => uid.to_string(),
+	}
+}
+
+/// The `caps_key` of every pod in `store`: answers under other keys are of pods or containers that
+/// are gone.
+pub fn caps_keys(store: &[std::sync::Arc<Pod>]) -> std::collections::HashSet<String> {
+	store.iter().map(|p| caps_key(p.metadata.uid.as_deref().unwrap_or_default(), container_run(p).as_deref())).collect()
 }
 
 /// Running pods in `ns` matching `labels` (`key=value,...`).
@@ -1129,16 +1161,16 @@ pub fn pods(store: &[std::sync::Arc<Pod>], ns: &str, selector: &BTreeMap<String,
 	pods_of(store, ns, selector, false)
 }
 
-/// The uids of the pods `pods` lists, Pending ones and those without a status or an IP yet too: each
-/// must have answered `/capabilities` before the token file says `allow_freebind` (#105). Pods that
-/// have ended (`Failed`, such as an evicted one, or `Succeeded`) never answer or start again, and are
-/// left out.
-pub fn pod_uids(store: &[std::sync::Arc<Pod>], ns: &str, selector: &BTreeMap<String, String>) -> Vec<String> {
+/// The `caps_key`s of the pods `pods` lists, Pending ones and those without a status or an IP yet too:
+/// each must have answered `/capabilities` before the token file says `allow_freebind` (#105), from
+/// the container it runs now (#112). Pods that have ended (`Failed`, such as an evicted one, or
+/// `Succeeded`) never answer or start again, and are left out.
+pub fn pod_keys(store: &[std::sync::Arc<Pod>], ns: &str, selector: &BTreeMap<String, String>) -> Vec<String> {
 	let ended = |p: &Pod| matches!(p.status.as_ref().and_then(|s| s.phase.as_deref()), Some("Failed" | "Succeeded"));
 	store
 		.iter()
 		.filter(|p| p.metadata.deletion_timestamp.is_none() && !ended(p) && selected(p, ns, selector))
-		.map(|p| p.metadata.uid.clone().unwrap_or_default())
+		.map(|p| caps_key(p.metadata.uid.as_deref().unwrap_or_default(), container_run(p).as_deref()))
 		.collect()
 }
 
@@ -1188,6 +1220,7 @@ fn pods_of(store: &[std::sync::Arc<Pod>], ns: &str, selector: &BTreeMap<String, 
 				certs: p.metadata.annotations.as_ref().and_then(|a| a.get(ANNOTATION_CERTS)).cloned(),
 				target: if managed { labels.get(LABEL_GATEWAY).cloned() } else { None },
 				rproxy_image: p.spec.as_ref().and_then(|s| s.containers.iter().find(|c| c.name == "rproxy")).and_then(|c| c.image.clone()),
+				rproxy_run: container_run(p),
 			})
 		})
 		.collect();
@@ -1739,7 +1772,7 @@ mod tests {
 			pod("done", Some("Succeeded"), false, true),
 		];
 		let sel: BTreeMap<String, String> = [(LABEL_GATEWAY.to_string(), "web-gw-1".to_string())].into();
-		assert_eq!(pod_uids(&store, "web", &sel), ["uid-running", "uid-pending", "uid-no-status"]);
+		assert_eq!(pod_keys(&store, "web", &sel), ["uid-running", "uid-pending", "uid-no-status"]);
 		assert_eq!(pods(&store, "web", &sel).into_iter().map(|e| e.uid).collect::<Vec<_>>(), ["uid-running"], "talked to: running only");
 		// fleet pods (the chart's DaemonSet): picked by the selector only, without the managed-by label
 		let fleet = |name: &str, phase: Option<&str>| {
@@ -1757,7 +1790,36 @@ mod tests {
 		};
 		let store = vec![fleet("f-running", Some("Running")), fleet("f-pending", Some("Pending")), fleet("f-evicted", Some("Failed"))];
 		let sel = parse_selector("app.kubernetes.io/name=rproxy,app.kubernetes.io/component=fleet");
-		assert_eq!(pod_uids(&store, "rproxy-gateway-system", &sel), ["uid-f-running", "uid-f-pending"]);
-		assert!(pod_uids(&store, "web", &sel).is_empty(), "another namespace");
+		assert_eq!(pod_keys(&store, "rproxy-gateway-system", &sel), ["uid-f-running", "uid-f-pending"]);
+		assert!(pod_keys(&store, "web", &sel).is_empty(), "another namespace");
+		// once the kubelet says what the rproxy container runs, that is in the key (#112)
+		let with_status = |restarts: i32, image_id: &str, container_id: &str| {
+			let mut v = serde_json::json!({
+				"metadata": {
+					"name": "f-a", "namespace": "rproxy-gateway-system", "uid": "uid-f-a",
+					"labels": {"app.kubernetes.io/name": "rproxy", "app.kubernetes.io/component": "fleet"},
+				},
+				"spec": {"containers": [{"name": "rproxy"}, {"name": "certsync"}]},
+				"status": {"phase": "Running", "podIP": "10.0.0.3", "containerStatuses": [
+					{"name": "certsync", "image": "c", "imageID": "sha256:c", "ready": true, "restartCount": 7, "containerID": "containerd://s"},
+				]},
+			});
+			v["status"]["containerStatuses"].as_array_mut().unwrap().push(serde_json::json!({
+				"name": "rproxy", "image": "r", "imageID": image_id, "ready": true, "restartCount": restarts, "containerID": container_id,
+			}));
+			std::sync::Arc::new(serde_json::from_value::<Pod>(v).unwrap())
+		};
+		let a = with_status(0, "sha256:new", "containerd://c1");
+		let ep = &pods(std::slice::from_ref(&a), "rproxy-gateway-system", &sel)[0];
+		assert_eq!(ep.rproxy_run.as_deref(), Some("0/sha256:new/containerd://c1"), "the rproxy container's, not certsync's");
+		assert_eq!(pod_keys(std::slice::from_ref(&a), "rproxy-gateway-system", &sel), [ep.caps_key()]);
+		assert_eq!(caps_keys(std::slice::from_ref(&a)), [ep.caps_key()].into());
+		for (other, why) in [
+			(with_status(1, "sha256:new", "containerd://c2"), "a restart"),
+			(with_status(0, "sha256:old", "containerd://c1"), "another image"),
+		] {
+			assert!(!caps_keys(&[other]).contains(&ep.caps_key()), "{why}");
+		}
+		assert_eq!(caps_key("u", None), "u", "before the kubelet says: the uid");
 	}
 }

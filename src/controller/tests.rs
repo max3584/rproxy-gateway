@@ -382,7 +382,7 @@ async fn freebind_needs_every_pod_to_have_answered() {
 		rproxy_image: Some(image.into()),
 		..Default::default()
 	};
-	let uids = |eps: &[&Endpoint]| eps.iter().map(|e| e.uid.clone()).collect::<Vec<_>>();
+	let uids = |eps: &[&Endpoint]| eps.iter().map(|e| e.caps_key()).collect::<Vec<_>>();
 	let (new, old) = ("example/rproxy:freebind-new", "example/rproxy:freebind-old");
 	let shipped = provision::RPROXY_IMAGE;
 	let mut caps = HashMap::new();
@@ -421,6 +421,46 @@ async fn freebind_needs_every_pod_to_have_answered() {
 	fake.lock().unwrap().control_limits = false;
 	assert!(!freebind_known(&rp, std::slice::from_ref(&n2), &uids(&[&n2]), Some(new), &mut caps).await, "a reused tag");
 	assert!(!freebind_known(&rp, &[n1.clone(), n2.clone()], &uids(&[&n1, &n2]), None, &mut caps).await);
+}
+
+/// A pod's `/capabilities` answer is its container's (#112): a container that restarts in the same pod
+/// (with `imagePullPolicy: Always`, maybe onto older contents pushed under the tag) is asked again, so
+/// an earlier `control_limits: true` does not keep `allow_freebind` in a file it cannot read.
+#[tokio::test]
+async fn caps_are_asked_again_when_the_container_restarts() {
+	let fake = Arc::new(Mutex::new(Fake::default()));
+	let port = start(fake.clone()).await;
+	let rp = Client::new(None, "secret").unwrap();
+	let image = "example/rproxy:always";
+	let ep = |run: &str| Endpoint {
+		pod: "rproxy-a".into(),
+		uid: "u-a".into(),
+		ip: "127.0.0.1".into(),
+		api_port: port,
+		rproxy_image: Some(image.into()),
+		rproxy_run: Some(run.into()),
+		..Default::default()
+	};
+	let mut caps = HashMap::new();
+	fake.lock().unwrap().control_limits = true;
+	let first = ep("0/sha256:new/containerd://c1");
+	assert!(freebind_known(&rp, std::slice::from_ref(&first), &[first.caps_key()], Some(image), &mut caps).await);
+	// the same container: remembered, not asked again
+	fake.lock().unwrap().control_limits = false;
+	assert!(freebind_known(&rp, std::slice::from_ref(&first), &[first.caps_key()], Some(image), &mut caps).await);
+	// it restarted on the older contents of the tag: asked again
+	let again = ep("1/sha256:old/containerd://c2");
+	assert!(!freebind_known(&rp, std::slice::from_ref(&again), &[again.caps_key()], Some(image), &mut caps).await);
+	// crash-looping (not answering): not known either
+	let looping = Endpoint { api_port: 1, ..ep("2/sha256:old/containerd://c3") };
+	assert!(!freebind_known(&rp, std::slice::from_ref(&looping), &[looping.caps_key()], None, &mut caps).await);
+	// what rproxy has (sync_pod) is the container's too
+	let mut caps = HashMap::new();
+	sync_pod(&rp, &first, &plan(port, &[]), &mut Applied::new(), &mut caps).await;
+	assert_eq!(caps.keys().collect::<Vec<_>>(), [&first.caps_key()]);
+	sync_pod(&rp, &again, &plan(port, &[]), &mut Applied::new(), &mut caps).await;
+	assert!(caps.contains_key(&again.caps_key()), "asked again");
+	assert_ne!(first.caps_key(), again.caps_key());
 }
 
 #[tokio::test]
