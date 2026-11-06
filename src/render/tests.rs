@@ -1483,6 +1483,67 @@ spec:
 	assert!(rules.iter().any(|r| r.contains("Host(`gw.example.com`)")), "{rules:?}");
 }
 
+/// rproxy v0.4.20 refuses route, middleware and service names past 512 bytes or with white space,
+/// quotes, backslashes, backticks or braces (`400 invalid`). The longest Kubernetes names (a 253-byte
+/// route on a 253-byte ListenerSet's listener and on the Gateway's) stay within it.
+#[test]
+fn names_stay_within_rproxys_rules() {
+	let set = "l".repeat(253);
+	let route = "r".repeat(253);
+	let yaml = format!(
+		r#"{BASE}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {{name: gw, namespace: default}}
+spec:
+  gatewayClassName: rproxy
+  allowedListeners: {{namespaces: {{from: Same}}}}
+  listeners:
+    - {{name: main, port: 80, protocol: HTTP, hostname: gw.example.com}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ListenerSet
+metadata: {{name: {set}, namespace: default}}
+spec:
+  parentRef: {{name: gw}}
+  listeners:
+    - {{name: main, port: 80, protocol: HTTP, hostname: one.example.com}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {{name: {route}, namespace: default}}
+spec:
+  parentRefs:
+    - {{name: gw, sectionName: main}}
+    - {{kind: ListenerSet, group: gateway.networking.k8s.io, name: {set}, sectionName: main}}
+  rules:
+    - filters: [{{type: RequestHeaderModifier, requestHeaderModifier: {{set: [{{name: x-a, value: b}}]}}}}]
+      backendRefs: [{{name: web, port: 80}}]
+"#
+	);
+	let p = plan(&yaml);
+	let http = &p.rules_json()[0]["http"];
+	let routes: Vec<&str> = http["routes"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect();
+	assert_eq!(routes.len(), 2, "one per listener: {routes:?}");
+	assert_ne!(routes[0], routes[1]);
+	let ok = |n: &str| {
+		!n.is_empty()
+			&& n.len() <= crate::render::MAX_NAME
+			&& !n.chars().any(|c| c.is_control() || c.is_whitespace() || matches!(c, '"' | '\\' | '`' | '{' | '}'))
+	};
+	let services = http["services"].as_object().unwrap().keys();
+	let middlewares = http["middlewares"].as_object().unwrap().keys();
+	for n in routes.iter().copied().chain(services.map(String::as_str)).chain(middlewares.map(String::as_str)) {
+		assert!(ok(n), "{} bytes: {n}", n.len());
+	}
+	// the owner is still known from the name (rproxy's refusal of one route leaves out that route only)
+	for n in &routes {
+		assert_eq!(crate::controller::isolate::owner(n).as_deref(), Some(format!("default/{route}").as_str()), "{n}");
+	}
+	assert!(routes.iter().any(|n| n.ends_with("@main")), "a short listener stays as it is: {routes:?}");
+}
+
 #[test]
 fn grpc_routes() {
 	let yaml = format!(
