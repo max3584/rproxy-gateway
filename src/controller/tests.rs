@@ -357,8 +357,8 @@ async fn tokens_reload_is_known_from_the_image_or_the_pods() {
 		..Default::default()
 	};
 	let mut caps = HashMap::new();
-	assert!(image_feature(&rp, provision::RPROXY_IMAGE, "tokens_reload", &[], &mut caps).await, "the shipped image (v0.4.20)");
-	assert!(image_feature(&rp, provision::RPROXY_IMAGE, "control_limits", &[], &mut caps).await, "the shipped image (v0.4.20)");
+	assert!(image_feature(&rp, provision::RPROXY_IMAGE, "tokens_reload", &[], &mut caps).await, "the shipped image (v0.4.21)");
+	assert!(image_feature(&rp, provision::RPROXY_IMAGE, "control_limits", &[], &mut caps).await, "the shipped image (v0.4.21)");
 	assert!(!image_feature(&rp, provision::RPROXY_IMAGE, "another", &[], &mut caps).await);
 	assert!(!image_feature(&rp, "example/rproxy:reload", "tokens_reload", &[ep("r1")], &mut caps).await, "rproxy before v0.4.2");
 	fake.lock().unwrap().tokens_reload = true;
@@ -443,7 +443,7 @@ async fn the_settings_file_needs_every_pod_or_keeps_the_current_form() {
 	};
 	let custom = "example/rproxy:settings";
 	let mut caps = HashMap::new();
-	// a new Gateway of the shipped image (v0.4.20): written
+	// a new Gateway of the shipped image (v0.4.21): written
 	assert_eq!(settings_known(&rp, &[], &[], provision::RPROXY_IMAGE, false, &mut caps).await, SettingsKnown::Yes);
 	// another image without pods: not by its name
 	assert_eq!(settings_known(&rp, &[], &[], custom, false, &mut caps).await, SettingsKnown::No);
