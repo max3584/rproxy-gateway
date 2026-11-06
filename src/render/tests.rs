@@ -1544,6 +1544,55 @@ spec:
 	assert!(routes.iter().any(|n| n.ends_with("@main")), "a short listener stays as it is: {routes:?}");
 }
 
+/// rproxy's rule set names (rproxy-api `core::ruleset::validate_name`): `[a-z0-9]([a-z0-9._/-]{0,251}[a-z0-9])?`.
+fn rproxy_takes_set_name(n: &str) -> bool {
+	let edge = |c: Option<char>| c.is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+	let inner = n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '/' | '-'));
+	!n.is_empty() && n.len() <= crate::render::MAX_RULESET_NAME && inner && edge(n.chars().next()) && edge(n.chars().last())
+}
+
+/// A Gateway's rule set is `k8s/<namespace>/<name>`, which goes past rproxy's 253 bytes with a long
+/// Gateway name (#111): the tail is a hash then, under the same `k8s/<namespace>/` prefix.
+#[test]
+fn long_gateway_names_fit_rproxys_rule_set_names() {
+	use crate::render::ruleset_name;
+	// short names as before (existing sets keep their names)
+	assert_eq!(ruleset_name("default", "web"), "k8s/default/web");
+	let ns = "n".repeat(63);
+	let fits = "g".repeat(253 - "k8s/".len() - ns.len() - 1);
+	assert_eq!(ruleset_name(&ns, &fits), format!("k8s/{ns}/{fits}"), "exactly 253 bytes: as it is");
+	let longest = "g".repeat(253);
+	for (ns, name) in [(ns.as_str(), format!("{fits}g")), (ns.as_str(), longest.clone()), ("default", longest.clone())] {
+		let n = ruleset_name(ns, &name);
+		assert!(rproxy_takes_set_name(&n), "{} bytes: {n}", n.len());
+		assert!(n.starts_with(&format!("k8s/{ns}/g")), "{n}");
+		assert!(n.contains('_'), "never a Kubernetes name: {n}");
+		assert_eq!(n, ruleset_name(ns, &name), "the same every time");
+	}
+	// names that differ only past the cut stay apart, and so do namespaces
+	assert_ne!(ruleset_name(&ns, &longest), ruleset_name(&ns, &format!("{}h", &longest[..252])));
+	assert_ne!(ruleset_name("a", &longest), ruleset_name("b", &longest));
+	// a managed Gateway's token takes its own set only (`allow_rulesets` is a prefix): another long
+	// Gateway in the namespace does not start with it
+	let mine = ruleset_name(&ns, &longest);
+	assert!(!ruleset_name(&ns, &format!("{}x", &longest[..252])).starts_with(&mine));
+	// the plan's set
+	let yaml = format!(
+		r#"{BASE}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {{name: {longest}, namespace: {ns}}}
+spec:
+  gatewayClassName: rproxy
+  listeners: [{{name: http, port: 80, protocol: HTTP}}]
+"#
+	);
+	let p = plan(&yaml);
+	assert_eq!(p.ruleset, mine);
+	assert_eq!((p.namespace.as_str(), p.name.as_str()), (ns.as_str(), longest.as_str()), "status goes to the Gateway itself");
+}
+
 #[test]
 fn grpc_routes() {
 	let yaml = format!(

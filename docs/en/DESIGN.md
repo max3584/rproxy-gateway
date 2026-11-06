@@ -13,7 +13,7 @@ Gateway API / CRDs ──watch──▶ rproxy-gateway ──PUT /rulesets/k8s/<
 ```
 
 - The controller talks to rproxy only through the control API (`GET /capabilities`, `GET /readyz`, `GET` / `PUT` / `DELETE /rulesets/{name}`). rproxy knows nothing of the Kubernetes API.
-- One Gateway is one rproxy rule set (`k8s/<Gateway namespace>/<Gateway name>`). One (protocol, address, port) is one rule; listeners on the same port (different host names) merge into one rule.
+- One Gateway is one rproxy rule set (`k8s/<Gateway namespace>/<Gateway name>`). rproxy takes rule set names of at most 253 bytes (`400 invalid`), so a longer Gateway name (from 186 bytes with a 63-byte namespace) is cut where it fits and ends in `_<hash>` (the first 16 digits of the SHA-256 of `<namespace>/<name>`) instead (v0.4.21). `k8s/<namespace>/` stays, and Kubernetes names have no `_`, so it never meets a short-named Gateway's set. Short names do not change (rproxy refused the sets of long names before, so there is nothing to move). One (protocol, address, port) is one rule; listeners on the same port (different host names) merge into one rule.
 - One loop renders every Gateway it handles on each change (debounced) and every `--resync-secs` (30 seconds by default). When what it renders is the same as last time and the pod's set still has the etag of the last PUT, nothing is PUT.
 
 ## High availability (leader election)
