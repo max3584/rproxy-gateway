@@ -117,9 +117,12 @@ fleet:
   # and 5 s more). Make `delay` as long as your load balancer or VIP takes to move away from a node
   # (its health check on /readyz: interval x failures)
   shutdown: {delay: 5s, drain: 25s}
-  # more environment variables of the fleet's rproxy container (RPROXY_* only, not the ones this chart
-  # sets: RPROXY_API_ADDR, _PORT, RPROXY_TOKEN_FILE, RPROXY_TLS_*, RPROXY_FILES_TRUSTED_DIRS,
-  # RPROXY_SHUTDOWN_*). Every Gateway is one rule set on every fleet pod, and rproxy v0.4.20 takes at
+  # more environment variables of the fleet's rproxy container: RPROXY_* only, not the ones this chart
+  # sets or that change where rproxy reads its rules, files and token file (RPROXY_API_*,
+  # RPROXY_TOKEN_FILE, RPROXY_TOKENS_CHECK_SECS, RPROXY_TLS_*, RPROXY_FILES_*, RPROXY_CONFIG,
+  # RPROXY_DATABASE_URL, RPROXY_STATIC_RULES, RPROXY_UPDATE*, RPROXY_HANDOFF*, RPROXY_SHUTDOWN_*: the
+  # same as managed's rproxy.extraEnv, but rproxy's performance settings are open here). Quote the
+  # values ("5000"): an unquoted 1000000 in a values file becomes "1e+06". Every Gateway is one rule set on every fleet pod, and rproxy v0.4.20 takes at
   # most 1000 rule sets (RPROXY_MAX_RULESETS) and 10000 rules (RPROXY_MAX_RULES) by default: past them
   # a Gateway gets Programmed: False (Invalid, "rproxy refused the rule set: 409 limit: ..."). "0": no limit
   #   extraEnv:

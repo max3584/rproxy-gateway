@@ -55,13 +55,16 @@ spec:
             - {name: RPROXY_SHUTDOWN_DELAY, value: {{ .Values.fleet.shutdown.delay | toString | quote }}}
             - {name: RPROXY_SHUTDOWN_DRAIN, value: {{ .Values.fleet.shutdown.drain | toString | quote }}}
             {{- range .Values.fleet.extraEnv }}
-            {{- if not (hasPrefix "RPROXY_" (.name | default "")) }}
-            {{- fail (printf "fleet.extraEnv: %q: only RPROXY_* variables" (.name | default "")) }}
+            {{- $name := .name | default "" | toString }}
+            {{- if not (regexMatch "^RPROXY_[A-Z0-9_]+$" $name) }}
+            {{- fail (printf "fleet.extraEnv: %q: only RPROXY_* variables (upper-case letters, digits and _)" $name) }}
             {{- end }}
-            {{- if or (has .name (list "RPROXY_API_ADDR" "RPROXY_API_PORT" "RPROXY_TOKEN_FILE" "RPROXY_FILES_TRUSTED_DIRS")) (hasPrefix "RPROXY_TLS_" .name) (hasPrefix "RPROXY_SHUTDOWN_" .name) }}
-            {{- fail (printf "fleet.extraEnv: %s is set by the chart (RPROXY_SHUTDOWN_*: fleet.shutdown)" .name) }}
+            {{- /* the chart's and what would change where rproxy reads its rules, files and token file (as managed's rproxy.extraEnv) */}}
+            {{- $reserved := or (has $name (list "RPROXY_TOKEN_FILE" "RPROXY_TOKENS_CHECK_SECS" "RPROXY_CONFIG" "RPROXY_DATABASE_URL" "RPROXY_STATIC_RULES")) (hasPrefix "RPROXY_API_" $name) (hasPrefix "RPROXY_TLS_" $name) (hasPrefix "RPROXY_FILES_" $name) (hasPrefix "RPROXY_SHUTDOWN_" $name) (hasPrefix "RPROXY_UPDATE" $name) (hasPrefix "RPROXY_HANDOFF" $name) }}
+            {{- if $reserved }}
+            {{- fail (printf "fleet.extraEnv: %s is set by the chart or not open (RPROXY_SHUTDOWN_*: fleet.shutdown)" $name) }}
             {{- end }}
-            - name: {{ .name }}
+            - name: {{ $name | quote }}
               {{- if hasKey . "value" }}
               value: {{ .value | toString | quote }}
               {{- end }}
