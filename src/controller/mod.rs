@@ -605,7 +605,8 @@ async fn reconcile_all(
 	if let Mode::Fleet(f) = &cfg.mode {
 		let shown = cfg.ui.is_some() && plans.iter().filter(|(p, _)| p.accepted()).all(|(p, _)| ui::visible(p));
 		// rproxy v0.4.20 takes `allow_freebind` in the token file; older rproxy refuses the file with it
-		let freebind = pods_have(rp, &fleet_pods, "control_limits", &mut state.caps).await;
+		let uids = provision::pod_uids(&pods_now, &cfg.namespace, &provision::parse_selector(&f.selector));
+		let freebind = freebind_known(rp, &fleet_pods, &uids, None, &mut state.caps).await;
 		if let Err(e) = ui::apply_fleet_token(client, &cfg.namespace, &boot.token, shown, freebind).await {
 			warn!(error = %e, "cannot write the fleet's token file");
 			soon = true;
@@ -877,7 +878,9 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 			// rproxy v0.4.2 reads a changed token file again: the UI's token does not roll the pods
 			t.tokens_reload = image_feature(p.rp, &t.rproxy_image(m), "tokens_reload", &eps, &mut sub.caps).await;
 			// rproxy v0.4.20 takes `allow_freebind` in the token file; older rproxy refuses the file with it
-			t.control_limits = image_feature(p.rp, &t.rproxy_image(m), "control_limits", &eps, &mut sub.caps).await;
+			// (every pod of the Gateway too: an older pod of a rollout that restarts reads the new file)
+			let uids = provision::pod_uids(p.pods_now, &plan.namespace, &selector);
+			t.control_limits = freebind_known(p.rp, &eps, &uids, Some(&t.rproxy_image(m)), &mut sub.caps).await;
 			// the UI reads it (its token in the token file, its pods through the NetworkPolicy)
 			t.ui = p.cfg.ui.clone().filter(|_| ui::visible(&plan));
 			t.owner = match (&p.gateway_api_version, &gw.metadata.uid) {
@@ -1431,24 +1434,32 @@ async fn image_feature(rp: &Client, image: &str, feature: &str, eps: &[Endpoint]
 	known
 }
 
-/// Whether every pod in `eps` runs an image with `feature` (`image_feature`): none, or one whose image
-/// is not known, is no (the fleet's token file says `allow_freebind` only for rproxy that takes it).
-async fn pods_have(rp: &Client, eps: &[Endpoint], feature: &str, caps: &mut HashMap<String, Capabilities>) -> bool {
-	let mut images = BTreeSet::new();
-	for ep in eps {
-		match &ep.rproxy_image {
-			Some(image) => {
-				images.insert(image.clone());
-			}
-			None => return false,
-		}
+/// Whether the token file may say `allow_freebind` (rproxy v0.4.20, `features.control_limits`): older
+/// rproxy refuses a file with it, and a pod of it that starts again (a restart, a rollout's older pod)
+/// would not come up. Each pod there is (`uids`, in any phase: a Pending one has not answered) must
+/// itself have answered `/capabilities` with it; images remembered by name (`image_feature`) are not
+/// trusted here, since a tag can be pushed again, or pulled with other contents on another node.
+/// `target`: the image the pods roll to, known if it is the one this controller ships (and that has
+/// it, `SHIPPED_FEATURES`) or a pod running it answered; `None` (the fleet: its DaemonSet is the chart's) needs at least one pod.
+async fn freebind_known(
+	rp: &Client,
+	eps: &[Endpoint],
+	uids: &[String],
+	target: Option<&str>,
+	caps: &mut HashMap<String, Capabilities>,
+) -> bool {
+	pod_features(rp, eps, caps).await;
+	let answered = |uid: &str| caps.get(uid).is_some_and(|c| c.feature("control_limits"));
+	if !uids.iter().all(|u| answered(u)) {
+		return false;
 	}
-	for image in &images {
-		if !image_feature(rp, image, feature, eps, caps).await {
-			return false;
+	match target {
+		Some(image) => {
+			(image == provision::RPROXY_IMAGE && SHIPPED_FEATURES.contains(&"control_limits"))
+				|| eps.iter().any(|ep| ep.rproxy_image.as_deref() == Some(image) && answered(&ep.uid))
 		}
+		None => !uids.is_empty(),
 	}
-	!images.is_empty()
 }
 
 /// Whether `image` has a graceful shutdown (`features.graceful_shutdown`, rproxy v0.4.1): if not

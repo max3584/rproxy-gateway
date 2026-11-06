@@ -257,8 +257,9 @@ pub struct Target<'a> {
 	/// The rproxy image reads a changed token file again (`features.tokens_reload`, rproxy v0.4.2):
 	/// adding or removing the UI's token does not roll the pods (`api_hash`).
 	pub tokens_reload: bool,
-	/// The rproxy image has `features.control_limits` (rproxy v0.4.20): the token file says
-	/// `allow_freebind: true` (`bootstrap::token_file`; older rproxy refuses the field).
+	/// The rproxy has `features.control_limits` (rproxy v0.4.20): the image the pods roll to, and every
+	/// pod there is now (each answered so itself): the token file says `allow_freebind: true`
+	/// (`bootstrap::token_file`; older rproxy refuses the field).
 	pub control_limits: bool,
 	/// The UI reads this Gateway's rproxy (`--ui-namespace` set and the parameters' `ui.visible`
 	/// not false): its read-only token in the token file (rproxy before v0.4.2 reads the file at
@@ -1128,15 +1129,44 @@ pub fn pods(store: &[std::sync::Arc<Pod>], ns: &str, selector: &BTreeMap<String,
 	pods_of(store, ns, selector, false)
 }
 
+/// The uids of the pods `pods` lists, in any phase (Pending ones too, and those without an IP yet):
+/// each must have answered `/capabilities` before the token file says `allow_freebind` (#105).
+pub fn pod_uids(store: &[std::sync::Arc<Pod>], ns: &str, selector: &BTreeMap<String, String>) -> Vec<String> {
+	store
+		.iter()
+		.filter(|p| p.metadata.deletion_timestamp.is_none() && selected(p, ns, selector))
+		.map(|p| p.metadata.uid.clone().unwrap_or_default())
+		.collect()
+}
+
+/// Whether `p` is one of the pods `selector` picks in `ns`: a managed pod belongs to its Gateway's
+/// Deployment (a ReplicaSet `rproxy-<id>-...`); a pod someone else made with the same labels is not
+/// talked to.
+fn selected(p: &Pod, ns: &str, selector: &BTreeMap<String, String>) -> bool {
+	if p.metadata.namespace.as_deref() != Some(ns) {
+		return false;
+	}
+	let labels = p.metadata.labels.clone().unwrap_or_default();
+	if !selector.iter().all(|(k, v)| labels.get(k) == Some(v)) {
+		return false;
+	}
+	if labels.get("app.kubernetes.io/managed-by").map(String::as_str) != Some(MANAGER) {
+		return true;
+	}
+	let Some(id) = labels.get(LABEL_GATEWAY) else { return false };
+	let prefix = format!("{}-", object_name(id));
+	p.metadata
+		.owner_references
+		.iter()
+		.flatten()
+		.any(|o| o.kind == "ReplicaSet" && o.controller == Some(true) && o.name.starts_with(&prefix))
+}
+
 fn pods_of(store: &[std::sync::Arc<Pod>], ns: &str, selector: &BTreeMap<String, String>, terminating: bool) -> Vec<Endpoint> {
 	let mut out: Vec<Endpoint> = store
 		.iter()
-		.filter(|p| p.metadata.namespace.as_deref() == Some(ns))
-		.filter(|p| {
-			let l = p.metadata.labels.clone().unwrap_or_default();
-			selector.iter().all(|(k, v)| l.get(k) == Some(v))
-		})
 		.filter(|p| terminating || p.metadata.deletion_timestamp.is_none())
+		.filter(|p| selected(p, ns, selector))
 		.filter_map(|p| {
 			let st = p.status.as_ref()?;
 			if st.phase.as_deref() != Some("Running") {
@@ -1144,21 +1174,6 @@ fn pods_of(store: &[std::sync::Arc<Pod>], ns: &str, selector: &BTreeMap<String, 
 			}
 			let labels = p.metadata.labels.clone().unwrap_or_default();
 			let managed = labels.get("app.kubernetes.io/managed-by").map(String::as_str) == Some(MANAGER);
-			// a managed pod belongs to its Gateway's Deployment (a ReplicaSet `rproxy-<id>-...`):
-			// a pod someone else made with the same labels is not talked to
-			if managed {
-				let id = labels.get(LABEL_GATEWAY)?;
-				let prefix = format!("{}-", object_name(id));
-				let owned = p
-					.metadata
-					.owner_references
-					.iter()
-					.flatten()
-					.any(|o| o.kind == "ReplicaSet" && o.controller == Some(true) && o.name.starts_with(&prefix));
-				if !owned {
-					return None;
-				}
-			}
 			Some(Endpoint {
 				namespace: ns.to_string(),
 				pod: p.metadata.name.clone().unwrap_or_default(),
@@ -1685,5 +1700,40 @@ mod tests {
 		assert_eq!(names(ui_pods(&store, "web", &sel, Some("h2"))), ["new"]);
 		// without the hash (fleet; a pass that could not write the Secrets): Ready and not being deleted
 		assert_eq!(names(ui_pods(&store, "web", &sel, None)), ["new", "old-template"]);
+	}
+
+	/// The pods that must have answered before the token file says `allow_freebind` (#105): every pod of
+	/// the Gateway, Pending ones too (they have not answered), not those being deleted or made by others.
+	#[test]
+	fn pods_to_answer_include_pending_ones() {
+		let pod = |name: &str, phase: Option<&str>, deleting: bool, owned: bool| {
+			let mut v = serde_json::json!({
+				"metadata": {
+					"name": name, "namespace": "web", "uid": format!("uid-{name}"),
+					"labels": {LABEL_GATEWAY: "web-gw-1", "app.kubernetes.io/managed-by": MANAGER},
+				},
+				"spec": {"containers": [{"name": "rproxy"}]},
+			});
+			if owned {
+				v["metadata"]["ownerReferences"] = serde_json::json!([{"apiVersion": "apps/v1", "kind": "ReplicaSet", "name": format!("{}-abc", object_name("web-gw-1")), "uid": "rs", "controller": true}]);
+			}
+			if let Some(phase) = phase {
+				v["status"] = serde_json::json!({"phase": phase, "podIP": "10.0.0.1"});
+			}
+			if deleting {
+				v["metadata"]["deletionTimestamp"] = serde_json::json!("2026-10-08T00:00:00Z");
+			}
+			std::sync::Arc::new(serde_json::from_value::<Pod>(v).unwrap())
+		};
+		let store = vec![
+			pod("running", Some("Running"), false, true),
+			pod("pending", Some("Pending"), false, true),
+			pod("no-status", None, false, true),
+			pod("stopping", Some("Running"), true, true),
+			pod("someone-elses", Some("Running"), false, false),
+		];
+		let sel: BTreeMap<String, String> = [(LABEL_GATEWAY.to_string(), "web-gw-1".to_string())].into();
+		assert_eq!(pod_uids(&store, "web", &sel), ["uid-running", "uid-pending", "uid-no-status"]);
+		assert_eq!(pods(&store, "web", &sel).into_iter().map(|e| e.uid).collect::<Vec<_>>(), ["uid-running"], "talked to: running only");
 	}
 }

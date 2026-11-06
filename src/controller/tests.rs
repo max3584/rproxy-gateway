@@ -364,37 +364,62 @@ async fn tokens_reload_is_known_from_the_image_or_the_pods() {
 	assert!(!graceful(&rp, "example/rproxy:reload", &[], &mut HashMap::new()).await, "per feature");
 }
 
-/// The token file says `allow_freebind: true` only for rproxy known to have `features.control_limits`
-/// (rproxy v0.4.20; older rproxy refuses the file with it, #105): the shipped image, or an image a pod
-/// running it said so of. The fleet's: every fleet pod's image.
+/// The token file says `allow_freebind: true` only when every pod there is has itself answered
+/// `/capabilities` with `features.control_limits` (rproxy v0.4.20; older rproxy refuses the file with
+/// it, and its pods would not start again, #105), and the image the pods roll to is known: the shipped
+/// one, or one a pod running it answered. An image remembered by name is not enough.
 #[tokio::test]
-async fn control_limits_is_known_from_the_image_or_the_pods() {
+async fn freebind_needs_every_pod_to_have_answered() {
 	let fake = Arc::new(Mutex::new(Fake::default()));
 	let port = start(fake.clone()).await;
 	let rp = Client::new(None, "secret").unwrap();
-	let ep = |uid: &str, image: Option<&str>| Endpoint {
+	let ep = |uid: &str, image: &str| Endpoint {
 		pod: format!("rproxy-{uid}"),
 		uid: uid.into(),
 		ip: "127.0.0.1".into(),
 		api_port: port,
-		rproxy_image: image.map(String::from),
+		rproxy_image: Some(image.into()),
 		..Default::default()
 	};
-	let (new, old) = ("example/rproxy:limits", "example/rproxy:before-limits");
+	let uids = |eps: &[&Endpoint]| eps.iter().map(|e| e.uid.clone()).collect::<Vec<_>>();
+	let (new, old) = ("example/rproxy:freebind-new", "example/rproxy:freebind-old");
+	let shipped = provision::RPROXY_IMAGE;
 	let mut caps = HashMap::new();
-	// not known yet: left out (an older rproxy keeps working, with rproxy v0.4.20's warning only)
-	assert!(!image_feature(&rp, new, "control_limits", &[], &mut caps).await, "no pods yet");
-	assert!(!pods_have(&rp, &[], "control_limits", &mut caps).await, "no fleet pods");
-	assert!(!pods_have(&rp, &[ep("c1", Some(old))], "control_limits", &mut caps).await, "rproxy v0.4.19");
-	assert!(!image_feature(&rp, old, "control_limits", &[ep("c1", Some(old))], &mut caps).await);
-	// a pod of another image that has it
+	// a new Gateway of the shipped image: no pod to start again with the file (once the shipped image
+	// is rproxy v0.4.20)
+	let ships = SHIPPED_FEATURES.contains(&"control_limits");
+	assert_eq!(freebind_known(&rp, &[], &[], Some(shipped), &mut caps).await, ships);
+	// the fleet without pods, another image without pods: not known
+	assert!(!freebind_known(&rp, &[], &[], None, &mut caps).await);
+	assert!(!freebind_known(&rp, &[], &[], Some(new), &mut caps).await);
+	// a pod of rproxy v0.4.19 (answers without control_limits)
+	let o1 = ep("f-old1", old);
+	assert!(
+		!freebind_known(&rp, std::slice::from_ref(&o1), &uids(&[&o1]), Some(shipped), &mut caps).await,
+		"the shipped image, an older pod"
+	);
 	fake.lock().unwrap().control_limits = true;
-	assert!(image_feature(&rp, new, "control_limits", &[ep("c2", Some(new))], &mut caps).await);
-	assert!(image_feature(&rp, new, "control_limits", &[], &mut HashMap::new()).await, "remembered");
-	assert!(pods_have(&rp, &[ep("c2", Some(new))], "control_limits", &mut caps).await);
-	// every fleet pod: one of an image not known (c1 answered before), or without an image, says no
-	assert!(!pods_have(&rp, &[ep("c2", Some(new)), ep("c1", Some(old))], "control_limits", &mut caps).await);
-	assert!(!pods_have(&rp, &[ep("c2", Some(new)), ep("c3", None)], "control_limits", &mut caps).await);
+	let n1 = ep("f-new1", new);
+	// a rollout with the older pod still there: it would read the file if it restarted
+	assert!(!freebind_known(&rp, &[n1.clone(), o1.clone()], &uids(&[&n1, &o1]), Some(new), &mut caps).await, "rollout");
+	assert!(!freebind_known(&rp, &[n1.clone(), o1.clone()], &uids(&[&n1, &o1]), None, &mut caps).await, "fleet rollout");
+	// once it is gone
+	assert!(freebind_known(&rp, std::slice::from_ref(&n1), &uids(&[&n1]), Some(new), &mut caps).await);
+	assert!(freebind_known(&rp, std::slice::from_ref(&n1), &uids(&[&n1]), None, &mut caps).await);
+	// a pod that has not answered yet (Pending: no IP, not among the running pods)
+	let mut all = uids(&[&n1]);
+	all.push("f-pending".into());
+	assert!(!freebind_known(&rp, std::slice::from_ref(&n1), &all, Some(new), &mut caps).await, "a Pending pod");
+	assert!(!freebind_known(&rp, std::slice::from_ref(&n1), &all, None, &mut caps).await, "a Pending fleet pod");
+	// the shipped image, its pod not answered yet
+	assert!(!freebind_known(&rp, &[], &["f-shipped".to_string()], Some(shipped), &mut caps).await);
+	// the target image known only by a pod that answered: no pod of it, not known
+	let n2 = ep("f-new2", new);
+	assert!(!freebind_known(&rp, &[], &[], Some(new), &mut caps).await, "not by the name");
+	// a tag pushed again with an older rproxy: its new pod answers without control_limits
+	fake.lock().unwrap().control_limits = false;
+	assert!(!freebind_known(&rp, std::slice::from_ref(&n2), &uids(&[&n2]), Some(new), &mut caps).await, "a reused tag");
+	assert!(!freebind_known(&rp, &[n1.clone(), n2.clone()], &uids(&[&n1, &n2]), None, &mut caps).await);
 }
 
 #[tokio::test]
