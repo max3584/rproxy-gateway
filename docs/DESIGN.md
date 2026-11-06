@@ -13,7 +13,7 @@ Gateway API / CRD ──watch──▶ rproxy-gateway ──PUT /rulesets/k8s/<n
 ```
 
 - rproxy と話すのは制御 API だけ（`GET /capabilities`、`GET /readyz`、`GET` / `PUT` / `DELETE /rulesets/{name}`）。rproxy は Kubernetes の API を知らない。
-- Gateway 1 つが rproxy のルールセット 1 つ（`k8s/<Gateway の namespace>/<Gateway の名前>`）。(プロトコル, アドレス, ポート) 1 つがルール 1 つで、同じポートのリスナー（ホスト名が違う）は 1 つのルールにまとめる。
+- Gateway 1 つが rproxy のルールセット 1 つ（`k8s/<Gateway の namespace>/<Gateway の名前>`）。rproxy はルールセットの名前を 253 バイトまでしか受け付けない（`400 invalid`）ので、それを超える長い Gateway の名前（namespace が 63 バイトなら 186 バイトから）では、253 バイトに収まるところで名前を切り、後ろを `_<ハッシュ>`（`<namespace>/<名前>` の SHA-256 の先頭 16 桁）にする（v0.4.21）。`k8s/<namespace>/` はそのままで、Kubernetes の名前には `_` がないので、短い名前の Gateway の組と重ならない。短い名前は変わらない（長い名前の組は前から rproxy に断られていたので、移すものはない）。(プロトコル, アドレス, ポート) 1 つがルール 1 つで、同じポートのリスナー（ホスト名が違う）は 1 つのルールにまとめる。
 - ひとつのループが、変更のたび（少し待ってまとめる）と `--resync-secs`（既定 30 秒）ごとに、担当するすべての Gateway を描き直す。描いた内容が前回と同じで、Pod のセットの etag も前回 PUT したときのままなら PUT しない。
 
 ## 冗長化（リーダー選出）

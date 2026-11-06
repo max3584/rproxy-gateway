@@ -127,7 +127,7 @@ namespace のラベルはテナントが書けないようにしておく（name
 
 ## rproxy のルールセットの持ち主
 
-rproxy はルールセットを、作ったトークンの名前のものにする（ほかの admin でないトークンは変えられない）。コントローラのトークンは値が変わっても名前はいつも `rproxy-gateway` なので、トークンを入れ替えても（rproxy の再起動のあとの PUT し直しも）同じ持ち主のまま。トークンの `allow_rulesets` は、fleet のものが `k8s/`、managed の Gateway ごとのものがその Gateway のルールセット（`k8s/<namespace>/<name>`）だけ。
+rproxy はルールセットを、作ったトークンの名前のものにする（ほかの admin でないトークンは変えられない）。コントローラのトークンは値が変わっても名前はいつも `rproxy-gateway` なので、トークンを入れ替えても（rproxy の再起動のあとの PUT し直しも）同じ持ち主のまま。トークンの `allow_rulesets` は、fleet のものが `k8s/`、managed の Gateway ごとのものがその Gateway のルールセット（`k8s/<namespace>/<name>`。長い名前では後ろがハッシュ、[DESIGN.md](DESIGN.md) の「全体」）だけ。
 
 rproxy が `features.control_limits`（rproxy v0.4.20）を持つと分かっているときは、トークンファイルに `allow_freebind: true` も書く（#105）。fleet の `listen: addresses` は Gateway の `spec.addresses` で `listen_freebind` を使って待ち受け、rproxy v0.4.20 は `listen_freebind` のルールを `admin` のトークン、`allow_freebind: true` のトークン、ルールセットの `PUT` では `allow_rulesets` のあるトークンにだけ許す。コントローラのトークンは 3 つ目でも通るが、ファイルに書かないとトークンごとに 1 回 `token.freebind` の警告が出るので、意図して使うことをファイルで示す。managed の Gateway ごとのトークンも同じ決め方で書く（managed は `listen_freebind` を使わず、`allow_rulesets` で許される範囲も変わらない）。
 

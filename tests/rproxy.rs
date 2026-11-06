@@ -55,10 +55,14 @@ impl Rproxy {
 
 	/// `freebind`: the token file says `allow_freebind: true` (rproxy v0.4.20, `features.control_limits`).
 	fn start_with(bin: &Path, dir: &Path, api: u16, freebind: bool) -> Rproxy {
+		Rproxy::start_allowing(bin, dir, api, rproxy_gateway::controller::bootstrap::FLEET_RULESETS, freebind)
+	}
+
+	/// The controller's token may change the rule sets under `allow_rulesets` (a managed Gateway's: its own set).
+	fn start_allowing(bin: &Path, dir: &Path, api: u16, allow_rulesets: &str, freebind: bool) -> Rproxy {
 		let tokens = dir.join("tokens.yaml");
 		use rproxy_gateway::controller::bootstrap;
-		std::fs::write(&tokens, bootstrap::token_file(TOKEN, bootstrap::FLEET_RULESETS, freebind) + &bootstrap::ui_token_entry(UI_TOKEN))
-			.unwrap();
+		std::fs::write(&tokens, bootstrap::token_file(TOKEN, allow_rulesets, freebind) + &bootstrap::ui_token_entry(UI_TOKEN)).unwrap();
 		let log = std::fs::File::create(dir.join(format!("rproxy-{api}.log"))).unwrap();
 		let child = Command::new(bin)
 			.env("RPROXY_API_ADDR", "127.0.0.1")
@@ -917,4 +921,72 @@ spec:
 	// `r1` has no backend: nothing gets through
 	let (status, body) = get_with(port, "closed.example.com", "/x", "Authorization: allow\r\n").await;
 	assert_ne!(status, 200, "{body}");
+}
+
+/// A Gateway named past rproxy's 253 bytes of a rule set name (#111): its set is applied under the
+/// hashed name, with a managed Gateway's token that may change that set only.
+#[tokio::test]
+async fn a_long_gateway_name_on_a_real_rproxy() {
+	let Some(bin) = rproxy_bin() else { return };
+	let _ = rustls::crypto::ring::default_provider().install_default();
+	let dir = std::env::temp_dir().join(format!("rproxy-gateway-long-name-{}", std::process::id()));
+	let _ = std::fs::remove_dir_all(&dir);
+	std::fs::create_dir_all(&dir).unwrap();
+	let backend = echo_backend().await;
+	let [port, api] = free_ports();
+	let (ns, name) = ("n".repeat(63), "g".repeat(253));
+	let set = render::ruleset_name(&ns, &name);
+	assert_ne!(set, format!("k8s/{ns}/{name}"));
+	let rp = Rproxy::start_allowing(&bin, &dir, api, &set, false);
+	rp.wait().await;
+	let client = Client::new(None, TOKEN).unwrap();
+	let caps = client.capabilities(SocketAddr::from(([127, 0, 0, 1], api))).await.unwrap();
+	let yaml = format!(
+		r#"
+apiVersion: v1
+kind: Service
+metadata: {{name: echo, namespace: {ns}}}
+spec: {{ports: [{{name: http, port: 80}}]}}
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata: {{name: echo-1, namespace: {ns}, labels: {{kubernetes.io/service-name: echo}}}}
+addressType: IPv4
+ports: [{{name: http, port: {backend}}}]
+endpoints: [{{addresses: [127.0.0.1]}}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {{name: {name}, namespace: {ns}, generation: 1}}
+spec:
+  gatewayClassName: rproxy
+  listeners: [{{name: http, port: {port}, protocol: HTTP}}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {{name: web, namespace: {ns}}}
+spec:
+  parentRefs: [{{name: {name}}}]
+  hostnames: [long.example.com]
+  rules: [{{backendRefs: [{{name: echo, port: 80}}]}}]
+"#
+	);
+	let mut world = World::default();
+	world.read_manifests(&yaml).unwrap();
+	let opts = render::Options { listen_addrs: vec!["127.0.0.1".into()], features: render::Features::of(&caps), ..Default::default() };
+	let plan = render::render_gateway(&world, &world.gateways[0], &opts);
+	assert_eq!(plan.ruleset, set);
+	let ep = Endpoint { pod: "rproxy".into(), uid: "1".into(), ip: "127.0.0.1".into(), api_port: api, ..Default::default() };
+	let mut applied = Applied::new();
+	let mut caps_cache = HashMap::new();
+	let (r, _) = sync_pod(&client, &ep, &plan, &mut applied, &mut caps_cache).await;
+	let PodSync::Synced(views, _) = &r else { panic!("{r:?}") };
+	assert!(views.iter().all(|v| v.state == "running"), "{views:?}");
+	let (status, body) = get(port, "long.example.com", "/x").await;
+	assert_eq!(status, 200, "{body}");
+	// the token's allow_rulesets is the set's own name: another Gateway's set in the namespace is refused
+	let other = render::ruleset_name(&ns, &format!("{}x", &name[..252]));
+	assert_eq!(api_status(api, "PUT", &format!("/rulesets/{other}"), TOKEN, "{\"generation\": 1, \"rules\": []}").await, 403);
+	drop(rp);
+	let _ = std::fs::remove_dir_all(&dir);
 }

@@ -127,7 +127,7 @@ How the management UI (TCP-UDP-rproxy-ui's chart, installed apart) reads the rpr
 
 ## Owners of rproxy's rule sets
 
-rproxy makes a rule set belong to the name of the token that created it (other non-admin tokens cannot change it). The controller's token is always named `rproxy-gateway` whatever its value, so after a token rotation (and after re-PUTs once rproxy restarts) the owner stays the same. The tokens' `allow_rulesets` are `k8s/` for the fleet's and, for each managed Gateway's, only that Gateway's rule set (`k8s/<namespace>/<name>`).
+rproxy makes a rule set belong to the name of the token that created it (other non-admin tokens cannot change it). The controller's token is always named `rproxy-gateway` whatever its value, so after a token rotation (and after re-PUTs once rproxy restarts) the owner stays the same. The tokens' `allow_rulesets` are `k8s/` for the fleet's and, for each managed Gateway's, only that Gateway's rule set (`k8s/<namespace>/<name>`; a long name ends in a hash, [DESIGN.md](DESIGN.md), "Overview").
 
 When the rproxy is known to have `features.control_limits` (rproxy v0.4.20), the token file also says `allow_freebind: true` (#105). The fleet's `listen: addresses` listens on Gateways' `spec.addresses` with `listen_freebind`, and rproxy v0.4.20 allows `listen_freebind` rules only to an `admin` token, a token with `allow_freebind: true`, or, for a rule set's `PUT`, a token with `allow_rulesets`. The controller's token passes on the last one, but without the field rproxy logs a `token.freebind` warning once per token, so the file says the use is intended. Each managed Gateway's token is decided the same way (managed does not use `listen_freebind`, and `allow_rulesets` already allows as much).
 
