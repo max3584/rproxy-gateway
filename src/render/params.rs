@@ -1128,6 +1128,16 @@ spec:
 		assert_eq!(get("RPROXY_SPLICE_AFTER"), Some("65536"), "rproxy's environment takes bytes");
 		assert_eq!(get("RPROXY_SPLICE_PIPE_SIZE"), Some("1048576"));
 		assert_eq!(get("RPROXY_GEOIP_DB"), Some("/x"));
+		// rproxy v0.4.20's limits of the control API (#110): open to the class's extraEnv
+		let p = resolve(&format!(
+			"{CLASS}{}{}",
+			class_params("  rproxy: {extraEnv: [{name: RPROXY_MAX_RULESETS, value: '5000'}, {name: RPROXY_MAX_RULES, value: '0'}]}"),
+			gateway("  replicas: 1")
+		))
+		.unwrap()
+		.unwrap();
+		let env: Vec<(String, String)> = rproxy_env(&p).into_iter().map(|e| (e.name, e.value.unwrap_or_default())).collect();
+		assert_eq!(env, [("RPROXY_MAX_RULESETS".to_string(), "5000".to_string()), ("RPROXY_MAX_RULES".to_string(), "0".to_string())]);
 	}
 
 	/// #109: `rproxy.http` becomes rproxy's settings file (`global.http.timeouts`), checked as rproxy

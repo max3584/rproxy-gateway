@@ -81,6 +81,29 @@ jobs:
               echo "fleet.http: $bad should be refused"; exit 1
             fi
           done
+          # fleet.extraEnv reaches the DaemonSet's rproxy container (rproxy's limits, #110), as a string
+          helm template t charts/rproxy-gateway --set fleet.enabled=true --set 'fleet.extraEnv[0].name=RPROXY_MAX_RULESETS' \
+            --set 'fleet.extraEnv[0].value=5000' > "$RUNNER_TEMP/env.yaml"
+          grep -A1 -- '- name: "RPROXY_MAX_RULESETS"' "$RUNNER_TEMP/env.yaml" | grep -q 'value: "5000"'
+          # and names the chart sets, names not open, and names that are not plain RPROXY_* stop helm
+          # (white space YAML would trim, a new line that would add entries)
+          printf 'fleet:\n  enabled: true\n  extraEnv:\n    - {name: "RPROXY_TOKEN_FILE ", value: x}\n' > "$RUNNER_TEMP/space.yaml"
+          printf 'fleet:\n  enabled: true\n  extraEnv:\n    - {name: "RPROXY_X\\n- name: RPROXY_TOKEN_FILE", value: x}\n' > "$RUNNER_TEMP/newline.yaml"
+          for f in space newline; do
+            if helm template t charts/rproxy-gateway -f "$RUNNER_TEMP/$f.yaml" > /dev/null 2> "$RUNNER_TEMP/$f.err"; then
+              echo "fleet.extraEnv ($f) should fail"; exit 1
+            fi
+            grep -q 'only RPROXY_\* variables' "$RUNNER_TEMP/$f.err" || { cat "$RUNNER_TEMP/$f.err"; exit 1; }
+          done
+          for n in RPROXY_TOKEN_FILE RPROXY_TOKENS_CHECK_SECS RPROXY_SHUTDOWN_DELAY RPROXY_API_MAX_CONNECTIONS RPROXY_FILES_OWNER RPROXY_CONFIG \
+            RPROXY_DATABASE_URL RPROXY_STATIC_RULES RPROXY_UPDATE_URL RPROXY_HANDOFF_SOCKET rproxy_x HOME; do
+            if helm template t charts/rproxy-gateway --set fleet.enabled=true --set "fleet.extraEnv[0].name=$n" --set 'fleet.extraEnv[0].value=x' > /dev/null 2>&1; then
+              echo "fleet.extraEnv $n should fail"; exit 1
+            fi
+          done
+          # rproxy's other settings stay open
+          helm template t charts/rproxy-gateway --set fleet.enabled=true --set 'fleet.extraEnv[0].name=RPROXY_MAX_RULES' \
+            --set 'fleet.extraEnv[0].value=0' --set 'fleet.extraEnv[1].name=RPROXY_WORKERS' --set 'fleet.extraEnv[1].value=4' > /dev/null
 
   config:
     name: config (kustomize)
