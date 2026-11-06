@@ -1547,7 +1547,7 @@ fn http_settings_condition(known: SettingsKnown, image: &str) -> render::status:
 		render::status::Cond::new(
 			render::params::HTTP_CONDITION,
 			true,
-			"Applied",
+			"Kept",
 			format!("rproxy.http is in rproxy's settings file; whether every pod of {image} takes it is not known yet (kept as it is)"),
 		)
 	} else {

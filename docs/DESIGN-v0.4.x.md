@@ -576,10 +576,10 @@ spec:
 - 外したとき：Secret の `config.json` は消さずに残す（中身もそのまま）。前のテンプレートの Pod はボリュームの `items` でこの項目を名指しているので、消すと kubelet がそのボリューム（トークン・証明書）を更新しなくなり、古い ReplicaSet が作り直す Pod はマウントできない。新しいテンプレートは `RPROXY_CONFIG` を持たないので読まず、ハッシュにも入らないので Pod も入れ替わらない。
 - rproxy の版：`allow_freebind` と同じ決め方（SECURITY.md）で、`features.http_stream_limits`（v0.4.20）を確かめる。v0.4.17〜v0.4.19 は知らない項目のある設定ファイルを誤りとして起動しない（#112 と同じ種類の問題）ため、イメージの名前で覚えたもの（`image_feature`）は信じない：
   - 今ある Pod の**すべて**が、今動いているコンテナから自分の `/capabilities` で答えたこと、かつ Pod を入れ替える先のイメージが、出荷するもの（`SHIPPED_FEATURES`）か、そのイメージを動かす今の Pod が答えたもの。このとき書く（`Applied`）。
-  - 分からない（コントローラが起動したばかりで、自前のイメージの Pod にまだ届かない、など）が、そのイメージの今の Pod がもう `RPROXY_CONFIG` で読んでいて、どの Pod も「持たない」と答えていないときは、今の形のまま書き続ける（`Applied`、message に「分かるまでそのまま」）。外すと Pod が既定に戻って入れ替わり、分かった後にまた入れ替わる（2 回の rollout と、黙って既定に戻ること）のを避けるため。
+  - 分からない（コントローラが起動したばかりで、自前のイメージの Pod にまだ届かない、など）が、そのイメージの今の Pod がもう `RPROXY_CONFIG` で読んでいて、どの Pod も「持たない」と答えていないときは、今の形のまま書き続ける（`True`・`Kept`）。外すと Pod が既定に戻って入れ替わり、分かった後にまた入れ替わる（2 回の rollout と、黙って既定に戻ること）のを避けるため。
   - どれかの Pod が持たないと答えた（付け直したタグの古い rproxy）、または分からずにまだファイルを読んでいない形：書かない（`UnsupportedRproxy`、rproxy の既定）。
-  - 引き換え：今の形を残す間に、同じタグで古い中身の Pod が新しく立つと、その Pod は起動しない（その Pod が答えないので「持たない」とはまだ分からない）。答えた後の反映で外し、Pod は既定の形に入れ替わる。持たない Pod を一度でも見れば書かないので、続けて起動に失敗し続けることはない。古いイメージの Pod（rollout の古い ReplicaSet）は `RPROXY_CONFIG` を持たないので、Secret にファイルがあっても読まない。
-- 状態：`rproxy.http` が何かを決めているあいだ、Gateway に条件 `rproxy.max3584.net/HTTPSettings` を出す：`True`・`Applied`、`False`・`UnsupportedRproxy`（イメージが分からない・古い。rproxy の既定で動く）。`Programmed` は変えない。外すと条件も消す。
+  - 引き換え：今の形を残す間に、同じタグで古い中身（v0.4.17〜v0.4.19）の Pod が新しく立つと、その Pod はファイルのために起動せず、起動しないので `/capabilities` にも答えない。そのため「持たない」とは分からないまま `Kept` が続き、その Pod は起動に失敗し続ける（ほかの Pod は今の形のまま動く）。直すには、タグを正しいイメージに直すか、`rproxy.http` を外す。一度でも「持たない」と答えた Pod があれば書かない。古いイメージの Pod（rollout の古い ReplicaSet）は `RPROXY_CONFIG` を持たないので、Secret にファイルがあっても読まない。
+- 状態：`rproxy.http` が何かを決めているあいだ、Gateway に条件 `rproxy.max3584.net/HTTPSettings` を出す：`True`・`Applied`、`True`・`Kept`（分かるまで今の形のまま。parameters が誤りで前の形を残すときも）、`False`・`UnsupportedRproxy`（イメージが分からない・古い。rproxy の既定で動く）。`Programmed` は変えない。外すと条件も消す。
 - 誰が決めるか：自分の Gateway の Pod だけに効くので、`rproxy.performance` と同じく Gateway の参照でも既定で書ける（`policy.gatewayOverrides` の既定に `rproxy.http`）。丸ごと置き換え（クラスと Gateway の両方にあれば Gateway のもの）。
 - 検証（2.4 と同じく `InvalidParameters`）：時間は 365 日まで、`http2PingTimeout: 0s` は不可、`http2MaxStreams` は 1〜10000（CRD でも）。rproxy の `HttpTimeoutsSpec::check` と同じ。
 - parameters が誤りになった Gateway（2.4 の前の形のまま）は、Secret の `config.json` も前のままにし（上の「外したとき」と同じ）、今の Pod がファイルを読んでいれば Gateway の条件 `rproxy.max3584.net/HTTPSettings` を `True`・`Kept` にする。

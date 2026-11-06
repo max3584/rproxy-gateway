@@ -467,7 +467,8 @@ async fn the_settings_file_needs_every_pod_or_keeps_the_current_form() {
 		SettingsKnown::No
 	);
 	assert!(!http_settings_condition(SettingsKnown::No, custom).status);
-	assert!(http_settings_condition(SettingsKnown::Kept, custom).status);
+	let kept = http_settings_condition(SettingsKnown::Kept, custom);
+	assert!(kept.status && kept.reason == "Kept", "{kept:?}");
 }
 
 /// A pod's `/capabilities` answer is its container's (#112): a container that restarts in the same pod
