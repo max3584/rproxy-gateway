@@ -54,6 +54,21 @@ spec:
             # SIGTERM: keep accepting (GET /readyz: draining), then let connections end (rproxy v0.4.1)
             - {name: RPROXY_SHUTDOWN_DELAY, value: {{ .Values.fleet.shutdown.delay | toString | quote }}}
             - {name: RPROXY_SHUTDOWN_DRAIN, value: {{ .Values.fleet.shutdown.drain | toString | quote }}}
+            {{- range .Values.fleet.extraEnv }}
+            {{- if not (hasPrefix "RPROXY_" (.name | default "")) }}
+            {{- fail (printf "fleet.extraEnv: %q: only RPROXY_* variables" (.name | default "")) }}
+            {{- end }}
+            {{- if or (has .name (list "RPROXY_API_ADDR" "RPROXY_API_PORT" "RPROXY_TOKEN_FILE" "RPROXY_FILES_TRUSTED_DIRS")) (hasPrefix "RPROXY_TLS_" .name) (hasPrefix "RPROXY_SHUTDOWN_" .name) }}
+            {{- fail (printf "fleet.extraEnv: %s is set by the chart (RPROXY_SHUTDOWN_*: fleet.shutdown)" .name) }}
+            {{- end }}
+            - name: {{ .name }}
+              {{- if hasKey . "value" }}
+              value: {{ .value | toString | quote }}
+              {{- end }}
+              {{- with .valueFrom }}
+              valueFrom: {{- toYaml . | nindent 16 }}
+              {{- end }}
+            {{- end }}
           ports:
             - {name: api, containerPort: 9443}
           livenessProbe:

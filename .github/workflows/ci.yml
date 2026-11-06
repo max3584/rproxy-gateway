@@ -65,6 +65,16 @@ jobs:
             echo "fleet.vip should fail"; exit 1
           fi
           grep -q 'fleet.vip was removed' "$RUNNER_TEMP/vip.err"
+          # fleet.extraEnv reaches the DaemonSet's rproxy container (rproxy's limits, #110), as a string
+          helm template t charts/rproxy-gateway --set fleet.enabled=true --set 'fleet.extraEnv[0].name=RPROXY_MAX_RULESETS' \
+            --set 'fleet.extraEnv[0].value=5000' > "$RUNNER_TEMP/env.yaml"
+          grep -A1 -- '- name: RPROXY_MAX_RULESETS' "$RUNNER_TEMP/env.yaml" | grep -q 'value: "5000"'
+          # and names the chart sets stop helm
+          for n in RPROXY_TOKEN_FILE RPROXY_SHUTDOWN_DELAY HOME; do
+            if helm template t charts/rproxy-gateway --set fleet.enabled=true --set "fleet.extraEnv[0].name=$n" --set 'fleet.extraEnv[0].value=x' > /dev/null 2>&1; then
+              echo "fleet.extraEnv $n should fail"; exit 1
+            fi
+          done
 
   config:
     name: config (kustomize)
