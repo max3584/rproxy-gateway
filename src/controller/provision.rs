@@ -271,6 +271,7 @@ pub struct Target<'a> {
 	pub ui: Option<UiAccess>,
 }
 
+pub use crate::render::gateway_name_label;
 pub use crate::render::params::{SERVICE_ANNOTATION_DENY, service_annotation_allowed};
 
 impl<'a> Target<'a> {
@@ -312,10 +313,12 @@ impl<'a> Target<'a> {
 	}
 
 	/// Metadata of a managed object: the infrastructure labels and annotations,
-	/// with ours on top (they select the pods), and the Gateway as owner.
+	/// with ours on top (they select the pods), and the Gateway as owner. The Gateway's
+	/// full `<namespace>/<name>` is in the annotation `ANNOTATION_GATEWAY` (the label
+	/// `gateway-name` holds a hash for a name longer than 63 characters: `gateway_name_label`).
 	fn meta(&self, name: &str, own: BTreeMap<String, String>) -> ObjectMeta {
 		let mut l = self.labels.clone();
-		l.insert(LABEL_GATEWAY_NAME.into(), self.plan.name.clone());
+		l.insert(LABEL_GATEWAY_NAME.into(), gateway_name_label(&self.plan.name));
 		l.extend(own);
 		let mut a = self.annotations.clone();
 		a.insert(ANNOTATION_GATEWAY.into(), format!("{}/{}", self.plan.namespace, self.plan.name));
@@ -1336,6 +1339,84 @@ mod tests {
 		assert_ne!(id, gateway_id("default-web", "", "u1"));
 		assert_ne!(id, gateway_id("default", "web", "u2"), "created again: new objects");
 		assert!(gateway_id(&"n".repeat(63), &"g".repeat(253), "u").len() <= 47);
+	}
+
+	/// A Kubernetes label value: at most 63 characters, `[A-Za-z0-9]` at both ends, `-_.` inside.
+	fn label_value(v: &str) -> bool {
+		let edge = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric());
+		v.is_empty()
+			|| (v.len() <= crate::render::LABEL_VALUE_MAX
+				&& edge(v.chars().next())
+				&& edge(v.chars().last())
+				&& v.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+	}
+
+	#[test]
+	fn gateway_name_label_fits_a_label_value() {
+		let short = "g".repeat(63);
+		assert_eq!(gateway_name_label(&short), short, "63 characters: the name itself");
+		assert_eq!(gateway_name_label("web"), "web");
+		assert!(!label_value(&"g".repeat(64)), "64 characters: not a label value");
+		// the example of kubernetes-sigs/gateway-api#3070 (GEP-1762)
+		let long = "example-very-very-very-very-very-very-very-very-very-long-gateway-name";
+		assert_eq!(gateway_name_label(long), "example-very-very-ve-65cb6f84bc9e50270d0a6c2f845fd98c6fe8d89f");
+		// scripts/e2e.sh's (computed there with sha1sum)
+		let e2e = format!("long-gateway-name-{}", "x".repeat(70));
+		assert_eq!(gateway_name_label(&e2e), "long-gateway-name-xx-87ce4c6f0048c287dbfcf288c97f54b619480279");
+		for n in [64, 100, 253] {
+			// a DNS subdomain with `-` and `.` (one at the 20th character)
+			let name: String = "long-gateway.name-1".repeat(14).chars().take(n - 1).chain(['z']).collect();
+			let v = gateway_name_label(&name);
+			assert_eq!(v.len(), 61, "{n}: {v}");
+			assert!(label_value(&v), "{n}: {v}");
+			assert!(v.starts_with(&name[..20]), "{n}: readable start");
+			assert_eq!(v, gateway_name_label(&name), "stable");
+		}
+		let a = format!("{}a", "g".repeat(70));
+		let b = format!("{}b", "g".repeat(70));
+		assert_ne!(gateway_name_label(&a), gateway_name_label(&b), "same start, different names");
+	}
+
+	/// Gateways named 63, 64 and 253 characters: every managed object has valid labels, and
+	/// the selectors (the Deployment's is immutable) are the same as for a short name and pick the pods.
+	#[test]
+	fn long_gateway_names() {
+		let m = Managed { replicas: 2, ..Default::default() };
+		let short = plan();
+		let short_t = Target::new(&short);
+		let short_sel = deployment(&short_t, &m, "h").spec.unwrap().selector.match_labels.unwrap();
+		for n in [63, 64, 253] {
+			let mut p = plan();
+			p.name = "g".repeat(n);
+			let t = Target::new(&p);
+			let want = if n <= 63 { p.name.clone() } else { gateway_name_label(&p.name) };
+			let d = deployment(&t, &m, "h");
+			let svc = service(&t, &m);
+			let pdb = pod_disruption_budget(&t, &m).expect("2 replicas");
+			let np = network_policy(&t, "rproxy-gateway");
+			let sa = service_account(&t);
+			let api = api_secret(&t, None, &boot()).unwrap();
+			let certs = t.meta(&certs_secret_name(&t.id), t.secret_labels());
+			let spec = d.spec.clone().unwrap();
+			let tmpl = spec.template.metadata.clone().unwrap();
+			let metas = [&d.metadata, &tmpl, &svc.metadata, &pdb.metadata, &np.metadata, &sa.metadata, &api.metadata, &certs];
+			for meta in metas {
+				let l = meta.labels.as_ref().unwrap();
+				assert_eq!(l[LABEL_GATEWAY_NAME], want, "{n}");
+				assert!(l.values().all(|v| label_value(v)), "{n}: {l:?}");
+				assert!(meta.name.as_ref().is_none_or(|m| m.len() <= 63), "{n}: {:?}", meta.name);
+				assert_eq!(meta.annotations.as_ref().unwrap()[ANNOTATION_GATEWAY], format!("default/{}", p.name), "the full name");
+			}
+			let pod_labels = tmpl.labels.unwrap();
+			let picks = |sel: &BTreeMap<String, String>| sel.iter().all(|(k, v)| pod_labels.get(k) == Some(v));
+			let sel = spec.selector.match_labels.unwrap();
+			assert_eq!(sel.keys().collect::<Vec<_>>(), short_sel.keys().collect::<Vec<_>>(), "{n}: same selector keys");
+			assert!(!sel.contains_key(LABEL_GATEWAY_NAME), "the selector does not use the name");
+			assert!(picks(&sel), "{n}: Deployment");
+			assert!(picks(&svc.spec.unwrap().selector.unwrap()), "{n}: Service");
+			assert!(picks(&pdb.spec.unwrap().selector.unwrap().match_labels.unwrap()), "{n}: PDB");
+			assert!(picks(&np.spec.unwrap().pod_selector.unwrap().match_labels.unwrap()), "{n}: NetworkPolicy");
+		}
 	}
 
 	#[test]

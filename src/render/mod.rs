@@ -521,6 +521,8 @@ pub fn foreign_file(v: &Value, cert_dir: &str, names: &BTreeSet<String>) -> Opti
 fn address_policy(world: &World, gw: &Gateway, ips: &[String], opts: &Options) -> Option<String> {
 	let gw_name = gw.metadata.name.clone().unwrap_or_default();
 	let gw_ns = gw.metadata.namespace.clone().unwrap_or_default();
+	// the label's value, as the managed objects carry it (a hash for a name over 63 characters)
+	let label = gateway_name_label(&gw_name);
 	for a in ips {
 		let Ok(ip) = a.parse::<std::net::IpAddr>() else { continue };
 		if !opts.address_cidrs.iter().any(|c| c.contains(ip)) {
@@ -531,13 +533,31 @@ fn address_policy(world: &World, gw: &Gateway, ips: &[String], opts: &Options) -
 			});
 		}
 		let ours = |ns: &str, svc: &k8s_openapi::api::core::v1::Service| {
-			ns == gw_ns && svc.metadata.labels.as_ref().and_then(|l| l.get("gateway.networking.k8s.io/gateway-name")) == Some(&gw_name)
+			ns == gw_ns && svc.metadata.labels.as_ref().and_then(|l| l.get("gateway.networking.k8s.io/gateway-name")) == Some(&label)
 		};
 		if let Some((ns, name)) = service_with(world, ip, ours) {
 			return Some(format!("{a}: Service {ns}/{name} has that address"));
 		}
 	}
 	None
+}
+
+/// The most characters a label value has (Kubernetes).
+pub const LABEL_VALUE_MAX: usize = 63;
+
+/// The value of `gateway.networking.k8s.io/gateway-name` for a Gateway named `name`: the name
+/// itself when it fits a label value (63 characters), else its first 20 characters, `-` and the SHA-1
+/// (hex) of the rest — 61 characters. That is the form proposed for GEP-1762
+/// (kubernetes-sigs/gateway-api#3070, for #2592); the GEP itself says nothing about long names.
+/// Gateway names are DNS subdomains (lowercase letters, digits, `-`, `.`), so the value is a valid label value.
+pub fn gateway_name_label(name: &str) -> String {
+	if name.chars().count() <= LABEL_VALUE_MAX {
+		return name.to_string();
+	}
+	let head: String = name.chars().take(20).collect();
+	let rest = &name[head.len()..];
+	let sum = ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, rest.as_bytes());
+	format!("{head}-{}", crate::pem::hex(sum.as_ref()))
 }
 
 /// A Service (not `skip`) with `ip` as its cluster, external or load balancer address.
