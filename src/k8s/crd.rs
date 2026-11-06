@@ -69,7 +69,7 @@ pub struct PolicyTargetRef {
 #[kube(group = "rproxy.max3584.net", version = "v1beta1", kind = "RproxyPolicy", namespaced, shortname = "rppol")]
 #[kube(status = "PolicyStatus")]
 #[kube(
-	doc = "rproxy rule settings (limits, bandwidth, geoip, outlier_detection, allow_from, crowdsec, connect and response timeouts) attached to Gateways, listeners or Services"
+	doc = "rproxy rule settings (limits, bandwidth, geoip, outlier_detection, allow_from, crowdsec, connect, response and L4 relay timeouts) attached to Gateways, listeners or Services"
 )]
 #[serde(rename_all = "camelCase")]
 pub struct RproxyPolicySpec {
@@ -102,6 +102,17 @@ pub struct RproxyPolicySpec {
 	/// default (`--backend-response-timeout`); an HTTPRoute rule's own `timeouts` still win.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub response_timeout: Option<String>,
+	/// How long a relayed L4 TCP connection (TCPRoute, TLSRoute passthrough) may carry nothing either
+	/// way before rproxy closes it (`30m`, `0s` for no limit, else at least 1s): an L4 tcp rule's
+	/// `idle_timeout` (rproxy v0.4.20; rproxy's own default is 1h). Not for HTTP rules (their client
+	/// connections: RproxyGatewayParameters rproxy.http.timeouts).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub idle_timeout: Option<String>,
+	/// After one side has finished sending (half-closed), how long the other direction may carry
+	/// nothing before rproxy closes the connection (`5m`, `0s` for none: idleTimeout only, else at
+	/// least 1s): an L4 tcp rule's `half_close_timeout` (rproxy v0.4.20; rproxy's own default is 1m).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub half_close_timeout: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, JsonSchema)]

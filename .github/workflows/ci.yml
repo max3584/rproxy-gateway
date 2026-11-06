@@ -65,6 +65,15 @@ jobs:
             echo "fleet.vip should fail"; exit 1
           fi
           grep -q 'fleet.vip was removed' "$RUNNER_TEMP/vip.err"
+          # fleet.http: rproxy's settings file (a ConfigMap) named by RPROXY_CONFIG; none by default
+          helm template t charts/rproxy-gateway --set fleet.enabled=true --set fleet.http.timeouts.http2_max_streams=1000 \
+            --set fleet.http.timeouts.write_stall=2m > "$RUNNER_TEMP/http.yaml"
+          grep -F 'config.json:' "$RUNNER_TEMP/http.yaml" | grep -F 'http2_max_streams' | grep -qF '1000'
+          grep -q 'kind: ConfigMap' "$RUNNER_TEMP/http.yaml"
+          grep -q 'name: RPROXY_CONFIG, value: /etc/rproxy-gateway/config/config.json' "$RUNNER_TEMP/http.yaml"
+          if helm template t charts/rproxy-gateway --set fleet.enabled=true | grep -q RPROXY_CONFIG; then
+            echo "fleet.http {} should write no settings file"; exit 1
+          fi
 
   config:
     name: config (kustomize)

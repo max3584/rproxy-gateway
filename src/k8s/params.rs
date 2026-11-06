@@ -239,10 +239,63 @@ pub struct RproxyParams {
 	/// features.graceful_shutdown (v0.4.1); older rproxy keeps a preStop (docs/DESIGN-v0.4.x.md, E).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub shutdown: Option<Shutdown>,
+	/// rproxy's global.http: limits of the client connections of the Gateway's HTTP, HTTPS and GRPC
+	/// listeners (rproxy v0.4.20, features.http_stream_limits), written to rproxy's settings file.
+	/// Replaced as a whole when a Gateway's parameters set it.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub http: Option<HttpParams>,
 	/// More RPROXY_* environment variables of the rproxy container (Kubernetes EnvVars): only in
 	/// the GatewayClass's parameters; names the controller sets are refused.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub extra_env: Option<Vec<FreeForm>>,
+}
+
+/// rproxy's `global.http` (rproxy-api docs/API.md, `global.http.timeouts`): one process, so every
+/// listener of the Gateway. Left out: rproxy's defaults.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HttpParams {
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub timeouts: Option<HttpTimeouts>,
+	/// Streams at once on one HTTP/2 client connection (1 to 10000; rproxy's default 128). Raise it
+	/// for gRPC clients that keep many long streams on one channel (GRPCRoute).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	#[schemars(range(min = 1, max = 10000))]
+	pub http2_max_streams: Option<u32>,
+}
+
+/// rproxy's `global.http.timeouts`: durations such as `30s`, `5m`, `2h`; `0s` is no limit (not for
+/// http2PingTimeout). Each applies to new client connections.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HttpTimeouts {
+	/// The TLS handshake of HTTPS listeners (default 10s).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub tls_handshake: Option<String>,
+	/// From the connection to its first byte (default 10s).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub first_byte: Option<String>,
+	/// From the connection to the first request's headers; on HTTP/1.1 each later request's too (default 30s).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub request_headers: Option<String>,
+	/// A connection with no request in progress is closed (default 180s).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub idle: Option<String>,
+	/// Silence while reading a request body (default 60s; not for gRPC).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub request_body_idle: Option<String>,
+	/// An HTTP/2 PING after this long without reads (default 60s; 0s: none).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub http2_ping_interval: Option<String>,
+	/// How long a PING's answer may take (default 20s; not 0s).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub http2_ping_timeout: Option<String>,
+	/// A write to a client that takes nothing for this long closes the connection (default 60s).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub write_stall: Option<String>,
+	/// An upgraded connection (WebSocket) with nothing either way for this long is closed (default 1h).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub upgraded_idle: Option<String>,
 }
 
 /// rproxy's `global.performance` (rproxy-api docs/DESIGN-v0.4.md 12.).
@@ -329,7 +382,8 @@ pub struct ParamsPolicy {
 	/// The fields a Gateway's parameters may set (default: replicas, podDisruptionBudget,
 	/// pod.labels, pod.annotations, pod.resources, pod.topologySpreadConstraints,
 	/// service.externalTrafficPolicy, service.loadBalancerSourceRanges, service.ipFamilyPolicy,
-	/// service.labels, service.annotations, rproxy.logLevel, rproxy.performance, rproxy.shutdown, ui).
+	/// service.labels, service.annotations, rproxy.logLevel, rproxy.performance, rproxy.shutdown,
+	/// rproxy.http, ui).
 	/// Also: service.type, service.loadBalancerClass, pod.nodeSelector, pod.tolerations, pod.affinity,
 	/// pod.priorityClassName, proxyProtocol. rproxy.image, rproxy.extraEnv and policy cannot be listed.
 	#[serde(default, skip_serializing_if = "Option::is_none")]

@@ -72,8 +72,28 @@ fn settings(p: &RproxyPolicy) -> Vec<(&'static str, Value)> {
 	out
 }
 
-/// A policy's `connectTimeout` and `responseTimeout`, checked (`Err`: why not).
-fn timeouts(p: &RproxyPolicy) -> Result<(Option<String>, Option<String>), String> {
+/// A policy's timeouts, checked.
+#[derive(Default)]
+struct Timeouts {
+	connect: Option<String>,
+	response: Option<String>,
+	/// L4 tcp rules' `idle_timeout` and `half_close_timeout` (rproxy v0.4.20), as rproxy writes them
+	/// (`0s`, `90s`, `1500ms`).
+	idle: Option<String>,
+	half_close: Option<String>,
+}
+
+impl Timeouts {
+	fn relay(&self) -> bool {
+		self.idle.is_some() || self.half_close.is_some()
+	}
+}
+
+/// The longest relay timeout (rproxy's longest duration: 365 days).
+const MAX_RELAY_MS: u64 = 365 * 24 * 3_600_000;
+
+/// A policy's `connectTimeout`, `responseTimeout`, `idleTimeout` and `halfCloseTimeout`, checked (`Err`: why not).
+fn timeouts(p: &RproxyPolicy) -> Result<Timeouts, String> {
 	let check = |what: &str, v: &Option<String>, min: u64, max: u64| -> Result<Option<String>, String> {
 		match v.as_deref().map(str::trim) {
 			None => Ok(None),
@@ -83,32 +103,65 @@ fn timeouts(p: &RproxyPolicy) -> Result<(Option<String>, Option<String>), String
 			},
 		}
 	};
-	Ok((check("connectTimeout", &p.spec.connect_timeout, 100, 600_000)?, check("responseTimeout", &p.spec.response_timeout, 1, 3_600_000)?))
+	// `0s` (no limit) or 1s to 365 days (rproxy's `validate_relay_timeout`), in one unit as rproxy reads it
+	let relay = |what: &str, v: &Option<String>| -> Result<Option<String>, String> {
+		match v.as_deref().map(str::trim) {
+			None => Ok(None),
+			Some(d) => match crate::render::duration_ms(d) {
+				Some(0) => Ok(Some("0s".into())),
+				Some(ms) if (1000..=MAX_RELAY_MS).contains(&ms) => {
+					Ok(Some(if ms % 1000 == 0 { format!("{}s", ms / 1000) } else { format!("{ms}ms") }))
+				}
+				_ => Err(format!("{what} {d:?}: 0s (no limit) or a duration from 1s to 365 days (8760h)")),
+			},
+		}
+	};
+	Ok(Timeouts {
+		connect: check("connectTimeout", &p.spec.connect_timeout, 100, 600_000)?,
+		response: check("responseTimeout", &p.spec.response_timeout, 1, 3_600_000)?,
+		idle: relay("idleTimeout", &p.spec.idle_timeout)?,
+		half_close: relay("halfCloseTimeout", &p.spec.half_close_timeout)?,
+	})
 }
 
-/// Puts a policy's timeouts on a rule: an L4 tcp rule's `connect_timeout`, or the `http` services
-/// `service` picks: `timeouts.connect`, and `timeouts.response` unless the route rule set its own.
-/// What is set already (an older policy) stays.
-fn put_timeouts(r: &mut rp::Rule, connect: &Option<String>, response: &Option<String>, service: impl Fn(&str) -> bool) {
+/// Puts a policy's timeouts on a rule: an L4 tcp rule's `connect_timeout` (and with `relay`, its
+/// `idle_timeout` and `half_close_timeout`), or the `http` services `service` picks: `timeouts.connect`,
+/// and `timeouts.response` unless the route rule set its own. What is set already (an older policy)
+/// stays. Returns whether an L4 tcp rule got a relay timeout.
+fn put_timeouts(r: &mut rp::Rule, t: &Timeouts, relay: bool, service: impl Fn(&str) -> bool) -> bool {
 	match r.http.as_mut() {
 		Some(http) => {
 			for (_, svc) in http.services.iter_mut().filter(|(n, _)| service(n)) {
-				if let Some(c) = connect {
+				if let Some(c) = &t.connect {
 					crate::render::set_timeout(svc, "connect", c);
 				}
-				if let (Some(t), false) = (response, svc.route_timeouts) {
+				if let (Some(t), false) = (&t.response, svc.route_timeouts) {
 					crate::render::set_timeout(svc, "response", t);
 				}
 			}
+			false
 		}
 		None if r.protocol == rp::Protocol::Tcp => {
-			if let Some(c) = connect {
+			if let Some(c) = &t.connect {
 				set_once(&mut r.extra, "connect_timeout", &Value::String(c.clone()));
 			}
+			if !relay {
+				return false;
+			}
+			for (k, v) in [("idle_timeout", &t.idle), ("half_close_timeout", &t.half_close)] {
+				if let Some(v) = v {
+					set_once(&mut r.extra, k, &Value::String(v.clone()));
+				}
+			}
+			t.relay()
 		}
-		None => {}
+		None => false,
 	}
 }
+
+/// The policy condition about `idleTimeout` / `halfCloseTimeout` (only while the policy sets one and
+/// reaches an L4 tcp rule).
+pub const RELAY_CONDITION: &str = "rproxy.max3584.net/RelayTimeouts";
 
 fn set_once(map: &mut serde_json::Map<String, Value>, key: &str, value: &Value) {
 	if !map.contains_key(key) {
@@ -117,7 +170,14 @@ fn set_once(map: &mut serde_json::Map<String, Value>, key: &str, value: &Value) 
 }
 
 /// Applies the policies of `gw`'s namespace to its rules; returns their status for this Gateway.
-pub fn apply(world: &World, gw: &Gateway, rules: &mut [rp::Rule], targets: &Targets) -> Vec<PolicyStatus> {
+/// `features`: what every pod of the Gateway takes (`tcp_idle_timeout` for the relay timeouts).
+pub fn apply(
+	world: &World,
+	gw: &Gateway,
+	rules: &mut [rp::Rule],
+	targets: &Targets,
+	features: &crate::render::Features,
+) -> Vec<PolicyStatus> {
 	let gw_ns = gw.metadata.namespace.clone().unwrap_or_default();
 	let gw_name = gw.metadata.name.clone().unwrap_or_default();
 	let mut policies: Vec<&RproxyPolicy> =
@@ -128,7 +188,10 @@ pub fn apply(world: &World, gw: &Gateway, rules: &mut [rp::Rule], targets: &Targ
 	for p in policies {
 		let mut touched = false;
 		let mut problems = vec![];
-		let (connect, response) = match timeouts(p) {
+		// L4 tcp rules the relay timeouts reached (or would have, on an rproxy without them)
+		let mut relayed = false;
+		let relay = features.tcp_idle_timeout;
+		let times = match timeouts(p) {
 			Ok(t) => t,
 			Err(e) => {
 				// a wrong timeout: the policy is not used (its other settings neither)
@@ -168,7 +231,7 @@ pub fn apply(world: &World, gw: &Gateway, rules: &mut [rp::Rule], targets: &Targ
 						}
 						set_once(&mut r.extra, k, &v);
 					}
-					put_timeouts(r, &connect, &response, |_| true);
+					relayed |= put_timeouts(r, &times, relay, |_| true) || (!relay && times.relay() && l4_tcp(r));
 				}
 			} else if is_service {
 				let svc: Key = (gw_ns.clone(), t.name.clone());
@@ -180,7 +243,7 @@ pub fn apply(world: &World, gw: &Gateway, rules: &mut [rp::Rule], targets: &Targ
 						for (k, v) in settings(p) {
 							set_once(&mut r.extra, k, &v);
 						}
-						put_timeouts(r, &connect, &response, |_| true);
+						relayed |= put_timeouts(r, &times, relay, |_| true) || (!relay && times.relay() && l4_tcp(r));
 					}
 					if let Some(http) = r.http.as_mut() {
 						for (name, s) in http.services.iter_mut() {
@@ -200,7 +263,7 @@ pub fn apply(world: &World, gw: &Gateway, rules: &mut [rp::Rule], targets: &Targ
 							.cloned()
 							.collect();
 						if !picked.is_empty() {
-							put_timeouts(r, &connect, &response, |n| picked.iter().any(|p| p == n));
+							put_timeouts(r, &times, relay, |n| picked.iter().any(|p| p == n));
 						}
 					}
 				}
@@ -214,15 +277,33 @@ pub fn apply(world: &World, gw: &Gateway, rules: &mut [rp::Rule], targets: &Targ
 		} else {
 			Cond::new("Accepted", false, "TargetNotFound", problems.join("; "))
 		};
+		let mut conds = vec![cond];
+		if relayed {
+			conds.push(if relay {
+				Cond::new(RELAY_CONDITION, true, "Applied", "idleTimeout / halfCloseTimeout are set on the L4 TCP rules")
+			} else {
+				Cond::new(
+					RELAY_CONDITION,
+					false,
+					"UnsupportedRproxy",
+					"idleTimeout / halfCloseTimeout need a newer rproxy (GET /capabilities: tcp_idle_timeout, rproxy v0.4.20): not set, rproxy's own defaults apply",
+				)
+			});
+		}
 		out.push(PolicyStatus {
 			namespace: gw_ns.clone(),
 			name: p.metadata.name.clone().unwrap_or_default(),
 			generation: p.metadata.generation.unwrap_or(0),
 			ancestor: json!({"group": GROUP, "kind": "Gateway", "namespace": gw_ns, "name": gw_name}),
-			conds: vec![cond],
+			conds,
 		});
 	}
 	out
+}
+
+/// An L4 tcp rule (where `idle_timeout` / `half_close_timeout` go).
+fn l4_tcp(r: &rp::Rule) -> bool {
+	r.http.is_none() && r.protocol == rp::Protocol::Tcp
 }
 
 /// The RproxyRules naming `gw`: rules to add (JSON) and their status.

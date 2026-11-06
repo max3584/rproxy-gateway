@@ -55,6 +55,11 @@ impl Rproxy {
 
 	/// `freebind`: the token file says `allow_freebind: true` (rproxy v0.4.20, `features.control_limits`).
 	fn start_with(bin: &Path, dir: &Path, api: u16, freebind: bool) -> Rproxy {
+		Rproxy::start_env(bin, dir, api, freebind, &[])
+	}
+
+	/// With more environment variables (`RPROXY_CONFIG`).
+	fn start_env(bin: &Path, dir: &Path, api: u16, freebind: bool, env: &[(&str, &Path)]) -> Rproxy {
 		let tokens = dir.join("tokens.yaml");
 		use rproxy_gateway::controller::bootstrap;
 		std::fs::write(&tokens, bootstrap::token_file(TOKEN, bootstrap::FLEET_RULESETS, freebind) + &bootstrap::ui_token_entry(UI_TOKEN))
@@ -65,6 +70,7 @@ impl Rproxy {
 			.env("RPROXY_API_PORT", api.to_string())
 			.env("RPROXY_TOKEN_FILE", &tokens)
 			.env("RPROXY_LOG_LEVEL", "info")
+			.envs(env.iter().map(|(k, v)| (*k, *v)))
 			.stdout(Stdio::from(log.try_clone().unwrap()))
 			.stderr(Stdio::from(log))
 			.spawn()
@@ -917,4 +923,171 @@ spec:
 	// `r1` has no backend: nothing gets through
 	let (status, body) = get_with(port, "closed.example.com", "/x", "Authorization: allow\r\n").await;
 	assert_ne!(status, 200, "{body}");
+}
+
+/// A TCP backend sending back what it gets.
+async fn tcp_echo() -> u16 {
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let port = listener.local_addr().unwrap().port();
+	tokio::spawn(async move {
+		loop {
+			let Ok((mut tcp, _)) = listener.accept().await else { continue };
+			tokio::spawn(async move {
+				let (mut r, mut w) = tcp.split();
+				let _ = tokio::io::copy(&mut r, &mut w).await;
+			});
+		}
+	});
+	port
+}
+
+/// Whether rproxy closes a connection left silent (within `within`).
+async fn closed_within(tcp: &mut tokio::net::TcpStream, within: Duration) -> bool {
+	let mut buf = [0u8; 16];
+	matches!(tokio::time::timeout(within, tcp.read(&mut buf)).await, Ok(Ok(0)) | Ok(Err(_)))
+}
+
+/// #108 and #109: an RproxyPolicy's `idleTimeout` / `halfCloseTimeout` (rproxy v0.4.20 `idle_timeout`,
+/// `half_close_timeout`) are taken on the TCPRoute's rule and close a silent relayed connection, and the
+/// settings file the controller writes for RproxyGatewayParameters `rproxy.http` (`global.http.timeouts`)
+/// starts rproxy and is in force on the HTTP listener.
+#[tokio::test]
+async fn relay_timeouts_and_http_settings_on_a_real_rproxy() {
+	let Some(bin) = rproxy_bin() else { return };
+	let dir = std::env::temp_dir().join(format!("rproxy-gateway-timeouts-{}", std::process::id()));
+	let _ = std::fs::remove_dir_all(&dir);
+	std::fs::create_dir_all(&dir).unwrap();
+	let backend = echo_backend().await;
+	let tcp_backend = tcp_echo().await;
+	let [http_port, tcp_port, tcp2_port, api] = free_ports();
+	let params = r#"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: {name: rproxy}
+spec:
+  controllerName: rproxy.max3584.net/gateway-controller
+  parametersRef: {group: rproxy.max3584.net, kind: RproxyGatewayParameters, name: rproxy-default, namespace: rproxy-gateway-system}
+---
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyGatewayParameters
+metadata: {name: rproxy-default, namespace: rproxy-gateway-system}
+spec:
+  rproxy:
+    http:
+      http2MaxStreams: 1000
+      timeouts: {firstByte: 1s, writeStall: 2m, upgradedIdle: 0s}
+"#;
+	let yaml = format!(
+		r#"{params}
+---
+apiVersion: v1
+kind: Service
+metadata: {{name: echo, namespace: default}}
+spec: {{ports: [{{name: http, port: 80}}]}}
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata: {{name: echo-1, namespace: default, labels: {{kubernetes.io/service-name: echo}}}}
+addressType: IPv4
+ports: [{{name: http, port: {backend}}}]
+endpoints: [{{addresses: [127.0.0.1]}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {{name: db, namespace: default}}
+spec: {{ports: [{{name: tcp, port: 5432}}]}}
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata: {{name: db-1, namespace: default, labels: {{kubernetes.io/service-name: db}}}}
+addressType: IPv4
+ports: [{{name: tcp, port: {tcp_backend}}}]
+endpoints: [{{addresses: [127.0.0.1]}}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {{name: gw, namespace: default, generation: 1}}
+spec:
+  gatewayClassName: rproxy
+  listeners:
+    - {{name: http, port: {http_port}, protocol: HTTP}}
+    - {{name: db, port: {tcp_port}, protocol: TCP}}
+    - {{name: db2, port: {tcp2_port}, protocol: TCP}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {{name: web, namespace: default}}
+spec:
+  parentRefs: [{{name: gw, sectionName: http}}]
+  rules: [{{backendRefs: [{{name: echo, port: 80}}]}}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata: {{name: db, namespace: default}}
+spec:
+  parentRefs: [{{name: gw, sectionName: db}}]
+  rules: [{{backendRefs: [{{name: db, port: 5432}}]}}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata: {{name: db2, namespace: default}}
+spec:
+  parentRefs: [{{name: gw, sectionName: db2}}]
+  rules: [{{backendRefs: [{{name: db, port: 5432}}]}}]
+---
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyPolicy
+metadata: {{name: short, namespace: default}}
+spec:
+  targetRefs: [{{group: gateway.networking.k8s.io, kind: Gateway, name: gw, sectionName: db}}]
+  idleTimeout: 1s
+  halfCloseTimeout: 0s
+"#
+	);
+	let mut world = World::default();
+	world.read_manifests(&yaml).unwrap();
+	// the settings file as the controller writes it into the control API Secret
+	let spec = render::params::gateway_parameters(&world, &world.gateways[0], &render::params::ParamsOptions::default()).unwrap().unwrap();
+	let file = dir.join(render::params::SETTINGS_FILE);
+	std::fs::write(&file, render::params::settings_file(&spec).unwrap()).unwrap();
+	let rp = Rproxy::start_env(&bin, &dir, api, false, &[("RPROXY_CONFIG", &file)]);
+	rp.wait().await;
+	let client = Client::new(None, TOKEN).unwrap();
+	let caps = client.capabilities(SocketAddr::from(([127, 0, 0, 1], api))).await.unwrap();
+	if !caps.feature("tcp_idle_timeout") || !caps.feature("http_stream_limits") {
+		eprintln!("rproxy {} has no tcp_idle_timeout / http_stream_limits (v0.4.20); skipped", caps.version);
+		return;
+	}
+	let opts = render::Options { listen_addrs: vec!["127.0.0.1".into()], features: render::Features::of(&caps), ..Default::default() };
+	let plan = render::render_gateway(&world, &world.gateways[0], &opts);
+	let st = &plan.policies[0];
+	assert!(st.conds.iter().any(|c| c.kind == render::policy::RELAY_CONDITION && c.status), "{:?}", st.conds);
+	let ep = Endpoint { pod: "rproxy".into(), uid: "1".into(), ip: "127.0.0.1".into(), api_port: api, ..Default::default() };
+	let mut applied = Applied::new();
+	let mut caps_cache = HashMap::new();
+	let (r, _) = sync_pod(&client, &ep, &plan, &mut applied, &mut caps_cache).await;
+	let PodSync::Synced(views, _) = r else { panic!("{r:?}\nrules: {}", serde_json::to_string_pretty(&plan.rules_json()).unwrap()) };
+	for v in &views {
+		assert_eq!(v.state, "running", "{} {:?}", v.key(), v.error);
+	}
+	// the policy's listener: a relayed connection silent for longer than idleTimeout is closed
+	let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", tcp_port)).await.unwrap();
+	tcp.write_all(b"ping").await.unwrap();
+	let mut buf = [0u8; 4];
+	tokio::time::timeout(Duration::from_secs(5), tcp.read_exact(&mut buf)).await.unwrap().unwrap();
+	assert_eq!(&buf, b"ping");
+	assert!(closed_within(&mut tcp, Duration::from_secs(5)).await, "idleTimeout 1s");
+	// the other listener: rproxy's own (1h)
+	let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", tcp2_port)).await.unwrap();
+	tcp.write_all(b"ping").await.unwrap();
+	tokio::time::timeout(Duration::from_secs(5), tcp.read_exact(&mut buf)).await.unwrap().unwrap();
+	assert!(!closed_within(&mut tcp, Duration::from_secs(3)).await, "rproxy's default stays");
+	// the settings file: firstByte 1s (rproxy's own is 10s) closes a connection that sends nothing
+	let (status, body) = get(http_port, "any", "/x").await;
+	assert!(status == 200 && body.ends_with("/x|any|"), "{body}");
+	let mut idle = tokio::net::TcpStream::connect(("127.0.0.1", http_port)).await.unwrap();
+	assert!(closed_within(&mut idle, Duration::from_secs(5)).await, "global.http.timeouts.first_byte 1s");
+	drop(rp);
+	let _ = std::fs::remove_dir_all(&dir);
 }

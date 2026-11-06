@@ -261,6 +261,10 @@ pub struct Target<'a> {
 	/// pod there is now (each answered so itself): the token file says `allow_freebind: true`
 	/// (`bootstrap::token_file`; older rproxy refuses the field).
 	pub control_limits: bool,
+	/// rproxy's settings file (`render::params::settings_file`: the parameters' `rproxy.http`), for an
+	/// image known to take it (`features.http_stream_limits`, rproxy v0.4.20): in the control API Secret,
+	/// named by `RPROXY_CONFIG`. `None`: no settings file (as before).
+	pub settings: Option<String>,
 	/// The UI reads this Gateway's rproxy (`--ui-namespace` set and the parameters' `ui.visible`
 	/// not false): its read-only token in the token file (rproxy before v0.4.2 reads the file at
 	/// start: the pods roll), the UI's pods let through the NetworkPolicy.
@@ -283,6 +287,7 @@ impl<'a> Target<'a> {
 			graceful: false,
 			tokens_reload: false,
 			control_limits: false,
+			settings: None,
 			ui: None,
 		}
 	}
@@ -420,13 +425,16 @@ pub fn api_secret(t: &Target, current: Option<&Secret>, boot: &bootstrap::Bootst
 	if t.ui.is_some() {
 		tokens.push_str(&bootstrap::ui_token_entry(&bootstrap::derive_ui_token(&boot.token, &t.id)));
 	}
-	let data: BTreeMap<String, Vec<u8>> = [
+	let mut data: BTreeMap<String, Vec<u8>> = [
 		("tls.crt".to_string(), crt),
 		("tls.key".to_string(), key),
 		("ca.crt".to_string(), boot.ca_pem.clone()),
 		("tokens.yaml".to_string(), tokens.into_bytes()),
 	]
 	.into();
+	if let Some(f) = &t.settings {
+		data.insert(crate::render::params::SETTINGS_FILE.to_string(), f.clone().into_bytes());
+	}
 	let mut meta = t.meta(&api_secret_name(&t.id), t.secret_labels());
 	meta.labels.get_or_insert_default().remove(LABEL_CERTS_FOR);
 	meta.annotations.get_or_insert_default().insert(ANNOTATION_SERVER_NAME.into(), name);
@@ -503,6 +511,10 @@ pub fn deployment(t: &Target, m: &Managed, api_hash: &str) -> Deployment {
 		// the kubelet mounts Secrets as root (0440, group fsGroup): rproxy may use root's files there
 		env("RPROXY_FILES_TRUSTED_DIRS", &format!("{CERT_DIR},{API_DIR}")),
 	];
+	// the parameters' rproxy.http: a settings file rproxy reads again when it changes (no roll)
+	if t.settings.is_some() {
+		rproxy_env.push(env("RPROXY_CONFIG", &format!("{API_DIR}/{}", crate::render::params::SETTINGS_FILE)));
+	}
 	// SIGTERM: keep accepting for delay (GET /readyz: draining), then let connections end for drain
 	// (rproxy v0.4.1). Else the preStop keeps an older rproxy serving, which stops at once on SIGTERM
 	let (delay, drain) = if t.graceful { shutdown(t, m) } else { (Duration::ZERO, Duration::ZERO) };
@@ -554,6 +566,10 @@ pub fn deployment(t: &Target, m: &Managed, api_hash: &str) -> Deployment {
 		..Default::default()
 	};
 	let item = |k: &str| KeyToPath { key: k.into(), path: k.into(), ..Default::default() };
+	let mut api_items = vec![item("tokens.yaml"), item("tls.crt"), item("tls.key")];
+	if t.settings.is_some() {
+		api_items.push(item(crate::render::params::SETTINGS_FILE));
+	}
 	let mut pod_meta = t.meta(&name, labels(&t.id));
 	pod_meta.annotations.get_or_insert_default().insert(ANNOTATION_API.into(), api_hash.into());
 	// the parameters' pod labels and annotations: under the infrastructure's and ours
@@ -616,7 +632,7 @@ pub fn deployment(t: &Target, m: &Managed, api_hash: &str) -> Deployment {
 					affinity: object(pp.affinity.as_ref()),
 					priority_class_name: pp.priority_class_name.clone(),
 					volumes: Some(vec![
-						secret_volume("api", &api_secret_name(&t.id), Some(vec![item("tokens.yaml"), item("tls.crt"), item("tls.key")])),
+						secret_volume("api", &api_secret_name(&t.id), Some(api_items)),
 						secret_volume("certs", &certs_secret_name(&t.id), None),
 					]),
 					..Default::default()
@@ -946,12 +962,15 @@ pub async fn apply_secrets(
 /// is part of it (adding or removing it rolls the pods once); an rproxy that reads a changed token file
 /// again (`tokens_reload`, max3584/rproxy-api#253) takes it without a roll. The same goes for the
 /// controller's `allow_freebind` (rproxy v0.4.20, which reads the file again): learning that a pod's
-/// image has `features.control_limits` does not roll the pods.
+/// image has `features.control_limits` does not roll the pods. rproxy's settings file is never part of it:
+/// it is written only for rproxy v0.4.20 and later, which reads the file again when it changes (adding or
+/// removing it changes the pod template: `RPROXY_CONFIG`).
 pub fn api_hash(data: &BTreeMap<String, Vec<u8>>, tokens_reload: bool) -> String {
-	if !tokens_reload {
-		return content_hash(data);
-	}
 	let mut d = data.clone();
+	d.remove(crate::render::params::SETTINGS_FILE);
+	if !tokens_reload {
+		return content_hash(&d);
+	}
 	if let Some(f) = d.get_mut("tokens.yaml") {
 		*f = bootstrap::without_freebind(bootstrap::without_ui_entry(&String::from_utf8_lossy(f))).into_bytes();
 	}
@@ -1603,6 +1622,51 @@ mod tests {
 		let other = boot();
 		let renewed = api_secret(&t, Some(&first), &other).unwrap();
 		assert_ne!(data_of(Some(&renewed))["tls.crt"], d["tls.crt"]);
+	}
+
+	/// #109: the parameters' rproxy.http is rproxy's settings file in the control API Secret, named by
+	/// RPROXY_CONFIG; its content does not roll the pods (rproxy v0.4.20 reads it again).
+	#[test]
+	fn rproxy_settings_file() {
+		let b = boot();
+		let p = plan();
+		let mut t = Target::new(&p);
+		let env = |pod: &PodSpec, n: &str| pod.containers[0].env.iter().flatten().find(|e| e.name == n).and_then(|e| e.value.clone());
+		let items = |pod: &PodSpec| -> Vec<String> {
+			pod.volumes
+				.iter()
+				.flatten()
+				.find(|v| v.name == "api")
+				.unwrap()
+				.secret
+				.as_ref()
+				.unwrap()
+				.items
+				.iter()
+				.flatten()
+				.map(|i| i.key.clone())
+				.collect()
+		};
+		// none: as before
+		let off = api_secret(&t, None, &b).unwrap();
+		assert!(!data_of(Some(&off)).contains_key(crate::render::params::SETTINGS_FILE));
+		let pod = deployment(&t, &Managed::default(), "h").spec.unwrap().template.spec.unwrap();
+		assert_eq!(env(&pod, "RPROXY_CONFIG"), None);
+		assert_eq!(items(&pod), ["tokens.yaml", "tls.crt", "tls.key"]);
+		t.settings = Some("{\"version\": 1, \"global\": {\"http\": {\"timeouts\": {\"http2_max_streams\": 1000}}}}\n".into());
+		let on = api_secret(&t, Some(&off), &b).unwrap();
+		let d_on = data_of(Some(&on));
+		assert_eq!(d_on[crate::render::params::SETTINGS_FILE], t.settings.clone().unwrap().into_bytes());
+		let pod = deployment(&t, &Managed::default(), "h").spec.unwrap().template.spec.unwrap();
+		assert_eq!(env(&pod, "RPROXY_CONFIG").as_deref(), Some("/etc/rproxy-gateway/api/config.json"));
+		assert!(pod.volumes.iter().flatten().all(|v| v.secret.is_some()), "Secret volumes only (the admission policy)");
+		assert_eq!(items(&pod), ["tokens.yaml", "tls.crt", "tls.key", "config.json"]);
+		// its content is not in the pods' hash (both ways of reading the token file)
+		let d_off = data_of(Some(&off));
+		for reload in [false, true] {
+			assert_eq!(api_hash(&d_on, reload), api_hash(&d_off, reload));
+		}
+		assert_eq!(api_hash(&d_off, false), content_hash(&d_off), "without it: the same hash as before");
 	}
 
 	#[test]

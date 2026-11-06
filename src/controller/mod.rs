@@ -830,6 +830,8 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 			}
 		}
 	}
+	// the parameters' rproxy.http (managed: the Gateway's condition)
+	let mut http_cond = None;
 	let (addresses, endpoints) = match &p.cfg.mode {
 		Mode::Managed(_) if plan.kept.is_some() => {
 			keep_id = Some(id.clone());
@@ -844,6 +846,11 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 				_ => None,
 			};
 			let current_api = p.world.secrets.get(&(plan.namespace.clone(), provision::api_secret_name(&id)));
+			// the Deployment stays as it was: so does the settings file it names
+			t.settings = current_api
+				.and_then(|s| s.data.as_ref())
+				.and_then(|d| d.get(render::params::SETTINGS_FILE))
+				.map(|f| String::from_utf8_lossy(&f.0).into_owned());
 			match provision::apply_secrets(p.client, &t, p.boot, current_api, &mut sub.absent).await {
 				Ok((certs, _)) => provision::touch_pods(p.client, &eps, &certs).await,
 				Err(e) => {
@@ -881,6 +888,13 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 			// (every pod of the Gateway too: an older pod of a rollout that restarts reads the new file)
 			let uids = provision::pod_uids(p.pods_now, &plan.namespace, &selector);
 			t.control_limits = freebind_known(p.rp, &eps, &uids, Some(&t.rproxy_image(m)), &mut sub.caps).await;
+			// the parameters' rproxy.http: rproxy's settings file, for an image known to take it
+			if let Some(file) = render::params::settings_file(&t.params) {
+				let image = t.rproxy_image(m);
+				let known = image_feature(p.rp, &image, "http_stream_limits", &eps, &mut sub.caps).await;
+				http_cond = Some(http_settings_condition(known, &image));
+				t.settings = known.then_some(file);
+			}
 			// the UI reads it (its token in the token file, its pods through the NetworkPolicy)
 			t.ui = p.cfg.ui.clone().filter(|_| ui::visible(&plan));
 			t.owner = match (&p.gateway_api_version, &gw.metadata.uid) {
@@ -978,6 +992,7 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 			)
 		}
 	};
+	plan.conds.extend(http_cond);
 	let addresses = if plan.address_error.is_some() { vec![] } else { addresses };
 	// the pods side by side (each with its own part of what was applied)
 	let jobs = endpoints.iter().map(|ep| {
@@ -1411,7 +1426,7 @@ pub async fn sync_pod(
 static FEATURE_IMAGES: std::sync::Mutex<BTreeSet<(String, String)>> = std::sync::Mutex::new(BTreeSet::new());
 
 /// Features of the image this controller ships (`--rproxy-image`'s default, rproxy v0.4.20).
-const SHIPPED_FEATURES: &[&str] = &["graceful_shutdown", "tokens_reload", "control_limits"];
+const SHIPPED_FEATURES: &[&str] = &["graceful_shutdown", "tokens_reload", "control_limits", "http_stream_limits"];
 
 /// Whether `image` has `feature` (rproxy's `features`): the image this controller ships, or one a pod
 /// running it said so of. Unknown (another image before its pods answer): no; the pods roll again
@@ -1459,6 +1474,27 @@ async fn freebind_known(
 				|| eps.iter().any(|ep| ep.rproxy_image.as_deref() == Some(image) && answered(&ep.uid))
 		}
 		None => !uids.is_empty(),
+	}
+}
+
+/// The Gateway condition while its parameters set `rproxy.http` (`HTTP_CONDITION`).
+fn http_settings_condition(known: bool, image: &str) -> render::status::Cond {
+	if known {
+		render::status::Cond::new(
+			render::params::HTTP_CONDITION,
+			true,
+			"Applied",
+			"rproxy.http is in rproxy's settings file (global.http.timeouts)",
+		)
+	} else {
+		render::status::Cond::new(
+			render::params::HTTP_CONDITION,
+			false,
+			"UnsupportedRproxy",
+			format!(
+				"rproxy.http needs an rproxy known to take it (GET /capabilities: http_stream_limits, rproxy v0.4.20); {image} is not (yet): rproxy's defaults apply"
+			),
+		)
 	}
 }
 

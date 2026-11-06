@@ -78,6 +78,7 @@ spec:
     logLevel: info
     performance: {workers: 4, udpShards: auto, cpuAffinity: none, busyPollUsecs: 0, splice: {enabled: true}}
     shutdown: {delay: 15s, drain: 25s}  # E（6.）
+    http: {http2MaxStreams: 1000, timeouts: {writeStall: 2m}}  # 16.2（v0.4.21）。rproxy の global.http（設定ファイル）
     extraEnv: []                        # クラスだけ。コントローラが決める名前は書けない
   ui: {visible: true}                   # C。UI に見せるか（Gateway はクラスの既定を false にだけできる）
   proxyProtocol:                        # 14.（v0.4.13）。前段の PROXY protocol のヘッダを TCP のポートで読む
@@ -88,7 +89,7 @@ spec:
     gatewayOverrides: [replicas, podDisruptionBudget, pod.labels, pod.annotations, pod.resources,
       pod.topologySpreadConstraints, service.externalTrafficPolicy, service.loadBalancerSourceRanges,
       service.ipFamilyPolicy, service.labels, service.annotations, rproxy.logLevel, rproxy.performance,
-      rproxy.shutdown, ui]
+      rproxy.shutdown, rproxy.http, ui]
     maxReplicas: 10
     allowedPriorityClasses: []
     allowedLoadBalancerClasses: []
@@ -120,8 +121,9 @@ spec:
 | `service.labels`・`service.annotations` | Service | なし | ラベルは `pod.labels` と同じ。Gateway の参照の注釈は `spec.infrastructure.annotations` と同じ許可リスト（2.5） |
 | `rproxy.image` | rproxy のコンテナ | `--rproxy-image` | 参照の形（`repo:tag` か `repo@sha256:…`） |
 | `rproxy.logLevel` | `RPROXY_LOG_LEVEL` | なし | `error`・`warn`・`info`・`debug`・`trace` |
-| `rproxy.performance` | `RPROXY_WORKERS`・`RPROXY_UDP_SHARDS`・`RPROXY_CPU_AFFINITY`・`RPROXY_BUSY_POLL_USECS`・`RPROXY_SPLICE`・`RPROXY_SPLICE_AFTER`・`RPROXY_SPLICE_FULL_READS`・`RPROXY_SPLICE_PIPE_SIZE` | なし | rproxy の `global.performance` と同じ範囲（managed の rproxy は設定ファイルを使わないので環境変数で渡す） |
+| `rproxy.performance` | `RPROXY_WORKERS`・`RPROXY_UDP_SHARDS`・`RPROXY_CPU_AFFINITY`・`RPROXY_BUSY_POLL_USECS`・`RPROXY_SPLICE`・`RPROXY_SPLICE_AFTER`・`RPROXY_SPLICE_FULL_READS`・`RPROXY_SPLICE_PIPE_SIZE` | なし | rproxy の `global.performance` と同じ範囲（環境変数のある項目なので環境変数で渡す） |
 | `rproxy.shutdown.delay`・`.drain` | `RPROXY_SHUTDOWN_DELAY`・`RPROXY_SHUTDOWN_DRAIN` と猶予（6.） | `--shutdown-delay`（15 秒）・`--shutdown-drain`（25 秒） | `0s`〜`10m`。`features.graceful_shutdown` のない rproxy には写さない（preStop のまま） |
+| `rproxy.http` | rproxy の設定ファイル（`global.http.timeouts`）：制御 API の Secret の `config.json` と `RPROXY_CONFIG`（16.2） | なし（rproxy の既定、設定ファイルなし） | 時間は 365 日まで（`0s` は上限なし、`http2PingTimeout` は不可）、`http2MaxStreams` は 1〜10000。`features.http_stream_limits` を持つと分かったイメージにだけ書く |
 | `rproxy.extraEnv` | rproxy のコンテナ | なし | `RPROXY_*` だけ。コントローラが決める名前（`RPROXY_API_*`・`RPROXY_TOKEN_FILE`・`RPROXY_TLS_*`・`RPROXY_FILES_*`・`RPROXY_CONFIG`・`RPROXY_DATABASE_URL`・`RPROXY_UPDATE*`・`RPROXY_HANDOFF*`・`RPROXY_STATIC_RULES`・`RPROXY_SHUTDOWN_*`、上の項目で渡す名前）は誤り |
 | `ui.visible` | C の発見の Secret に載せるか | クラスの値、なければ `true` | Gateway はクラスが `false` のとき `true` にできない（v0.4.3 から。`ui.namespace` のときだけ効く） |
 | `proxyProtocol` | ルールセットの tcp のルールの `proxy_protocol`（14.） | なし（ヘッダを読まない） | `from` は空にできず 64 件まで、CIDR か IP、`/0` は誤り。`required` の既定は `true`。丸ごと置き換え（クラスと Gateway の両方にあれば Gateway のもの） |
@@ -147,7 +149,7 @@ spec:
 
 | 項目 | Gateway の参照（テナント） | 理由 |
 |---|---|---|
-| replicas・PDB・resources・Pod のラベル／注釈・topologySpread・externalTrafficPolicy・sourceRanges・ipFamilyPolicy・Service のラベル・logLevel・performance・shutdown・ui | 既定で許す | 自分の namespace の中で済む。量は ResourceQuota・LimitRange と `maxReplicas` で抑える |
+| replicas・PDB・resources・Pod のラベル／注釈・topologySpread・externalTrafficPolicy・sourceRanges・ipFamilyPolicy・Service のラベル・logLevel・performance・shutdown・`rproxy.http`・ui | 既定で許す | 自分の namespace の中で済む。量は ResourceQuota・LimitRange と `maxReplicas` で抑える |
 | Service の注釈 | 許すが、LB のアドレスを決める接頭辞（`metallb.universe.tf/` など）は許可リスト（`--service-annotation-prefix`、クラスの `policy.serviceAnnotationPrefixes`）を通ったものだけ。ほかは `InvalidParameters` | v0.4 の `spec.infrastructure.annotations` と同じ線（CVE-2020-8554 の形）。参照では黙って落とさず誤りにする |
 | `service.type`・`loadBalancerClass` | 既定で許さない | 外へのアドレスを取れる（クラスの `policy` で開ける） |
 | nodeSelector・tolerations・affinity・priorityClassName | 既定で許さない | 専用ノード・コントロールプレーンに載る、ほかを追い出す（クラスの `policy` で開ける） |
@@ -480,6 +482,7 @@ fleet のルールは `0.0.0.0`（`--listen-addr`）で待ち受けるので、2
   - `responseTimeout`（1h まで）：`http` のサービスの `timeouts.response`。
   - targetRefs の範囲（Gateway・`sectionName` のリスナー・Service）でコントローラの既定を置き換える。古いポリシーが勝つのは他の項目と同じ。HTTPRoute の規則の `timeouts`（`request`・`backendRequest`）があるサービスには `responseTimeout` を付けない（ルートが勝つ）。
   - 時間の形が誤っていれば、そのポリシーを使わず `Accepted: False`（`Invalid`）にする。
+  - v0.4.21 で L4 の中継の `idleTimeout`・`halfCloseTimeout` も足した（16.1）。
 - **e. 既定の応答の時間 30 秒**（`--backend-response-timeout`、chart の `backends.responseTimeout`、`""` で rproxy の 60 秒）：HTTPRoute の規則のうち `timeouts` のないもののサービスに `timeouts.response: 30s`。
   - rproxy の `timeouts.response` は、リクエストの本文を送り終えてから応答ヘッダが届くまでの時間。応答の本文（大きなダウンロード・SSE・ロングポーリングの本文）や、101 の後の WebSocket は切らない。本文を送り続けているリクエスト（アップロード・ストリーム）は送り終わるまで数え始めない。
   - 時間切れは 504 で、`outlier_detection` の gateway の失敗に数える（3 回で外れる）。
@@ -526,3 +529,54 @@ spec:
 - 決まりの場所：`src/render/tenant.rs`（名前の書き換え・URL・種類）、`src/render/http.rs`（ExtensionRef、backend のないルール）、`src/render/migrate.rs`（移行）。
 - 前からの利用者への影響：ほかのルートや存在しないサービスを書いていた RproxyMiddleware、`forward_auth.address`・`oidc` を使う RproxyMiddleware は、クラスで開けるまでルートが `Accepted: False` になる。移行した Traefik の `forwardAuth` は今までどおり動く（`applyToMigrated: true` のときだけ絞る）。自分のルートの `<namespace>/<route>/r<i>`（GRPCRoute は `grpc:` 付きも）はそのまま使える。クラスの parameters が誤りの間は、RproxyMiddleware・移行したミドルウェア・RproxyRule のルートが外れる（前は既定の扱いで動いていた）。
 - 試験：単体（`src/render/tenant.rs`、`src/render/tests.rs` の `rproxy_middleware_services_stay_in_the_route`・`middleware_urls_out_follow_the_class`・`grpc_route_middlewares_name_their_own_rules`・`invalid_class_parameters_refuse_tenant_middlewares`、RproxyRule の `policy.rproxyRules`）、本物の rproxy（`tests/rproxy.rs` の `rproxy_middleware_services_on_a_real_rproxy`：書き換えた名前を rproxy が受け付け、自分のルールの認証サーバに聞き、backend のないルールでは通さない）。
+
+## 16. L4 の中継の時間切れと HTTP の接続の上限（v0.4.21、#108・#109）
+
+rproxy v0.4.20 は、L4 の `tcp` のルールに既定で `idle_timeout` 1 時間・`half_close_timeout` 1 分を効かせ（rproxy-api #353）、HTTP のクライアントの接続に `write_stall`・`upgraded_idle`・`http2_max_streams`（既定 128、前は 200）を足した（rproxy-api #356）。どちらも gateway から変える口がなかったので、CRD の項目として出す（オーナーの決定：注釈・コントローラのフラグではなく CRD の項目）。
+
+### 16.1 RproxyPolicy の `idleTimeout`・`halfCloseTimeout`（#108）
+
+```yaml
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyPolicy
+metadata: {name: db, namespace: default}
+spec:
+  targetRefs: [{group: "", kind: Service, name: postgres}]
+  idleTimeout: 8h          # 何も運ばない接続を閉じるまで（rproxy の既定 1h）
+  halfCloseTimeout: 0s     # 片側が送り終えた後（既定 1m）。0s：なし（idleTimeout だけ）
+```
+
+- 写す先：L4 の tcp のルール（TCPRoute、passthrough の TLSRoute、rproxy が終端する TLSRoute、移行した IngressRouteTCP など、`http` のない tcp のルールすべて）の `idle_timeout`・`half_close_timeout`。`http` のルール（HTTP・HTTPS、HTTPS と同じポートの passthrough）と UDP には付けない（rproxy が断る。HTTP の接続は 16.2 の `global.http.timeouts`、UDP は `udp_idle_secs`）。
+- targetRefs の範囲（Gateway・`sectionName` のリスナー・Service）は `connectTimeout` と同じ（13.1 の d.）。古いポリシーが勝つのも同じ。RproxyRule は書かれたまま。
+- 検証は `connectTimeout` と同じく、誤りならそのポリシーを使わない（`Accepted: False`、`Invalid`）。値は `0s`（上限なし）か 1 秒〜365 日（rproxy の `validate_relay_timeout` と同じ）。rproxy には 1 つの単位で送る（`8h` → `28800s`。rproxy は `1h30m` の形を読まない）。
+- rproxy の版：`features.tcp_idle_timeout`（v0.4.20）を Gateway のすべての Pod が持つときだけ送る（古い rproxy は組ごと断るため）。持たなければ送らず、ポリシーのほかの項目（`allowFrom` など）は付ける。ポリシーの状態に条件 `rproxy.max3584.net/RelayTimeouts` を出す：`True`・`Applied`、`False`・`UnsupportedRproxy`（`Accepted` は変えない。rollout の途中で `allowFrom` などが外れないように、無効にはしない）。条件は、ポリシーがこの 2 つを書き、L4 の tcp のルールに届くときだけ。
+- 試験：単体（`src/render/tests.rs` の `policy_relay_timeouts`：tcp・passthrough に付き、http・UDP に付かない、Service の範囲、古い rproxy、誤った値）、本物の rproxy（`tests/rproxy.rs` の `relay_timeouts_and_http_settings_on_a_real_rproxy`：組が通り、`idleTimeout: 1s` のリスナーの黙った接続が閉じ、ほかのリスナーは既定のまま）。
+
+### 16.2 RproxyGatewayParameters の `rproxy.http`（#109）
+
+```yaml
+spec:
+  rproxy:
+    http:
+      http2MaxStreams: 1000            # HTTP/2 の接続 1 本の同時ストリーム（1〜10000、rproxy の既定 128）
+      timeouts:                        # rproxy の global.http.timeouts（省いた項目は rproxy の既定）
+        writeStall: 2m                 # 読まないクライアントへの書き込み（既定 60s）
+        upgradedIdle: 0s               # WebSocket などで何も流れない時間（既定 1h、0s：なし）
+        idle: 180s                     # ほかに tlsHandshake・firstByte・requestHeaders・requestBodyIdle・http2PingInterval・http2PingTimeout
+```
+
+- **渡し方：rproxy の設定ファイル**（`RPROXY_CONFIG`）。コントローラは `{"version": 1, "global": {"http": {"timeouts": {...}}}}` を Gateway の制御 API の Secret（`rproxy-<id>-api`）の `config.json` に書き、Pod にはその項目と `RPROXY_CONFIG=/etc/rproxy-gateway/api/config.json` を足す。値は rproxy の名前（`write_stall` など）と 1 つの単位の時間にする。
+  - `PATCH /config/global`（rproxy-api #342、`features.global_api`）を使わない理由：
+    - その API は `admin` のスコープが要る。コントローラのトークンは `rules:read`・`rules:write`・`acme:write` と自分のルールセットの名前（`allow_rulesets`）だけに絞っており（docs/SECURITY.md）、`admin` を足すとトークン 1 つで rproxy のすべて（更新・設定の読み直し・ほかの持ち主のルール）を変えられるようになる。
+    - API の値は DB がなければ再起動で消えるので、Pod が起動するたびに送り直す必要がある。その間（readiness の後の数秒）は既定で動く。設定ファイルなら起動の時から効く。
+    - managed の rproxy の設定は Pod の形（環境変数、2.2 の `rproxy.performance`）で渡してきた。`global.http.timeouts` には環境変数がないので、同じく Pod に渡せる設定ファイルを使う。
+  - ファイルに書いた項目はファイルが勝つ（UI の `PATCH /config/global` は `409 static`）。Gateway の持ち主が CRD で決めたものを UI が黙って変えないので、これでよい。
+  - ConfigMap でなく Secret に入れるのは、admission policy（`rbac.admissionPolicy`）が managed の Pod のボリュームを Secret だけに絞っていて、コントローラに ConfigMap を書く権限もないため（権限を広げない）。
+- 入れ替え：`config.json` の中身は Pod のテンプレートのハッシュ（`api_hash`）に入れない。rproxy v0.4.20 は設定ファイルが変わると読み直す（10 秒ごと）ので、値を変えても Pod は入れ替わらない（kubelet が Secret のファイルを書き換えるまで 1 分ほど）。`rproxy.http` を初めて付けたとき・すべて外したときは、Pod のテンプレート（`RPROXY_CONFIG` と項目）が変わるので入れ替わる。どれも新しい接続から効く。
+- rproxy の版：`features.http_stream_limits`（v0.4.20）を持つと分かったイメージ（コントローラが出荷するイメージか、そのイメージを動かす Pod が答えたもの。`graceful_shutdown` と同じ `image_feature`）にだけ書く。古い rproxy は `write_stall` などを知らずに起動しない（設定の誤り）ため。古いイメージの Pod（rollout の古い ReplicaSet）は `RPROXY_CONFIG` を持たないので、Secret にファイルがあっても読まない。分からなければ書かない。
+- 状態：`rproxy.http` が何かを決めているあいだ、Gateway に条件 `rproxy.max3584.net/HTTPSettings` を出す：`True`・`Applied`、`False`・`UnsupportedRproxy`（イメージが分からない・古い。rproxy の既定で動く）。`Programmed` は変えない。外すと条件も消す。
+- 誰が決めるか：自分の Gateway の Pod だけに効くので、`rproxy.performance` と同じく Gateway の参照でも既定で書ける（`policy.gatewayOverrides` の既定に `rproxy.http`）。丸ごと置き換え（クラスと Gateway の両方にあれば Gateway のもの）。
+- 検証（2.4 と同じく `InvalidParameters`）：時間は 365 日まで、`http2PingTimeout: 0s` は不可、`http2MaxStreams` は 1〜10000（CRD でも）。rproxy の `HttpTimeoutsSpec::check` と同じ。
+- parameters が誤りになった Gateway（2.4 の前の形のまま）は、Secret の `config.json` も前のままにする（Deployment が名指しているため）。
+- **fleet**：1 つの rproxy のプロセスがすべての Gateway に仕えるので、プロセス全体の設定は Gateway ごとの CRD ではなく chart で決める。chart の `fleet.http`（rproxy の `global.http` の形のまま、例 `{timeouts: {http2_max_streams: 1000}}`。既定 `{}`）を ConfigMap `rproxy-fleet-config` の `config.json` にし、DaemonSet に `RPROXY_CONFIG` を足す（`{}` なら何も描かない）。fleet の DaemonSet は chart のものでコントローラは作らないので、コントローラで描く理由がない。版の確かめはできないので v0.4.20 以上で使う（rproxy が断る値では新しい Pod が起動しない）。
+- 試験：単体（`src/render/params.rs` の `http_settings`：ファイルの形・単位・検証・合わせ方・`policy`、`src/controller/provision.rs` の `rproxy_settings_file`：Secret の項目・`RPROXY_CONFIG`・ハッシュに入れないこと）、本物の rproxy（`tests/rproxy.rs`：コントローラの書くファイルで rproxy が起動し、`firstByte: 1s` が HTTP のリスナーで効く）、CI の `helm template`（`fleet.http`）。

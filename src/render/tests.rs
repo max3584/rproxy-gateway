@@ -2176,6 +2176,125 @@ spec:
 	assert_eq!(web["default/web/r0"]["timeouts"]["connect"], "1s", "an invalid policy is not used");
 }
 
+/// #108: an RproxyPolicy's `idleTimeout` / `halfCloseTimeout` go on L4 tcp rules (TCPRoute, TLSRoute
+/// passthrough) as rproxy's `idle_timeout` / `half_close_timeout`, never on http rules nor UDP; an
+/// rproxy without `features.tcp_idle_timeout` gets nothing (the policy says so, its other settings stay);
+/// a wrong value makes the policy invalid.
+#[test]
+fn policy_relay_timeouts() {
+	let routes = r#"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: web, namespace: default}
+spec:
+  parentRefs: [{name: gw, sectionName: http}]
+  rules: [{backendRefs: [{name: web, port: 80}]}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata: {name: pg, namespace: default}
+spec:
+  parentRefs: [{name: gw, sectionName: pg}]
+  rules: [{backendRefs: [{name: db, port: 5432}]}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TLSRoute
+metadata: {name: t, namespace: default}
+spec:
+  parentRefs: [{name: gw, sectionName: sni}]
+  hostnames: [a.example.com]
+  rules: [{backendRefs: [{name: tls, port: 443}]}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: UDPRoute
+metadata: {name: dns, namespace: default}
+spec:
+  parentRefs: [{name: gw, sectionName: dns}]
+  rules: [{backendRefs: [{name: db, port: 5432}]}]
+"#;
+	let listeners = r#"  - {name: http, port: 80, protocol: HTTP}
+  - {name: pg, port: 5432, protocol: TCP}
+  - {name: sni, port: 8443, protocol: TLS, hostname: "*.example.com", tls: {mode: Passthrough}}
+  - {name: dns, port: 53, protocol: UDP}"#;
+	let yaml = format!("{BASE}{L4_BASE}{}{routes}", gw(listeners));
+	let render = |extra: &str, features: Features| {
+		let w = world(&format!("{yaml}{extra}"));
+		let opts = Options { backends: BackendDefaults::standard(), features, ..Options::default() };
+		let p = render_gateway(&w, &w.gateways[0], &opts);
+		let rules = p.rules_json();
+		let rule = |port: u16| rules.iter().find(|r| r["listen_port"] == port).unwrap().clone();
+		([rule(80), rule(5432), rule(8443), rule(53)], p.policies)
+	};
+	// none: rproxy's own (1h, 1m)
+	let ([web, pg, sni, dns], _) = render("", Features::default());
+	for r in [&web, &pg, &sni, &dns] {
+		assert!(r.get("idle_timeout").is_none() && r.get("half_close_timeout").is_none(), "{r}");
+	}
+	let policy = r#"
+---
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyPolicy
+metadata: {name: long, namespace: default}
+spec:
+  targetRefs: [{group: gateway.networking.k8s.io, kind: Gateway, name: gw}]
+  idleTimeout: 8h
+  halfCloseTimeout: 0s
+  allowFrom: [10.0.0.0/8]
+"#;
+	let ([web, pg, sni, dns], st) = render(policy, Features::default());
+	assert_eq!((pg["idle_timeout"].as_str(), pg["half_close_timeout"].as_str()), (Some("28800s"), Some("0s")), "{pg}");
+	assert_eq!((sni["idle_timeout"].as_str(), sni["half_close_timeout"].as_str()), (Some("28800s"), Some("0s")), "passthrough: {sni}");
+	assert!(web.get("idle_timeout").is_none(), "not on http rules (global.http.timeouts): {web}");
+	assert!(dns.get("idle_timeout").is_none(), "not on UDP (udp_idle_secs): {dns}");
+	assert!(cond(&st[0].conds, "Accepted").status);
+	let c = cond(&st[0].conds, policy::RELAY_CONDITION);
+	assert_eq!((c.status, c.reason.as_str()), (true, "Applied"));
+	// on a Service: only the L4 rules sending to it; a policy on an HTTP Service gets no relay condition
+	let on_db = r#"
+---
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyPolicy
+metadata: {name: db, namespace: default}
+spec:
+  targetRefs: [{group: "", kind: Service, name: db}]
+  idleTimeout: 1500ms
+---
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyPolicy
+metadata: {name: web, namespace: default}
+spec:
+  targetRefs: [{group: "", kind: Service, name: web}]
+  idleTimeout: 10m
+"#;
+	let ([web, pg, sni, _], st) = render(on_db, Features::default());
+	assert_eq!(pg["idle_timeout"], "1500ms");
+	assert!(pg.get("half_close_timeout").is_none());
+	assert!(sni.get("idle_timeout").is_none() && web.get("idle_timeout").is_none());
+	let web_st = st.iter().find(|s| s.name == "web").unwrap();
+	assert!(web_st.conds.iter().all(|c| c.kind != policy::RELAY_CONDITION), "{:?}", web_st.conds);
+	// an rproxy before v0.4.20: not sent (it would refuse the rule set), the rest of the policy applies
+	let old = Features { tcp_idle_timeout: false, ..Features::default() };
+	let ([_, pg, sni, _], st) = render(policy, old);
+	assert!(pg.get("idle_timeout").is_none() && sni.get("half_close_timeout").is_none(), "{pg}");
+	assert_eq!(pg["allow_from"], json!(["10.0.0.0/8"]));
+	assert!(cond(&st[0].conds, "Accepted").status);
+	let c = cond(&st[0].conds, policy::RELAY_CONDITION);
+	assert_eq!((c.status, c.reason.as_str()), (false, "UnsupportedRproxy"));
+	assert!(c.message.contains("tcp_idle_timeout"), "{}", c.message);
+	// wrong values: the policy is not used
+	for bad in ["idleTimeout: 500ms", "idleTimeout: soon", "idleTimeout: 9000h", "halfCloseTimeout: 1ms"] {
+		let wrong =
+			if bad.starts_with("half") { policy.replace("halfCloseTimeout: 0s", bad) } else { policy.replace("idleTimeout: 8h", bad) };
+		let ([_, pg, _, _], st) = render(&wrong, Features::default());
+		let c = cond(&st[0].conds, "Accepted");
+		assert_eq!((c.status, c.reason.as_str()), (false, "Invalid"), "{bad}");
+		let field = bad.split(':').next().unwrap();
+		assert!(c.message.contains(field), "{bad}: {}", c.message);
+		assert!(pg.get("allow_from").is_none(), "{bad}: an invalid policy is not used");
+	}
+}
+
 #[test]
 fn proxy_protocol_on_tcp_rules() {
 	let class = |spec: &str| {
