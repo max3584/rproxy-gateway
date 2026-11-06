@@ -1410,8 +1410,8 @@ pub async fn sync_pod(
 /// pods all restart at once keeps its shape).
 static FEATURE_IMAGES: std::sync::Mutex<BTreeSet<(String, String)>> = std::sync::Mutex::new(BTreeSet::new());
 
-/// Features of the image this controller ships (`--rproxy-image`'s default, rproxy v0.4.2).
-const SHIPPED_FEATURES: &[&str] = &["graceful_shutdown", "tokens_reload"];
+/// Features of the image this controller ships (`--rproxy-image`'s default, rproxy v0.4.20).
+const SHIPPED_FEATURES: &[&str] = &["graceful_shutdown", "tokens_reload", "control_limits"];
 
 /// Whether `image` has `feature` (rproxy's `features`): the image this controller ships, or one a pod
 /// running it said so of. Unknown (another image before its pods answer): no; the pods roll again
