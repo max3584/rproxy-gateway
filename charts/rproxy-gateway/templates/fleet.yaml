@@ -1,4 +1,19 @@
 {{- if .Values.fleet.enabled }}
+{{- with .Values.fleet.http }}
+# rproxy's settings file: global.http (fleet.http)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rproxy-fleet-config
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "rproxy-gateway.labels" $ | nindent 4 }}
+    app.kubernetes.io/name: rproxy
+    app.kubernetes.io/component: fleet
+data:
+  config.json: {{ dict "version" 1 "global" (dict "http" .) | toJson | quote }}
+---
+{{- end }}
 # fleet mode: rproxy on every node (hostNetwork), serving every Gateway. The controller
 # PUTs each Gateway's rule set to every pod. The control API is TLS + token (Secrets the
 # controller creates on its first start: install the chart, then the DaemonSet's pods start).
@@ -54,6 +69,10 @@ spec:
             # SIGTERM: keep accepting (GET /readyz: draining), then let connections end (rproxy v0.4.1)
             - {name: RPROXY_SHUTDOWN_DELAY, value: {{ .Values.fleet.shutdown.delay | toString | quote }}}
             - {name: RPROXY_SHUTDOWN_DRAIN, value: {{ .Values.fleet.shutdown.drain | toString | quote }}}
+            {{- if .Values.fleet.http }}
+            # fleet.http: rproxy reads its settings file again when it changes
+            - {name: RPROXY_CONFIG, value: /etc/rproxy-gateway/config/config.json}
+            {{- end }}
             {{- range .Values.fleet.extraEnv }}
             {{- $name := .name | default "" | toString }}
             {{- if not (regexMatch "^RPROXY_[A-Z0-9_]+$" $name) }}
@@ -90,6 +109,9 @@ spec:
             - {name: token, mountPath: /etc/rproxy-gateway/token, readOnly: true}
             - {name: api-tls, mountPath: /etc/rproxy-gateway/api-tls, readOnly: true}
             - {name: certs, mountPath: /var/run/rproxy-gateway/certs, readOnly: true}
+            {{- if .Values.fleet.http }}
+            - {name: config, mountPath: /etc/rproxy-gateway/config, readOnly: true}
+            {{- end }}
         - name: certsync
           image: {{ include "rproxy-gateway.controllerImage" . }}
           imagePullPolicy: {{ .Values.controller.image.pullPolicy }}
@@ -117,6 +139,10 @@ spec:
         # every Gateway's certificate files, written by the controller
         - name: certs
           secret: {secretName: rproxy-fleet-certs, defaultMode: 288, optional: true}  # 0440
+        {{- if .Values.fleet.http }}
+        - name: config
+          configMap: {name: rproxy-fleet-config}
+        {{- end }}
       {{- with .Values.fleet.nodeSelector }}
       nodeSelector: {{- toYaml . | nindent 8 }}
       {{- end }}

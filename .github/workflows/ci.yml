@@ -65,6 +65,22 @@ jobs:
             echo "fleet.vip should fail"; exit 1
           fi
           grep -q 'fleet.vip was removed' "$RUNNER_TEMP/vip.err"
+          # fleet.http: rproxy's settings file (a ConfigMap) named by RPROXY_CONFIG; none by default
+          helm template t charts/rproxy-gateway --set fleet.enabled=true --set fleet.http.timeouts.http2_max_streams=1000 \
+            --set fleet.http.timeouts.write_stall=2m > "$RUNNER_TEMP/http.yaml"
+          grep -F 'config.json:' "$RUNNER_TEMP/http.yaml" | grep -F 'http2_max_streams' | grep -qF '1000'
+          grep -q 'kind: ConfigMap' "$RUNNER_TEMP/http.yaml"
+          grep -q 'name: RPROXY_CONFIG, value: /etc/rproxy-gateway/config/config.json' "$RUNNER_TEMP/http.yaml"
+          if helm template t charts/rproxy-gateway --set fleet.enabled=true | grep -q RPROXY_CONFIG; then
+            echo "fleet.http {} should write no settings file"; exit 1
+          fi
+          # values.schema.json: rproxy's names and shapes only (a value rproxy refuses stops the fleet's pods)
+          for bad in "fleet.http.timeouts.writeStall=2m" "fleet.http.timeouts.write_stall=2 minutes" "fleet.http.timeouts.http2_max_streams=0" \
+            "fleet.http.timeouts.http2_ping_timeout=0s" "fleet.http.other=1"; do
+            if helm template t charts/rproxy-gateway --set fleet.enabled=true --set "$bad" > /dev/null 2>&1; then
+              echo "fleet.http: $bad should be refused"; exit 1
+            fi
+          done
           # fleet.extraEnv reaches the DaemonSet's rproxy container (rproxy's limits, #110), as a string
           helm template t charts/rproxy-gateway --set fleet.enabled=true --set 'fleet.extraEnv[0].name=RPROXY_MAX_RULESETS' \
             --set 'fleet.extraEnv[0].value=5000' > "$RUNNER_TEMP/env.yaml"

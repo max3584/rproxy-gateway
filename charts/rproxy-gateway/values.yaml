@@ -140,6 +140,17 @@ fleet:
   # addresses on the nodes: MetalLB, kube-vip, keepalived... Gateways without spec.addresses keep the
   # wildcard). addresses needs rproxy v0.4.3 (listen_freebind); with an older rproxy the wildcard is kept
   listen: wildcard
+  # rproxy's global.http on the fleet's pods, as rproxy writes it (rproxy-api docs/API.md
+  # "global.http.timeouts"): limits of the client connections of every Gateway's HTTP, HTTPS and GRPC
+  # listeners (one rproxy process serves them all), e.g. {timeouts: {http2_max_streams: 1000,
+  # write_stall: 2m, upgraded_idle: 1h, idle: 180s}}. Written to a ConfigMap rproxy reads as its
+  # settings file (RPROXY_CONFIG; a change is read again without a restart). Needs rproxy v0.4.20 for
+  # write_stall, upgraded_idle and http2_max_streams; a value rproxy refuses keeps new pods from
+  # starting, so values.schema.json makes helm refuse unknown names (writeStall: rproxy's names are
+  # snake_case) and wrong shapes. Check the file against the rproxy image too before rolling it out:
+  # rproxy-api --check-config config.json (docs/DESIGN-v0.4.x.md 16.2). {}: rproxy's defaults (no
+  # settings file). Managed Gateways: RproxyGatewayParameters rproxy.http (camelCase, checked by the controller)
+  http: {}
 
 # what every backend the controller renders gets (the pods of the Services behind HTTPRoutes,
 # GRPCRoutes, TLSRoutes, TCPRoutes, UDPRoutes), unless an RproxyPolicy sets outlierDetection

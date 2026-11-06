@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "description": "Checks only some values (the rest of values.yaml is free); see values.yaml for every value.",
+  "type": "object",
+  "properties": {
+    "fleet": {
+      "type": "object",
+      "properties": {
+        "http": {
+          "description": "rproxy's global.http on the fleet's pods, in rproxy's names (rproxy-api docs/API.md global.http.timeouts): a value rproxy refuses would keep the fleet's pods from starting",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "timeouts": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "tls_handshake": {
+                  "type": "string",
+                  "pattern": "^[0-9]+(ms|s|m|h)$",
+                  "description": "a duration as rproxy reads it: 10s, 500ms, 5m, 2h; 0s for no limit"
+                },
+                "first_byte": {
+                  "type": "string",
+                  "pattern": "^[0-9]+(ms|s|m|h)$",
+                  "description": "a duration as rproxy reads it: 10s, 500ms, 5m, 2h; 0s for no limit"
+                },
+                "request_headers": {
+                  "type": "string",
+                  "pattern": "^[0-9]+(ms|s|m|h)$",
+                  "description": "a duration as rproxy reads it: 10s, 500ms, 5m, 2h; 0s for no limit"
+                },
+                "idle": {
+                  "type": "string",
+                  "pattern": "^[0-9]+(ms|s|m|h)$",
+                  "description": "a duration as rproxy reads it: 10s, 500ms, 5m, 2h; 0s for no limit"
+                },
+                "request_body_idle": {
+                  "type": "string",
+                  "pattern": "^[0-9]+(ms|s|m|h)$",
+                  "description": "a duration as rproxy reads it: 10s, 500ms, 5m, 2h; 0s for no limit"
+                },
+                "http2_ping_interval": {
+                  "type": "string",
+                  "pattern": "^[0-9]+(ms|s|m|h)$",
+                  "description": "a duration as rproxy reads it: 10s, 500ms, 5m, 2h; 0s for no limit"
+                },
+                "http2_ping_timeout": {
+                  "allOf": [
+                    {
+                      "type": "string",
+                      "pattern": "^[0-9]+(ms|s|m|h)$",
+                      "description": "a duration as rproxy reads it: 10s, 500ms, 5m, 2h; 0s for no limit"
+                    },
+                    {
+                      "not": {
+                        "pattern": "^0+(ms|s|m|h)$"
+                      }
+                    }
+                  ],
+                  "description": "not 0s"
+                },
+                "write_stall": {
+                  "type": "string",
+                  "pattern": "^[0-9]+(ms|s|m|h)$",
+                  "description": "a duration as rproxy reads it: 10s, 500ms, 5m, 2h; 0s for no limit"
+                },
+                "upgraded_idle": {
+                  "type": "string",
+                  "pattern": "^[0-9]+(ms|s|m|h)$",
+                  "description": "a duration as rproxy reads it: 10s, 500ms, 5m, 2h; 0s for no limit"
+                },
+                "http2_max_streams": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 10000
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

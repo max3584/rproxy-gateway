@@ -78,6 +78,7 @@ spec:
     logLevel: info
     performance: {workers: 4, udpShards: auto, cpuAffinity: none, busyPollUsecs: 0, splice: {enabled: true}}
     shutdown: {delay: 15s, drain: 25s}  # E (6.)
+    http: {http2MaxStreams: 1000, timeouts: {writeStall: 2m}}  # 16.2 (v0.4.21): rproxy's global.http (a settings file)
     extraEnv: []                        # the class only; names the controller sets are refused
   ui: {visible: true}                   # C: shown to the UI (a Gateway can only turn the class's default to false)
   proxyProtocol:                        # 14. (v0.4.13): PROXY protocol headers from the front end, read on TCP ports
@@ -88,7 +89,7 @@ spec:
     gatewayOverrides: [replicas, podDisruptionBudget, pod.labels, pod.annotations, pod.resources,
       pod.topologySpreadConstraints, service.externalTrafficPolicy, service.loadBalancerSourceRanges,
       service.ipFamilyPolicy, service.labels, service.annotations, rproxy.logLevel, rproxy.performance,
-      rproxy.shutdown, ui]
+      rproxy.shutdown, rproxy.http, ui]
     maxReplicas: 10
     allowedPriorityClasses: []
     allowedLoadBalancerClasses: []
@@ -120,8 +121,9 @@ The default column applies when neither reference sets the field; each is the v0
 | `service.labels`, `service.annotations` | the Service | none | labels as `pod.labels`. Annotations from a Gateway's reference go through the allow list of `spec.infrastructure.annotations` (2.5) |
 | `rproxy.image` | the rproxy container | `--rproxy-image` | an image reference (`repo:tag` or `repo@sha256:...`) |
 | `rproxy.logLevel` | `RPROXY_LOG_LEVEL` | none | `error`, `warn`, `info`, `debug`, `trace` |
-| `rproxy.performance` | `RPROXY_WORKERS`, `RPROXY_UDP_SHARDS`, `RPROXY_CPU_AFFINITY`, `RPROXY_BUSY_POLL_USECS`, `RPROXY_SPLICE`, `RPROXY_SPLICE_AFTER`, `RPROXY_SPLICE_FULL_READS`, `RPROXY_SPLICE_PIPE_SIZE` | none | the ranges of rproxy's `global.performance` (managed rproxy has no settings file, so environment variables) |
+| `rproxy.performance` | `RPROXY_WORKERS`, `RPROXY_UDP_SHARDS`, `RPROXY_CPU_AFFINITY`, `RPROXY_BUSY_POLL_USECS`, `RPROXY_SPLICE`, `RPROXY_SPLICE_AFTER`, `RPROXY_SPLICE_FULL_READS`, `RPROXY_SPLICE_PIPE_SIZE` | none | the ranges of rproxy's `global.performance` (these have environment variables, so they are passed so) |
 | `rproxy.shutdown.delay`, `.drain` | `RPROXY_SHUTDOWN_DELAY`, `RPROXY_SHUTDOWN_DRAIN` and the grace period (6.) | `--shutdown-delay` (15 s), `--shutdown-drain` (25 s) | `0s` to `10m`. Not put on rproxy without `features.graceful_shutdown` (it keeps the preStop) |
+| `rproxy.http` | rproxy's settings file (`global.http.timeouts`): `config.json` in the control API Secret and `RPROXY_CONFIG` (16.2) | none (rproxy's defaults, no settings file) | durations up to 365 days (`0s` no limit, not for `http2PingTimeout`), `http2MaxStreams` 1 to 10000. Written only when every pod and the image they roll to are known to have `features.http_stream_limits` (16.2) |
 | `rproxy.extraEnv` | the rproxy container | none | `RPROXY_*` only. Names the controller sets (`RPROXY_API_*`, `RPROXY_TOKEN_FILE`, `RPROXY_TLS_*`, `RPROXY_FILES_*`, `RPROXY_CONFIG`, `RPROXY_DATABASE_URL`, `RPROXY_UPDATE*`, `RPROXY_HANDOFF*`, `RPROXY_STATIC_RULES`, `RPROXY_SHUTDOWN_*`, and those of the fields above) are refused |
 | `ui.visible` | whether C's discovery Secret lists the Gateway | the class's value, else `true` | a Gateway cannot make it `true` when the class says `false` (v0.4.3; only with `ui.namespace`) |
 | `proxyProtocol` | `proxy_protocol` of the rule set's tcp rules (14.) | none (no header read) | `from` not empty, at most 64, CIDRs or IPs, no `/0`; `required` defaults to `true`. Replaced as a whole (the Gateway's when both have one) |
@@ -147,7 +149,7 @@ The default column applies when neither reference sets the field; each is the v0
 
 | Field | From a Gateway's reference (tenant) | Why |
 |---|---|---|
-| replicas, PDB, resources, pod labels and annotations, topology spread, externalTrafficPolicy, source ranges, ipFamilyPolicy, Service labels, logLevel, performance, shutdown, ui | allowed by default | stays in their namespace; amounts are bounded by ResourceQuota, LimitRange and `maxReplicas` |
+| replicas, PDB, resources, pod labels and annotations, topology spread, externalTrafficPolicy, source ranges, ipFamilyPolicy, Service labels, logLevel, performance, shutdown, `rproxy.http`, ui | allowed by default | stays in their namespace; amounts are bounded by ResourceQuota, LimitRange and `maxReplicas` |
 | Service annotations | allowed, but prefixes that pick load balancer addresses (`metallb.universe.tf/`, ...) only through the allow lists (`--service-annotation-prefix`, the class's `policy.serviceAnnotationPrefixes`); others are `InvalidParameters` | the same line as v0.4's `spec.infrastructure.annotations` (the CVE-2020-8554 pattern). A reference gets an error instead of a silent drop |
 | `service.type`, `loadBalancerClass` | not by default | can take outside addresses (the class's `policy` opens them) |
 | nodeSelector, tolerations, affinity, priorityClassName | not by default | dedicated nodes, the control plane, evicting others (the class's `policy` opens them) |
@@ -480,6 +482,7 @@ Measured with v0.4.4's `mode=fleet-vip` (the VIP sidecar is gone in v0.4.5; the 
   - `responseTimeout` (up to 1h): an `http` service's `timeouts.response`.
   - They replace the controller's defaults for what targetRefs reach (a Gateway, a listener by `sectionName`, a Service). The oldest policy wins, as for the other fields. Services of an HTTPRoute rule with its own `timeouts` (`request`, `backendRequest`) get no `responseTimeout` (the route wins).
   - A malformed duration makes the policy unused and `Accepted: False` (`Invalid`).
+  - v0.4.21 adds the L4 relay `idleTimeout` and `halfCloseTimeout` (16.1).
 - **e. A default response timeout of 30 s** (`--backend-response-timeout`, the chart's `backends.responseTimeout`; `""` for rproxy's 60 s): `timeouts.response: 30s` on the services of HTTPRoute rules without `timeouts`.
   - rproxy's `timeouts.response` runs from the end of the request body to the response headers. Response bodies (large downloads, SSE, long-polling bodies) and a WebSocket after its 101 are not cut. A request still sending its body (uploads, streams) does not start the clock until it ends.
   - A timeout is a 504 and counts as a gateway failure for `outlier_detection` (ejected after 3).
@@ -526,3 +529,69 @@ On a shared Gateway one port's rproxy rule holds every tenant's services and mid
 - Where: `src/render/tenant.rs` (rewriting names, URLs, kinds), `src/render/http.rs` (ExtensionRef, rules without a backend), `src/render/migrate.rs` (migration).
 - For existing users: RproxyMiddlewares naming another route's or a missing service, and RproxyMiddlewares using `forward_auth.address` or `oidc` make their routes `Accepted: False` until the class opens them. Migrated Traefik `forwardAuth` keeps working (bounded only with `applyToMigrated: true`). The own route's `<namespace>/<route>/r<i>` (with `grpc:` for a GRPCRoute too) keeps working. While the class's parameters are invalid, routes with RproxyMiddlewares or migrated middlewares, and RproxyRules, are left out (before, they ran as with the defaults).
 - Tests: unit (`src/render/tenant.rs`; `rproxy_middleware_services_stay_in_the_route`, `middleware_urls_out_follow_the_class`, `grpc_route_middlewares_name_their_own_rules`, `invalid_class_parameters_refuse_tenant_middlewares` and RproxyRules' `policy.rproxyRules` in `src/render/tests.rs`), real rproxy (`rproxy_middleware_services_on_a_real_rproxy` in `tests/rproxy.rs`: rproxy takes the rewritten names, asks the own rule's auth server, and lets nothing through for a rule without a backend).
+
+## 16. L4 relay timeouts and limits of HTTP connections (v0.4.21, #108, #109)
+
+rproxy v0.4.20 gives L4 `tcp` rules an `idle_timeout` of 1 hour and a `half_close_timeout` of 1 minute by default (rproxy-api #353), and adds `write_stall`, `upgraded_idle` and `http2_max_streams` (128 by default, 200 before) to HTTP client connections (rproxy-api #356). The gateway had no way to change either, so they are CRD fields (the owner's decision: CRD fields, not annotations or controller flags).
+
+### 16.1 RproxyPolicy `idleTimeout` and `halfCloseTimeout` (#108)
+
+```yaml
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyPolicy
+metadata: {name: db, namespace: default}
+spec:
+  targetRefs: [{group: "", kind: Service, name: postgres}]
+  idleTimeout: 8h          # until a connection moving nothing is closed (rproxy's default 1h)
+  halfCloseTimeout: 0s     # after one side has finished sending (default 1m); 0s: none (idleTimeout only)
+```
+
+- Where they go: `idle_timeout` and `half_close_timeout` of L4 tcp rules (TCPRoute, passthrough TLSRoute, TLSRoute rproxy terminates, migrated IngressRouteTCP: every tcp rule without `http`). Not on `http` rules (HTTP, HTTPS, passthrough on an HTTPS port) nor UDP (rproxy refuses them there; HTTP connections have 16.2's `global.http.timeouts`, UDP `udp_idle_secs`).
+- targetRefs (Gateway, a listener with `sectionName`, Service) work as for `connectTimeout` (13.1 d.); the oldest policy wins as for the other fields. RproxyRules stay as written.
+- Checked as `connectTimeout` is: a wrong value makes the policy unused (`Accepted: False`, `Invalid`). Values: `0s` (no limit) or 1 second to 365 days (rproxy's `validate_relay_timeout`). Sent to rproxy in one unit (`8h` → `28800s`; rproxy does not read `1h30m`).
+- rproxy version: sent only when every pod of the Gateway has `features.tcp_idle_timeout` (v0.4.20; older rproxy refuses the whole set). Otherwise they are left out and the rest of the policy (`allowFrom` and the like) still applies. The policy's status gets the condition `rproxy.max3584.net/RelayTimeouts`: `True`, `Applied`, or `False`, `UnsupportedRproxy` (`Accepted` is not changed: the policy is not made invalid, so `allowFrom` and the like do not drop off in the middle of a rollout). The condition is there only when the policy sets one of the two and reaches an L4 tcp rule.
+- Tests: unit (`policy_relay_timeouts` in `src/render/tests.rs`: on tcp and passthrough, not on http or UDP, Service targets, older rproxy, wrong values), real rproxy (`relay_timeouts_and_http_settings_on_a_real_rproxy` in `tests/rproxy.rs`: the set is taken, a silent connection on the `idleTimeout: 1s` listener is closed, the other listener keeps the default).
+
+### 16.2 RproxyGatewayParameters `rproxy.http` (#109)
+
+```yaml
+spec:
+  rproxy:
+    http:
+      http2MaxStreams: 1000            # streams at once on one HTTP/2 connection (1 to 10000, rproxy's default 128)
+      timeouts:                        # rproxy's global.http.timeouts (fields left out: rproxy's defaults)
+        writeStall: 2m                 # a write to a client that does not read (default 60s)
+        upgradedIdle: 0s               # nothing moving on a WebSocket and the like (default 1h, 0s: none)
+        idle: 180s                     # also tlsHandshake, firstByte, requestHeaders, requestBodyIdle, http2PingInterval, http2PingTimeout
+```
+
+- **How: rproxy's settings file** (`RPROXY_CONFIG`). The controller writes `{"version": 1, "global": {"http": {"timeouts": {...}}}}` as `config.json` into the Gateway's control API Secret (`rproxy-<id>-api`), and gives the pods that key and `RPROXY_CONFIG=/etc/rproxy-gateway/api/config.json`. Values use rproxy's names (`write_stall` and so on) and durations in one unit.
+  - Why not `PATCH /config/global` (rproxy-api #342, `features.global_api`):
+    - That API needs the `admin` scope. The controller's token is narrowed to `rules:read`, `rules:write`, `acme:write` and its own rule set names (`allow_rulesets`) (docs/SECURITY.md); `admin` would let one token change everything in rproxy (updates, reloading the settings, other owners' rules).
+    - API values are lost on a restart without a database, so they would have to be sent again each time a pod starts, running on the defaults meanwhile (a few seconds after readiness). A settings file is in force from the start.
+    - Managed rproxy's settings have come with the pod (environment variables, `rproxy.performance` in 2.2). `global.http.timeouts` has no environment variable, so a settings file, which the pod also carries, is used.
+  - What the file sets wins (the UI's `PATCH /config/global` gets `409 static`). That is wanted: the UI does not silently change what the Gateway's owner set in the CRD.
+  - A Secret rather than a ConfigMap: the admission policy (`rbac.admissionPolicy`) allows only Secret volumes on managed pods, and the controller cannot write ConfigMaps (its permissions are not widened).
+- Changes: `config.json` is not in the pod template's hash (`api_hash`). rproxy v0.4.20 reads its settings file again when it changes (every 10 s), so changing a value does not roll the pods (the kubelet takes about a minute to update the Secret's files). Setting `rproxy.http` for the first time, or removing all of it, changes the pod template (`RPROXY_CONFIG` and the key) and rolls them. Either way new connections get the values.
+- Removing it: the Secret's `config.json` is kept (as it is). Pods of the template before name the key in their volume's `items`; without it the kubelet stops updating that volume (tokens, certificate), and pods the old ReplicaSet makes again cannot mount it. The new template has no `RPROXY_CONFIG`, so it does not read the file, and the file is not in the hash, so nothing rolls.
+- rproxy version: `features.http_stream_limits` (v0.4.20) is decided as `allow_freebind` is (SECURITY.md). rproxy v0.4.17 to v0.4.19 refuse a settings file with names they do not know and do not start (the same kind of problem as #112), so an image remembered by its name (`image_feature`) is not trusted:
+  - Every pod there is answered `/capabilities` itself, from the container it runs now, and the image the pods roll to is the shipped one (`SHIPPED_FEATURES`) or one a current pod running it answered: written (`Applied`).
+  - Not known (the controller just started and a pod of a custom image is not reachable yet, and the like), but the current pods of that image already read a file (`RPROXY_CONFIG`) and no pod answered without the feature: the current form is kept and the file still written (`True`, `Kept`). Removing it would roll the pods back to the defaults and again once known (two rollouts, and silently back to the defaults).
+  - A pod answered without it (an older rproxy under a tag pushed again), or not known for a form that reads no file yet: not written (`UnsupportedRproxy`, rproxy's defaults).
+  - Trade-off: while the current form is kept, a new pod pulling older contents (v0.4.17 to v0.4.19) under the same tag does not start because of the file, and so never answers `/capabilities`. It is never known not to have the feature, `Kept` goes on, and that pod keeps failing to start (the other pods keep the current form). To fix it, correct the tag to the right image or remove `rproxy.http`. A pod that once answered without the feature is never written for. Pods of an older image (a rollout's old ReplicaSet) have no `RPROXY_CONFIG` and do not read the file even when the Secret has it.
+- Status: while `rproxy.http` sets anything, the Gateway gets the condition `rproxy.max3584.net/HTTPSettings`: `True`, `Applied`; `True`, `Kept` (the current form kept until known, and while invalid parameters keep the form before); or `False`, `UnsupportedRproxy` (the image is unknown or older; rproxy's defaults apply). `Programmed` is not changed. Removing it removes the condition.
+- Who decides: it affects only the Gateway's own pods, so like `rproxy.performance` a Gateway's parameters may set it by default (`rproxy.http` is in the default `policy.gatewayOverrides`). Replaced as a whole (with both the class's and the Gateway's, the Gateway's).
+- Checked (`InvalidParameters`, as in 2.4): durations up to 365 days, no `http2PingTimeout: 0s`, `http2MaxStreams` 1 to 10000 (in the CRD too). The same as rproxy's `HttpTimeoutsSpec::check`.
+- A Gateway whose parameters became invalid (kept as it was, 2.4) keeps the Secret's `config.json` as it was too (as in "Removing it" above), and while its pods read the file the Gateway's condition `rproxy.max3584.net/HTTPSettings` is `True`, `Kept`.
+- **fleet**: one rproxy process serves every Gateway, so process-wide settings are the chart's, not a per-Gateway CRD's. The chart's `fleet.http` (rproxy's `global.http` shape as it is; `{}` by default) becomes `config.json` of the ConfigMap `rproxy-fleet-config`, and the DaemonSet gets `RPROXY_CONFIG` (nothing is rendered for `{}`). The fleet's DaemonSet is the chart's, not the controller's, so there is no reason to render it in the controller.
+  - The same settings managed and fleet (managed in Kubernetes' camelCase, fleet in rproxy's names):
+
+    ```yaml
+    # managed: RproxyGatewayParameters
+    spec: {rproxy: {http: {http2MaxStreams: 1000, timeouts: {writeStall: 2m}}}}
+    # fleet: the chart's values
+    fleet: {http: {timeouts: {http2_max_streams: 1000, write_stall: 2m}}}
+    ```
+
+  - The chart's `values.schema.json` checks the names and shapes of `fleet.http` (durations like `10s`, `500ms`, `5m`, `2h`; `http2_ping_timeout` not `0s`; `http2_max_streams` 1 to 10000), so helm refuses a mistake like `writeStall` (with a value rproxy refuses, that node's rproxy does not start and the DaemonSet's rollout stops). The rest (the 365-day limit and so on) is rproxy's to check. The version cannot be checked either: use rproxy v0.4.20 or later, and run `rproxy-api --check-config config.json` with the same image first (the `config.json` of the ConfigMap from `helm template`, as a file).
+- Tests: unit (`http_settings` in `src/render/params.rs`: the file's shape, units, checks, merging, `policy`; `rproxy_settings_file` in `src/controller/provision.rs`: the Secret's key, `RPROXY_CONFIG`, kept out of the hash, kept when removed, the pods' current form; `the_settings_file_needs_every_pod_or_keeps_the_current_form` in `src/controller/tests.rs`: each pod's answer, nothing by name, kept while unknown, a tag pushed again), real rproxy (`tests/rproxy.rs`: rproxy starts with the file the controller writes, `firstByte: 1s` is in force on the HTTP listener, a rewritten file takes effect without a restart), CI's `helm template` (`fleet.http`, and what `values.schema.json` refuses).

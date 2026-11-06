@@ -19,7 +19,9 @@ use serde_json::Value;
 
 use crate::k8s::crd::{FreeForm, GROUP};
 use crate::k8s::gateway::{Gateway, GatewayClass};
-use crate::k8s::params::{IntOrStr, MiddlewarePolicy, ParamsPolicy, Performance, ProxyProtocolParams, RproxyGatewayParametersSpec as Spec};
+use crate::k8s::params::{
+	HttpParams, IntOrStr, MiddlewarePolicy, ParamsPolicy, Performance, ProxyProtocolParams, RproxyGatewayParametersSpec as Spec,
+};
 use crate::render::world::World;
 
 pub const KIND: &str = "RproxyGatewayParameters";
@@ -64,6 +66,7 @@ pub const DEFAULT_OVERRIDES: &[&str] = &[
 	"rproxy.logLevel",
 	"rproxy.performance",
 	"rproxy.shutdown",
+	"rproxy.http",
 	"ui",
 ];
 
@@ -288,6 +291,7 @@ pub fn set_paths(spec: &Spec) -> Vec<&'static str> {
 		add(r.log_level.is_some(), "rproxy.logLevel");
 		add(r.performance.is_some(), "rproxy.performance");
 		add(r.shutdown.is_some(), "rproxy.shutdown");
+		add(r.http.is_some(), "rproxy.http");
 		add(r.extra_env.is_some(), "rproxy.extraEnv");
 	}
 	add(spec.ui.is_some(), "ui");
@@ -482,6 +486,9 @@ fn check_values(spec: &Spec) -> Result<(), String> {
 					}
 				}
 			}
+		}
+		if let Some(h) = &r.http {
+			http_timeouts(h).map_err(|e| format!("spec.rproxy.http.{e}"))?;
 		}
 		for (i, e) in r.extra_env.iter().flatten().enumerate() {
 			let e: EnvVar = read(e).map_err(|e| format!("spec.rproxy.extraEnv[{i}]: {e}"))?;
@@ -717,6 +724,64 @@ pub fn performance_env(p: &Performance) -> Result<Vec<(String, String)>, String>
 	Ok(out)
 }
 
+/// The longest duration rproxy takes (365 days).
+const MAX_DURATION_MS: u64 = 365 * 24 * 3_600_000;
+
+/// rproxy's `global.http.timeouts` for `rproxy.http` (an error names the field): its names, the
+/// durations in one unit as rproxy reads them (`90s`, `1500ms`; `0s` no limit), `http2_max_streams`.
+pub fn http_timeouts(h: &HttpParams) -> Result<serde_json::Map<String, Value>, String> {
+	let mut out = serde_json::Map::new();
+	if let Some(t) = &h.timeouts {
+		for (field, name, v) in [
+			("tlsHandshake", "tls_handshake", &t.tls_handshake),
+			("firstByte", "first_byte", &t.first_byte),
+			("requestHeaders", "request_headers", &t.request_headers),
+			("idle", "idle", &t.idle),
+			("requestBodyIdle", "request_body_idle", &t.request_body_idle),
+			("http2PingInterval", "http2_ping_interval", &t.http2_ping_interval),
+			("http2PingTimeout", "http2_ping_timeout", &t.http2_ping_timeout),
+			("writeStall", "write_stall", &t.write_stall),
+			("upgradedIdle", "upgraded_idle", &t.upgraded_idle),
+		] {
+			let Some(v) = v else { continue };
+			let ms = crate::render::duration_ms(v.trim())
+				.filter(|ms| *ms <= MAX_DURATION_MS)
+				.ok_or_else(|| format!("timeouts.{field}: {v:?} is not a duration up to 365 days (30s, 5m, 2h; 0s for no limit)"))?;
+			if ms == 0 && name == "http2_ping_timeout" {
+				return Err(format!("timeouts.{field}: 0s is not a time to wait"));
+			}
+			let shown = if ms % 1000 == 0 { format!("{}s", ms / 1000) } else { format!("{ms}ms") };
+			out.insert(name.into(), Value::String(shown));
+		}
+	}
+	if let Some(n) = h.http2_max_streams {
+		if !(1..=10_000).contains(&n) {
+			return Err("http2MaxStreams: 1 to 10000".into());
+		}
+		out.insert("http2_max_streams".into(), Value::from(n));
+	}
+	Ok(out)
+}
+
+/// The Gateway condition about the parameters' `rproxy.http` (managed, only while it sets something).
+pub const HTTP_CONDITION: &str = "rproxy.max3584.net/HTTPSettings";
+
+/// The name of rproxy's settings file in the control API Secret (JSON: rproxy reads a file not
+/// ending in `.yaml` / `.yml` as JSON).
+pub const SETTINGS_FILE: &str = "config.json";
+
+/// rproxy's settings file (`RPROXY_CONFIG`) for `spec`: `global.http.timeouts` of `rproxy.http`
+/// (checked before). `None`: nothing to write (rproxy's defaults; no settings file, as before v0.4.21).
+pub fn settings_file(spec: &Spec) -> Option<String> {
+	let h = spec.rproxy.as_ref()?.http.as_ref()?;
+	let timeouts = http_timeouts(h).ok()?;
+	if timeouts.is_empty() {
+		return None;
+	}
+	let doc = serde_json::json!({"version": 1, "global": {"http": {"timeouts": timeouts}}});
+	Some(format!("{}\n", serde_json::to_string_pretty(&doc).unwrap_or_default()))
+}
+
 /// rproxy's extra environment variables from `spec` (logLevel, performance, extraEnv), checked before.
 pub fn rproxy_env(spec: &Spec) -> Vec<EnvVar> {
 	let mut out = vec![];
@@ -783,6 +848,7 @@ pub fn merge(base: &Spec, over: &Spec) -> Spec {
 			log_level: o.log_level.or(b.log_level),
 			performance: o.performance.clone().or_else(|| b.performance.clone()),
 			shutdown: o.shutdown.clone().or_else(|| b.shutdown.clone()),
+			http: o.http.clone().or_else(|| b.http.clone()),
 			extra_env: o.extra_env.clone().or_else(|| b.extra_env.clone()),
 		}),
 		(b, o) => o.clone().or_else(|| b.clone()),
@@ -1072,6 +1138,47 @@ spec:
 		.unwrap();
 		let env: Vec<(String, String)> = rproxy_env(&p).into_iter().map(|e| (e.name, e.value.unwrap_or_default())).collect();
 		assert_eq!(env, [("RPROXY_MAX_RULESETS".to_string(), "5000".to_string()), ("RPROXY_MAX_RULES".to_string(), "0".to_string())]);
+	}
+
+	/// #109: `rproxy.http` becomes rproxy's settings file (`global.http.timeouts`), checked as rproxy
+	/// checks it; a Gateway may set it by default and replaces the class's as a whole.
+	#[test]
+	fn http_settings() {
+		let err = |gw: &str| resolve(&gateway(gw)).unwrap_err();
+		let ok = |gw: &str| resolve(&gateway(gw)).unwrap().unwrap();
+		let p = ok(
+			"  rproxy: {http: {http2MaxStreams: 1000, timeouts: {writeStall: 2m, upgradedIdle: 0s, idle: 1h, http2PingTimeout: 1500ms, requestBodyIdle: 90s}}}",
+		);
+		let file: Value = serde_json::from_str(&settings_file(&p).unwrap()).unwrap();
+		assert_eq!(
+			file,
+			serde_json::json!({"version": 1, "global": {"http": {"timeouts": {
+				"write_stall": "120s", "upgraded_idle": "0s", "idle": "3600s", "http2_ping_timeout": "1500ms",
+				"request_body_idle": "90s", "http2_max_streams": 1000
+			}}}})
+		);
+		// nothing set: no settings file (as before)
+		assert_eq!(settings_file(&ok("  rproxy: {http: {timeouts: {}}}")), None);
+		assert_eq!(settings_file(&ok("  rproxy: {logLevel: info}")), None);
+		assert!(err("  rproxy: {http: {timeouts: {idle: soon}}}").contains("spec.rproxy.http.timeouts.idle"));
+		assert!(err("  rproxy: {http: {timeouts: {writeStall: 9000h}}}").contains("up to 365 days"));
+		assert!(err("  rproxy: {http: {timeouts: {http2PingTimeout: 0s}}}").contains("http2PingTimeout: 0s is not a time to wait"));
+		assert!(err("  rproxy: {http: {http2MaxStreams: 0}}").contains("http2MaxStreams: 1 to 10000"));
+		assert!(err("  rproxy: {http: {http2MaxStreams: 10001}}").contains("http2MaxStreams"));
+		// the class's and a Gateway's: the Gateway's replaces it as a whole; closed when the class's policy says so
+		let both = |class: &str, gw: &str| resolve(&format!("{CLASS}{}{}", class_params(class), gateway(gw)));
+		let p = both("  rproxy: {http: {http2MaxStreams: 500, timeouts: {idle: 5m}}}", "  rproxy: {http: {timeouts: {writeStall: 30s}}}")
+			.unwrap()
+			.unwrap();
+		let h = p.rproxy.unwrap().http.unwrap();
+		assert_eq!((h.http2_max_streams, h.timeouts.unwrap().idle), (None, None), "replaced as a whole");
+		let p = both("  rproxy: {http: {http2MaxStreams: 500}}", "  replicas: 2").unwrap().unwrap();
+		assert_eq!(p.rproxy.unwrap().http.unwrap().http2_max_streams, Some(500), "the class's stays");
+		assert!(
+			both("  policy: {gatewayOverrides: [replicas]}", "  rproxy: {http: {http2MaxStreams: 500}}")
+				.unwrap_err()
+				.contains("spec.rproxy.http: not allowed by the GatewayClass")
+		);
 	}
 
 	#[test]

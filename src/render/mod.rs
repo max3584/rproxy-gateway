@@ -251,6 +251,8 @@ pub struct Features {
 	pub connect_timeout: bool,
 	/// `proxy_protocol` of tcp rules: PROXY headers from the front ends (rproxy v0.4.13, `features.proxy_protocol_in`).
 	pub proxy_protocol_in: bool,
+	/// `idle_timeout` and `half_close_timeout` of L4 tcp rules (rproxy v0.4.20, `features.tcp_idle_timeout`).
+	pub tcp_idle_timeout: bool,
 }
 
 impl Default for Features {
@@ -286,6 +288,7 @@ impl Default for Features {
 			fa_all_response_headers: true,
 			connect_timeout: true,
 			proxy_protocol_in: true,
+			tcp_idle_timeout: true,
 		}
 	}
 }
@@ -323,6 +326,7 @@ impl Features {
 			fa_all_response_headers: c.lists("forward_auth", "all_response_headers"),
 			connect_timeout: c.feature("connect_timeout"),
 			proxy_protocol_in: c.feature("proxy_protocol_in"),
+			tcp_idle_timeout: c.feature("tcp_idle_timeout"),
 		}
 	}
 
@@ -358,6 +362,7 @@ impl Features {
 			fa_all_response_headers: self.fa_all_response_headers && o.fa_all_response_headers,
 			connect_timeout: self.connect_timeout && o.connect_timeout,
 			proxy_protocol_in: self.proxy_protocol_in && o.proxy_protocol_in,
+			tcp_idle_timeout: self.tcp_idle_timeout && o.tcp_idle_timeout,
 		}
 	}
 }
@@ -1611,6 +1616,7 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 		gw,
 		&mut plan.rules,
 		&policy::Targets { listeners: &by_name, l4_services: &l4_services, http_services: &http_services },
+		&opts.features,
 	);
 	opts.backends.apply(&mut plan.rules, &opts.features);
 	let taken: Vec<String> = plan.rules.iter().map(|r| r.key()).collect();

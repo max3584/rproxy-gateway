@@ -49,6 +49,8 @@ pub const OWN_CONDITION_TYPES: &[&str] = &[
 	"InsecureFrontendValidationMode",
 	"BackendsHealthy",
 	crate::render::proxy_protocol::CONDITION,
+	crate::render::params::HTTP_CONDITION,
+	crate::render::policy::RELAY_CONDITION,
 ];
 
 pub fn to_k8s(conds: &[Cond], generation: i64, previous: Option<&Value>, now: &str) -> Vec<Value> {
