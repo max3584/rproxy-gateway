@@ -390,6 +390,27 @@ kubectl -n e2e delete gateway steal-dns > /dev/null
 kubectl -n e2e delete rproxyrule steal-key > /dev/null
 test "$(kubectl -n e2e get networkpolicy -l gateway.networking.k8s.io/gateway-name=e2e -o name | wc -l)" = 1
 
+echo "== a Gateway name over 63 characters: the gateway-name label is cut and hashed (#117)"
+long=long-gateway-name-$(printf 'x%.0s' $(seq 1 70))
+# the first 20 characters, "-" and the SHA-1 of the rest (proposed for GEP-1762, gateway-api#3070)
+long_label="${long:0:20}-$(printf %s "${long:20}" | sha1sum | cut -c1-40)"
+cat <<YAML | kubectl apply -f - > /dev/null
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {name: $long, namespace: e2e}
+spec:
+  gatewayClassName: rproxy
+  listeners: [{name: http, port: 80, protocol: HTTP}]
+YAML
+kubectl -n e2e wait --for=condition=Programmed "gateway/$long" --timeout=240s > /dev/null
+for kind in deploy svc serviceaccount networkpolicy secret; do
+  test "$(kubectl -n e2e get "$kind" -l "gateway.networking.k8s.io/gateway-name=$long_label" -o name | wc -l)" -ge 1
+done
+kubectl -n e2e rollout status deploy -l "gateway.networking.k8s.io/gateway-name=$long_label" --timeout=180s > /dev/null
+test "$(kubectl -n e2e get svc -l "gateway.networking.k8s.io/gateway-name=$long_label" -o jsonpath='{.items[0].metadata.annotations.rproxy\.max3584\.net/gateway}')" = "e2e/$long"
+kubectl -n e2e delete gateway "$long" > /dev/null
+retry 120 sh -c "test -z \"\$(kubectl -n e2e get pods,deploy -l gateway.networking.k8s.io/gateway-name=$long_label -o name)\""
+
 if kubectl get validatingadmissionpolicybinding rproxy-gateway-managed-only > /dev/null 2>&1; then
   echo "== rbac.admissionPolicy: the controller writes only what it made (labelled managed-by)"
   as=--as=system:serviceaccount:$NS:rproxy-gateway

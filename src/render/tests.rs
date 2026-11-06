@@ -1276,6 +1276,19 @@ fn gateway_addresses_and_parameters() {
 	let w = world(&taken);
 	let p = render_gateway(&w, &w.gateways[0], &allowed);
 	assert!(p.address_error.as_deref().is_some_and(|e| e.contains("kube-system/dns")), "{:?}", p.address_error);
+	// the Gateway's own Service has the address: a long-named Gateway's Service carries the hashed label
+	let long = "g".repeat(80);
+	let own = |label: &str| {
+		yaml_with("  addresses: [{value: 192.0.2.54}]\n").replace("name: gw,", &format!("name: {long},"))
+			+ &format!(
+				"\n---\napiVersion: v1\nkind: Service\nmetadata: {{name: rproxy-x, namespace: default, labels: {{gateway.networking.k8s.io/gateway-name: {label}}}}}\nspec: {{clusterIP: 10.96.0.9, externalIPs: [192.0.2.54], ports: [{{port: 80}}]}}\n"
+			)
+	};
+	let w = world(&own(&crate::render::gateway_name_label(&long)));
+	assert_eq!(w.gateways[0].metadata.name.as_deref(), Some(long.as_str()));
+	assert_eq!(render_gateway(&w, &w.gateways[0], &allowed).address_error, None, "its own Service");
+	let w = world(&own("other"));
+	assert!(render_gateway(&w, &w.gateways[0], &allowed).address_error.is_some_and(|e| e.contains("default/rproxy-x")));
 	let p = with("  addresses: [{type: test/fake-invalid-type, value: x}, {value: 192.0.2.10}]\n");
 	assert_eq!(cond(&p.conds, "Accepted").reason, "UnsupportedAddress");
 	assert!(!p.accepted());

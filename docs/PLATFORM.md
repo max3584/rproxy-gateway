@@ -502,7 +502,7 @@ spec:
     - {name: tcp, port: 9100, targetPort: 9100}
 ```
 
-- **selector で選ぶ（勧める）**：コントローラは Gateway の rproxy の Pod に `app.kubernetes.io/name: rproxy` と `gateway.networking.k8s.io/gateway-name: <Gateway の名前>`（Gateway API の決まったラベル）を付ける。Service の selector は同じ名前空間の Pod だけを選ぶので、この 2 つで Gateway が決まる。Gateway を作り直しても（Service `rproxy-<id>` の名前が変わっても）そのまま使え、`port` と `targetPort` を変えられる。readiness gate で、ルールセットを反映する前の Pod や終わりかけの Pod には送られない。`rproxy.max3584.net/gateway`（`<id>`）のラベルは Gateway の uid のハッシュを含むので selector に使わない。
+- **selector で選ぶ（勧める）**：コントローラは Gateway の rproxy の Pod に `app.kubernetes.io/name: rproxy` と `gateway.networking.k8s.io/gateway-name: <Gateway の名前>`（Gateway API の決まったラベル）を付ける。63 文字を超える名前の Gateway では、この値は名前の先頭 20 文字・`-`・残りの SHA-1 になる（ラベルの値は 63 文字まで。[DESIGN.md](DESIGN.md)。selector には Pod の `metadata.labels` の値を写す）。Service の selector は同じ名前空間の Pod だけを選ぶので、この 2 つで Gateway が決まる。Gateway を作り直しても（Service `rproxy-<id>` の名前が変わっても）そのまま使え、`port` と `targetPort` を変えられる。readiness gate で、ルールセットを反映する前の Pod や終わりかけの Pod には送られない。`rproxy.max3584.net/gateway`（`<id>`）のラベルは Gateway の uid のハッシュを含むので selector に使わない。
 - **ExternalName**：`spec: {type: ExternalName, externalName: rproxy-<id>.shop.svc.cluster.local}` でも届く（DNS の CNAME）。ただし Gateway を作り直すと `rproxy-<id>` が変わるので書き直しが要り、ポートは変えられない（クライアントは listener の port を呼ぶ）。HTTP の Host はクライアントが書いた名前（`api`）のまま。
 - 元の Service の selector を書き換えて rproxy の Pod に向ける形もできるが、その Service を Helm・Argo CD が持っているなら次の同期で元に戻される（差分として出続ける）。改名なら、アプリの chart・マニフェストで Service の名前を `api-backend` に変え、`api` は rproxy 側のマニフェストに置くので、持ち主がぶつからない。
 - 切り替えの順：`api-backend` と Gateway・ルートを先に作り、Gateway が `Programmed` になってから `api` を差し替える（アプリの chart の `api` を消し、rproxy 側の `api` を作る）。差し替えの間だけ `api` に endpoint のない時間がありうる。
