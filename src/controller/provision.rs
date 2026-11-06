@@ -1129,12 +1129,15 @@ pub fn pods(store: &[std::sync::Arc<Pod>], ns: &str, selector: &BTreeMap<String,
 	pods_of(store, ns, selector, false)
 }
 
-/// The uids of the pods `pods` lists, in any phase (Pending ones too, and those without an IP yet):
-/// each must have answered `/capabilities` before the token file says `allow_freebind` (#105).
+/// The uids of the pods `pods` lists, Pending ones and those without a status or an IP yet too: each
+/// must have answered `/capabilities` before the token file says `allow_freebind` (#105). Pods that
+/// have ended (`Failed`, such as an evicted one, or `Succeeded`) never answer or start again, and are
+/// left out.
 pub fn pod_uids(store: &[std::sync::Arc<Pod>], ns: &str, selector: &BTreeMap<String, String>) -> Vec<String> {
+	let ended = |p: &Pod| matches!(p.status.as_ref().and_then(|s| s.phase.as_deref()), Some("Failed" | "Succeeded"));
 	store
 		.iter()
-		.filter(|p| p.metadata.deletion_timestamp.is_none() && selected(p, ns, selector))
+		.filter(|p| p.metadata.deletion_timestamp.is_none() && !ended(p) && selected(p, ns, selector))
 		.map(|p| p.metadata.uid.clone().unwrap_or_default())
 		.collect()
 }
@@ -1731,9 +1734,30 @@ mod tests {
 			pod("no-status", None, false, true),
 			pod("stopping", Some("Running"), true, true),
 			pod("someone-elses", Some("Running"), false, false),
+			// evicted: never answers, never starts again
+			pod("evicted", Some("Failed"), false, true),
+			pod("done", Some("Succeeded"), false, true),
 		];
 		let sel: BTreeMap<String, String> = [(LABEL_GATEWAY.to_string(), "web-gw-1".to_string())].into();
 		assert_eq!(pod_uids(&store, "web", &sel), ["uid-running", "uid-pending", "uid-no-status"]);
 		assert_eq!(pods(&store, "web", &sel).into_iter().map(|e| e.uid).collect::<Vec<_>>(), ["uid-running"], "talked to: running only");
+		// fleet pods (the chart's DaemonSet): picked by the selector only, without the managed-by label
+		let fleet = |name: &str, phase: Option<&str>| {
+			let mut v = serde_json::json!({
+				"metadata": {
+					"name": name, "namespace": "rproxy-gateway-system", "uid": format!("uid-{name}"),
+					"labels": {"app.kubernetes.io/name": "rproxy", "app.kubernetes.io/component": "fleet"},
+				},
+				"spec": {"containers": [{"name": "rproxy"}]},
+			});
+			if let Some(phase) = phase {
+				v["status"] = serde_json::json!({"phase": phase, "podIP": "10.0.0.2"});
+			}
+			std::sync::Arc::new(serde_json::from_value::<Pod>(v).unwrap())
+		};
+		let store = vec![fleet("f-running", Some("Running")), fleet("f-pending", Some("Pending")), fleet("f-evicted", Some("Failed"))];
+		let sel = parse_selector("app.kubernetes.io/name=rproxy,app.kubernetes.io/component=fleet");
+		assert_eq!(pod_uids(&store, "rproxy-gateway-system", &sel), ["uid-f-running", "uid-f-pending"]);
+		assert!(pod_uids(&store, "web", &sel).is_empty(), "another namespace");
 	}
 }
