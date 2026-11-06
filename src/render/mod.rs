@@ -728,9 +728,25 @@ pub fn on_listener(name: &str, label: &str) -> String {
 	if full.len() <= MAX_NAME { full } else { format!("{name}@{}", crate::pem::short_hash(label.as_bytes())) }
 }
 
-/// The ruleset name of a Gateway.
+/// rproxy's longest rule set name (rproxy-api v0.4.0, `core::ruleset::MAX_NAME`): it refuses a longer
+/// one (`400 invalid`).
+pub const MAX_RULESET_NAME: usize = 253;
+
+/// The ruleset name of a Gateway: `k8s/<namespace>/<name>`. A Gateway name may be 253 bytes, so past
+/// `MAX_RULESET_NAME` the name's tail is cut and `_<hash>` (16 digits, of `<namespace>/<name>`) put in
+/// its place: still under `k8s/<namespace>/` (`allow_rulesets` and the fleet's clean-up go by that), and
+/// never a short Gateway's name (Kubernetes names have no `_`). Shorter names stay as they are.
 pub fn ruleset_name(namespace: &str, name: &str) -> String {
-	format!("k8s/{namespace}/{name}")
+	let full = format!("k8s/{namespace}/{name}");
+	if full.len() <= MAX_RULESET_NAME {
+		return full;
+	}
+	let hash = crate::pem::short_hash(format!("{namespace}/{name}").as_bytes());
+	let mut keep = MAX_RULESET_NAME.saturating_sub("k8s/".len() + namespace.len() + "/_".len() + hash.len()).min(name.len());
+	while !name.is_char_boundary(keep) {
+		keep -= 1;
+	}
+	format!("k8s/{namespace}/{}_{hash}", &name[..keep])
 }
 
 /// Whether `parent` refers to the Gateway `gw` (from a route in `route_ns`).

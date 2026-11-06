@@ -127,7 +127,7 @@ namespace のラベルはテナントが書けないようにしておく（name
 
 ## rproxy のルールセットの持ち主
 
-rproxy はルールセットを、作ったトークンの名前のものにする（ほかの admin でないトークンは変えられない）。コントローラのトークンは値が変わっても名前はいつも `rproxy-gateway` なので、トークンを入れ替えても（rproxy の再起動のあとの PUT し直しも）同じ持ち主のまま。トークンの `allow_rulesets` は、fleet のものが `k8s/`、managed の Gateway ごとのものがその Gateway のルールセット（`k8s/<namespace>/<name>`）だけ。
+rproxy はルールセットを、作ったトークンの名前のものにする（ほかの admin でないトークンは変えられない）。コントローラのトークンは値が変わっても名前はいつも `rproxy-gateway` なので、トークンを入れ替えても（rproxy の再起動のあとの PUT し直しも）同じ持ち主のまま。トークンの `allow_rulesets` は、fleet のものが `k8s/`、managed の Gateway ごとのものがその Gateway のルールセット（`k8s/<namespace>/<name>`。長い名前では後ろがハッシュ、[DESIGN.md](DESIGN.md) の「全体」）だけ。
 
 コントローラのトークンに `admin` のスコープは付けない。rproxy の `global` の設定（RproxyGatewayParameters の `rproxy.http`、v0.4.21）は `admin` の要る `PATCH /config/global` で送らず、Gateway の制御 API の Secret に入れた rproxy の設定ファイル（`config.json`、`RPROXY_CONFIG`）で渡す（[DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) の 16.2）。
 

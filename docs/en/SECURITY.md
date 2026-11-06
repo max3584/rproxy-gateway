@@ -127,7 +127,7 @@ How the management UI (TCP-UDP-rproxy-ui's chart, installed apart) reads the rpr
 
 ## Owners of rproxy's rule sets
 
-rproxy makes a rule set belong to the name of the token that created it (other non-admin tokens cannot change it). The controller's token is always named `rproxy-gateway` whatever its value, so after a token rotation (and after re-PUTs once rproxy restarts) the owner stays the same. The tokens' `allow_rulesets` are `k8s/` for the fleet's and, for each managed Gateway's, only that Gateway's rule set (`k8s/<namespace>/<name>`).
+rproxy makes a rule set belong to the name of the token that created it (other non-admin tokens cannot change it). The controller's token is always named `rproxy-gateway` whatever its value, so after a token rotation (and after re-PUTs once rproxy restarts) the owner stays the same. The tokens' `allow_rulesets` are `k8s/` for the fleet's and, for each managed Gateway's, only that Gateway's rule set (`k8s/<namespace>/<name>`; a long name ends in a hash, [DESIGN.md](DESIGN.md), "Overview").
 
 The controller's token never gets the `admin` scope. rproxy's `global` settings (RproxyGatewayParameters `rproxy.http`, v0.4.21) are not sent with `PATCH /config/global`, which needs `admin`, but as rproxy's settings file in the Gateway's control API Secret (`config.json`, `RPROXY_CONFIG`) ([DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) 16.2).
 
