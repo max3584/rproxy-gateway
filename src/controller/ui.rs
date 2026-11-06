@@ -293,6 +293,7 @@ mod tests {
 			certs: None,
 			target: Some("team-a-web-abc123".into()),
 			rproxy_image: None,
+			rproxy_run: None,
 		}
 	}
 

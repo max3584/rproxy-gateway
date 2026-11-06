@@ -279,7 +279,7 @@ rproxy-api が `--shutdown-delay` / `RPROXY_SHUTDOWN_DELAY`（SIGTERM の後、`
 
 - rproxy-api v0.4.1 で入った。chart の rproxy のイメージ（`rproxy.image.tag`、`--rproxy-image` の既定、release.yml の `RPROXY_VERSION`）を 0.4.1 に上げた。
 - 古い rproxy のイメージを `rproxy.image` で使うと `RPROXY_SHUTDOWN_*` は効かず、SIGTERM ですぐ止まる。そのため新しい形（preStop なし、`/readyz`）にするのは、Pod の rproxy が `features.graceful_shutdown` を持つと分かってから：コントローラが出荷するイメージ（`--rproxy-image` の既定）はそのまま、ほかのイメージはそれを動かす Pod の `/capabilities` が答えてから（Pod がもう一度入れ替わる。分かったイメージはコントローラが動いている間覚える）。分からない間は v0.4.1 の形（preStop、`/healthz`、`RPROXY_SHUTDOWN_*` なし）。
-- トークンファイルの `allow_freebind: true`（rproxy v0.4.20 の `features.control_limits`、#105）は、もっと慎重に決める：今ある Pod のすべて（Pending も）がそれぞれ `/capabilities` で答えたときだけ書き、イメージの名前で覚えたものは信じない（タグの付け直し、ノードごとに違う中身。v0.4.19 以前はこの項目のあるトークンファイルを断り、その Pod は起動し直せない）。managed は Pod を入れ替える先のイメージも分かっていること（出荷するイメージか、それを動かす Pod が答えたもの）。詳しくは [SECURITY.md](SECURITY.md) の「rproxy のルールセットの持ち主」。rproxy が `tokens_reload` を持つので、書き足しても Pod は入れ替わらない（ハッシュに入れない）。
+- トークンファイルの `allow_freebind: true`（rproxy v0.4.20 の `features.control_limits`、#105）は、もっと慎重に決める：今ある Pod のすべて（Pending も）がそれぞれ `/capabilities` で答えたときだけ書き（答えは Pod の rproxy のコンテナごと。再起動・`imageID` が変われば聞き直す、#112）、イメージの名前で覚えたものは信じない（タグの付け直し、ノードごとに違う中身。v0.4.19 以前はこの項目のあるトークンファイルを断り、その Pod は起動し直せない）。managed は Pod を入れ替える先のイメージも分かっていること（出荷するイメージか、それを動かす Pod が答えたもの）。詳しくは [SECURITY.md](SECURITY.md) の「rproxy のルールセットの持ち主」。rproxy が `tokens_reload` を持つので、書き足しても Pod は入れ替わらない（ハッシュに入れない）。
 
 ### 6.2 形
 
