@@ -138,10 +138,13 @@ pub fn derive_token(master: &str, target: &str) -> String {
 /// The token is named `rproxy-gateway` whatever its value: rproxy makes the token's name
 /// the owner of the rule sets it creates, so a rotated token (same name) still owns them.
 /// `allow_rulesets`: the rule set name prefixes it may change (`k8s/`; a managed Gateway's
-/// own set).
+/// own set). `allow_freebind: true`: the fleet's rules listen on Gateways' `spec.addresses` with
+/// `listen_freebind` (rproxy v0.4.20 lets a rule set's `PUT` from a token with `allow_rulesets`
+/// do it anyway, but warns `token.freebind` unless the token file says so, #105). rproxy v0.4.19
+/// and earlier refuse the field: the controller ships rproxy v0.4.20 or later.
 pub fn token_file(token: &str, allow_rulesets: &str) -> String {
 	format!(
-		"# written by rproxy-gateway: the controller's token (rule sets; ACME certificates for Traefik certResolver)\ntokens:\n  - name: rproxy-gateway\n    sha256: {}\n    scopes: [rules:read, rules:write, acme:write]\n    allow_rulesets: [\"{}\"]\n",
+		"# written by rproxy-gateway: the controller's token (rule sets; ACME certificates for Traefik certResolver)\ntokens:\n  - name: rproxy-gateway\n    sha256: {}\n    scopes: [rules:read, rules:write, acme:write]\n    allow_rulesets: [\"{}\"]\n    allow_freebind: true\n",
 		crate::pem::sha256_hex(token.as_bytes()),
 		allow_rulesets
 	)
@@ -287,6 +290,10 @@ mod tests {
 		assert!(file.contains("rules:write"));
 		assert!(file.contains("allow_rulesets: [\"k8s/\"]"), "{file}");
 		assert!(token_file(&token, "k8s/default/web").contains("allow_rulesets: [\"k8s/default/web\"]"));
+		// the fleet listens on Gateways' addresses (listen_freebind): said in the file (rproxy v0.4.20, #105)
+		let doc: serde_json::Value = serde_saphyr::from_str(&file).unwrap();
+		assert_eq!(doc["tokens"][0]["allow_freebind"], serde_json::json!(true), "{file}");
+		assert_eq!(doc["tokens"][0]["allow_rulesets"], serde_json::json!(["k8s/"]));
 	}
 
 	#[test]

@@ -129,6 +129,10 @@ namespace のラベルはテナントが書けないようにしておく（name
 
 rproxy はルールセットを、作ったトークンの名前のものにする（ほかの admin でないトークンは変えられない）。コントローラのトークンは値が変わっても名前はいつも `rproxy-gateway` なので、トークンを入れ替えても（rproxy の再起動のあとの PUT し直しも）同じ持ち主のまま。トークンの `allow_rulesets` は、fleet のものが `k8s/`、managed の Gateway ごとのものがその Gateway のルールセット（`k8s/<namespace>/<name>`）だけ。
 
+トークンファイルには `allow_freebind: true` も書く（v0.4.20、#105）。fleet の `listen: addresses` は Gateway の `spec.addresses` で `listen_freebind` を使って待ち受け、rproxy v0.4.20 は `listen_freebind` のルールを `admin` のトークン、`allow_freebind: true` のトークン、組の `PUT` では `allow_rulesets` のあるトークンにだけ許す。コントローラのトークンは 3 つ目でも通るが、ファイルに書かないとトークンごとに 1 回 `token.freebind` の警告が出るので、意図して使うことをファイルで示す。managed の Gateway ごとのトークンも同じ形で書く（managed は `listen_freebind` を使わず、`allow_rulesets` で許される範囲も変わらない）。
+
+**rproxy v0.4.19 以前はこの項目を知らず、トークンファイルを誤りとして断る**。コントローラが出荷する rproxy（chart の `rproxy.image` の既定、`--rproxy-image` の既定）は v0.4.20 以上。chart の `rproxy.image`（managed の既定と fleet の DaemonSet）・GatewayClass の parameters の `rproxy.image`・`--rproxy-image` で v0.4.19 以前のイメージに固定しているなら、コントローラを v0.4.20 に上げる前に rproxy のイメージも v0.4.20 以上にする。動いている古い rproxy は読み直しに失敗しても今のトークンを使い続ける（`reload.tokens` の警告）が、再起動した Pod・新しい Pod は起動できない。コントローラを v0.4.19 以前に戻すときは、コントローラがトークンファイルを書き直す（`allow_freebind` が外れる）ので、rproxy はそのままでよい。
+
 ## rproxy のファイルの所有者の確認
 
 rproxy は、ルールや設定が指す証明書・鍵のファイルが rproxy のユーザーのものかを確かめる（`global.files.owner_check`）。kubelet は Secret のボリュームのファイルを root の持ち物（グループは fsGroup、モード 0440）にするので、コントローラは rproxy に `RPROXY_FILES_TRUSTED_DIRS` を渡し、そのディレクトリ（managed：`/var/run/rproxy-gateway/certs`・`/etc/rproxy-gateway/api`、fleet：それに `/etc/rproxy-gateway/api-tls`・`/etc/rproxy-gateway/token`）では root のファイルも使えるようにする。モードの確認（グループ・ほかの人が書けない、鍵はほかの人が読めない）はそのまま。

@@ -553,6 +553,14 @@ endpoints: [{{addresses: [127.0.0.1]}}]
 			assert!(v.error.as_deref().unwrap_or("").contains("k8s/default/a"), "{:?}", v.error);
 		}
 	}
+	// rproxy v0.4.20 (`features.control_limits`) warns `token.freebind` for a token whose file does not
+	// say `allow_freebind: true`; the controller's says it (#105)
+	if caps.feature("control_limits") {
+		let log = std::fs::read_to_string(dir.join(format!("rproxy-{api}.log"))).unwrap();
+		assert!(!log.contains("token.freebind"), "{log}");
+	}
+	drop(rp);
+	let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A backend answering with the client address it was given: `<x-forwarded-for>`.
