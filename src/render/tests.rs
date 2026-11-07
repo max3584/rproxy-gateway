@@ -704,7 +704,7 @@ fn listener_filters_become_pre_routing() {
 	assert!(old.accepted(), "{:?}", old.conds);
 	assert!(old.ports().contains(&(rp::Protocol::Tcp, 8080)));
 	// known to lack it: refused ("lacks it"); placed still when a pod answered so (else no pod would
-	// be left, and it would be placed again), not when the pods roll to the bundled rproxy v0.4.21
+	// be left, and it would be placed again), not when the pods roll to a bundled rproxy known to lack it
 	let w = world(&yaml);
 	for (place, placed) in [(true, true), (false, false)] {
 		let lacking = render_gateway(&w, &w.gateways[0], &Options { pre_routing: PreRouting::Lacking { place }, ..Default::default() });

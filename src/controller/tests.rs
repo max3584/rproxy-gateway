@@ -362,8 +362,12 @@ async fn tokens_reload_is_known_from_the_image_or_the_pods() {
 		..Default::default()
 	};
 	let mut caps = HashMap::new();
-	assert!(image_feature(&rp, provision::RPROXY_IMAGE, "tokens_reload", &[], &mut caps).await, "the shipped image (v0.4.21)");
-	assert!(image_feature(&rp, provision::RPROXY_IMAGE, "control_limits", &[], &mut caps).await, "the shipped image (v0.4.21)");
+	assert!(image_feature(&rp, provision::RPROXY_IMAGE, "tokens_reload", &[], &mut caps).await, "the shipped image (v0.4.22)");
+	assert!(image_feature(&rp, provision::RPROXY_IMAGE, "control_limits", &[], &mut caps).await, "the shipped image (v0.4.22)");
+	assert!(
+		image_feature(&rp, provision::RPROXY_IMAGE, crate::render::listener_filters::FEATURE, &[], &mut caps).await,
+		"the shipped image (v0.4.22)"
+	);
 	assert!(!image_feature(&rp, provision::RPROXY_IMAGE, "another", &[], &mut caps).await);
 	assert!(!image_feature(&rp, "example/rproxy:reload", "tokens_reload", &[ep("r1")], &mut caps).await, "rproxy before v0.4.2");
 	fake.lock().unwrap().tokens_reload = true;
@@ -448,7 +452,7 @@ async fn the_settings_file_needs_every_pod_or_keeps_the_current_form() {
 	};
 	let custom = "example/rproxy:settings";
 	let mut caps = HashMap::new();
-	// a new Gateway of the shipped image (v0.4.21): written
+	// a new Gateway of the shipped image (v0.4.22): written
 	assert_eq!(settings_known(&rp, &[], &[], provision::RPROXY_IMAGE, false, &mut caps).await, SettingsKnown::Yes);
 	// another image without pods: not by its name
 	assert_eq!(settings_known(&rp, &[], &[], custom, false, &mut caps).await, SettingsKnown::No);
@@ -980,8 +984,8 @@ fn listener_filters_claimed_only_when_rproxy_runs_them() {
 }
 
 /// Listener filters while not every pod has answered (a scale-up, a restart, a rollout to another image):
-/// kept where they are already in force; refused (`Lacking`) once a pod answers without `pre_routing` or
-/// the target is the bundled image without it; else waiting (`Unknown`).
+/// kept where they are already in force; refused (`Lacking`) once a pod answers without `pre_routing`;
+/// known with no pod yet for the bundled image (rproxy v0.4.22 has it); else waiting (`Unknown`).
 #[tokio::test]
 async fn listener_filters_are_kept_while_a_new_pod_is_not_known() {
 	use crate::render::PreRouting;
@@ -1037,8 +1041,26 @@ async fn listener_filters_are_kept_while_a_new_pod_is_not_known() {
 		pre_routing_state(&rp, &[a.clone(), b.clone()], &with_b, Some(image), set, &mut caps).await,
 		PreRouting::Lacking { place: true }
 	);
-	// the bundled image without it (rproxy v0.4.21): lacking and not placed, also with no pod yet
-	assert_eq!(pre_routing_state(&rp, &[], &[], Some(provision::RPROXY_IMAGE), set, &mut caps).await, PreRouting::Lacking { place: false });
+	// the bundled image (rproxy v0.4.22) has it: known with no pod yet, with the kinds rproxy-api documents
+	let documented: Vec<String> = crate::render::listener_filters::DOCUMENTED_KINDS.iter().map(|k| k.to_string()).collect();
+	assert_eq!(
+		pre_routing_state(&rp, &[], &[], Some(provision::RPROXY_IMAGE), set, &mut caps).await,
+		PreRouting::Known { kinds: documented, ports: None }
+	);
+	// ... a scale-up of it: kept on the port in force (the new pod runs the bundled image)
+	let shipped_new = ep("k-shipped-new", provision::RPROXY_IMAGE, 1);
+	assert_eq!(
+		pre_routing_state(&rp, std::slice::from_ref(&a), &[pod(&a), pod(&shipped_new)], Some(provision::RPROXY_IMAGE), set, &mut caps)
+			.await,
+		kept()
+	);
+	// ... but a pod of it that answered without it (a tag pushed again with older contents): lacking, still placed
+	let shipped_old = ep("k-shipped-old", provision::RPROXY_IMAGE, without_port);
+	assert_eq!(
+		pre_routing_state(&rp, std::slice::from_ref(&shipped_old), &[pod(&shipped_old)], Some(provision::RPROXY_IMAGE), set, &mut caps)
+			.await,
+		PreRouting::Lacking { place: true }
+	);
 	// another image with no pod yet: not known
 	assert_eq!(pre_routing_state(&rp, &[], &[], Some("example/rproxy:unknown"), set, &mut caps).await, PreRouting::Unknown);
 	// nothing in force (no pre_routing in the set, or no set): not started on a pod not known
