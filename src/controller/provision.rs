@@ -785,7 +785,8 @@ pub fn service(t: &Target, m: &Managed) -> Service {
 			allocate_load_balancer_node_ports: (service_type == "LoadBalancer").then_some(m.allocate_node_ports),
 			external_ips: (!t.addresses.is_empty()).then(|| t.addresses.clone()),
 			load_balancer_class: sp.load_balancer_class.clone().filter(|_| service_type == "LoadBalancer"),
-			load_balancer_source_ranges: sp.load_balancer_source_ranges.clone(),
+			// LoadBalancer only: the API server refuses it on another type (a Cluster-only Gateway's ClusterIP)
+			load_balancer_source_ranges: sp.load_balancer_source_ranges.clone().filter(|_| service_type == "LoadBalancer"),
 			ip_family_policy: sp.ip_family_policy.map(|p| p.as_str().to_string()),
 			type_: Some(service_type),
 			..Default::default()
@@ -1741,7 +1742,7 @@ mod tests {
 		assert_eq!(spec.type_.as_deref(), Some("NodePort"));
 		assert_eq!(spec.external_traffic_policy.as_deref(), Some("Local"));
 		assert_eq!(spec.ip_family_policy.as_deref(), Some("PreferDualStack"));
-		assert_eq!(spec.load_balancer_source_ranges, Some(vec!["203.0.113.0/24".to_string()]));
+		assert_eq!(spec.load_balancer_source_ranges, None, "LoadBalancer only (the API server refuses them on a NodePort)");
 		assert_eq!(spec.allocate_load_balancer_node_ports, None, "NodePort");
 		// without parameters: the flags, as in v0.4.1
 		let t = Target::new(&p);
@@ -2148,6 +2149,16 @@ mod tests {
 		let mut only = plan.clone();
 		only.address_requests = vec![req("", "Cluster")];
 		assert_eq!(Target::new(&only).service_type(&m), "ClusterIP");
+		// the parameters' loadBalancerSourceRanges stay off a ClusterIP Service (the API server refuses them)
+		let mut t2 = Target::new(&only);
+		t2.params.service = Some(crate::k8s::params::ServiceParams {
+			load_balancer_source_ranges: Some(vec!["203.0.113.0/24".into()]),
+			..Default::default()
+		});
+		assert_eq!(service(&t2, &m).spec.unwrap().load_balancer_source_ranges, None);
+		let mut t3 = Target::new(&plan);
+		t3.params.service = t2.params.service.clone();
+		assert_eq!(service(&t3, &m).spec.unwrap().load_balancer_source_ranges, Some(vec!["203.0.113.0/24".to_string()]));
 		assert_eq!(l.get(LABEL_GATEWAY), Some(&t.id), "collect_garbage finds it with the Gateway's objects");
 	}
 }

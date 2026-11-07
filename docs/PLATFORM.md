@@ -459,7 +459,7 @@ spec:
 ```
 
 - 項目が全部 `Cluster`（既定の到達範囲の項目がない）なら、Gateway の Service も `LoadBalancer` にせず `ClusterIP` にする（クラスタの外に出さない）。
-- 値のない項目の Service は位置で名前を決めるので、`spec.addresses` の順を変えると作り直され、ClusterIP が変わる。
+- 値のない項目の Service は位置で名前を決めるので、`spec.addresses` の順を変えると作り直され、ClusterIP が変わる。到達範囲を混ぜる形に変えるとき（既定の項目に `Cluster` を足すなど）は、新しい項目を末尾に足す（前の項目の位置を変えない）。
 - **値つきの `Cluster`（決まった ClusterIP）は既定で使えない。** 値を書くと、テナントがコントローラの権限で空いている好きな ClusterIP を取れる（プラットフォームがほかに配るつもりのアドレスでも）。使わせるクラスだけ、GatewayClass の parameters の `policy.clusterIPs: true` で開ける。開けていないクラスでは、その項目を割り当てない（`AddressesAssigned: False`）。ServiceCIDR の外や使われている値は API サーバが断る。
 - fleet には Gateway ごとの ClusterIP がないので、`Cluster` の項目は割り当てない（`GatewayAddressRoutabilityCluster` も名乗らない）。
 

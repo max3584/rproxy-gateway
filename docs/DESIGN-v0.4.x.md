@@ -118,7 +118,7 @@ spec:
 | `service.type` | Service | `--service-type`（`LoadBalancer`） | `LoadBalancer`・`NodePort`・`ClusterIP` |
 | `service.externalTrafficPolicy` | Service | `--external-traffic-policy`、なければ `LoadBalancer` は `Local`・`NodePort` は `Cluster`（v0.4.1 と同じ） | `Local`・`Cluster` |
 | `service.loadBalancerClass` | Service | なし | Gateway の参照では `policy.allowedLoadBalancerClasses` の内。作った後は変えられない（2.4） |
-| `service.loadBalancerSourceRanges`・`ipFamilyPolicy` | Service | なし | CIDR、`SingleStack`・`PreferDualStack`・`RequireDualStack` |
+| `service.loadBalancerSourceRanges`・`ipFamilyPolicy` | Service | なし | CIDR（`loadBalancerSourceRanges` は Service が LoadBalancer のときだけ付ける）、`SingleStack`・`PreferDualStack`・`RequireDualStack` |
 | `service.labels`・`service.annotations` | Service | なし | ラベルは `pod.labels` と同じ。Gateway の参照の注釈は `spec.infrastructure.annotations` と同じ許可リスト（2.5） |
 | `rproxy.image` | rproxy のコンテナ | `--rproxy-image` | 参照の形（`repo:tag` か `repo@sha256:…`） |
 | `rproxy.logLevel` | `RPROXY_LOG_LEVEL` | なし | `error`・`warn`・`info`・`debug`・`trace` |

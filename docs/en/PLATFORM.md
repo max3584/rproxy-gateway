@@ -459,7 +459,7 @@ spec:
 ```
 
 - When every entry is `Cluster` (none of the default routability), the Gateway's own Service is `ClusterIP` too, not `LoadBalancer` (nothing exposed outside the cluster).
-- A valueless entry's Service is named by its place, so reordering `spec.addresses` makes it again with another ClusterIP.
+- A valueless entry's Service is named by its place, so reordering `spec.addresses` makes it again with another ClusterIP. When moving to mixed routabilities (adding a `Cluster` entry to default ones, say), add the new entries at the end (the earlier entries keep their places).
 - **A `Cluster` entry with a value (a given ClusterIP) is off by default.** With a value a tenant could take any free ClusterIP through the controller's permissions (even one the platform means to hand out elsewhere). Classes that allow it set `policy.clusterIPs: true` in the GatewayClass's parameters; elsewhere such an entry is not assigned (`AddressesAssigned: False`). The API server refuses a value outside the ServiceCIDR or already taken.
 - The fleet has no ClusterIP per Gateway: `Cluster` entries are not assigned there (and `GatewayAddressRoutabilityCluster` is not claimed).
 

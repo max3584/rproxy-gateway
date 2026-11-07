@@ -118,7 +118,7 @@ The default column applies when neither reference sets the field; each is the v0
 | `service.type` | the Service | `--service-type` (`LoadBalancer`) | `LoadBalancer`, `NodePort`, `ClusterIP` |
 | `service.externalTrafficPolicy` | the Service | `--external-traffic-policy`, else `Local` for `LoadBalancer` and `Cluster` for `NodePort` (as in v0.4.1) | `Local`, `Cluster` |
 | `service.loadBalancerClass` | the Service | none | from a Gateway's reference, one of `policy.allowedLoadBalancerClasses`. Cannot change once made (2.4) |
-| `service.loadBalancerSourceRanges`, `ipFamilyPolicy` | the Service | none | CIDRs; `SingleStack`, `PreferDualStack`, `RequireDualStack` |
+| `service.loadBalancerSourceRanges`, `ipFamilyPolicy` | the Service | none | CIDRs (`loadBalancerSourceRanges` only on a LoadBalancer Service); `SingleStack`, `PreferDualStack`, `RequireDualStack` |
 | `service.labels`, `service.annotations` | the Service | none | labels as `pod.labels`. Annotations from a Gateway's reference go through the allow list of `spec.infrastructure.annotations` (2.5) |
 | `rproxy.image` | the rproxy container | `--rproxy-image` | an image reference (`repo:tag` or `repo@sha256:...`) |
 | `rproxy.logLevel` | `RPROXY_LOG_LEVEL` | none | `error`, `warn`, `info`, `debug`, `trace` |
