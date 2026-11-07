@@ -453,6 +453,124 @@ spec:
 	}
 }
 
+/// HTTPRouteBackendURLRewrite (Gateway API v1.7): the suite's manifest
+/// (conformance/tests/httproute-backend-url-rewrite.yaml), a URLRewrite on a backendRef.
+#[test]
+fn url_rewrite_on_backend_refs() {
+	let yaml = format!(
+		"{BASE}{}{}",
+		gw("  - {name: http, port: 8080, protocol: HTTP}"),
+		r#"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: u, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  rules:
+    - matches: [{path: {type: PathPrefix, value: /full}}]
+      backendRefs:
+        - name: web
+          port: 80
+          filters:
+            - type: URLRewrite
+              urlRewrite: {path: {type: ReplaceFullPath, replaceFullPath: /rewritten-full}}
+    - matches: [{path: {type: PathPrefix, value: /prefix}}]
+      backendRefs:
+        - name: web
+          port: 80
+          filters:
+            - type: URLRewrite
+              urlRewrite: {path: {type: ReplacePrefixMatch, replacePrefixMatch: /rewritten-prefix}}
+"#
+	);
+	let p = plan(&yaml);
+	assert!(cond(&p.parents[0].conds, "Accepted").status, "{:?}", p.parents[0].conds);
+	assert!(cond(&p.parents[0].conds, "ResolvedRefs").status, "{:?}", p.parents[0].conds);
+	let http = &p.rules_json()[0]["http"];
+	let mws = |svc: &str| -> Vec<serde_json::Value> {
+		let servers = http["services"][svc]["servers"].as_array().unwrap().clone();
+		assert!(!servers.is_empty());
+		// every server of the backendRef carries the rewrite
+		let first = servers[0]["middlewares"].clone();
+		assert!(servers.iter().all(|s| s["middlewares"] == first), "{servers:?}");
+		first.as_array().unwrap().iter().map(|n| http["middlewares"][n.as_str().unwrap()].clone()).collect()
+	};
+	assert_eq!(mws("default/u/r0"), vec![json!({"replace_path": {"path": "/rewritten-full"}})]);
+	let prefix = mws("default/u/r1");
+	assert_eq!(prefix.len(), 1);
+	let r = &prefix[0]["replace_path_regex"];
+	assert_eq!(r["regex"], "^/prefix(/.*)?$");
+	assert_eq!(r["replacement"], "/rewritten-prefix${1}");
+	// the routes themselves rewrite nothing
+	for route in http["routes"].as_array().unwrap() {
+		assert!(route.get("middlewares").is_none_or(|m| m.as_array().unwrap().is_empty()), "{route:?}");
+	}
+}
+
+/// Listener filters (GEP-5224) run before route matching; rproxy cannot yet, so such a listener
+/// is not accepted (an ExternalAuth there must not be skipped silently).
+#[test]
+fn listener_filters_not_accepted() {
+	let yaml = format!(
+		"{BASE}{}",
+		gw(r#"  - {name: plain, port: 8080, protocol: HTTP}
+  - name: auth
+    port: 8081
+    protocol: HTTP
+    filters:
+      requests:
+        - type: ExternalAuth
+          externalAuth: {protocol: HTTP, backendRef: {name: api, namespace: other, port: 8000}, http: {}}
+  - {name: empty, port: 8082, protocol: HTTP, filters: {requests: []}}"#),
+	);
+	let p = plan(&yaml);
+	let l = |n: &str| p.listeners.iter().find(|x| x.name == n).unwrap();
+	let c = cond(&l("auth").conds, "Accepted");
+	assert_eq!((c.status, c.reason.as_str()), (false, "UnsupportedValue"));
+	assert!(c.message.contains("filters.requests[0] (ExternalAuth)"), "{}", c.message);
+	assert!(cond(&l("plain").conds, "Accepted").status);
+	assert!(cond(&l("empty").conds, "Accepted").status);
+}
+
+/// A listener not accepted for its filters keeps its host name out of a wildcard listener on the same
+/// port: its requests get no route (404), not the wildcard's routes without the ExternalAuth.
+#[test]
+fn listener_filters_do_not_fall_through_to_a_wildcard() {
+	let yaml = format!(
+		"{BASE}{}{}",
+		gw(r#"  - {name: wild, port: 8080, protocol: HTTP, hostname: "*.example.com"}
+  - name: secure
+    port: 8080
+    protocol: HTTP
+    hostname: secure.example.com
+    filters:
+      requests:
+        - type: ExternalAuth
+          externalAuth: {protocol: HTTP, backendRef: {name: api, namespace: other, port: 8000}, http: {}}"#),
+		r#"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: r, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  rules: [{backendRefs: [{name: web, port: 80}]}]
+"#
+	);
+	let p = plan(&yaml);
+	let l = |n: &str| p.listeners.iter().find(|x| x.name == n).unwrap();
+	assert!(!cond(&l("secure").conds, "Accepted").status);
+	assert!(cond(&l("wild").conds, "Accepted").status);
+	let http = &p.rules_json()[0]["http"];
+	let routes = http["routes"].as_array().unwrap();
+	assert!(!routes.is_empty());
+	for r in routes {
+		let m = r["match"].as_str().unwrap();
+		assert!(m.contains("!Host(`secure.example.com`)"), "{m}");
+	}
+}
+
 #[test]
 fn external_auth() {
 	let yaml = format!(
@@ -1289,6 +1407,32 @@ fn gateway_addresses_and_parameters() {
 	assert_eq!(render_gateway(&w, &w.gateways[0], &allowed).address_error, None, "its own Service");
 	let w = world(&own("other"));
 	assert!(render_gateway(&w, &w.gateways[0], &allowed).address_error.is_some_and(|e| e.contains("default/rproxy-x")));
+	// routability (GEP-5093): a Cluster value is the API server's ClusterIP to give, not an external IP
+	// (neither --address-cidr nor another Service's address applies); every entry kept in order
+	let p = with_opts(
+		"  addresses: [{value: 10.96.7.7, routability: Cluster}, {routability: Cluster}, {}, {routability: testing.x-k8s.io/sentinel}, {routability: example.com/Wan}]\n",
+		&Options::default(),
+	);
+	assert!(p.accepted());
+	assert!(p.addresses.is_empty() && p.address_error.is_none(), "{:?} {:?}", p.addresses, p.address_error);
+	let r: Vec<(&str, &str)> = p.address_requests.iter().map(|r| (r.value.as_str(), r.routability.as_str())).collect();
+	assert_eq!(r, [("10.96.7.7", "Cluster"), ("", "Cluster"), ("", ""), ("", "testing.x-k8s.io/sentinel"), ("", "example.com/Wan")]);
+	assert!(
+		p.address_requests[0].refused.as_deref().is_some_and(|e| e.contains("policy.clusterIPs")),
+		"a given ClusterIP is off by default"
+	);
+	assert!(p.address_requests[1].refused.is_none(), "any ClusterIP is allowed");
+	// the class allows a given ClusterIP (policy.clusterIPs, as the CRD names it)
+	let w = world(&format!(
+		"{}{}",
+		yaml_with("  addresses: [{value: 10.96.7.7, routability: Cluster}]\n"),
+		class_with("{policy: {clusterIPs: true}}")
+	));
+	let p = render_gateway(&w, &w.gateways[0], &allowed);
+	assert!(p.address_requests[0].refused.is_none(), "{:?}", p.address_requests);
+	let p = with("  addresses: [{value: 192.0.2.10}, {value: 10.96.7.7, routability: Cluster}]\n");
+	assert_eq!(p.addresses, ["192.0.2.10"]);
+	assert_eq!(p.address_requests.len(), 2);
 	let p = with("  addresses: [{type: test/fake-invalid-type, value: x}, {value: 192.0.2.10}]\n");
 	assert_eq!(cond(&p.conds, "Accepted").reason, "UnsupportedAddress");
 	assert!(!p.accepted());

@@ -164,6 +164,9 @@ pub struct GatewayAddress {
 	/// Empty: any address of the type (GatewayAddressEmpty).
 	#[serde(default)]
 	pub value: String,
+	/// Where the address is reachable from (GEP-5093, experimental): empty, `Cluster` or a prefixed value.
+	#[serde(default)]
+	pub routability: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -178,6 +181,11 @@ pub struct Listener {
 	pub tls: Option<ListenerTls>,
 	#[serde(default)]
 	pub allowed_routes: Option<AllowedRoutes>,
+	/// Pre-routing filters (GEP-5224, Gateway API v1.7 experimental): not supported (rproxy has
+	/// no middlewares before route matching yet, max3584/rproxy-api#386), so a listener with
+	/// `filters.requests` is not accepted rather than served without them.
+	#[serde(default)]
+	pub filters: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

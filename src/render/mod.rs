@@ -17,6 +17,7 @@ pub mod migrate;
 pub mod params;
 pub mod policy;
 pub mod proxy_protocol;
+pub mod routability;
 pub mod status;
 pub mod tenant;
 pub mod traefik_mw;
@@ -458,8 +459,11 @@ pub struct GatewayPlan {
 	pub notes: Vec<String>,
 	/// The (protocol, port) of listeners that can be served (Service ports).
 	pub listener_ports: BTreeSet<(rp::Protocol, u16)>,
-	/// `spec.addresses`: the IP addresses asked for (empty: whatever the Service gets).
+	/// `spec.addresses`: the IP addresses asked for with the default routability (the Service's
+	/// `externalIPs`; empty: whatever the Service gets).
 	pub addresses: Vec<String>,
+	/// `spec.addresses` (IP addresses), each with its routability (GEP-5093, `routability`).
+	pub address_requests: Vec<routability::Request>,
 	/// Why an address of `spec.addresses` cannot be used (`Programmed: False`, `AddressNotUsable`).
 	pub address_error: Option<String>,
 	/// The ListenerSets naming this Gateway (attached or not).
@@ -584,29 +588,48 @@ pub fn service_with(
 	None
 }
 
-/// `spec.addresses` → (the IPs asked for, why one cannot be used); `Err`: an
+/// `gateway_addresses`: (static IPs with the default routability, why one cannot be used, every entry).
+pub type GatewayAddresses = (Vec<String>, Option<String>, Vec<routability::Request>);
+
+/// The IP addresses of `spec.addresses` → (the static ones with the default routability (the
+/// Service's `externalIPs`), why one cannot be used, every entry with its routability); `Err`: an
 /// address type that is not supported (`Accepted: False`, `UnsupportedAddress`).
-pub fn gateway_addresses(gw: &Gateway) -> Result<(Vec<String>, Option<String>), String> {
+pub fn gateway_addresses(gw: &Gateway) -> Result<GatewayAddresses, String> {
 	let mut ips = vec![];
 	let mut unusable = None;
+	let mut requests = vec![];
 	for a in &gw.spec.addresses {
 		let kind = a.kind.as_deref().unwrap_or("IPAddress");
 		if kind != "IPAddress" {
 			return Err(format!("address type {kind} is not supported (IPAddress only)"));
 		}
+		let r = routability::Request { value: a.value.clone(), routability: a.routability.clone().unwrap_or_default(), refused: None };
 		if a.value.is_empty() {
 			// an address of this type, any value: the Service's
+			requests.push(r);
 			continue;
 		}
 		match a.value.parse::<std::net::IpAddr>() {
-			Ok(ip) if usable_ip(ip) => ips.push(ip.to_string()),
+			// a ClusterIP (Cluster) is the API server's to give: not an external IP
+			Ok(ip) if usable_ip(ip) && !r.routability.is_empty() => requests.push(routability::Request { value: ip.to_string(), ..r }),
+			Ok(ip) if usable_ip(ip) => {
+				ips.push(ip.to_string());
+				requests.push(routability::Request { value: ip.to_string(), ..r });
+			}
 			Ok(_) => {
-				unusable.get_or_insert(format!("{} cannot be used (unspecified, loopback, link-local or multicast)", a.value));
+				let why = format!("{} cannot be used (unspecified, loopback, link-local or multicast)", a.value);
+				if r.routability.is_empty() {
+					// a static address: the Gateway is not programmed (AddressNotUsable)
+					unusable.get_or_insert(why);
+					requests.push(r);
+				} else {
+					requests.push(routability::Request { refused: Some(why), ..r });
+				}
 			}
 			Err(_) => return Err(format!("{:?} is not an IP address", a.value)),
 		}
 	}
-	Ok((ips, unusable))
+	Ok((ips, unusable, requests))
 }
 
 impl GatewayPlan {
@@ -730,6 +753,10 @@ struct ListenerState<'a> {
 	/// rproxy's `tls.client_auth` for the listener's port (frontend validation).
 	client_auth: Option<Value>,
 	accepted: bool,
+	/// Not accepted only for its pre-routing filters (GEP-5224, not supported): its host name still
+	/// stays out of the port's other listeners (`exclusions`), so its traffic is not served by a
+	/// wildcard sibling without the filters (an ExternalAuth skipped).
+	filtered: bool,
 	/// Accepted but with nothing to serve with (no usable certificate): routes
 	/// attach, but no rule is made.
 	unservable: bool,
@@ -896,6 +923,7 @@ fn validate_listener<'a>(
 		certs: vec![],
 		client_auth: None,
 		accepted: true,
+		filtered: false,
 		unservable: false,
 		attached: 0,
 	};
@@ -939,6 +967,24 @@ fn validate_listener<'a>(
 	if !invalid_kinds.is_empty() {
 		resolved =
 			Cond::new("ResolvedRefs", false, "InvalidRouteKinds", format!("route kinds not supported: {}", invalid_kinds.join(", ")));
+	}
+	// listener filters run before route matching (GEP-5224); served without them, an ExternalAuth
+	// would be skipped: not accepted until rproxy can run them (max3584/rproxy-api#386)
+	if let Some(reqs) = l.filters.as_ref().and_then(|f| f.get("requests")).and_then(Value::as_array).filter(|r| !r.is_empty()) {
+		// GEP-5224: the message names the filters not supported
+		let named: Vec<String> = reqs
+			.iter()
+			.enumerate()
+			.map(|(i, f)| format!("filters.requests[{i}] ({})", f.get("type").and_then(Value::as_str).unwrap_or("?")))
+			.collect();
+		st.accepted = false;
+		st.filtered = true;
+		st.conds.push(Cond::new(
+			"Accepted",
+			false,
+			"UnsupportedValue",
+			format!("{}: listener filters are not supported (rproxy runs no filter before route matching)", named.join(", ")),
+		));
 	}
 	if family == Family::Https && tls_mode != "Terminate" {
 		st.accepted = false;
@@ -1183,7 +1229,9 @@ fn exclusions(listeners: &[ListenerState], i: usize) -> Vec<String> {
 	listeners
 		.iter()
 		.enumerate()
-		.filter(|(j, o)| *j != i && o.accepted && !o.unservable && o.port == listeners[i].port && o.family == listeners[i].family)
+		.filter(|(j, o)| {
+			*j != i && (o.accepted || o.filtered) && !o.unservable && o.port == listeners[i].port && o.family == listeners[i].family
+		})
 		.filter_map(|(_, o)| o.l.hostname.clone())
 		.filter(|h| match me {
 			None => true,
@@ -1809,8 +1857,17 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 			.collect();
 		plan.conds.push(proxy_protocol::apply(&mut plan.rules, &own, &pp, opts.features.proxy_protocol_in));
 	}
-	if let Ok((ips, unusable)) = addresses {
+	if let Ok((ips, unusable, mut requests)) = addresses {
+		// a given ClusterIP: a Service with that clusterIP in the Gateway's namespace, only where the class allows it
+		let cluster_ips = params::class_policy(world, gw, &opts.params).is_some_and(|p| p.cluster_ips == Some(true));
+		for r in requests.iter_mut().filter(|r| !r.routability.is_empty() && !r.value.is_empty() && r.refused.is_none()) {
+			if !cluster_ips {
+				r.refused =
+					Some("a given ClusterIP is off for this GatewayClass (its parameters' policy.clusterIPs: true allows it)".into());
+			}
+		}
 		plan.addresses = ips;
+		plan.address_requests = requests;
 		plan.address_error = unusable;
 		if plan.address_error.is_none() {
 			plan.address_error = address_policy(world, gw, &plan.addresses, opts);

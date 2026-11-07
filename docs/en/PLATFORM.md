@@ -447,6 +447,23 @@ spec:
 - Failover is the Service's endpoints (kube-proxy, the CNI); replaced pods leave through the readiness gate and `/readyz`.
 - To send in-cluster clients' traffic through rproxy (keeping the original Service name), see "[Sending in-cluster (east-west) traffic through rproxy](#sending-in-cluster-east-west-traffic-through-rproxy)" next.
 
+### Gateway API `routability: Cluster` (v0.4.22, GEP-5093)
+
+An entry of a Gateway's `spec.addresses` with `routability: Cluster` (Gateway API v1.7 experimental CRDs) makes rproxy-gateway create a ClusterIP Service **in the Gateway's namespace** for that entry (`rproxy-<id>-n<place>`, or `rproxy-<id>-<8 hex digits of the value's hash>` with a value; label `rproxy.max3584.net/address: "true"`) selecting the rproxy pods. `status.addresses` reports that ClusterIP with `routability: Cluster`.
+
+```yaml
+spec:
+  addresses:
+    - {type: IPAddress}                       # the default (the Service's external address, the ClusterIP for a ClusterIP Service)
+    - {type: IPAddress, routability: Cluster} # a ClusterIP Service of its own
+```
+
+- When every entry is `Cluster` (none of the default routability), the Gateway's own Service is `ClusterIP` too, not `LoadBalancer` (nothing exposed outside the cluster).
+- A valueless entry's Service is named by its place, so reordering `spec.addresses` makes it again with another ClusterIP. When moving to mixed routabilities (adding a `Cluster` entry to default ones, say), add the new entries at the end (the earlier entries keep their places).
+- **A `Cluster` entry with a value (a given ClusterIP) is off by default.** With a value a tenant could take any free ClusterIP through the controller's permissions (even one the platform means to hand out elsewhere). Classes that allow it set `policy.clusterIPs: true` in the GatewayClass's parameters; elsewhere such an entry is not assigned (`AddressesAssigned: False`). The API server refuses a value outside the ServiceCIDR or already taken.
+- The fleet has no ClusterIP per Gateway: `Cluster` entries are not assigned there (and `GatewayAddressRoutabilityCluster` is not claimed).
+
+
 ## Sending in-cluster (east-west) traffic through rproxy
 
 To give in-cluster clients (other pods) rproxy's features too (rate limits, GeoIP, CrowdSec, TLS termination, L7 routing, access logs), create a ClusterIP Gateway as above and route to the real backend Service. Clients call the name of the Gateway's Service. The e2e test (the "east-west" step of `scripts/e2e.sh`) checks this setup (HTTPRoute, TCPRoute, both ways of naming below) from a pod inside the cluster.
