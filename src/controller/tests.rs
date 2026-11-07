@@ -30,6 +30,8 @@ struct Fake {
 	control_limits: bool,
 	/// `features.http_stream_limits` (rproxy v0.4.20)
 	http_stream_limits: bool,
+	/// `features.http_options` `pre_routing` (rproxy v0.4.22)
+	pre_routing: bool,
 	/// Tokens that may read (`GET /rules`): the UI's
 	readers: BTreeSet<String>,
 	/// HTTP routes whose match has `BAD` are refused without naming them (else by name)
@@ -80,9 +82,11 @@ async fn handle(fake: Arc<Mutex<Fake>>, req: Request<hyper::body::Incoming>) -> 
 		}
 		("GET", "/capabilities") => {
 			let (graceful, reload, limits, streams) = (f.graceful, f.tokens_reload, f.control_limits, f.http_stream_limits);
+			let (options, kinds) =
+				if f.pre_routing { (json!(["pre_routing"]), json!(["headers", "forward_auth"])) } else { (json!([]), json!([])) };
 			reply(
 				200,
-				json!({"version": "0.4.0", "features": {"rulesets": true, "labels": true, "conditions": true, "readyz": true, "graceful_shutdown": graceful, "tokens_reload": reload, "control_limits": limits, "http_stream_limits": streams}}),
+				json!({"version": "0.4.0", "features": {"rulesets": true, "labels": true, "conditions": true, "readyz": true, "graceful_shutdown": graceful, "tokens_reload": reload, "control_limits": limits, "http_stream_limits": streams, "http_options": options, "pre_routing_kinds": kinds}}),
 			)
 		}
 		("GET", p) if p.starts_with("/rulesets/") => {
@@ -935,7 +939,7 @@ fn supported_features_match_the_conformance_script() {
 	let mut script_features: Vec<&str> = list.split(',').collect();
 	// the conformance job runs the managed mode, on a cluster that serves ClusterTrustBundles (Kubernetes 1.37: v1)
 	let served = crate::render::world::World { cluster_trust_bundles: Some(Default::default()), ..Default::default() };
-	let mut ours: Vec<&str> = super::supported_features(&super::Mode::Managed(Default::default()), &served);
+	let mut ours: Vec<&str> = super::supported_features(&super::Mode::Managed(Default::default()), &served, true);
 	script_features.sort();
 	ours.sort();
 	assert_eq!(script_features, ours, "SUPPORTED_FEATURES and scripts/conformance.sh FEATURES differ");
@@ -946,20 +950,160 @@ fn supported_features_match_the_conformance_script() {
 fn cluster_trust_bundle_claimed_only_when_served() {
 	let managed = super::Mode::Managed(Default::default());
 	let mut w = crate::render::world::World::default();
-	assert!(!super::supported_features(&managed, &w).contains(&"ClusterTrustBundle"));
+	assert!(!super::supported_features(&managed, &w, false).contains(&"ClusterTrustBundle"));
 	w.cluster_trust_bundles = Some(Default::default());
-	assert!(super::supported_features(&managed, &w).contains(&"ClusterTrustBundle"));
+	assert!(super::supported_features(&managed, &w, false).contains(&"ClusterTrustBundle"));
 }
 
 /// `GatewayAddressRoutabilityCluster` only in managed mode; `GatewayAddressRoutability` in both (GEP-5093).
 #[test]
 fn cluster_routability_claimed_only_when_managed() {
 	let w = crate::render::world::World::default();
-	let managed = super::supported_features(&super::Mode::Managed(Default::default()), &w);
+	let managed = super::supported_features(&super::Mode::Managed(Default::default()), &w, false);
 	assert!(managed.contains(&"GatewayAddressRoutabilityCluster") && managed.contains(&"GatewayAddressRoutability"));
 	let fleet = super::supported_features(
 		&super::Mode::Fleet(crate::controller::provision::Fleet { selector: String::new(), addresses: vec![], listen_on_addresses: false }),
 		&w,
+		false,
 	);
 	assert!(!fleet.contains(&"GatewayAddressRoutabilityCluster") && fleet.contains(&"GatewayAddressRoutability"));
+}
+
+/// `GatewayListenerFilters` only when the rproxy runs listener filters (rproxy v0.4.22, `http.pre_routing`).
+#[test]
+fn listener_filters_claimed_only_when_rproxy_runs_them() {
+	let w = crate::render::world::World::default();
+	let managed = super::Mode::Managed(Default::default());
+	assert!(!super::supported_features(&managed, &w, false).contains(&"GatewayListenerFilters"));
+	assert!(super::supported_features(&managed, &w, true).contains(&"GatewayListenerFilters"));
+	assert!(!super::SUPPORTED_FEATURES.contains(&"GatewayListenerFilters"));
+}
+
+/// Listener filters while not every pod has answered (a scale-up, a restart, a rollout to another image):
+/// kept where they are already in force; refused (`Lacking`) once a pod answers without `pre_routing` or
+/// the target is the bundled image without it; else waiting (`Unknown`).
+#[tokio::test]
+async fn listener_filters_are_kept_while_a_new_pod_is_not_known() {
+	use crate::render::PreRouting;
+	let with = Arc::new(Mutex::new(Fake { pre_routing: true, ..Default::default() }));
+	let with_port = start(with.clone()).await;
+	let without = Arc::new(Mutex::new(Fake::default()));
+	let without_port = start(without.clone()).await;
+	let rp = Client::new(None, "secret").unwrap();
+	let image = "example/rproxy:pre-routing";
+	let next = "example/rproxy:pre-routing-next";
+	let ep = |uid: &str, image: &str, port: u16| Endpoint {
+		pod: format!("rproxy-{uid}"),
+		uid: uid.into(),
+		ip: "127.0.0.1".into(),
+		api_port: port,
+		rproxy_image: Some(image.into()),
+		..Default::default()
+	};
+	let pod = |e: &Endpoint| (e.caps_key(), e.rproxy_image.clone());
+	let set = "k8s/default/gw";
+	let rule = |pre: &[&str]| json!({"protocol": "tcp", "listen_addr": "0.0.0.0", "listen_port": 8080, "http": {"routes": [], "pre_routing": pre}});
+	with.lock().unwrap().sets.insert(set.into(), (1, "e1".into(), vec![rule(&["listener:f0"])]));
+	let kept = || PreRouting::Known { kinds: vec!["headers".into(), "forward_auth".into()], ports: Some([8080].into()) };
+	let a = ep("k-a", image, with_port);
+	// a new pod (no IP yet, so not an endpoint; Pending: its spec's image)
+	let new = ep("k-new", image, 1);
+	let mut caps = HashMap::new();
+	// every pod: known, not kept
+	let all = pre_routing_state(&rp, std::slice::from_ref(&a), &[pod(&a)], Some(image), set, &mut caps).await;
+	assert_eq!(all, PreRouting::Known { kinds: vec!["headers".into(), "forward_auth".into()], ports: None });
+	// a scale-up: the new pod not answering yet, kept on the port in force
+	let pods = [pod(&a), pod(&new)];
+	assert_eq!(pre_routing_state(&rp, std::slice::from_ref(&a), &pods, Some(image), set, &mut caps).await, kept());
+	// the fleet (no image to compare)
+	assert_eq!(pre_routing_state(&rp, std::slice::from_ref(&a), &pods, None, set, &mut caps).await, kept());
+	// a rollout to another image: the old pod answered with it, the new one runs the target, which is
+	// remembered (a Gateway's pods answered for it before) or the bundled image with it
+	let rolled = ep("k-rolled", next, 1);
+	let rollout = [pod(&a), pod(&rolled)];
+	assert_eq!(pre_routing_state(&rp, std::slice::from_ref(&a), &rollout, Some(next), set, &mut caps).await, PreRouting::Unknown);
+	FEATURE_IMAGES.lock().unwrap().insert((crate::render::listener_filters::FEATURE.into(), next.into()));
+	assert_eq!(pre_routing_state(&rp, std::slice::from_ref(&a), &rollout, Some(next), set, &mut caps).await, kept());
+	// ... but not when a pod not known runs another image than the target, or an old pod has not answered
+	let stray = ep("k-stray", "example/rproxy:stray", 1);
+	let mixed = [pod(&a), pod(&rolled), pod(&stray)];
+	assert_eq!(pre_routing_state(&rp, std::slice::from_ref(&a), &mixed, Some(next), set, &mut caps).await, PreRouting::Unknown);
+	let old_unknown = [pod(&ep("k-old", image, 1)), pod(&rolled)];
+	assert_eq!(pre_routing_state(&rp, &[], &old_unknown, Some(next), set, &mut caps).await, PreRouting::Unknown);
+	// a pod that answered without pre_routing: refused at once (lacking)
+	let b = ep("k-b", image, without_port);
+	let with_b = [pod(&a), pod(&b), pod(&new)];
+	assert_eq!(
+		pre_routing_state(&rp, &[a.clone(), b.clone()], &with_b, Some(image), set, &mut caps).await,
+		PreRouting::Lacking { place: true }
+	);
+	// the bundled image without it (rproxy v0.4.21): lacking and not placed, also with no pod yet
+	assert_eq!(pre_routing_state(&rp, &[], &[], Some(provision::RPROXY_IMAGE), set, &mut caps).await, PreRouting::Lacking { place: false });
+	// another image with no pod yet: not known
+	assert_eq!(pre_routing_state(&rp, &[], &[], Some("example/rproxy:unknown"), set, &mut caps).await, PreRouting::Unknown);
+	// nothing in force (no pre_routing in the set, or no set): not started on a pod not known
+	with.lock().unwrap().sets.insert(set.into(), (2, "e2".into(), vec![rule(&[])]));
+	assert_eq!(pre_routing_state(&rp, std::slice::from_ref(&a), &pods, Some(image), set, &mut caps).await, PreRouting::Unknown);
+	with.lock().unwrap().sets.clear();
+	assert_eq!(pre_routing_state(&rp, std::slice::from_ref(&a), &pods, Some(image), set, &mut caps).await, PreRouting::Unknown);
+	// no pod answered at all: not kept
+	assert_eq!(pre_routing_state(&rp, &[], &[pod(&new)], Some(image), set, &mut caps).await, PreRouting::Unknown);
+}
+
+/// A managed Gateway whose listeners all have filters, on an image of another name that lacks
+/// `pre_routing` (an older custom build, the bundled image mirrored elsewhere): unknown, so placed; its
+/// pod answers without it, lacking, and the Gateway stays placed (no loop of removing and placing it
+/// again, its load balancer with it).
+#[tokio::test]
+async fn a_gateway_on_an_image_lacking_listener_filters_stays_placed() {
+	use crate::render::PreRouting;
+	let old = Arc::new(Mutex::new(Fake::default()));
+	let port = start(old.clone()).await;
+	let rp = Client::new(None, "secret").unwrap();
+	let image = "registry.example.com/mirror/rproxy:0.4.21";
+	let yaml = r#"
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyMiddleware
+metadata: {name: tag, namespace: default}
+spec: {headers: {request: {set: {x-tag: one}}}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {name: gw, namespace: default}
+spec:
+  gatewayClassName: rproxy
+  listeners:
+    - name: f
+      port: 8080
+      protocol: HTTP
+      filters: {requests: [{type: ExtensionRef, extensionRef: {group: rproxy.max3584.net, kind: RproxyMiddleware, name: tag}}]}
+"#;
+	let mut world = crate::render::world::World::default();
+	world.read_manifests(yaml).unwrap();
+	let render = |pre_routing: PreRouting| {
+		crate::render::render_gateway(&world, &world.gateways[0], &render::Options { pre_routing, ..Default::default() })
+	};
+	let set = "k8s/default/gw";
+	let mut caps = HashMap::new();
+	// no pod yet: unknown, placed (accepted, the port on the Service: the Deployment and Service are kept)
+	let none = pre_routing_state(&rp, &[], &[], Some(image), set, &mut caps).await;
+	assert_eq!(none, PreRouting::Unknown);
+	let plan = render(none);
+	assert!(plan.accepted() && !plan.ports().is_empty(), "{:?}", plan.conds);
+	// its pod answers without pre_routing: lacking, refused with that message, and still placed
+	let ep = Endpoint {
+		pod: "rproxy-a".into(),
+		uid: "u-a".into(),
+		ip: "127.0.0.1".into(),
+		api_port: port,
+		rproxy_image: Some(image.into()),
+		..Default::default()
+	};
+	let lacking =
+		pre_routing_state(&rp, std::slice::from_ref(&ep), &[(ep.caps_key(), Some(image.into()))], Some(image), set, &mut caps).await;
+	assert_eq!(lacking, PreRouting::Lacking { place: true });
+	let plan = render(lacking);
+	let l = plan.listeners[0].conds.iter().find(|c| c.kind == "Accepted").unwrap();
+	assert!(!l.status && l.message.contains("lacks it"), "{l:?}");
+	assert!(plan.accepted() && !plan.ports().is_empty() && plan.rules.is_empty(), "{:?}", plan.conds);
 }

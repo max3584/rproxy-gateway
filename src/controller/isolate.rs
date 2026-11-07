@@ -156,7 +156,9 @@ pub fn without(rule: &Value, owners: &BTreeSet<String>) -> Value {
 	let gone = |r: &&Value| r["name"].as_str().and_then(owner).is_some_and(|o| owners.contains(&o));
 	let (dropped, kept): (Vec<&Value>, Vec<&Value>) = list.iter().partition(gone);
 	let http = &rule["http"];
-	let still = used(http, kept.iter().copied().chain(http.get("default")));
+	// the listeners' filters (`pre_routing`) are never left out with a route
+	let pre = serde_json::json!({"middlewares": http.get("pre_routing").cloned().unwrap_or_default()});
+	let still = used(http, kept.iter().copied().chain(http.get("default")).chain(std::iter::once(&pre)));
 	let unused: Used = used(http, dropped.into_iter()).difference(&still).cloned().collect();
 	out["http"]["routes"] = Value::Array(kept.into_iter().cloned().collect());
 	for part in ["services", "middlewares"] {

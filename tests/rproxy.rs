@@ -1292,3 +1292,133 @@ spec:
 	drop(rp);
 	let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Listener filters (GEP-5224) as rproxy's `http.pre_routing` (rproxy v0.4.22): an ExternalAuth that
+/// refuses before any route is chosen (also for a path no route has), then an RproxyMiddleware whose
+/// header the route matches on, in the listener's order. Skipped on an rproxy without
+/// `http_options.pre_routing`, where the listener is not accepted and nothing is served.
+#[tokio::test]
+async fn listener_filters_on_a_real_rproxy() {
+	let Some(bin) = rproxy_bin() else { return };
+	let _ = rustls::crypto::ring::default_provider().install_default();
+	let dir = std::env::temp_dir().join(format!("rproxy-gateway-listener-filters-{}", std::process::id()));
+	let _ = std::fs::remove_dir_all(&dir);
+	std::fs::create_dir_all(&dir).unwrap();
+	let backend = echo_backend().await;
+	let auth = auth_backend().await;
+	let [port, api] = free_ports();
+	let rp = Rproxy::start(&bin, &dir, api);
+	rp.wait().await;
+	let client = Client::new(None, TOKEN).unwrap();
+	let caps = client.capabilities(SocketAddr::from(([127, 0, 0, 1], api))).await.unwrap();
+	let yaml = format!(
+		r#"
+apiVersion: v1
+kind: Service
+metadata: {{name: echo, namespace: default}}
+spec: {{ports: [{{name: http, port: 80}}]}}
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata: {{name: echo-1, namespace: default, labels: {{kubernetes.io/service-name: echo}}}}
+addressType: IPv4
+ports: [{{name: http, port: {backend}}}]
+endpoints: [{{addresses: [127.0.0.1]}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {{name: authz, namespace: default}}
+spec: {{ports: [{{name: http, port: 80}}]}}
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata: {{name: authz-1, namespace: default, labels: {{kubernetes.io/service-name: authz}}}}
+addressType: IPv4
+ports: [{{name: http, port: {auth}}}]
+endpoints: [{{addresses: [127.0.0.1]}}]
+---
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyMiddleware
+metadata: {{name: tag, namespace: default}}
+spec: {{headers: {{request: {{set: {{x-test: tagged}}}}}}}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {{name: gw, namespace: default, generation: 1}}
+spec:
+  gatewayClassName: rproxy
+  listeners:
+    - name: http
+      port: {port}
+      protocol: HTTP
+      filters:
+        requests:
+          - type: ExternalAuth
+            externalAuth: {{protocol: HTTP, backendRef: {{name: authz, port: 80}}, http: {{path: /check}}}}
+          - type: ExtensionRef
+            extensionRef: {{group: rproxy.max3584.net, kind: RproxyMiddleware, name: tag}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {{name: tagged, namespace: default}}
+spec:
+  parentRefs: [{{name: gw}}]
+  rules:
+    - matches: [{{path: {{type: PathPrefix, value: /x}}, headers: [{{name: x-test, value: tagged}}]}}]
+      backendRefs: [{{name: echo, port: 80}}]
+"#
+	);
+	let mut world = World::default();
+	world.read_manifests(&yaml).unwrap();
+	let kinds = caps.names("pre_routing_kinds");
+	let pre_routing = if caps.has(render::listener_filters::FEATURE) {
+		render::PreRouting::Known { kinds, ports: None }
+	} else {
+		render::PreRouting::Lacking { place: true }
+	};
+	let opts = render::Options {
+		listen_addrs: vec!["127.0.0.1".into()],
+		features: render::Features::of(&caps),
+		pre_routing: pre_routing.clone(),
+		..Default::default()
+	};
+	let plan = render::render_gateway(&world, &world.gateways[0], &opts);
+	let accepted = plan.listeners[0].conds.iter().any(|c| c.kind == "Accepted" && c.status);
+	if pre_routing != (render::PreRouting::Known { kinds: caps.names("pre_routing_kinds"), ports: None }) {
+		// never served without its filters (the Gateway stays placed: its pod answered)
+		assert!(!accepted && plan.rules.is_empty() && plan.accepted(), "{:?}", plan.listeners[0].conds);
+		eprintln!("rproxy {} has no http_options pre_routing (v0.4.22); skipped", caps.version);
+		drop(rp);
+		let _ = std::fs::remove_dir_all(&dir);
+		return;
+	}
+	assert!(accepted, "{:?}", plan.listeners[0].conds);
+	let ep = Endpoint { pod: "rproxy".into(), uid: "1".into(), ip: "127.0.0.1".into(), api_port: api, ..Default::default() };
+	let mut applied = Applied::new();
+	let mut caps_cache = HashMap::new();
+	let (r, _) = sync_pod(&client, &ep, &plan, &mut applied, &mut caps_cache).await;
+	let PodSync::Synced(views, excluded) = &r else { panic!("{r:?}\nrules: {}", serde_json::to_string(&plan.rules_json()).unwrap()) };
+	assert!(views.iter().all(|v| v.state == "running") && excluded.is_empty(), "{views:?} {excluded:?}");
+	// what the controller reads to keep the filters while a new pod is not known (`kept_pre_routing`)
+	let set = client.get_ruleset(SocketAddr::from(([127, 0, 0, 1], api)), &plan.ruleset).await.unwrap().unwrap();
+	assert!(
+		set.rules.iter().any(|r| r.http.as_ref().is_some_and(|h| h["pre_routing"] == serde_json::json!(["listener:f0", "listener:f1"]))),
+		"{:?}",
+		set.rules
+	);
+	// refused before routing: for a route's path and for a path no route has (not 404)
+	let (status, body) = get(port, "any.example.com", "/x").await;
+	assert_eq!(status, 403, "{body}");
+	let (status, body) = get(port, "any.example.com", "/nothing-here").await;
+	assert_eq!(status, 403, "{body}");
+	// allowed: the auth server's x-test is copied in, then the RproxyMiddleware sets it (the listener's
+	// order), and the route matches the header the filters left
+	let (status, body) = get_with(port, "any.example.com", "/x", "Authorization: allow\r\n").await;
+	assert_eq!(status, 200, "{body}");
+	assert!(body.ends_with("/x|any.example.com|tagged"), "{body}");
+	// allowed, no route: 404 after the filters
+	let (status, body) = get_with(port, "any.example.com", "/nothing-here", "Authorization: allow\r\n").await;
+	assert_eq!(status, 404, "{body}");
+	drop(rp);
+	let _ = std::fs::remove_dir_all(&dir);
+}

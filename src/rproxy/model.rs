@@ -169,6 +169,11 @@ pub struct Http {
 	pub services: BTreeMap<String, Service>,
 	#[serde(skip_serializing_if = "BTreeMap::is_empty")]
 	pub middlewares: BTreeMap<String, Value>,
+	/// Middlewares (names in `middlewares`) every request of the rule goes through, in this order,
+	/// before a route is chosen (`features.http_options` `pre_routing`, rproxy v0.4.22): a Gateway
+	/// listener's `filters.requests` (GEP-5224).
+	#[serde(skip_serializing_if = "Vec::is_empty")]
+	pub pre_routing: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -265,6 +270,9 @@ pub struct RuleView {
 	pub error: Option<String>,
 	#[serde(default)]
 	pub conditions: Vec<RuleCondition>,
+	/// The rule's `http` as rproxy has it (`http.pre_routing`: listener filters in force).
+	#[serde(default)]
+	pub http: Option<Value>,
 }
 
 impl RuleView {
@@ -350,6 +358,20 @@ impl Capabilities {
 	/// A name in a list-shaped feature (`middlewares`, `services`).
 	pub fn lists(&self, feature: &str, name: &str) -> bool {
 		self.features.get(feature).and_then(Value::as_array).is_some_and(|a| a.iter().any(|v| v.as_str() == Some(name)))
+	}
+
+	/// `feature` (a `true` one), or `<list>.<name>` for a name in a list-shaped feature
+	/// (`http_options.pre_routing`).
+	pub fn has(&self, feature: &str) -> bool {
+		match feature.split_once('.') {
+			Some((list, name)) => self.lists(list, name),
+			None => self.feature(feature),
+		}
+	}
+
+	/// The names of a list-shaped feature (`pre_routing_kinds`).
+	pub fn names(&self, feature: &str) -> Vec<String> {
+		self.features.get(feature).and_then(Value::as_array).into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect()
 	}
 }
 
