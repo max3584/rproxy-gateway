@@ -27,7 +27,7 @@ use kube::api::{Api, DynamicObject, Patch, PatchParams};
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
-use crate::render::{self, GatewayPlan, RouteKind};
+use crate::render::{self, GatewayPlan, RouteKind, routability};
 use crate::rproxy::client::{ApiError, Client, server_name_for};
 use crate::rproxy::model::{Capabilities, RuleView};
 use provision::{Endpoint, Mode};
@@ -59,6 +59,7 @@ pub const SUPPORTED_FEATURES: &[&str] = &[
 	"HTTPRouteBackendProtocolWebSocket",
 	"HTTPRouteBackendTimeout",
 	"GatewayStaticAddresses",
+	"GatewayAddressRoutability",
 	"GatewayAddressEmpty",
 	"GatewayInfrastructure",
 	"HTTPRoute303RedirectStatusCode",
@@ -92,6 +93,19 @@ pub const SUPPORTED_FEATURES: &[&str] = &[
 	"HTTPRouteExternalAuthGRPC",
 	"HTTPRouteExternalAuthForwardBody",
 ];
+
+/// Features claimed only in managed mode: a `Cluster` address is a Gateway's own ClusterIP Service,
+/// which the fleet does not have (GEP-5093).
+pub const MANAGED_FEATURES: &[&str] = &["GatewayAddressRoutabilityCluster"];
+
+/// The features the GatewayClasses of this controller claim (`supportedFeatures`).
+pub fn supported_features(mode: &Mode) -> Vec<&'static str> {
+	let mut out = SUPPORTED_FEATURES.to_vec();
+	if matches!(mode, Mode::Managed(_)) {
+		out.extend(MANAGED_FEATURES);
+	}
+	out
+}
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -441,8 +455,13 @@ async fn reconcile_all(
 			let name = c.metadata.name.clone().unwrap_or_default();
 			let previous = api.get_status(&name).await.ok().and_then(|o| o.data.get("status").cloned());
 			let invalid = render::params::class_parameters(&world, c, &params_opts).err();
-			let st =
-				status::class_status(c.metadata.generation.unwrap_or(0), SUPPORTED_FEATURES, invalid.as_deref(), previous.as_ref(), &now);
+			let st = status::class_status(
+				c.metadata.generation.unwrap_or(0),
+				&supported_features(&cfg.mode),
+				invalid.as_deref(),
+				previous.as_ref(),
+				&now,
+			);
 			let old = status::without_features(&st);
 			if previous.as_ref() != Some(&st) && previous.as_ref() != Some(&old) {
 				match patch_status(&api, &name, st).await {
@@ -840,7 +859,7 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 	}
 	// the parameters' rproxy.http (managed: the Gateway's condition)
 	let mut http_cond = None;
-	let (addresses, endpoints) = match &p.cfg.mode {
+	let (src, endpoints) = match &p.cfg.mode {
 		Mode::Managed(_) if plan.kept.is_some() => {
 			keep_id = Some(id.clone());
 			keep_pdb = true;
@@ -870,15 +889,17 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 					soon = true;
 				}
 			}
-			let addresses = match p.world.services.get(&svc_key) {
-				Some(_) if !plan.addresses.is_empty() => plan.addresses.iter().map(|a| ("IPAddress".to_string(), a.clone())).collect(),
-				Some(s) => provision::service_addresses(s),
-				None => vec![],
+			let svc = p.world.services.get(&svc_key);
+			let src = routability::Sources {
+				default: svc.map(provision::service_addresses).unwrap_or_default(),
+				statics: statics(svc.is_some(), &plan),
+				dedicated: existing_address_services(p.world, &plan),
+				no_dedicated: None,
 			};
-			(addresses, eps)
+			(Some(src), eps)
 		}
 		// not accepted (an unsupported address type, invalid parameters): nothing is deployed
-		_ if !plan.accepted() => (vec![], vec![]),
+		_ if !plan.accepted() => (None, vec![]),
 		Mode::Managed(m) => {
 			keep_id = Some(id.clone());
 			let absent = &mut sub.absent;
@@ -919,6 +940,8 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 			}
 			let current_api = p.world.secrets.get(&(plan.namespace.clone(), provision::api_secret_name(&id)));
 			let applied = provision::apply_managed(p.client, &t, m, p.boot, current_api, absent).await;
+			// not written this pass: what there is
+			let mut dedicated = existing_address_services(p.world, &plan);
 			let svc = match applied {
 				Ok(a) => {
 					provision::touch_pods(p.client, &eps, &a.certs).await;
@@ -930,6 +953,7 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 						ui_group = ui::managed_group(&plan.namespace, &plan.name, &id, &p.boot.token, &pods);
 					}
 					keep_pdb = a.pdb;
+					dedicated = a.dedicated;
 					a.service
 				}
 				Err(e) => {
@@ -964,15 +988,14 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 				plan.serving_pending = Some("waiting for the rproxy Service's endpoints to be ready on the nodes".into());
 				soon = true;
 			}
-			let addresses = match svc.as_ref() {
-				// the addresses asked for, once the Service has them
-				Some(_) if !plan.addresses.is_empty() && plan.address_error.is_none() => {
-					plan.addresses.iter().map(|a| ("IPAddress".to_string(), a.clone())).collect()
-				}
-				Some(s) => provision::service_addresses(s),
-				None => vec![],
+			// the static addresses asked for, once the Service has them
+			let src = routability::Sources {
+				default: svc.as_ref().map(provision::service_addresses).unwrap_or_default(),
+				statics: statics(svc.is_some(), &plan),
+				dedicated,
+				no_dedicated: None,
 			};
-			(addresses, eps)
+			(Some(src), eps)
 		}
 		Mode::Fleet(f) => {
 			let eps = p.fleet_pods.to_vec();
@@ -996,17 +1019,25 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 				}
 				plan.addresses.clone()
 			};
-			(
-				addrs
-					.into_iter()
-					.map(|a| (if a.parse::<std::net::IpAddr>().is_ok() { "IPAddress" } else { "Hostname" }.to_string(), a))
-					.collect(),
-				eps,
-			)
+			let kind = |a: &str| if a.parse::<std::net::IpAddr>().is_ok() { "IPAddress" } else { "Hostname" };
+			let src = routability::Sources {
+				default: addrs.iter().map(|a| routability::StatusAddress::new(kind(a), a, "")).collect(),
+				statics: statics(true, &plan),
+				dedicated: BTreeMap::new(),
+				no_dedicated: Some("the rproxy fleet has no ClusterIP of a Gateway's own".into()),
+			};
+			(Some(src), eps)
+		}
+	};
+	// status.addresses, one for each spec.addresses entry (GEP-5093), and AddressesAssigned
+	let (addresses, assigned) = match &src {
+		None => (vec![], None),
+		Some(src) => {
+			let (a, c) = routability::assign(&plan.address_requests, src);
+			(a, Some(c))
 		}
 	};
 	plan.conds.extend(http_cond);
-	let addresses = if plan.address_error.is_some() { vec![] } else { addresses };
 	// the pods side by side (each with its own part of what was applied)
 	let jobs = endpoints.iter().map(|ep| {
 		let mut applied: Applied = sub.applied.iter().filter(|((uid, _), _)| *uid == ep.uid).map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -1035,18 +1066,41 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 		set_gates(p.client, p.pods_now, &done).await;
 	}
 	if let Some(api) = dyn_api(p.client, p.cache, "Gateway", Some(&plan.namespace)) {
-		let st = status::gateway_status(&plan, &addresses, &results, gw.status.as_ref(), p.now);
+		let st = status::gateway_status(&plan, &addresses, assigned, &results, gw.status.as_ref(), p.now);
 		for set in &plan.listener_sets {
 			write_listener_set_status(p.client, p.cache, p.world, set, &results, p.now).await;
 		}
-		if gw.status.as_ref() != Some(&st) {
+		// CRDs without routability (before Gateway API v1.7, or the standard channel) drop it: as written
+		if gw.status.as_ref() != Some(&st) && gw.status.as_ref() != Some(&status::without_routability(&st)) {
 			if let Err(e) = patch_status(&api, &plan.name, st).await {
 				warn!(gateway = %plan.ruleset, error = %e, "cannot write Gateway status");
 			}
 		}
 	}
 
+	let addresses = addresses.into_iter().map(|a| (a.kind, a.value)).collect();
 	GatewayOut { plan, results, pod_done, addresses, keep_id, keep_pdb, soon, sub, ui_group }
+}
+
+/// Whether the static addresses (default routability, with a value) are in place: the Service is
+/// there and none of them is refused (`AddressNotUsable`; the other entries are still assigned).
+fn statics(have_service: bool, plan: &GatewayPlan) -> Result<(), String> {
+	match &plan.address_error {
+		Some(e) => Err(e.clone()),
+		None if !have_service => Err("waiting for the rproxy Service".into()),
+		None => Ok(()),
+	}
+}
+
+/// The ClusterIPs of the Services of the dedicated `spec.addresses` entries there are now.
+fn existing_address_services(world: &render::world::World, plan: &GatewayPlan) -> BTreeMap<usize, Result<String, String>> {
+	provision::dedicated_services(plan)
+		.into_iter()
+		.filter_map(|(i, name, _)| {
+			let ip = world.services.get(&(plan.namespace.clone(), name))?.spec.as_ref()?.cluster_ip.clone()?;
+			Some((i, Ok(ip)))
+		})
+		.collect()
 }
 
 /// Whether the Gateway is not accepted only because of its parameters (it may keep its last good rproxy).
@@ -1140,7 +1194,7 @@ fn fleet_freebind(eps: &[Endpoint], caps: &HashMap<String, Capabilities>) -> boo
 /// `--address-cidr` (IPv4 first: the first is `listen_addr`, the rest `extra_listen_addrs`); `None`: the
 /// wildcard (no addresses, or one the render refuses: `AddressNotUsable`).
 fn listen_addresses(gw: &crate::k8s::gateway::Gateway, cidrs: &[render::Cidr]) -> Option<Vec<String>> {
-	let (mut ips, unusable) = render::gateway_addresses(gw).ok()?;
+	let (mut ips, unusable, _) = render::gateway_addresses(gw).ok()?;
 	if ips.is_empty() || unusable.is_some() {
 		return None;
 	}

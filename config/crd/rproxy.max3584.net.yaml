@@ -558,6 +558,14 @@ spec:
                       type: string
                     nullable: true
                     type: array
+                  clusterIPs:
+                    description: |-
+                      Whether the class's Gateways may ask for a given ClusterIP (`spec.addresses` with `routability: Cluster`
+                      and a `value`, GEP-5093; default false). The controller makes a Service with that `clusterIP` in the
+                      Gateway's namespace: with it a tenant can take any free ClusterIP, which the platform may hand out
+                      elsewhere. A `Cluster` entry without a value (any ClusterIP) is always allowed.
+                    nullable: true
+                    type: boolean
                   gatewayOverrides:
                     description: |-
                       The fields a Gateway's parameters may set (default: replicas, podDisruptionBudget,
@@ -997,6 +1005,14 @@ spec:
                       type: string
                     nullable: true
                     type: array
+                  clusterIPs:
+                    description: |-
+                      Whether the class's Gateways may ask for a given ClusterIP (`spec.addresses` with `routability: Cluster`
+                      and a `value`, GEP-5093; default false). The controller makes a Service with that `clusterIP` in the
+                      Gateway's namespace: with it a tenant can take any free ClusterIP, which the platform may hand out
+                      elsewhere. A `Cluster` entry without a value (any ClusterIP) is always allowed.
+                    nullable: true
+                    type: boolean
                   gatewayOverrides:
                     description: |-
                       The fields a Gateway's parameters may set (default: replicas, podDisruptionBudget,

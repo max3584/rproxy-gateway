@@ -164,6 +164,9 @@ pub struct GatewayAddress {
 	/// Empty: any address of the type (GatewayAddressEmpty).
 	#[serde(default)]
 	pub value: String,
+	/// Where the address is reachable from (GEP-5093, experimental): empty, `Cluster` or a prefixed value.
+	#[serde(default)]
+	pub routability: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

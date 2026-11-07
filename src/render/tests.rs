@@ -1407,6 +1407,32 @@ fn gateway_addresses_and_parameters() {
 	assert_eq!(render_gateway(&w, &w.gateways[0], &allowed).address_error, None, "its own Service");
 	let w = world(&own("other"));
 	assert!(render_gateway(&w, &w.gateways[0], &allowed).address_error.is_some_and(|e| e.contains("default/rproxy-x")));
+	// routability (GEP-5093): a Cluster value is the API server's ClusterIP to give, not an external IP
+	// (neither --address-cidr nor another Service's address applies); every entry kept in order
+	let p = with_opts(
+		"  addresses: [{value: 10.96.7.7, routability: Cluster}, {routability: Cluster}, {}, {routability: testing.x-k8s.io/sentinel}, {routability: example.com/Wan}]\n",
+		&Options::default(),
+	);
+	assert!(p.accepted());
+	assert!(p.addresses.is_empty() && p.address_error.is_none(), "{:?} {:?}", p.addresses, p.address_error);
+	let r: Vec<(&str, &str)> = p.address_requests.iter().map(|r| (r.value.as_str(), r.routability.as_str())).collect();
+	assert_eq!(r, [("10.96.7.7", "Cluster"), ("", "Cluster"), ("", ""), ("", "testing.x-k8s.io/sentinel"), ("", "example.com/Wan")]);
+	assert!(
+		p.address_requests[0].refused.as_deref().is_some_and(|e| e.contains("policy.clusterIPs")),
+		"a given ClusterIP is off by default"
+	);
+	assert!(p.address_requests[1].refused.is_none(), "any ClusterIP is allowed");
+	// the class allows a given ClusterIP (policy.clusterIPs, as the CRD names it)
+	let w = world(&format!(
+		"{}{}",
+		yaml_with("  addresses: [{value: 10.96.7.7, routability: Cluster}]\n"),
+		class_with("{policy: {clusterIPs: true}}")
+	));
+	let p = render_gateway(&w, &w.gateways[0], &allowed);
+	assert!(p.address_requests[0].refused.is_none(), "{:?}", p.address_requests);
+	let p = with("  addresses: [{value: 192.0.2.10}, {value: 10.96.7.7, routability: Cluster}]\n");
+	assert_eq!(p.addresses, ["192.0.2.10"]);
+	assert_eq!(p.address_requests.len(), 2);
 	let p = with("  addresses: [{type: test/fake-invalid-type, value: x}, {value: 192.0.2.10}]\n");
 	assert_eq!(cond(&p.conds, "Accepted").reason, "UnsupportedAddress");
 	assert!(!p.accepted());
