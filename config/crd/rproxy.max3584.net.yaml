@@ -558,7 +558,7 @@ spec:
                       type: string
                     nullable: true
                     type: array
-                  clusterIps:
+                  clusterIPs:
                     description: |-
                       Whether the class's Gateways may ask for a given ClusterIP (`spec.addresses` with `routability: Cluster`
                       and a `value`, GEP-5093; default false). The controller makes a Service with that `clusterIP` in the
@@ -1005,7 +1005,7 @@ spec:
                       type: string
                     nullable: true
                     type: array
-                  clusterIps:
+                  clusterIPs:
                     description: |-
                       Whether the class's Gateways may ask for a given ClusterIP (`spec.addresses` with `routability: Cluster`
                       and a `value`, GEP-5093; default false). The controller makes a Service with that `clusterIP` in the

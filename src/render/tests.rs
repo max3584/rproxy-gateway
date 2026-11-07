@@ -1299,6 +1299,19 @@ fn gateway_addresses_and_parameters() {
 	assert!(p.addresses.is_empty() && p.address_error.is_none(), "{:?} {:?}", p.addresses, p.address_error);
 	let r: Vec<(&str, &str)> = p.address_requests.iter().map(|r| (r.value.as_str(), r.routability.as_str())).collect();
 	assert_eq!(r, [("10.96.7.7", "Cluster"), ("", "Cluster"), ("", ""), ("", "testing.x-k8s.io/sentinel"), ("", "example.com/Wan")]);
+	assert!(
+		p.address_requests[0].refused.as_deref().is_some_and(|e| e.contains("policy.clusterIPs")),
+		"a given ClusterIP is off by default"
+	);
+	assert!(p.address_requests[1].refused.is_none(), "any ClusterIP is allowed");
+	// the class allows a given ClusterIP (policy.clusterIPs, as the CRD names it)
+	let w = world(&format!(
+		"{}{}",
+		yaml_with("  addresses: [{value: 10.96.7.7, routability: Cluster}]\n"),
+		class_with("{policy: {clusterIPs: true}}")
+	));
+	let p = render_gateway(&w, &w.gateways[0], &allowed);
+	assert!(p.address_requests[0].refused.is_none(), "{:?}", p.address_requests);
 	let p = with("  addresses: [{value: 192.0.2.10}, {value: 10.96.7.7, routability: Cluster}]\n");
 	assert_eq!(p.addresses, ["192.0.2.10"]);
 	assert_eq!(p.address_requests.len(), 2);
