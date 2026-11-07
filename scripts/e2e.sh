@@ -154,13 +154,21 @@ test "$(kubectl -n e2e get gateway e2e -o jsonpath='{.status.listeners[?(@.name=
 ctb_v=$(kubectl api-resources --api-group=certificates.k8s.io --no-headers 2>/dev/null | awk '$1 == "clustertrustbundles" {print $(NF-2)}')
 frontend=$(kubectl get crd gateways.gateway.networking.k8s.io -o json \
   | jq '[.spec.versions[] | select(.name == "v1") | .schema.openAPIV3Schema.properties.spec.properties.tls.properties.frontend.properties.default.properties.validation // empty] | length')
+# the feature is claimed exactly when the API server serves ClusterTrustBundles (GEP-5075)
+claims_ctb() { kubectl get gatewayclass rproxy -o json | jq -e '[.status.supportedFeatures[]?.name] | index("ClusterTrustBundle") != null' > /dev/null; }
+if [ -n "$ctb_v" ]; then
+  echo "== ClusterTrustBundle ($ctb_v): claimed"
+  retry 60 claims_ctb
+else
+  echo "== ClusterTrustBundle: not served here, not claimed"
+  if claims_ctb; then echo "ClusterTrustBundle claimed without the API"; exit 1; fi
+fi
 if [ -n "$ctb_v" ] && [ "$frontend" -gt 0 ]; then
   echo "== ClusterTrustBundle ($ctb_v, GEP-5075): client certificates checked against a cluster-wide CA"
   openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=e2e-client-ca -keyout "$work/client-ca.key" -out "$work/client-ca.crt" 2> /dev/null
   openssl req -newkey rsa:2048 -nodes -subj /CN=e2e-client -keyout "$work/client.key" -out "$work/client.csr" 2> /dev/null
   openssl x509 -req -in "$work/client.csr" -CA "$work/client-ca.crt" -CAkey "$work/client-ca.key" -CAcreateserial -days 2 \
     -extfile <(printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=clientAuth\n') -out "$work/client.crt" 2> /dev/null
-  test "$(kubectl get gatewayclass rproxy -o json | jq '[.status.supportedFeatures[].name] | index("ClusterTrustBundle") != null')" = true
   cat <<YAML | kubectl apply -f - > /dev/null
 apiVersion: $ctb_v
 kind: ClusterTrustBundle
@@ -206,9 +214,8 @@ YAML
   retry 60 sh -c "! curl -sf $mtls --cert $work/client.crt --key $work/client.key https://secure.example.com/gone > /dev/null"
   kubectl -n e2e delete gateway mtls > /dev/null
   kubectl -n e2e delete httproute mtls > /dev/null
-else
-  echo "== ClusterTrustBundle: not served here (or Gateway API without frontend validation), skipped"
-  test "$(kubectl get gatewayclass rproxy -o json | jq '[.status.supportedFeatures[]?.name] | index("ClusterTrustBundle") == null')" = true
+elif [ -n "$ctb_v" ]; then
+  echo "== ClusterTrustBundle: this Gateway API has no frontend client certificate validation, mTLS skipped"
 fi
 
 echo "== east-west (docs/PLATFORM.md): clients in the cluster call the original Service name, rproxy in between"

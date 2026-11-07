@@ -96,7 +96,8 @@ namespace のラベルはテナントが書けないようにしておく（name
     - まず `rbac.admissionPolicy.validationActions: [Warn, Audit]` で試せる。コントローラに書き換えさせる Secret を手で作るとき（制御 API のトークンなど）は、そのラベルを付け、`Opaque` にする。
   - 両方を合わせると、コントローラが書けるのは見ている namespace の、上の形に合う自分の物だけ、読めるのは見ている namespace の中だけになる。それでも乗っ取られたコントローラはその namespace の Secret を読み、そこに rproxy の形の Pod を動かせるので、Gateway を置く namespace を分けるのが前提になる。
 - chart は ClusterRole `rproxy-gateway-parameters-edit`（`rproxygatewayparameters` の読み書き）を namespace の admin に集約する（`rbac.authorization.k8s.io/aggregate-to-admin`。edit には渡さない。`rbac.aggregateToAdmin: false` で切れる）。書ける範囲はクラスの `policy` で抑える。GatewayClass の `parametersRef` はコントローラの namespace のものしか使わないので、テナントはクラスの既定を変えられない。
-- `controller.watchNamespaces`（`--watch-namespaces`）を決めると、そこ（とコントローラの namespace）だけを watch し、chart はその namespace ごとの Role を作る。ClusterRole に残るのは GatewayClass と namespace（allowedRoutes の selector）だけ。
+- `controller.watchNamespaces`（`--watch-namespaces`）を決めると、そこ（とコントローラの namespace）だけを watch し、chart はその namespace ごとの Role を作る。ClusterRole に残るのは GatewayClass と namespace（allowedRoutes の selector）と ClusterTrustBundle だけ。
+- ClusterRole は ClusterTrustBundle（`certificates.k8s.io` の `clustertrustbundles`、クラスタ全体の CA の束で秘密ではない）の get・list・watch を持つ（v0.4.22、`caCertificateRefs` から参照するため。GEP-5075）。Kubernetes は既定で認証済みの利用者全員に読ませている（ClusterRoleBinding `system:cluster-trust-bundle-discovery`）。それを外した固めたクラスタで chart の権限も外すと、コントローラは ClusterTrustBundle を一覧できないので「出ていない」として扱い（起動を待たせず止まらない）、参照は `InvalidKind`（Gateway は `InvalidCACertificateKind`）になり、`ClusterTrustBundle` を名乗らない。watch が続けて失敗したときも、その間は束を使わない（古い CA で通さない）。
 
 ## ネットワーク
 

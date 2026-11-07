@@ -6,9 +6,10 @@
 //! (`rediscover`): a CRD installed later is watched without a restart.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Pod, Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::Ingress;
@@ -26,7 +27,30 @@ use crate::render::world::{Key, World};
 struct DynKind {
 	kind: &'static str,
 	store: Multi<DynamicObject>,
+	/// Consecutive watch errors (0 after an event).
+	errors: Arc<AtomicU32>,
+	/// The watch tasks (stopped when an optional kind is dropped).
+	tasks: Vec<tokio::task::AbortHandle>,
 }
+
+impl DynKind {
+	/// Every watch has listed once (without waiting).
+	fn listed(&self) -> bool {
+		self.store.0.iter().all(|s| s.wait_until_ready().now_or_never().is_some_and(|r| r.is_ok()))
+	}
+}
+
+/// Kinds that may be served yet not readable by the controller (a hardened cluster without
+/// `system:cluster-trust-bundle-discovery`), or go away: probed with a `list` before they are
+/// watched, never waited for long, and dropped (their objects no longer used) once their watch
+/// keeps failing, then looked for again (GEP-5075: no crash or hang, no stale trust anchors).
+const OPTIONAL_KINDS: &[&str] = &["ClusterTrustBundle"];
+
+/// Consecutive watch errors after which an optional kind is dropped (the watcher backs off between them).
+const DROP_AFTER: u32 = 3;
+
+/// The longest wait for an optional kind's first list.
+const OPTIONAL_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// One watch per namespace watched (or one for all namespaces), read as one.
 pub struct Multi<K: kube::Resource + 'static>(Vec<Store<K>>)
@@ -219,31 +243,47 @@ where
 	reader
 }
 
-fn spawn_dyn_watch(client: &kube::Client, ar: &ApiResource, scope: &Scope, changed: Arc<Notify>) -> Multi<DynamicObject> {
+fn spawn_dyn_watch(client: &kube::Client, ar: &ApiResource, scope: &Scope, changed: Arc<Notify>) -> DynParts {
 	let apis: Vec<Api<DynamicObject>> = match scope {
 		Some(nss) if !CLUSTER_KINDS.contains(&ar.kind.as_str()) => {
 			nss.iter().map(|ns| Api::namespaced_with(client.clone(), ns, ar)).collect()
 		}
 		_ => vec![Api::all_with(client.clone(), ar)],
 	};
-	Multi(apis.into_iter().map(|api| spawn_dyn_watch_one(api, ar, changed.clone())).collect())
+	let errors = Arc::new(AtomicU32::new(0));
+	let (stores, tasks) = apis.into_iter().map(|api| spawn_dyn_watch_one(api, ar, changed.clone(), errors.clone())).unzip();
+	(Multi(stores), errors, tasks)
 }
 
-fn spawn_dyn_watch_one(api: Api<DynamicObject>, ar: &ApiResource, changed: Arc<Notify>) -> Store<DynamicObject> {
+/// A dynamic kind's watches: the stores, the consecutive errors, the tasks.
+type DynParts = (Multi<DynamicObject>, Arc<AtomicU32>, Vec<tokio::task::AbortHandle>);
+
+fn spawn_dyn_watch_one(
+	api: Api<DynamicObject>,
+	ar: &ApiResource,
+	changed: Arc<Notify>,
+	errors: Arc<AtomicU32>,
+) -> (Store<DynamicObject>, tokio::task::AbortHandle) {
 	let writer = reflector::store::Writer::new(ar.clone());
 	let reader = writer.as_reader();
 	let stream = reflector::reflector(writer, watcher(api, watcher::Config::default()).default_backoff());
 	let kind = ar.kind.clone();
-	tokio::spawn(async move {
+	let task = tokio::spawn(async move {
 		let mut stream = std::pin::pin!(stream);
 		while let Some(ev) = stream.next().await {
 			match ev {
-				Ok(_) => changed.notify_one(),
-				Err(e) => warn!(kind, error = %e, "watch error"),
+				Ok(_) => {
+					errors.store(0, Ordering::Relaxed);
+					changed.notify_one();
+				}
+				Err(e) => {
+					errors.fetch_add(1, Ordering::Relaxed);
+					warn!(kind, error = %e, "watch error");
+				}
 			}
 		}
 	});
-	reader
+	(reader, task.abort_handle())
 }
 
 impl Cache {
@@ -291,19 +331,44 @@ impl Cache {
 	pub async fn rediscover(&self, client: &kube::Client, first: bool) -> anyhow::Result<()> {
 		let groups = discover(client).await?;
 		let mut added = false;
+		// optional kinds whose watch keeps failing (gone, or no longer readable): dropped, probed again below
+		let mut dropped = false;
+		self.dynamic.write().unwrap().retain(|(d, _)| {
+			let failing = OPTIONAL_KINDS.contains(&d.kind) && d.errors.load(Ordering::Relaxed) >= DROP_AFTER;
+			if failing {
+				warn!(kind = d.kind, "the watch keeps failing: not used until it can be read again");
+				d.tasks.iter().for_each(tokio::task::AbortHandle::abort);
+				dropped = true;
+			}
+			!failing
+		});
 		for (group, kind) in self.wanted(&groups) {
 			if self.dynamic.read().unwrap().iter().any(|(d, _)| d.kind == kind) {
 				continue;
 			}
 			match groups.iter().find(|(g, k, _)| g == group && k == kind) {
 				Some((_, _, ar)) => {
+					let optional = OPTIONAL_KINDS.contains(&kind);
+					if optional {
+						// served, but readable? (forbidden on a hardened cluster: as if not served)
+						let probe =
+							Api::<DynamicObject>::all_with(client.clone(), ar).list(&kube::api::ListParams::default().limit(1)).await;
+						if let Err(e) = probe {
+							if first {
+								warn!(kind, version = %ar.version, error = %e, "served but cannot be listed: references to it are refused (looked for again later)");
+							}
+							continue;
+						}
+					}
 					info!(kind, version = %ar.version, "watching");
-					let store = spawn_dyn_watch(client, ar, &self.scope, self.changed.clone());
-					if !first {
+					let (store, errors, tasks) = spawn_dyn_watch(client, ar, &self.scope, self.changed.clone());
+					if optional {
+						let _ = tokio::time::timeout(OPTIONAL_WAIT, store.wait_until_ready()).await;
+					} else if !first {
 						// a new kind: render once it has listed
 						let _ = store.wait_until_ready().await;
 					}
-					self.dynamic.write().unwrap().push((DynKind { kind, store }, ar.clone()));
+					self.dynamic.write().unwrap().push((DynKind { kind, store, errors, tasks }, ar.clone()));
 					added = true;
 				}
 				None if first && group == crate::manifests::CTB_GROUP => {
@@ -313,7 +378,7 @@ impl Cache {
 				None => {}
 			}
 		}
-		if added && !first {
+		if (added && !first) || dropped {
 			self.changed.notify_one();
 		}
 		Ok(())
@@ -330,7 +395,15 @@ impl Cache {
 		if let Some(i) = &self.ingresses {
 			let _ = i.wait_until_ready().await;
 		}
-		let stores: Vec<Store<DynamicObject>> = self.dynamic.read().unwrap().iter().flat_map(|(d, _)| d.store.0.clone()).collect();
+		// optional kinds were waited for (briefly) when their watch started
+		let stores: Vec<Store<DynamicObject>> = self
+			.dynamic
+			.read()
+			.unwrap()
+			.iter()
+			.filter(|(d, _)| !OPTIONAL_KINDS.contains(&d.kind))
+			.flat_map(|(d, _)| d.store.0.clone())
+			.collect();
 		for s in stores {
 			let _ = s.wait_until_ready().await;
 		}
@@ -376,6 +449,10 @@ impl Cache {
 			w.namespaces.insert(n.metadata.name.clone().unwrap_or_default(), n.metadata.labels.clone().unwrap_or_default());
 		}
 		for (d, ar) in self.dynamic.read().unwrap().iter() {
+			if OPTIONAL_KINDS.contains(&d.kind) && (!d.listed() || d.errors.load(Ordering::Relaxed) >= DROP_AFTER) {
+				// not listed yet, or failing: none of its objects is used (no stale trust anchors)
+				continue;
+			}
 			if d.kind == "ClusterTrustBundle" {
 				// served: an empty set is still a known kind
 				w.cluster_trust_bundles.get_or_insert_with(Default::default);
