@@ -806,6 +806,34 @@ fn listener_filters_per_port() {
 	assert_eq!(on(8081)["http"]["pre_routing"], json!(["listener:f0"]));
 }
 
+/// Kept (`Options::pre_routing_ports`, a pod not known yet): only the listeners on the ports where the
+/// filters are already in force are translated; the others wait for every pod.
+#[test]
+fn listener_filters_kept_on_their_ports() {
+	let f = "filters: {requests: [{type: ExtensionRef, extensionRef: {group: rproxy.max3584.net, kind: RproxyMiddleware, name: tag}}]}";
+	let yaml = format!(
+		"{BASE}{}{FILTER_MIDDLEWARES}",
+		gw(&format!(
+			r#"  - {{name: kept, port: 8080, protocol: HTTP, {f}}}
+  - {{name: new, port: 8081, protocol: HTTP, {f}}}"#
+		)),
+	);
+	let w = world(&yaml);
+	let opts = Options {
+		pre_routing: Some(listener_filters::DOCUMENTED_KINDS.iter().map(|k| k.to_string()).collect()),
+		pre_routing_ports: Some([8080].into()),
+		..Default::default()
+	};
+	let p = render_gateway(&w, &w.gateways[0], &opts);
+	let l = |n: &str| p.listeners.iter().find(|x| x.name == n).unwrap();
+	assert!(cond(&l("kept").conds, "Accepted").status);
+	let c = cond(&l("new").conds, "Accepted");
+	assert!(!c.status && c.message.contains("http_options pre_routing"), "{}", c.message);
+	let rules = p.rules_json();
+	assert_eq!(rules.iter().find(|r| r["listen_port"] == 8080).unwrap()["http"]["pre_routing"], json!(["listener:f0"]));
+	assert!(rules.iter().all(|r| r["listen_port"] != 8081));
+}
+
 #[test]
 fn external_auth() {
 	let yaml = format!(

@@ -66,6 +66,10 @@ pub struct Options {
 	/// to) answered `http_options` `pre_routing`. `None`: not known, and a listener with
 	/// `filters.requests` is not accepted (never served without its filters).
 	pub pre_routing: Option<Vec<String>>,
+	/// With `pre_routing`: `None` when every pod is known to run it; `Some(ports)` while it is only kept
+	/// (`controller::kept_pre_routing`: a pod not asked yet, the filters already in force on these ports
+	/// and the image unchanged), and then only the listeners on these ports are translated.
+	pub pre_routing_ports: Option<BTreeSet<u16>>,
 }
 
 /// What the controller gives every backend it renders unless an RproxyPolicy sets it (v0.4.5,
@@ -205,6 +209,7 @@ impl Default for Options {
 			params: params::ParamsOptions::default(),
 			backends: BackendDefaults::default(),
 			pre_routing: None,
+			pre_routing_ports: None,
 		}
 	}
 }
@@ -994,7 +999,7 @@ fn validate_listener<'a>(
 		let named: Vec<String> = reqs.iter().enumerate().map(|(i, f)| listener_filters::label(i, f)).collect();
 		let why = if !matches!(family, Family::Http | Family::Https) {
 			Some("listener filters apply to HTTP and HTTPS listeners only")
-		} else if opts.pre_routing.is_none() {
+		} else if !pre_routing_known(opts, st.port) {
 			Some(
 				"listener filters need every rproxy pod of the Gateway, and the image they roll to, to run middlewares before route matching (GET /capabilities: http_options pre_routing, rproxy v0.4.22); not known (yet)",
 			)
@@ -1003,7 +1008,7 @@ fn validate_listener<'a>(
 		};
 		if let Some(why) = why {
 			st.accepted = false;
-			st.awaits_rproxy = opts.pre_routing.is_none() && matches!(family, Family::Http | Family::Https);
+			st.awaits_rproxy = !pre_routing_known(opts, st.port) && matches!(family, Family::Http | Family::Https);
 			st.conds.push(Cond::new("Accepted", false, "UnsupportedValue", format!("{}: {why}", named.join(", "))));
 		}
 	}
@@ -1075,6 +1080,11 @@ fn validate_listener<'a>(
 	st.awaits_rproxy &= st.conds.iter().filter(|c| c.kind == "Accepted" && !c.status).count() == 1;
 	st.conds.push(resolved);
 	st
+}
+
+/// Whether listener filters on `port` are translated (`Options::pre_routing`, `pre_routing_ports`).
+fn pre_routing_known(opts: &Options, port: u16) -> bool {
+	opts.pre_routing.is_some() && opts.pre_routing_ports.as_ref().is_none_or(|p| p.contains(&port))
 }
 
 /// The listeners' filters (GEP-5224) as rproxy middlewares, by listener index, for the accepted

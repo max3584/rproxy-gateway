@@ -460,6 +460,7 @@ async fn reconcile_all(
 		params: params_opts.clone(),
 		backends: cfg.backends.clone(),
 		pre_routing: None,
+		pre_routing_ports: None,
 	};
 	let world = snapshot(client, cache, cfg, &opts).await;
 	let now = render::status::now();
@@ -540,11 +541,21 @@ async fn reconcile_all(
 			Mode::Fleet(_) => Some(None),
 		};
 		let keys = provision::pod_keys(&pods_now, &pods_ns, &selector);
-		let pre_routing = match target {
-			Some(target) => pre_routing_kinds(rp, &eps, &keys, target.as_deref(), &mut state.caps).await,
-			None => None,
+		let (pre_routing, pre_routing_ports) = match target {
+			Some(target) => match pre_routing_kinds(rp, &eps, &keys, target.as_deref(), &mut state.caps).await {
+				Some(kinds) => (Some(kinds), None),
+				// a pod not asked yet (a scale-up, a restart): the filters already in force are kept
+				None => {
+					let set = render::ruleset_name(&ns, &name);
+					match kept_pre_routing(rp, &eps, &keys, target.as_deref(), &set, &mut state.caps).await {
+						Some((kinds, ports)) => (Some(kinds), Some(ports)),
+						None => (None, None),
+					}
+				}
+			},
+			None => (None, None),
 		};
-		let mut opts = render::Options { features, pre_routing, ..opts.clone() };
+		let mut opts = render::Options { features, pre_routing, pre_routing_ports, ..opts.clone() };
 		// fleet listening on Gateways' addresses: a Gateway with spec.addresses (allowed by --address-cidr)
 		// listens on them (rproxy with listen_freebind: whether a node has them yet or not)
 		if let Mode::Fleet(f) = &cfg.mode {
@@ -1639,6 +1650,63 @@ async fn pre_routing_kinds(
 	Some(kinds.unwrap_or_else(|| render::listener_filters::DOCUMENTED_KINDS.iter().map(|k| k.to_string()).collect()))
 }
 
+/// Listener filters kept while not every pod is known to run them (like `SettingsKnown::Kept`): a
+/// listener whose filters went out would turn `Accepted: False` and its host name 404 on every pod while
+/// a new pod starts (a scale-up, a pod restarted), which is worse than what the check guards against
+/// (an older rproxy refuses the whole set, neither crashing nor serving without the filters). Kept when
+///
+/// - no pod there is (`keys`) answered without `pre_routing` (one that did refuses at once),
+/// - at least one did answer with it (the kinds are those every such pod lists),
+/// - every pod runs the image they roll to (`target`; the fleet: no image to compare), and
+/// - the rule set on a pod that answered with it already has `pre_routing`: only those ports
+///   (`Options::pre_routing_ports`), so a listener's filters are kept, never started, on a pod not known.
+async fn kept_pre_routing(
+	rp: &Client,
+	eps: &[Endpoint],
+	keys: &[String],
+	target: Option<&str>,
+	set: &str,
+	caps: &mut HashMap<String, Capabilities>,
+) -> Option<(Vec<String>, BTreeSet<u16>)> {
+	let feature = render::listener_filters::FEATURE;
+	pod_features(rp, eps, caps).await;
+	if keys.iter().any(|k| caps.get(k).is_some_and(|c| !c.has(feature))) {
+		return None;
+	}
+	if let Some(image) = target {
+		if !eps.iter().all(|ep| ep.rproxy_image.as_deref() == Some(image)) {
+			return None;
+		}
+	}
+	let answered: Vec<&Endpoint> =
+		eps.iter().filter(|ep| keys.contains(&ep.caps_key()) && caps.get(&ep.caps_key()).is_some_and(|c| c.has(feature))).collect();
+	let mut kinds: Option<Vec<String>> = None;
+	for ep in &answered {
+		let names = caps[&ep.caps_key()].names("pre_routing_kinds");
+		kinds = Some(match kinds {
+			None => names,
+			Some(v) => v.into_iter().filter(|n| names.contains(n)).collect(),
+		});
+	}
+	let kinds = kinds?;
+	for ep in answered {
+		let Ok(addr) = api_addr(ep) else { continue };
+		let Ok(Some(current)) = rp.scoped(ep.target.as_deref()).get_ruleset(addr, set).await else { continue };
+		let ports: BTreeSet<u16> = current
+			.rules
+			.iter()
+			.filter(|r| r.http.as_ref().and_then(|h| h.get("pre_routing")).and_then(Value::as_array).is_some_and(|a| !a.is_empty()))
+			.map(|r| r.listen_port)
+			.collect();
+		if ports.is_empty() {
+			return None;
+		}
+		info!(set, ?ports, "not every rproxy pod has answered yet: the listener filters in force are kept");
+		return Some((kinds, ports));
+	}
+	None
+}
+
 /// Whether the GatewayClasses claim `GatewayListenerFilters`: managed, the image the controller deploys
 /// is known to run listener filters (the one it ships, if that has them, or one whose Gateway's pods all
 /// answered so: `pre_routing_kinds`); fleet, every fleet pod answered so (`every_pod_has`).
@@ -1763,6 +1831,7 @@ fn refused_view(rule: &Value, message: &str) -> RuleView {
 		state: "failed".into(),
 		error: Some(message.into()),
 		conditions: vec![cond("Accepted"), cond("Programmed")],
+		http: None,
 	}
 }
 

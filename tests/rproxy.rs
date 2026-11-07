@@ -1395,6 +1395,13 @@ spec:
 	let (r, _) = sync_pod(&client, &ep, &plan, &mut applied, &mut caps_cache).await;
 	let PodSync::Synced(views, excluded) = &r else { panic!("{r:?}\nrules: {}", serde_json::to_string(&plan.rules_json()).unwrap()) };
 	assert!(views.iter().all(|v| v.state == "running") && excluded.is_empty(), "{views:?} {excluded:?}");
+	// what the controller reads to keep the filters while a new pod is not known (`kept_pre_routing`)
+	let set = client.get_ruleset(SocketAddr::from(([127, 0, 0, 1], api)), &plan.ruleset).await.unwrap().unwrap();
+	assert!(
+		set.rules.iter().any(|r| r.http.as_ref().is_some_and(|h| h["pre_routing"] == serde_json::json!(["listener:f0", "listener:f1"]))),
+		"{:?}",
+		set.rules
+	);
 	// refused before routing: for a route's path and for a path no route has (not 404)
 	let (status, body) = get(port, "any.example.com", "/x").await;
 	assert_eq!(status, 403, "{body}");

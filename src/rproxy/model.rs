@@ -270,6 +270,9 @@ pub struct RuleView {
 	pub error: Option<String>,
 	#[serde(default)]
 	pub conditions: Vec<RuleCondition>,
+	/// The rule's `http` as rproxy has it (`http.pre_routing`: listener filters in force).
+	#[serde(default)]
+	pub http: Option<Value>,
 }
 
 impl RuleView {
