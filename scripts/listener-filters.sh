@@ -1,14 +1,18 @@
 #!/bin/bash
 # Listener filters (GEP-5224, GatewayListenerFilters) on the conformance cluster (scripts/conformance.sh
 # runs it after the suite): Gateway API v1.7.0 has no conformance test for the feature yet. A listener's
-# ExtensionRef (an RproxyMiddleware setting a header) runs before route matching, and the route matches
-# on that header; the GatewayClass claims the feature. Skipped (exit 0) with Gateway API CRDs without
+# ExternalAuth (the echo server, which allows everything) and ExtensionRef (an RproxyMiddleware setting a
+# header) run before route matching, and the route matches on that header; the GatewayClass claims the
+# feature. With the ExternalAuth's Service gone, the listener reports InvalidListenerFilterRef and its
+# requests get 500, never the route. Skipped (exit 0) with Gateway API CRDs without
 # listeners[].filters (the standard channel, before v1.7) and with an rproxy without http.pre_routing
 # (before v0.4.22: the listener is not accepted, never served without its filters).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ns=listener-filters
 out=${RUNNER_TEMP:-/tmp}/listener-filters.json
+# the namespace goes however the script ends (its Gateway and rproxy with it)
+cleanup() { kubectl delete namespace "$ns" --wait=false > /dev/null 2>&1 || true; }
 
 retry() {  # retry <seconds> <command...>
   local until=$((SECONDS + $1)); shift
@@ -25,6 +29,7 @@ if [ "$fields" = 0 ]; then
   exit 0
 fi
 
+trap cleanup EXIT
 kubectl apply -f - > /dev/null <<'YAML'
 apiVersion: v1
 kind: Namespace
@@ -69,6 +74,8 @@ spec:
       protocol: HTTP
       filters:
         requests:
+          - type: ExternalAuth
+            externalAuth: {protocol: HTTP, backendRef: {name: echo, port: 8080}, http: {path: /auth, allowedResponseHeaders: [x-auth-none]}}
           - type: ExtensionRef
             extensionRef: {group: rproxy.max3584.net, kind: RproxyMiddleware, name: tag}
 ---
@@ -93,7 +100,6 @@ if ! retry 60 accepted; then
   echo "listener Accepted: $(cond status) $(cond reason): $message"
   if grep -q "http_options pre_routing" <<< "$message"; then
     echo "listener filters: skipped (this rproxy has no http.pre_routing, rproxy v0.4.22)"
-    kubectl delete namespace $ns --wait=false > /dev/null
     exit 0
   fi
   exit 1
@@ -105,5 +111,11 @@ retry 60 sh -c "curl -sf -H 'Host: lf.example.com' http://$addr/lf > $out"
 jq -e '.path == "/lf" and .headers["X-Tag"] == ["tagged"]' "$out" > /dev/null || { cat "$out"; exit 1; }
 claims() { kubectl get gatewayclass rproxy -o json | jq -e '[.status.supportedFeatures[]?.name] | index("GatewayListenerFilters") != null' > /dev/null; }
 retry 60 claims
-kubectl delete namespace $ns --wait=false > /dev/null
-echo "listener filters: passed (filters.requests ran before route matching; GatewayListenerFilters claimed)"
+# the ExternalAuth's Service gone: the filter answers 500 in its place (never skipped)
+kubectl -n $ns patch gateway lf --type=json \
+  -p '[{"op": "replace", "path": "/spec/listeners/0/filters/requests/0/externalAuth/backendRef/name", "value": "missing"}]' > /dev/null
+refs() { test "$(kubectl -n $ns get gateway lf -o jsonpath='{.status.listeners[0].conditions[?(@.type=="ResolvedRefs")].reason}')" = InvalidListenerFilterRef; }
+retry 60 refs
+status() { test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: lf.example.com' "http://$addr/lf")" = 500; }
+retry 60 status
+echo "listener filters: passed (ExternalAuth and ExtensionRef ran before route matching; an unresolved filter answered 500; GatewayListenerFilters claimed)"

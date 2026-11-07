@@ -633,7 +633,7 @@ spec:
 fn plan_pre_routing(yaml: &str) -> GatewayPlan {
 	let w = world(yaml);
 	let kinds = listener_filters::DOCUMENTED_KINDS.iter().map(|k| k.to_string()).collect();
-	render_gateway(&w, &w.gateways[0], &Options { pre_routing: Some(kinds), ..Default::default() })
+	render_gateway(&w, &w.gateways[0], &Options { pre_routing: PreRouting::Known { kinds, ports: None }, ..Default::default() })
 }
 
 const FILTER_MIDDLEWARES: &str = r#"
@@ -703,6 +703,13 @@ fn listener_filters_become_pre_routing() {
 	// whether they run listener filters
 	assert!(old.accepted(), "{:?}", old.conds);
 	assert!(old.ports().contains(&(rp::Protocol::Tcp, 8080)));
+	// known to lack it (a pod answered without it, the bundled rproxy v0.4.21): refused as before, nothing placed
+	let w = world(&yaml);
+	let lacking = render_gateway(&w, &w.gateways[0], &Options { pre_routing: PreRouting::Lacking, ..Default::default() });
+	let c = cond(&lacking.listeners[0].conds, "Accepted");
+	assert!(!c.status && c.message.contains("the Gateway's rproxy lacks it"), "{}", c.message);
+	assert!(!lacking.accepted(), "{:?}", lacking.conds);
+	assert!(lacking.ports().is_empty());
 }
 
 /// A filter rproxy cannot run before routing, one that changes Host, one naming a service, a filter
@@ -820,8 +827,10 @@ fn listener_filters_kept_on_their_ports() {
 	);
 	let w = world(&yaml);
 	let opts = Options {
-		pre_routing: Some(listener_filters::DOCUMENTED_KINDS.iter().map(|k| k.to_string()).collect()),
-		pre_routing_ports: Some([8080].into()),
+		pre_routing: PreRouting::Known {
+			kinds: listener_filters::DOCUMENTED_KINDS.iter().map(|k| k.to_string()).collect(),
+			ports: Some([8080].into()),
+		},
 		..Default::default()
 	};
 	let p = render_gateway(&w, &w.gateways[0], &opts);
@@ -3746,4 +3755,52 @@ spec:
 	let rules = p.rules_json();
 	let got: Vec<_> = rules[0]["tls"]["routes"].as_array().unwrap().iter().map(|r| json!([r["server_names"], r["remote_addr"]])).collect();
 	assert_eq!(json!(got), json!([[["abc.example.com"], "10.96.0.2"], [["abc.example.com"], "10.96.0.1"]]));
+}
+
+/// Listeners of one port are compared by their filters as built: a Gateway's and a ListenerSet's listener
+/// with the same list, where only the Gateway may reach the ExternalAuth Service (a ReferenceGrant from
+/// Gateways), cannot share one `pre_routing`.
+#[test]
+fn listener_filters_compared_as_built() {
+	let f = "filters: {requests: [{type: ExternalAuth, externalAuth: {protocol: HTTP, backendRef: {name: api, namespace: other, port: 8000}, http: {}}}]}";
+	let yaml = format!(
+		r#"{BASE}
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata: {{name: gateways, namespace: other}}
+spec:
+  from: [{{group: gateway.networking.k8s.io, kind: Gateway, namespace: default}}]
+  to: [{{group: "", kind: Service}}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {{name: gw, namespace: default}}
+spec:
+  gatewayClassName: rproxy
+  allowedListeners: {{namespaces: {{from: Same}}}}
+  listeners:
+    - {{name: main, port: 8080, protocol: HTTP, hostname: gw.example.com, {f}}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ListenerSet
+metadata: {{name: ls, namespace: default}}
+spec:
+  parentRef: {{name: gw}}
+  listeners:
+    - {{name: set, port: 8080, protocol: HTTP, hostname: set.example.com, {f}}}
+"#
+	);
+	let p = plan_pre_routing(&yaml);
+	let c = cond(&p.listeners[0].conds, "Accepted");
+	assert!(!c.status && c.message.contains("do not all have the same filters.requests"), "{}", c.message);
+	let set = &p.listener_sets[0].listeners[0];
+	assert!(!cond(&set.conds, "Accepted").status, "{:?}", set.conds);
+	assert_eq!(cond(&set.conds, "ResolvedRefs").reason, "RefNotPermitted");
+	// on ports of their own, the Gateway's listener resolves and the ListenerSet's answers 500
+	let apart = plan_pre_routing(&yaml.replace("{name: set, port: 8080", "{name: set, port: 8081"));
+	assert!(cond(&apart.listeners[0].conds, "Accepted").status, "{:?}", apart.listeners[0].conds);
+	let rules = apart.rules_json();
+	let mw = |port: u16| rules.iter().find(|r| r["listen_port"] == port).unwrap()["http"]["middlewares"]["listener:f0"].clone();
+	assert!(mw(8080).get("forward_auth").is_some() && mw(8081).get("respond").is_some());
 }

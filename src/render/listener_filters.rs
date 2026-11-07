@@ -29,7 +29,8 @@ use crate::rproxy::model as rp;
 pub const FEATURE: &str = "http_options.pre_routing";
 
 /// The kinds rproxy-api v0.4.22 runs before route matching (docs/API.md; `features.pre_routing_kinds`
-/// is what a pod says): for a Gateway with no pod yet whose image is known to have `pre_routing`.
+/// is what a pod says): for a Gateway with no pod yet whose image is known to have `pre_routing` (the
+/// bundled image once `SHIPPED_FEATURES` lists it).
 pub const DOCUMENTED_KINDS: &[&str] = &[
 	"redirect_scheme",
 	"redirect_regex",
@@ -112,7 +113,24 @@ pub fn build(ctx: &Ctx, ns: &str, reqs: &[Value], kinds: &[String]) -> Result<Bu
 			Some(mw) => mw,
 			None => {
 				// not resolved: this filter answers 500, nothing reaches routing without it
-				let c = part.resolved.take().unwrap_or_else(|| Cond::new("ResolvedRefs", false, "InvalidListenerFilterRef", ""));
+				if !kinds.iter().any(|k| k == "respond") {
+					return Err(format!(
+						"{at}: does not resolve, and rproxy cannot answer 500 in its place before routing (respond is not in pre_routing_kinds)"
+					));
+				}
+				// (`http::external_auth` gives no condition for a BackendTLSPolicy that cannot be used: its own status says why)
+				let c = part.resolved.take().unwrap_or_else(|| {
+					Cond::new(
+						"ResolvedRefs",
+						false,
+						"InvalidListenerFilterRef",
+						"the ExternalAuth backend's BackendTLSPolicy cannot be used",
+					)
+				});
+				// GEP-5224 (Conformance, "Unresolvable filter reference"): `InvalidListenerFilterRef` for a reference
+				// that does not resolve, `RefNotPermitted` across namespaces without a ReferenceGrant. Gateway API
+				// v1.7.0 has no constant for the first yet (only the GEP's text): kept as the GEP writes it. A Service
+				// that exists without a ready endpoint, or of a kind not supported, is reported the same way.
 				let reason = if c.reason == "RefNotPermitted" { "RefNotPermitted" } else { "InvalidListenerFilterRef" };
 				out.resolved.get_or_insert(Cond::new("ResolvedRefs", false, reason, format!("{at}: {}", c.message)));
 				json!({"respond": {"status": 500, "body": "500 Internal Server Error\n"}})

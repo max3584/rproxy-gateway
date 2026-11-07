@@ -1299,6 +1299,20 @@ pub fn pod_keys(store: &[std::sync::Arc<Pod>], ns: &str, selector: &BTreeMap<Str
 		.collect()
 }
 
+/// `pod_keys` with each pod's `rproxy` image (its spec: Pending pods too), for listener filters kept
+/// through a rollout (`controller::kept_pre_routing`).
+pub fn pod_key_images(store: &[std::sync::Arc<Pod>], ns: &str, selector: &BTreeMap<String, String>) -> Vec<(String, Option<String>)> {
+	let ended = |p: &Pod| matches!(p.status.as_ref().and_then(|s| s.phase.as_deref()), Some("Failed" | "Succeeded"));
+	store
+		.iter()
+		.filter(|p| p.metadata.deletion_timestamp.is_none() && !ended(p) && selected(p, ns, selector))
+		.map(|p| {
+			let image = p.spec.as_ref().and_then(|s| s.containers.iter().find(|c| c.name == "rproxy")).and_then(|c| c.image.clone());
+			(caps_key(p.metadata.uid.as_deref().unwrap_or_default(), container_run(p).as_deref()), image)
+		})
+		.collect()
+}
+
 /// Whether pods `selector` picks in `ns` run `image` with rproxy's settings file (`RPROXY_CONFIG`): the
 /// Deployment's current form, kept when whether the image takes the file is not known for a while
 /// (`controller::settings_known`).

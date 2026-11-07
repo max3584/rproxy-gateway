@@ -459,8 +459,7 @@ async fn reconcile_all(
 		cross_namespace_secrets: cfg.cross_namespace_secrets,
 		params: params_opts.clone(),
 		backends: cfg.backends.clone(),
-		pre_routing: None,
-		pre_routing_ports: None,
+		pre_routing: render::PreRouting::Unknown,
 	};
 	let world = snapshot(client, cache, cfg, &opts).await;
 	let now = render::status::now();
@@ -540,22 +539,15 @@ async fn reconcile_all(
 				.map(|p| Some(p.and_then(|p| p.rproxy.and_then(|r| r.image)).unwrap_or_else(|| m.rproxy_image.clone()))),
 			Mode::Fleet(_) => Some(None),
 		};
-		let keys = provision::pod_keys(&pods_now, &pods_ns, &selector);
-		let (pre_routing, pre_routing_ports) = match target {
-			Some(target) => match pre_routing_kinds(rp, &eps, &keys, target.as_deref(), &mut state.caps).await {
-				Some(kinds) => (Some(kinds), None),
-				// a pod not asked yet (a scale-up, a restart): the filters already in force are kept
-				None => {
-					let set = render::ruleset_name(&ns, &name);
-					match kept_pre_routing(rp, &eps, &keys, target.as_deref(), &set, &mut state.caps).await {
-						Some((kinds, ports)) => (Some(kinds), Some(ports)),
-						None => (None, None),
-					}
-				}
-			},
-			None => (None, None),
+		let pods = provision::pod_key_images(&pods_now, &pods_ns, &selector);
+		let pre_routing = match target {
+			Some(target) => {
+				let set = render::ruleset_name(&ns, &name);
+				pre_routing_state(rp, &eps, &pods, target.as_deref(), &set, &mut state.caps).await
+			}
+			None => render::PreRouting::Unknown,
 		};
-		let mut opts = render::Options { features, pre_routing, pre_routing_ports, ..opts.clone() };
+		let mut opts = render::Options { features, pre_routing, ..opts.clone() };
 		// fleet listening on Gateways' addresses: a Gateway with spec.addresses (allowed by --address-cidr)
 		// listens on them (rproxy with listen_freebind: whether a node has them yet or not)
 		if let Mode::Fleet(f) = &cfg.mode {
@@ -1539,6 +1531,8 @@ pub async fn sync_pod(
 static FEATURE_IMAGES: std::sync::Mutex<BTreeSet<(String, String)>> = std::sync::Mutex::new(BTreeSet::new());
 
 /// Features of the image this controller ships (`--rproxy-image`'s default, rproxy v0.4.21).
+/// When the bundled rproxy goes to v0.4.22, add `http_options.pre_routing` (`render::listener_filters::FEATURE`):
+/// until then the bundled image is known to lack listener filters (`render::PreRouting::Lacking`).
 const SHIPPED_FEATURES: &[&str] = &["graceful_shutdown", "tokens_reload", "control_limits", "http_stream_limits"];
 
 /// Whether `image` has `feature` (rproxy's `features`): the image this controller ships, or one a pod
@@ -1646,65 +1640,106 @@ async fn pre_routing_kinds(
 			Some(v) => v.into_iter().filter(|n| names.contains(n)).collect(),
 		});
 	}
-	// no pod yet, the image this controller ships: the kinds rproxy-api documents
+	// no pod yet, an image known to have it (`SHIPPED_FEATURES`): the kinds rproxy-api documents
 	Some(kinds.unwrap_or_else(|| render::listener_filters::DOCUMENTED_KINDS.iter().map(|k| k.to_string()).collect()))
+}
+
+/// Whether the Gateway's rproxy runs listener filters (`render::PreRouting`), for its pods (`pods`:
+/// each one's `caps_key` and image, Pending ones too) and the image they roll to (`target`; `None`: the
+/// fleet). `Known` when every pod and the target are known to (`pre_routing_kinds`) or the filters in
+/// force are kept (`kept_pre_routing`); `Lacking` when a pod answered without it or the target is the
+/// bundled image without it (`SHIPPED_FEATURES`); else `Unknown`.
+async fn pre_routing_state(
+	rp: &Client,
+	eps: &[Endpoint],
+	pods: &[(String, Option<String>)],
+	target: Option<&str>,
+	set: &str,
+	caps: &mut HashMap<String, Capabilities>,
+) -> render::PreRouting {
+	let feature = render::listener_filters::FEATURE;
+	let keys: Vec<String> = pods.iter().map(|(k, _)| k.clone()).collect();
+	if let Some(kinds) = pre_routing_kinds(rp, eps, &keys, target, caps).await {
+		return render::PreRouting::Known { kinds, ports: None };
+	}
+	let lacking = keys.iter().any(|k| caps.get(k).is_some_and(|c| !c.has(feature)))
+		|| target.is_some_and(|t| t == provision::RPROXY_IMAGE && !SHIPPED_FEATURES.contains(&feature));
+	if lacking {
+		return render::PreRouting::Lacking;
+	}
+	match kept_pre_routing(rp, eps, pods, target, set, caps).await {
+		Some((kinds, ports)) => render::PreRouting::Known { kinds, ports: Some(ports) },
+		None => render::PreRouting::Unknown,
+	}
 }
 
 /// Listener filters kept while not every pod is known to run them (like `SettingsKnown::Kept`): a
 /// listener whose filters went out would turn `Accepted: False` and its host name 404 on every pod while
-/// a new pod starts (a scale-up, a pod restarted), which is worse than what the check guards against
-/// (an older rproxy refuses the whole set, neither crashing nor serving without the filters). Kept when
+/// a new pod starts (a scale-up, a restarted pod, a rollout to another image), which is worse than what
+/// the check guards against (an older rproxy refuses the whole set, neither crashing nor serving without
+/// the filters). Kept when
 ///
-/// - no pod there is (`keys`) answered without `pre_routing` (one that did refuses at once),
-/// - at least one did answer with it (the kinds are those every such pod lists),
-/// - every pod runs the image they roll to (`target`; the fleet: no image to compare), and
-/// - the rule set on a pod that answered with it already has `pre_routing`: only those ports
-///   (`Options::pre_routing_ports`), so a listener's filters are kept, never started, on a pod not known.
+/// - no pod there is answered without `pre_routing` (one that did refuses at once),
+/// - every pod that answered has it (at least one; the kinds are those they all list), so every pod of
+///   another image than the target (an old pod of a rollout) has answered with it,
+/// - every pod that has not answered yet runs the target (by its spec, Pending ones too), and the target
+///   is known to have it: the bundled image when `SHIPPED_FEATURES` lists it, an image remembered from
+///   its pods' answers (`FEATURE_IMAGES`), or one a pod running it answered with it (the fleet: no image
+///   to compare), and
+/// - the rule sets of the pods that answered already have `pre_routing`: only those ports
+///   (`PreRouting::Known` `ports`), so filters are kept, never started, on a pod not known.
+///
+/// Still fail-closed: a new pod of an older rproxy under the target's name has no rule set before and
+/// refuses the whole set (`pre_routing` is a field it does not know).
 async fn kept_pre_routing(
 	rp: &Client,
 	eps: &[Endpoint],
-	keys: &[String],
+	pods: &[(String, Option<String>)],
 	target: Option<&str>,
 	set: &str,
 	caps: &mut HashMap<String, Capabilities>,
 ) -> Option<(Vec<String>, BTreeSet<u16>)> {
 	let feature = render::listener_filters::FEATURE;
 	pod_features(rp, eps, caps).await;
-	if keys.iter().any(|k| caps.get(k).is_some_and(|c| !c.has(feature))) {
+	if pods.iter().any(|(k, _)| caps.get(k).is_some_and(|c| !c.has(feature))) {
 		return None;
 	}
-	if let Some(image) = target {
-		if !eps.iter().all(|ep| ep.rproxy_image.as_deref() == Some(image)) {
+	let (answered, unknown): (Vec<_>, Vec<_>) = pods.iter().partition(|(k, _)| caps.contains_key(k));
+	if let Some(t) = target {
+		let target_known = (t == provision::RPROXY_IMAGE && SHIPPED_FEATURES.contains(&feature))
+			|| FEATURE_IMAGES.lock().unwrap().contains(&(feature.to_string(), t.to_string()))
+			|| answered.iter().any(|(_, image)| image.as_deref() == Some(t));
+		if !target_known || !unknown.iter().all(|(_, image)| image.as_deref() == Some(t)) {
 			return None;
 		}
 	}
-	let answered: Vec<&Endpoint> =
-		eps.iter().filter(|ep| keys.contains(&ep.caps_key()) && caps.get(&ep.caps_key()).is_some_and(|c| c.has(feature))).collect();
 	let mut kinds: Option<Vec<String>> = None;
-	for ep in &answered {
-		let names = caps[&ep.caps_key()].names("pre_routing_kinds");
+	for (k, _) in &answered {
+		let names = caps[k].names("pre_routing_kinds");
 		kinds = Some(match kinds {
 			None => names,
 			Some(v) => v.into_iter().filter(|n| names.contains(n)).collect(),
 		});
 	}
 	let kinds = kinds?;
-	for ep in answered {
+	// the ports in force on any pod that answered (every one of them runs it)
+	let mut ports = BTreeSet::new();
+	for ep in eps.iter().filter(|ep| answered.iter().any(|(k, _)| *k == ep.caps_key())) {
 		let Ok(addr) = api_addr(ep) else { continue };
 		let Ok(Some(current)) = rp.scoped(ep.target.as_deref()).get_ruleset(addr, set).await else { continue };
-		let ports: BTreeSet<u16> = current
-			.rules
-			.iter()
-			.filter(|r| r.http.as_ref().and_then(|h| h.get("pre_routing")).and_then(Value::as_array).is_some_and(|a| !a.is_empty()))
-			.map(|r| r.listen_port)
-			.collect();
-		if ports.is_empty() {
-			return None;
-		}
-		info!(set, ?ports, "not every rproxy pod has answered yet: the listener filters in force are kept");
-		return Some((kinds, ports));
+		ports.extend(
+			current
+				.rules
+				.iter()
+				.filter(|r| r.http.as_ref().and_then(|h| h.get("pre_routing")).and_then(Value::as_array).is_some_and(|a| !a.is_empty()))
+				.map(|r| r.listen_port),
+		);
 	}
-	None
+	if ports.is_empty() {
+		return None;
+	}
+	info!(set, ?ports, "not every rproxy pod has answered yet: the listener filters in force are kept");
+	Some((kinds, ports))
 }
 
 /// Whether the GatewayClasses claim `GatewayListenerFilters`: managed, the image the controller deploys

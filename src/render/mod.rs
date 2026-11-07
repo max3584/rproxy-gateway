@@ -61,15 +61,37 @@ pub struct Options {
 	pub params: params::ParamsOptions,
 	/// What every backend gets unless an RproxyPolicy sets it (passive health checks, connect timeouts).
 	pub backends: BackendDefaults,
-	/// The middleware kinds rproxy runs before route matching (`http.pre_routing`, rproxy v0.4.22:
-	/// `features.pre_routing_kinds`), when every rproxy pod of the Gateway (and the image they roll
-	/// to) answered `http_options` `pre_routing`. `None`: not known, and a listener with
-	/// `filters.requests` is not accepted (never served without its filters).
-	pub pre_routing: Option<Vec<String>>,
-	/// With `pre_routing`: `None` when every pod is known to run it; `Some(ports)` while it is only kept
-	/// (`controller::kept_pre_routing`: a pod not asked yet, the filters already in force on these ports
-	/// and the image unchanged), and then only the listeners on these ports are translated.
-	pub pre_routing_ports: Option<BTreeSet<u16>>,
+	/// Whether the Gateway's rproxy runs listener filters (`http.pre_routing`, rproxy v0.4.22).
+	pub pre_routing: PreRouting,
+}
+
+/// Whether the rproxy pods of a Gateway run middlewares before route matching (`http.pre_routing`,
+/// rproxy v0.4.22: `features.http_options` `pre_routing`). Otherwise a listener with `filters.requests`
+/// is not accepted (never served without its filters).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum PreRouting {
+	/// Not known yet (a pod has not answered): the listener waits, and the Gateway is still placed so
+	/// that its pods start and answer (`awaits_rproxy`).
+	#[default]
+	Unknown,
+	/// Known not to: a pod answered without it, or the pods roll to an image that lacks it (the bundled
+	/// rproxy before v0.4.22). The listener is refused and places nothing.
+	Lacking,
+	/// The kinds rproxy runs there (`features.pre_routing_kinds`). `ports`: `None` when every pod and the
+	/// image they roll to are known to run it; `Some` while it is only kept (`controller::kept_pre_routing`:
+	/// a pod not known yet), and then only the listeners on these ports (where the filters are already in
+	/// force) are translated, the others wait.
+	Known { kinds: Vec<String>, ports: Option<BTreeSet<u16>> },
+}
+
+impl PreRouting {
+	/// The kinds, when listener filters on `port` are translated.
+	pub fn kinds(&self, port: u16) -> Option<&[String]> {
+		match self {
+			PreRouting::Known { kinds, ports } if ports.as_ref().is_none_or(|p| p.contains(&port)) => Some(kinds),
+			_ => None,
+		}
+	}
 }
 
 /// What the controller gives every backend it renders unless an RproxyPolicy sets it (v0.4.5,
@@ -208,8 +230,7 @@ impl Default for Options {
 			cross_namespace_secrets: true,
 			params: params::ParamsOptions::default(),
 			backends: BackendDefaults::default(),
-			pre_routing: None,
-			pre_routing_ports: None,
+			pre_routing: PreRouting::Unknown,
 		}
 	}
 }
@@ -997,9 +1018,14 @@ fn validate_listener<'a>(
 		st.filtered = true;
 		// GEP-5224: the message names the filters
 		let named: Vec<String> = reqs.iter().enumerate().map(|(i, f)| listener_filters::label(i, f)).collect();
-		let why = if !matches!(family, Family::Http | Family::Https) {
+		let http = matches!(family, Family::Http | Family::Https);
+		let why = if !http {
 			Some("listener filters apply to HTTP and HTTPS listeners only")
-		} else if !pre_routing_known(opts, st.port) {
+		} else if opts.pre_routing == PreRouting::Lacking {
+			Some(
+				"listener filters need rproxy to run middlewares before route matching (GET /capabilities: http_options pre_routing, rproxy v0.4.22); the Gateway's rproxy lacks it",
+			)
+		} else if opts.pre_routing.kinds(st.port).is_none() {
 			Some(
 				"listener filters need every rproxy pod of the Gateway, and the image they roll to, to run middlewares before route matching (GET /capabilities: http_options pre_routing, rproxy v0.4.22); not known (yet)",
 			)
@@ -1008,7 +1034,7 @@ fn validate_listener<'a>(
 		};
 		if let Some(why) = why {
 			st.accepted = false;
-			st.awaits_rproxy = !pre_routing_known(opts, st.port) && matches!(family, Family::Http | Family::Https);
+			st.awaits_rproxy = http && opts.pre_routing != PreRouting::Lacking;
 			st.conds.push(Cond::new("Accepted", false, "UnsupportedValue", format!("{}: {why}", named.join(", "))));
 		}
 	}
@@ -1082,11 +1108,6 @@ fn validate_listener<'a>(
 	st
 }
 
-/// Whether listener filters on `port` are translated (`Options::pre_routing`, `pre_routing_ports`).
-fn pre_routing_known(opts: &Options, port: u16) -> bool {
-	opts.pre_routing.is_some() && opts.pre_routing_ports.as_ref().is_none_or(|p| p.contains(&port))
-}
-
 /// The listeners' filters (GEP-5224) as rproxy middlewares, by listener index, for the accepted
 /// listeners that have them (`opts.pre_routing` known). A filter that cannot be used refuses its
 /// listener (`Accepted: False`, `UnsupportedValue`). rproxy runs `pre_routing` for every request of a
@@ -1103,9 +1124,9 @@ fn listener_chains(
 	middleware_policy: Option<&crate::k8s::params::MiddlewarePolicy>,
 ) -> BTreeMap<usize, listener_filters::Chain> {
 	let mut chains = BTreeMap::new();
-	let Some(kinds) = &opts.pre_routing else { return chains };
 	for (i, st) in listeners.iter_mut().enumerate() {
 		let Some(reqs) = listener_filters::requests(st.l).filter(|_| st.accepted) else { continue };
+		let Some(kinds) = opts.pre_routing.kinds(st.port) else { continue };
 		let ctx = http::Ctx {
 			world,
 			scheme: if st.family == Some(Family::Https) { "https" } else { "http" },
@@ -1140,8 +1161,9 @@ fn listener_chains(
 		}
 	}
 	for ((_, port), members) in ports {
-		let keys: Vec<Option<(String, Vec<Value>)>> =
-			members.iter().map(|i| listener_filters::requests(listeners[*i].l).map(|r| (listeners[*i].ns.clone(), r.clone()))).collect();
+		// the filters as built (a Gateway's and a ListenerSet's listener with the same list can resolve
+		// differently: ReferenceGrants, namespaces)
+		let keys: Vec<Option<listener_filters::Chain>> = members.iter().map(|i| chains.get(i).cloned()).collect();
 		if keys.iter().all(|k| *k == keys[0]) {
 			continue;
 		}
