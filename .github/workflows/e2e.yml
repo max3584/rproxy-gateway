@@ -208,6 +208,9 @@ jobs:
           cache: false
       - name: scripts/conformance.sh
         run: scripts/conformance.sh
+      # GEP-5093 (GatewayAddressRoutability*): the v1.7.0 suite has no test for it yet; the GEP's scenarios
+      - name: address routability (scripts/routability.sh)
+        run: scripts/routability.sh
       - uses: actions/upload-artifact@v4
         if: always()
         with:
