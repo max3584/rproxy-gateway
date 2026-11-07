@@ -7,7 +7,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 CLUSTER=${CLUSTER:-rproxy-gateway}
-GATEWAY_API_VERSION=${GATEWAY_API_VERSION:-v1.6.3}
+GATEWAY_API_VERSION=${GATEWAY_API_VERSION:-v1.7.0}
 # standard (what README installs) or experimental (conformance.sh)
 GATEWAY_API_CHANNEL=${GATEWAY_API_CHANNEL:-standard}
 TRAEFIK_CRDS=${TRAEFIK_CRDS:-https://raw.githubusercontent.com/traefik/traefik/v3.7.14/docs/content/reference/dynamic-configuration/kubernetes-crd-definition-v1.yml}

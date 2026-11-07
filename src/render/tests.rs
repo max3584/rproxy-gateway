@@ -453,6 +453,85 @@ spec:
 	}
 }
 
+/// HTTPRouteBackendURLRewrite (Gateway API v1.7): the suite's manifest
+/// (conformance/tests/httproute-backend-url-rewrite.yaml), a URLRewrite on a backendRef.
+#[test]
+fn url_rewrite_on_backend_refs() {
+	let yaml = format!(
+		"{BASE}{}{}",
+		gw("  - {name: http, port: 8080, protocol: HTTP}"),
+		r#"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: u, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  rules:
+    - matches: [{path: {type: PathPrefix, value: /full}}]
+      backendRefs:
+        - name: web
+          port: 80
+          filters:
+            - type: URLRewrite
+              urlRewrite: {path: {type: ReplaceFullPath, replaceFullPath: /rewritten-full}}
+    - matches: [{path: {type: PathPrefix, value: /prefix}}]
+      backendRefs:
+        - name: web
+          port: 80
+          filters:
+            - type: URLRewrite
+              urlRewrite: {path: {type: ReplacePrefixMatch, replacePrefixMatch: /rewritten-prefix}}
+"#
+	);
+	let p = plan(&yaml);
+	assert!(cond(&p.parents[0].conds, "Accepted").status, "{:?}", p.parents[0].conds);
+	assert!(cond(&p.parents[0].conds, "ResolvedRefs").status, "{:?}", p.parents[0].conds);
+	let http = &p.rules_json()[0]["http"];
+	let mws = |svc: &str| -> Vec<serde_json::Value> {
+		let servers = http["services"][svc]["servers"].as_array().unwrap().clone();
+		assert!(!servers.is_empty());
+		// every server of the backendRef carries the rewrite
+		let first = servers[0]["middlewares"].clone();
+		assert!(servers.iter().all(|s| s["middlewares"] == first), "{servers:?}");
+		first.as_array().unwrap().iter().map(|n| http["middlewares"][n.as_str().unwrap()].clone()).collect()
+	};
+	assert_eq!(mws("default/u/r0"), vec![json!({"replace_path": {"path": "/rewritten-full"}})]);
+	let prefix = mws("default/u/r1");
+	assert_eq!(prefix.len(), 1);
+	let r = &prefix[0]["replace_path_regex"];
+	assert_eq!(r["regex"], "^/prefix(/.*)?$");
+	assert_eq!(r["replacement"], "/rewritten-prefix${1}");
+	// the routes themselves rewrite nothing
+	for route in http["routes"].as_array().unwrap() {
+		assert!(route.get("middlewares").is_none_or(|m| m.as_array().unwrap().is_empty()), "{route:?}");
+	}
+}
+
+/// Listener filters (GEP-5224) run before route matching; rproxy cannot yet, so such a listener
+/// is not accepted (an ExternalAuth there must not be skipped silently).
+#[test]
+fn listener_filters_not_accepted() {
+	let yaml = format!(
+		"{BASE}{}",
+		gw(r#"  - {name: plain, port: 8080, protocol: HTTP}
+  - name: auth
+    port: 8081
+    protocol: HTTP
+    filters:
+      requests:
+        - type: ExternalAuth
+          externalAuth: {protocol: HTTP, backendRef: {name: api, namespace: other, port: 8000}, http: {}}
+  - {name: empty, port: 8082, protocol: HTTP, filters: {requests: []}}"#),
+	);
+	let p = plan(&yaml);
+	let l = |n: &str| p.listeners.iter().find(|x| x.name == n).unwrap();
+	let c = cond(&l("auth").conds, "Accepted");
+	assert_eq!((c.status, c.reason.as_str()), (false, "UnsupportedValue"));
+	assert!(cond(&l("plain").conds, "Accepted").status);
+	assert!(cond(&l("empty").conds, "Accepted").status);
+}
+
 #[test]
 fn external_auth() {
 	let yaml = format!(

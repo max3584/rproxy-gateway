@@ -940,6 +940,12 @@ fn validate_listener<'a>(
 		resolved =
 			Cond::new("ResolvedRefs", false, "InvalidRouteKinds", format!("route kinds not supported: {}", invalid_kinds.join(", ")));
 	}
+	// listener filters run before route matching (GEP-5224); served without them, an ExternalAuth
+	// would be skipped: not accepted until rproxy can run them (max3584/rproxy-api#386)
+	if l.filters.as_ref().and_then(|f| f.get("requests")).and_then(Value::as_array).is_some_and(|r| !r.is_empty()) {
+		st.accepted = false;
+		st.conds.push(Cond::new("Accepted", false, "UnsupportedValue", "listener filters (filters.requests) are not supported"));
+	}
 	if family == Family::Https && tls_mode != "Terminate" {
 		st.accepted = false;
 		st.conds.push(Cond::new("Accepted", false, "UnsupportedValue", "HTTPS listeners terminate TLS (tls.mode Terminate)"));
