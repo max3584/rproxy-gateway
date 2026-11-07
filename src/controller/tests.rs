@@ -932,8 +932,19 @@ fn supported_features_match_the_conformance_script() {
 	let line = script.lines().find(|l| l.starts_with("FEATURES=${FEATURES:-")).expect("FEATURES in scripts/conformance.sh");
 	let list = line.trim_start_matches("FEATURES=${FEATURES:-").trim_end_matches('}');
 	let mut script_features: Vec<&str> = list.split(',').collect();
+	// the cluster of the conformance job serves what CLUSTER_FEATURES need (Kubernetes 1.37: ClusterTrustBundle v1)
 	let mut ours: Vec<&str> = super::SUPPORTED_FEATURES.to_vec();
+	ours.extend(super::CLUSTER_FEATURES);
 	script_features.sort();
 	ours.sort();
 	assert_eq!(script_features, ours, "SUPPORTED_FEATURES and scripts/conformance.sh FEATURES differ");
+}
+
+/// `ClusterTrustBundle` is claimed only when the API server serves ClusterTrustBundles (GEP-5075).
+#[test]
+fn cluster_trust_bundle_claimed_only_when_served() {
+	let mut w = crate::render::world::World::default();
+	assert!(!super::supported_features(&w).contains(&"ClusterTrustBundle"));
+	w.cluster_trust_bundles = Some(Default::default());
+	assert!(super::supported_features(&w).contains(&"ClusterTrustBundle"));
 }

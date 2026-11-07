@@ -38,6 +38,10 @@ pub struct World {
 	pub secrets: Objects<Secret>,
 	/// ConfigMaps with a `ca.crt` (CA certificates); read as the Secrets are.
 	pub config_maps: Objects<ConfigMap>,
+	/// ClusterTrustBundles (certificates.k8s.io, cluster-scoped): name → `spec.trustBundle`, for
+	/// `caCertificateRefs` (GEP-5075). `None`: the API server does not serve the kind (Kubernetes
+	/// before 1.37 without the beta API on), so a reference to one is an unknown kind.
+	pub cluster_trust_bundles: Option<BTreeMap<String, String>>,
 	/// Namespace labels.
 	pub namespaces: BTreeMap<String, BTreeMap<String, String>>,
 	pub middlewares: BTreeMap<Key, RproxyMiddleware>,

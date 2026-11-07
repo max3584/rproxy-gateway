@@ -38,7 +38,7 @@ metadata:
   labels:
     app.kubernetes.io/part-of: rproxy-gateway
 rules:
-  # cluster-scoped: GatewayClasses, namespaces (allowedRoutes selectors)
+  # cluster-scoped: GatewayClasses, namespaces (allowedRoutes selectors), ClusterTrustBundles (caCertificateRefs)
   - apiGroups: [gateway.networking.k8s.io]
     resources: [gatewayclasses]
     verbs: [get, list, watch]
@@ -47,6 +47,9 @@ rules:
     verbs: [get, update, patch]
   - apiGroups: [""]
     resources: [namespaces]
+    verbs: [get, list, watch]
+  - apiGroups: [certificates.k8s.io]
+    resources: [clustertrustbundles]
     verbs: [get, list, watch]
   # every namespace (controller.watchNamespaces narrows this to Roles in the listed namespaces)
   - apiGroups: [gateway.networking.k8s.io]

@@ -89,6 +89,19 @@ pub const SUPPORTED_FEATURES: &[&str] = &[
 	"HTTPRouteExternalAuthForwardBody",
 ];
 
+/// Features claimed only when the cluster serves what they need (GatewayClass `supportedFeatures`):
+/// `ClusterTrustBundle` (GEP-5075) only when the API server serves ClusterTrustBundles.
+pub const CLUSTER_FEATURES: &[&str] = &["ClusterTrustBundle"];
+
+/// `SUPPORTED_FEATURES` and the `CLUSTER_FEATURES` this cluster allows.
+pub fn supported_features(world: &render::world::World) -> Vec<&'static str> {
+	let mut out = SUPPORTED_FEATURES.to_vec();
+	if world.cluster_trust_bundles.is_some() {
+		out.push("ClusterTrustBundle");
+	}
+	out
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
 	pub controller_name: String,
@@ -437,8 +450,13 @@ async fn reconcile_all(
 			let name = c.metadata.name.clone().unwrap_or_default();
 			let previous = api.get_status(&name).await.ok().and_then(|o| o.data.get("status").cloned());
 			let invalid = render::params::class_parameters(&world, c, &params_opts).err();
-			let st =
-				status::class_status(c.metadata.generation.unwrap_or(0), SUPPORTED_FEATURES, invalid.as_deref(), previous.as_ref(), &now);
+			let st = status::class_status(
+				c.metadata.generation.unwrap_or(0),
+				&supported_features(&world),
+				invalid.as_deref(),
+				previous.as_ref(),
+				&now,
+			);
 			let old = status::without_features(&st);
 			if previous.as_ref() != Some(&st) && previous.as_ref() != Some(&old) {
 				match patch_status(&api, &name, st).await {

@@ -6,8 +6,8 @@
 //!   name). Two policies with the same target conflict: the oldest wins (GEP-713),
 //!   the other gets `Accepted: False` (`Conflicted`). One for a port wins over
 //!   one for the whole Service.
-//! - `caCertificateRefs` are ConfigMaps (`ca.crt`) of the policy's namespace,
-//!   written as one file; `wellKnownCACertificates: System` uses rproxy's
+//! - `caCertificateRefs` are ConfigMaps (`ca.crt`) of the policy's namespace and
+//!   ClusterTrustBundles (`spec.trustBundle`, by name, GEP-5075), written as one file; `wellKnownCACertificates: System` uses rproxy's
 //!   default roots. A policy without a usable CA gets `Accepted: False`
 //!   (`NoValidCACertificate`) and requests for its backends are answered with 500.
 
@@ -159,7 +159,23 @@ fn settings(
 	let mut bundle: Vec<u8> = vec![];
 	let mut resolved = Cond::ok("ResolvedRefs", "ResolvedRefs");
 	for r in &v.ca_certificate_refs {
-		let problem = if !r.group.is_empty() || r.kind != "ConfigMap" {
+		let problem = if r.group == crate::manifests::CTB_GROUP && r.kind == "ClusterTrustBundle" {
+			// cluster-scoped: by name, no ReferenceGrant (GEP-5075)
+			match crate::render::cluster_trust_bundle(world, &r.name) {
+				Ok(pem) => {
+					bundle.extend_from_slice(pem.trim_end().as_bytes());
+					bundle.push(b'\n');
+					None
+				}
+				Err(None) => Some(Cond::new(
+					"ResolvedRefs",
+					false,
+					"InvalidKind",
+					format!("caCertificateRef ClusterTrustBundle {}: the API server does not serve ClusterTrustBundles", r.name),
+				)),
+				Err(Some(e)) => Some(Cond::new("ResolvedRefs", false, "InvalidCACertificateRef", e)),
+			}
+		} else if !r.group.is_empty() || r.kind != "ConfigMap" {
 			Some(Cond::new(
 				"ResolvedRefs",
 				false,

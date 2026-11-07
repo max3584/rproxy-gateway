@@ -6,6 +6,9 @@ use serde_json::Value;
 
 use crate::render::world::World;
 
+/// The group of ClusterTrustBundle (Kubernetes' certificates API).
+pub const CTB_GROUP: &str = "certificates.k8s.io";
+
 impl World {
 	/// Adds one object by its `apiVersion` and `kind`; unknown kinds are ignored.
 	/// `Err` when a known kind does not have its shape.
@@ -54,6 +57,11 @@ impl World {
 			("", "ConfigMap") => {
 				let c: k8s_openapi::api::core::v1::ConfigMap = serde_json::from_value(obj).map_err(err)?;
 				self.config_maps.insert(crate::render::world::key(&c.metadata), c);
+			}
+			(CTB_GROUP, "ClusterTrustBundle") => {
+				let name = obj["metadata"]["name"].as_str().unwrap_or_default().to_string();
+				let bundle = obj["spec"]["trustBundle"].as_str().unwrap_or_default().to_string();
+				self.cluster_trust_bundles.get_or_insert_with(Default::default).insert(name, bundle);
 			}
 			("", "Namespace") => {
 				let n: k8s_openapi::api::core::v1::Namespace = serde_json::from_value(obj).map_err(err)?;

@@ -61,7 +61,7 @@ metadata:
   name: rproxy-gateway
   labels: {{- include "rproxy-gateway.labels" . | nindent 4 }}
 rules:
-  # cluster-scoped: GatewayClasses, namespaces (allowedRoutes selectors)
+  # cluster-scoped: GatewayClasses, namespaces (allowedRoutes selectors), ClusterTrustBundles (caCertificateRefs)
   - apiGroups: [gateway.networking.k8s.io]
     resources: [gatewayclasses]
     verbs: [get, list, watch]
@@ -70,6 +70,9 @@ rules:
     verbs: [get, update, patch]
   - apiGroups: [""]
     resources: [namespaces]
+    verbs: [get, list, watch]
+  - apiGroups: [certificates.k8s.io]
+    resources: [clustertrustbundles]
     verbs: [get, list, watch]
   {{- if not .Values.controller.watchNamespaces }}
   # every namespace (controller.watchNamespaces narrows this to Roles in the listed namespaces)

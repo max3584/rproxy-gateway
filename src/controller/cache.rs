@@ -192,7 +192,13 @@ pub const DYNAMIC_KINDS: &[(&str, &str)] = &[
 	(crate::k8s::crd::GROUP, "RproxyPolicy"),
 	(crate::k8s::crd::GROUP, "RproxyRule"),
 	(crate::k8s::crd::GROUP, "RproxyGatewayParameters"),
+	// Kubernetes' own: certificates.k8s.io/v1 from 1.37, earlier only with the beta (or alpha) API on;
+	// not served: references to one are an unknown kind, looked for again as the CRDs are
+	(crate::manifests::CTB_GROUP, "ClusterTrustBundle"),
 ];
+
+/// The cluster-scoped kinds of `DYNAMIC_KINDS` (watched in all namespaces whatever the scope).
+const CLUSTER_KINDS: &[&str] = &["GatewayClass", "ClusterTrustBundle"];
 
 fn spawn_watch<K>(api: Api<K>, changed: Arc<Notify>, what: &'static str) -> Store<K>
 where
@@ -214,9 +220,10 @@ where
 }
 
 fn spawn_dyn_watch(client: &kube::Client, ar: &ApiResource, scope: &Scope, changed: Arc<Notify>) -> Multi<DynamicObject> {
-	// GatewayClass is the one cluster-scoped kind read
 	let apis: Vec<Api<DynamicObject>> = match scope {
-		Some(nss) if ar.kind != "GatewayClass" => nss.iter().map(|ns| Api::namespaced_with(client.clone(), ns, ar)).collect(),
+		Some(nss) if !CLUSTER_KINDS.contains(&ar.kind.as_str()) => {
+			nss.iter().map(|ns| Api::namespaced_with(client.clone(), ns, ar)).collect()
+		}
 		_ => vec![Api::all_with(client.clone(), ar)],
 	};
 	Multi(apis.into_iter().map(|api| spawn_dyn_watch_one(api, ar, changed.clone())).collect())
@@ -299,6 +306,9 @@ impl Cache {
 					self.dynamic.write().unwrap().push((DynKind { kind, store }, ar.clone()));
 					added = true;
 				}
+				None if first && group == crate::manifests::CTB_GROUP => {
+					info!(group, kind, "not served by the API server; references to it are refused (looked for again later)")
+				}
 				None if first => warn!(group, kind, "not served by the API server (CRD not installed); looked for again later"),
 				None => {}
 			}
@@ -366,6 +376,10 @@ impl Cache {
 			w.namespaces.insert(n.metadata.name.clone().unwrap_or_default(), n.metadata.labels.clone().unwrap_or_default());
 		}
 		for (d, ar) in self.dynamic.read().unwrap().iter() {
+			if d.kind == "ClusterTrustBundle" {
+				// served: an empty set is still a known kind
+				w.cluster_trust_bundles.get_or_insert_with(Default::default);
+			}
 			for o in d.store.state() {
 				let mut v = match serde_json::to_value(&*o) {
 					Ok(v) => v,

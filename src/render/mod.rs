@@ -1033,8 +1033,29 @@ fn client_ca(
 		let group = r.group.as_deref().unwrap_or("");
 		let kind = r.kind.as_deref().unwrap_or("ConfigMap");
 		let ns = r.namespace.as_deref().unwrap_or(gw_ns);
-		let p = if !group.is_empty() || kind != "ConfigMap" {
-			Some(bad("InvalidCACertificateKind", format!("caCertificateRef {group}/{kind} {}: only ConfigMaps are supported", r.name)))
+		let p = if group == crate::manifests::CTB_GROUP && kind == "ClusterTrustBundle" {
+			// cluster-scoped: by name, no ReferenceGrant (GEP-5075)
+			if r.namespace.is_some() {
+				Some(bad("InvalidCACertificateRef", format!("ClusterTrustBundle {}: a cluster-scoped reference has no namespace", r.name)))
+			} else {
+				match cluster_trust_bundle(world, &r.name) {
+					Ok(pem) => {
+						bundle.extend_from_slice(pem.trim_end().as_bytes());
+						bundle.push(b'\n');
+						None
+					}
+					Err(None) => Some(bad(
+						"InvalidCACertificateKind",
+						format!("caCertificateRef ClusterTrustBundle {}: the API server does not serve ClusterTrustBundles", r.name),
+					)),
+					Err(Some(e)) => Some(bad("InvalidCACertificateRef", e)),
+				}
+			}
+		} else if !group.is_empty() || kind != "ConfigMap" {
+			Some(bad(
+				"InvalidCACertificateKind",
+				format!("caCertificateRef {group}/{kind} {}: only ConfigMaps and ClusterTrustBundles are supported", r.name),
+			))
 		} else if !world.granted((GROUP, "Gateway", gw_ns), ("", "ConfigMap", ns, &r.name)) {
 			Some(bad("RefNotPermitted", format!("ConfigMap {ns}/{}: no ReferenceGrant allows the reference", r.name)))
 		} else {
@@ -1058,6 +1079,18 @@ fn client_ca(
 		return (None, problem);
 	}
 	(Some(ca_file(&bundle, files, opts)), problem)
+}
+
+/// The PEM of the ClusterTrustBundle `name` (`spec.trustBundle`). `Err(None)`: the API server does
+/// not serve ClusterTrustBundles (an unknown kind); `Err(Some(_))`: missing, empty or not PEM.
+pub fn cluster_trust_bundle(world: &World, name: &str) -> Result<String, Option<String>> {
+	let bundles = world.cluster_trust_bundles.as_ref().ok_or(None)?;
+	let pem = bundles.get(name).ok_or_else(|| Some(format!("ClusterTrustBundle {name} not found")))?;
+	if pem.trim().is_empty() {
+		return Err(Some(format!("ClusterTrustBundle {name}: trustBundle is empty")));
+	}
+	crate::pem::check_certs(pem.as_bytes()).map_err(|e| Some(format!("ClusterTrustBundle {name} trustBundle: {e}")))?;
+	Ok(pem.clone())
 }
 
 /// Adds a CA bundle to `files` (named by its hash); returns its path.
