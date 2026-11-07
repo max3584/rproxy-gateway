@@ -768,6 +768,10 @@ struct ListenerState<'a> {
 	filtered: bool,
 	/// `Gateway` or `ListenerSet` (ReferenceGrants of an ExternalAuth filter are from it).
 	from_kind: &'static str,
+	/// Not accepted only because whether the rproxy pods run listener filters is not known (yet): the
+	/// Gateway is still deployed (its pods must start to answer `/capabilities`) and the listener's port
+	/// stays on the Service, so the pods and the Service do not change once it is accepted.
+	awaits_rproxy: bool,
 	/// Accepted but with nothing to serve with (no usable certificate): routes
 	/// attach, but no rule is made.
 	unservable: bool,
@@ -936,6 +940,7 @@ fn validate_listener<'a>(
 		accepted: true,
 		filtered: false,
 		from_kind: origin.kind,
+		awaits_rproxy: false,
 		unservable: false,
 		attached: 0,
 	};
@@ -998,6 +1003,7 @@ fn validate_listener<'a>(
 		};
 		if let Some(why) = why {
 			st.accepted = false;
+			st.awaits_rproxy = opts.pre_routing.is_none() && matches!(family, Family::Http | Family::Https);
 			st.conds.push(Cond::new("Accepted", false, "UnsupportedValue", format!("{}: {why}", named.join(", "))));
 		}
 	}
@@ -1065,6 +1071,8 @@ fn validate_listener<'a>(
 	if st.conds.iter().all(|c| c.kind != "Accepted") {
 		st.conds.push(Cond::ok("Accepted", "Accepted"));
 	}
+	// waiting for rproxy only when nothing else refuses the listener
+	st.awaits_rproxy &= st.conds.iter().filter(|c| c.kind == "Accepted" && !c.status).count() == 1;
 	st.conds.push(resolved);
 	st
 }
@@ -1294,6 +1302,7 @@ fn conflicts(listeners: &mut [ListenerState]) {
 			if let Some(reason) = reason {
 				let st = &mut listeners[i];
 				st.accepted = false;
+				st.awaits_rproxy = false;
 				status::set(&mut st.conds, Cond::new("Conflicted", true, reason, "another listener on this port takes it"));
 				status::set(&mut st.conds, Cond::new("Accepted", false, reason, "conflicts with another listener"));
 				break;
@@ -1933,10 +1942,15 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 		});
 	}
 	// Service ports: every listener that can be served, with or without a rule yet
-	plan.listener_ports =
-		listeners.iter().filter(|l| l.accepted && !l.unservable).filter_map(|l| l.family.map(|f| (f.protocol(), l.port))).collect();
+	// (and the ones waiting for the rproxy pods to answer whether they run listener filters)
+	plan.listener_ports = listeners
+		.iter()
+		.filter(|l| (l.accepted || l.awaits_rproxy) && !l.unservable)
+		.filter_map(|l| l.family.map(|f| (f.protocol(), l.port)))
+		.collect();
 	let own: Vec<&ListenerState> = listeners.iter().filter(|l| l.owner == Owner::Gateway).collect();
-	let any = own.iter().any(|l| l.accepted);
+	// a Gateway whose listeners wait for its rproxy pods is deployed (they answer once they run)
+	let any = own.iter().any(|l| l.accepted || l.awaits_rproxy);
 	let all = own.iter().all(|l| l.accepted);
 	let addresses = gateway_addresses(gw);
 	match params::gateway_parameters(world, gw, &opts.params) {

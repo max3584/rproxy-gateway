@@ -699,6 +699,10 @@ fn listener_filters_become_pre_routing() {
 	let old = plan(&yaml);
 	assert!(!cond(&old.listeners[0].conds, "Accepted").status);
 	assert!(old.rules_json().iter().all(|r| r["http"].get("pre_routing").is_none()));
+	// ... but the Gateway is deployed, with the port on its Service: its pods have to start to answer
+	// whether they run listener filters
+	assert!(old.accepted(), "{:?}", old.conds);
+	assert!(old.ports().contains(&(rp::Protocol::Tcp, 8080)));
 }
 
 /// A filter rproxy cannot run before routing, one that changes Host, one naming a service, a filter
