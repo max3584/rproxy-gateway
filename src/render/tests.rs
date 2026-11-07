@@ -571,6 +571,64 @@ spec:
 	}
 }
 
+/// The same with HTTPS, the filtered listener's certificate missing too (`unservable`): its host name
+/// still stays out of the wildcard listener (no fail-open through a broken certificate).
+#[test]
+fn listener_filters_without_a_certificate_do_not_fall_through() {
+	let (crt, key) = crate::pem::tests::pair("*.example.com");
+	let yaml = format!(
+		r#"{BASE}
+---
+apiVersion: v1
+kind: Secret
+metadata: {{name: cert, namespace: default}}
+stringData:
+  tls.crt: |
+{}
+  tls.key: |
+{}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {{name: gw, namespace: default}}
+spec:
+  gatewayClassName: rproxy
+  listeners:
+    - {{name: wild, port: 443, protocol: HTTPS, hostname: "*.example.com", tls: {{certificateRefs: [{{name: cert}}]}}}}
+    - name: secure
+      port: 443
+      protocol: HTTPS
+      hostname: secure.example.com
+      tls: {{certificateRefs: [{{name: missing}}]}}
+      filters:
+        requests:
+          - type: ExternalAuth
+            externalAuth: {{protocol: HTTP, backendRef: {{name: api, namespace: other, port: 8000}}, http: {{}}}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {{name: r, namespace: default}}
+spec:
+  parentRefs: [{{name: gw}}]
+  rules: [{{backendRefs: [{{name: web, port: 80}}]}}]
+"#,
+		indent(&crt),
+		indent(&key)
+	);
+	let p = plan(&yaml);
+	let l = |n: &str| p.listeners.iter().find(|x| x.name == n).unwrap();
+	assert!(!cond(&l("secure").conds, "Accepted").status);
+	assert!(cond(&l("wild").conds, "Accepted").status);
+	let rules = p.rules_json();
+	let rule = rules.iter().find(|r| r["listen_port"] == 443).expect("the wildcard listener is served");
+	let routes = rule["http"]["routes"].as_array().unwrap();
+	assert!(!routes.is_empty());
+	for r in routes {
+		let m = r["match"].as_str().unwrap();
+		assert!(m.contains("!Host(`secure.example.com`)"), "{m}");
+	}
+}
+
 #[test]
 fn external_auth() {
 	let yaml = format!(
