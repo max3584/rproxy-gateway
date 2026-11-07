@@ -59,7 +59,6 @@ pub const SUPPORTED_FEATURES: &[&str] = &[
 	"HTTPRouteBackendTimeout",
 	"GatewayStaticAddresses",
 	"GatewayAddressRoutability",
-	"GatewayAddressRoutabilityCluster",
 	"GatewayAddressEmpty",
 	"GatewayInfrastructure",
 	"HTTPRoute303RedirectStatusCode",
@@ -90,6 +89,19 @@ pub const SUPPORTED_FEATURES: &[&str] = &[
 	"HTTPRouteExternalAuthGRPC",
 	"HTTPRouteExternalAuthForwardBody",
 ];
+
+/// Features claimed only in managed mode: a `Cluster` address is a Gateway's own ClusterIP Service,
+/// which the fleet does not have (GEP-5093).
+pub const MANAGED_FEATURES: &[&str] = &["GatewayAddressRoutabilityCluster"];
+
+/// The features the GatewayClasses of this controller claim (`supportedFeatures`).
+pub fn supported_features(mode: &Mode) -> Vec<&'static str> {
+	let mut out = SUPPORTED_FEATURES.to_vec();
+	if matches!(mode, Mode::Managed(_)) {
+		out.extend(MANAGED_FEATURES);
+	}
+	out
+}
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -439,8 +451,13 @@ async fn reconcile_all(
 			let name = c.metadata.name.clone().unwrap_or_default();
 			let previous = api.get_status(&name).await.ok().and_then(|o| o.data.get("status").cloned());
 			let invalid = render::params::class_parameters(&world, c, &params_opts).err();
-			let st =
-				status::class_status(c.metadata.generation.unwrap_or(0), SUPPORTED_FEATURES, invalid.as_deref(), previous.as_ref(), &now);
+			let st = status::class_status(
+				c.metadata.generation.unwrap_or(0),
+				&supported_features(&cfg.mode),
+				invalid.as_deref(),
+				previous.as_ref(),
+				&now,
+			);
 			let old = status::without_features(&st);
 			if previous.as_ref() != Some(&st) && previous.as_ref() != Some(&old) {
 				match patch_status(&api, &name, st).await {
@@ -871,7 +888,7 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 			let svc = p.world.services.get(&svc_key);
 			let src = routability::Sources {
 				default: svc.map(provision::service_addresses).unwrap_or_default(),
-				statics: svc.is_some(),
+				statics: statics(svc.is_some(), &plan),
 				dedicated: existing_address_services(p.world, &plan),
 				no_dedicated: None,
 			};
@@ -970,7 +987,7 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 			// the static addresses asked for, once the Service has them
 			let src = routability::Sources {
 				default: svc.as_ref().map(provision::service_addresses).unwrap_or_default(),
-				statics: svc.is_some() && plan.address_error.is_none(),
+				statics: statics(svc.is_some(), &plan),
 				dedicated,
 				no_dedicated: None,
 			};
@@ -1001,7 +1018,7 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 			let kind = |a: &str| if a.parse::<std::net::IpAddr>().is_ok() { "IPAddress" } else { "Hostname" };
 			let src = routability::Sources {
 				default: addrs.iter().map(|a| routability::StatusAddress::new(kind(a), a, "")).collect(),
-				statics: plan.address_error.is_none(),
+				statics: statics(true, &plan),
 				dedicated: BTreeMap::new(),
 				no_dedicated: Some("the rproxy fleet has no ClusterIP of a Gateway's own".into()),
 			};
@@ -1011,10 +1028,6 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 	// status.addresses, one for each spec.addresses entry (GEP-5093), and AddressesAssigned
 	let (addresses, assigned) = match &src {
 		None => (vec![], None),
-		Some(_) if plan.address_error.is_some() => (
-			vec![],
-			Some(render::status::Cond::new(routability::CONDITION, false, "NotAssigned", plan.address_error.clone().unwrap_or_default())),
-		),
 		Some(src) => {
 			let (a, c) = routability::assign(&plan.address_requests, src);
 			(a, Some(c))
@@ -1063,6 +1076,16 @@ async fn gateway_pass(p: &Pass<'_>, gw: &crate::k8s::gateway::Gateway, mut plan:
 
 	let addresses = addresses.into_iter().map(|a| (a.kind, a.value)).collect();
 	GatewayOut { plan, results, pod_done, addresses, keep_id, keep_pdb, soon, sub, ui_group }
+}
+
+/// Whether the static addresses (default routability, with a value) are in place: the Service is
+/// there and none of them is refused (`AddressNotUsable`; the other entries are still assigned).
+fn statics(have_service: bool, plan: &GatewayPlan) -> Result<(), String> {
+	match &plan.address_error {
+		Some(e) => Err(e.clone()),
+		None if !have_service => Err("waiting for the rproxy Service".into()),
+		None => Ok(()),
+	}
 }
 
 /// The ClusterIPs of the Services of the dedicated `spec.addresses` entries there are now.

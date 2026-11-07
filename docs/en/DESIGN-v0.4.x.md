@@ -99,6 +99,7 @@ spec:
       applyToMigrated: false                              # true: bind middlewares migrated from Traefik too
     rproxyRules: true                   # 15.: false turns RproxyRules off (policy.middlewares does not bound them)
     serviceAnnotationPrefixes: []        # address/DNS annotations Gateways may put on the Service (v0.4.18)
+    clusterIPs: false                    # true: spec.addresses with routability: Cluster may name a ClusterIP (v0.4.22)
 ```
 
 ### 2.2 Fields

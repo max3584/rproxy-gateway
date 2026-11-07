@@ -39,17 +39,34 @@ kubectl get gatewayclass rproxy -o json \
 
 kubectl create namespace $NS --dry-run=client -o yaml | kubectl apply -f - > /dev/null
 svc_cidr_prefix=$(kubectl get svc kubernetes -o jsonpath='{.spec.clusterIP}' | awk -F. '{print $1"."$2}')
-# a free ClusterIP in the ServiceCIDR (the /16 of the kubernetes Service) for the static Cluster request
-static_ip="$svc_cidr_prefix.$((200 + RANDOM % 50)).$((10 + RANDOM % 200))"
+# a free ClusterIP in the ServiceCIDR's static band (its lowest 256 addresses for a /16: the API server hands
+# out the others first, so a dynamic Service does not hold it) for the static Cluster request
+static_ip="$svc_cidr_prefix.0.$((100 + RANDOM % 150))"
 echo "static Cluster address: $static_ip"
 
-gateway() {  # gateway <name> <addresses (YAML flow list)>
+# a class whose policy allows a given ClusterIP (policy.clusterIPs: off by default)
+cat <<YAML | kubectl apply -f - > /dev/null
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyGatewayParameters
+metadata: {name: rp-cluster-ips, namespace: rproxy-gateway-system}
+spec:
+  policy: {clusterIPs: true}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: {name: rproxy-cluster-ips}
+spec:
+  controllerName: rproxy.max3584.net/gateway-controller
+  parametersRef: {group: rproxy.max3584.net, kind: RproxyGatewayParameters, name: rp-cluster-ips, namespace: rproxy-gateway-system}
+YAML
+
+gateway() {  # gateway <name> <addresses (YAML flow list)> [class]
   cat <<YAML | kubectl apply -f - > /dev/null
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata: {name: $1, namespace: $NS}
 spec:
-  gatewayClassName: rproxy
+  gatewayClassName: ${3:-rproxy}
   addresses: $2
   listeners: [{name: http, port: 80, protocol: HTTP}]
 ---
@@ -93,18 +110,27 @@ for v in $(jq -r '.[].value' "$work/mixed.json"); do in_cidr "$v"; done
 test "$(kubectl -n $NS get svc -l rproxy.max3584.net/address=true,gateway.networking.k8s.io/gateway-name=mixed -o name | wc -l)" = 1
 answers mixed
 
-echo "== a static Cluster value in the ServiceCIDR: that ClusterIP"
-gateway static "[{type: IPAddress, value: \"$static_ip\", routability: Cluster}]"
+echo "== a static Cluster value: off by default (the class's policy.clusterIPs)"
+gateway refused "[{type: IPAddress, value: \"$static_ip\", routability: Cluster}]"
+retry 240 assigned refused False NotAssigned
+kubectl -n $NS get gateway refused -o jsonpath='{.status.conditions[?(@.type=="AddressesAssigned")].message}' | grep -q 'policy.clusterIPs'
+test "$(kubectl -n $NS get svc -l rproxy.max3584.net/address=true,gateway.networking.k8s.io/gateway-name=refused -o name | wc -l)" = 0
+# only Cluster entries: the Gateway's own Service is ClusterIP as well (not exposed)
+test "$(kubectl -n $NS get svc -l gateway.networking.k8s.io/gateway-name=refused,'!rproxy.max3584.net/address' -o jsonpath='{.items[0].spec.type}')" = ClusterIP
+kubectl -n $NS delete gateway refused > /dev/null
+
+echo "== a static Cluster value in the ServiceCIDR, allowed by the class: that ClusterIP"
+gateway static "[{type: IPAddress, value: \"$static_ip\", routability: Cluster}]" rproxy-cluster-ips
 retry 240 assigned static True AddressesAssigned
 addresses static | tee "$work/static.json"
 jq -e --arg ip "$static_ip" '. == [{value: $ip, routability: "Cluster"}]' "$work/static.json" > /dev/null
 answers static
 
 echo "== a static Cluster value outside the ServiceCIDR: not assigned; with an empty request: partially"
-gateway outside "[{type: IPAddress, value: \"192.0.2.77\", routability: Cluster}]"
+gateway outside "[{type: IPAddress, value: \"192.0.2.77\", routability: Cluster}]" rproxy-cluster-ips
 retry 240 assigned outside False NotAssigned
 retry 120 sh -c "test \"\$(kubectl -n $NS get gateway outside -o jsonpath='{.status.conditions[?(@.type==\"Programmed\")].reason}')\" = AddressNotAssigned"
-gateway outside "[{type: IPAddress, value: \"192.0.2.77\", routability: Cluster}, {type: IPAddress}]"
+gateway outside "[{type: IPAddress, value: \"192.0.2.77\", routability: Cluster}, {type: IPAddress}]" rproxy-cluster-ips
 retry 240 assigned outside False PartiallyAssigned
 kubectl -n $NS get gateway outside -o jsonpath='{.status.conditions[?(@.type=="AddressesAssigned")].message}' | grep -q 'spec.addresses\[0\]'
 addresses outside | tee "$work/outside.json"
@@ -121,5 +147,7 @@ gateway mixed "[{type: IPAddress}]"
 retry 120 sh -c "test \"\$(kubectl -n $NS get svc -l rproxy.max3584.net/address=true,gateway.networking.k8s.io/gateway-name=mixed -o name | wc -l)\" = 0"
 retry 120 sh -c "test \"\$(kubectl -n $NS get gateway mixed -o json | jq '.status.addresses | length')\" = 1"
 
-kubectl delete namespace $NS --wait=false > /dev/null
+kubectl delete namespace $NS --wait=true > /dev/null
+kubectl delete gatewayclass rproxy-cluster-ips --wait=false > /dev/null
+kubectl -n rproxy-gateway-system delete rproxygatewayparameters rp-cluster-ips > /dev/null
 echo "routability: ok"

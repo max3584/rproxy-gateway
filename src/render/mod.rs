@@ -603,7 +603,7 @@ pub fn gateway_addresses(gw: &Gateway) -> Result<GatewayAddresses, String> {
 		if kind != "IPAddress" {
 			return Err(format!("address type {kind} is not supported (IPAddress only)"));
 		}
-		let r = routability::Request { value: a.value.clone(), routability: a.routability.clone().unwrap_or_default() };
+		let r = routability::Request { value: a.value.clone(), routability: a.routability.clone().unwrap_or_default(), refused: None };
 		if a.value.is_empty() {
 			// an address of this type, any value: the Service's
 			requests.push(r);
@@ -617,7 +617,14 @@ pub fn gateway_addresses(gw: &Gateway) -> Result<GatewayAddresses, String> {
 				requests.push(routability::Request { value: ip.to_string(), ..r });
 			}
 			Ok(_) => {
-				unusable.get_or_insert(format!("{} cannot be used (unspecified, loopback, link-local or multicast)", a.value));
+				let why = format!("{} cannot be used (unspecified, loopback, link-local or multicast)", a.value);
+				if r.routability.is_empty() {
+					// a static address: the Gateway is not programmed (AddressNotUsable)
+					unusable.get_or_insert(why);
+					requests.push(r);
+				} else {
+					requests.push(routability::Request { refused: Some(why), ..r });
+				}
 			}
 			Err(_) => return Err(format!("{:?} is not an IP address", a.value)),
 		}
@@ -1740,7 +1747,15 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 			.collect();
 		plan.conds.push(proxy_protocol::apply(&mut plan.rules, &own, &pp, opts.features.proxy_protocol_in));
 	}
-	if let Ok((ips, unusable, requests)) = addresses {
+	if let Ok((ips, unusable, mut requests)) = addresses {
+		// a given ClusterIP: a Service with that clusterIP in the Gateway's namespace, only where the class allows it
+		let cluster_ips = params::class_policy(world, gw, &opts.params).is_some_and(|p| p.cluster_ips == Some(true));
+		for r in requests.iter_mut().filter(|r| !r.routability.is_empty() && !r.value.is_empty() && r.refused.is_none()) {
+			if !cluster_ips {
+				r.refused =
+					Some("a given ClusterIP is off for this GatewayClass (its parameters' policy.clusterIPs: true allows it)".into());
+			}
+		}
 		plan.addresses = ips;
 		plan.address_requests = requests;
 		plan.address_error = unusable;

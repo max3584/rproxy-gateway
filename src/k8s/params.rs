@@ -412,6 +412,12 @@ pub struct ParamsPolicy {
 	/// besides the controller's --service-annotation-prefix. For classes whose tenants are trusted with them.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub service_annotation_prefixes: Option<Vec<String>>,
+	/// Whether the class's Gateways may ask for a given ClusterIP (`spec.addresses` with `routability: Cluster`
+	/// and a `value`, GEP-5093; default false). The controller makes a Service with that `clusterIP` in the
+	/// Gateway's namespace: with it a tenant can take any free ClusterIP, which the platform may hand out
+	/// elsewhere. A `Cluster` entry without a value (any ClusterIP) is always allowed.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub cluster_ips: Option<bool>,
 }
 
 /// What tenants' middlewares may use (the GatewayClass's `policy.middlewares`).

@@ -447,6 +447,23 @@ spec:
 - 切り替えは Service の endpoint（kube-proxy・CNI）で、Pod の入れ替えは readiness gate と `/readyz` で外れる。
 - クラスタの中のクライアントの通信を rproxy に通す（元の Service 名のまま）なら、次の「[クラスタの中の通信（east-west）を rproxy に通す](#クラスタの中の通信east-westを-rproxy-に通す)」。
 
+### Gateway API の `routability: Cluster`（v0.4.22、GEP-5093）
+
+Gateway の `spec.addresses` に `routability: Cluster` の項目を書くと（Gateway API v1.7 の experimental の CRD）、rproxy-gateway はその項目ごとに **Gateway の namespace に** ClusterIP の Service（`rproxy-<id>-n<位置>`、値があれば `rproxy-<id>-<値のハッシュ 8 桁>`、ラベル `rproxy.max3584.net/address: "true"`）を作り、rproxy の Pod を選ばせる。`status.addresses` にはその ClusterIP を `routability: Cluster` で書く。
+
+```yaml
+spec:
+  addresses:
+    - {type: IPAddress}                       # 既定（Service の外向きのアドレス、ClusterIP の Service なら ClusterIP）
+    - {type: IPAddress, routability: Cluster} # 専用の ClusterIP の Service
+```
+
+- 項目が全部 `Cluster`（既定の到達範囲の項目がない）なら、Gateway の Service も `LoadBalancer` にせず `ClusterIP` にする（クラスタの外に出さない）。
+- 値のない項目の Service は位置で名前を決めるので、`spec.addresses` の順を変えると作り直され、ClusterIP が変わる。
+- **値つきの `Cluster`（決まった ClusterIP）は既定で使えない。** 値を書くと、テナントがコントローラの権限で空いている好きな ClusterIP を取れる（プラットフォームがほかに配るつもりのアドレスでも）。使わせるクラスだけ、GatewayClass の parameters の `policy.clusterIPs: true` で開ける。開けていないクラスでは、その項目を割り当てない（`AddressesAssigned: False`）。ServiceCIDR の外や使われている値は API サーバが断る。
+- fleet には Gateway ごとの ClusterIP がないので、`Cluster` の項目は割り当てない（`GatewayAddressRoutabilityCluster` も名乗らない）。
+
+
 ## クラスタの中の通信（east-west）を rproxy に通す
 
 クラスタの中のクライアント（ほかの Pod）からの通信にも rproxy の機能（流量の制限・GeoIP・CrowdSec・TLS の終端・L7 の振り分け・アクセスログ）を使うには、上の ClusterIP の Gateway を作り、ルートで本物のバックエンドの Service に送る。クライアントは Gateway の Service の名前を呼ぶ。e2e（`scripts/e2e.sh` の「east-west」）がこの形（HTTPRoute・TCPRoute、下の 2 つの名前の付け方）をクラスタの中の Pod から確かめている。

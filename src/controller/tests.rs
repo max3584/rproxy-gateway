@@ -933,8 +933,22 @@ fn supported_features_match_the_conformance_script() {
 	let line = script.lines().find(|l| l.starts_with("FEATURES=${FEATURES:-")).expect("FEATURES in scripts/conformance.sh");
 	let list = line.trim_start_matches("FEATURES=${FEATURES:-").trim_end_matches('}');
 	let mut script_features: Vec<&str> = list.split(',').collect();
-	let mut ours: Vec<&str> = super::SUPPORTED_FEATURES.to_vec();
+	// the conformance job runs the managed mode
+	let mut ours: Vec<&str> = super::supported_features(&super::Mode::Managed(Default::default()));
 	script_features.sort();
 	ours.sort();
 	assert_eq!(script_features, ours, "SUPPORTED_FEATURES and scripts/conformance.sh FEATURES differ");
+}
+
+/// `GatewayAddressRoutabilityCluster` only in managed mode; `GatewayAddressRoutability` in both (GEP-5093).
+#[test]
+fn cluster_routability_claimed_only_when_managed() {
+	let managed = super::supported_features(&super::Mode::Managed(Default::default()));
+	assert!(managed.contains(&"GatewayAddressRoutabilityCluster") && managed.contains(&"GatewayAddressRoutability"));
+	let fleet = super::supported_features(&super::Mode::Fleet(crate::controller::provision::Fleet {
+		selector: String::new(),
+		addresses: vec![],
+		listen_on_addresses: false,
+	}));
+	assert!(!fleet.contains(&"GatewayAddressRoutabilityCluster") && fleet.contains(&"GatewayAddressRoutability"));
 }

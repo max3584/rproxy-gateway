@@ -29,19 +29,22 @@ pub struct Request {
 	pub value: String,
 	/// Empty: the default.
 	pub routability: String,
+	/// Why it may not be served (a ClusterIP value the class's policy does not allow).
+	pub refused: Option<String>,
 }
 
 impl Request {
-	/// Served by a ClusterIP Service of its own.
+	/// Served by a ClusterIP Service of its own (managed mode).
 	pub fn dedicated(&self) -> bool {
-		self.routability == CLUSTER || self.routability == SENTINEL
+		(self.routability == CLUSTER || self.routability == SENTINEL) && self.refused.is_none()
 	}
 
 	/// The suffix of the name of its own Service (`index`: its place in `spec.addresses`): by the
-	/// value when there is one (a changed value is another Service; a Service's ClusterIP cannot
-	/// change), else by the place.
+	/// value when there is one (8 hex digits of its hash: a changed value is another Service, as a
+	/// Service's ClusterIP cannot change), else by the place (`n<index>`: reordering `spec.addresses`
+	/// makes those Services again, with other ClusterIPs).
 	pub fn service_suffix(&self, index: usize) -> String {
-		if self.value.is_empty() { format!("n{index}") } else { format!("a{}", &crate::pem::short_hash(self.value.as_bytes())[..4]) }
+		if self.value.is_empty() { format!("n{index}") } else { crate::pem::short_hash(self.value.as_bytes())[..8].to_string() }
 	}
 
 	fn describe(&self, index: usize) -> String {
@@ -71,18 +74,25 @@ impl StatusAddress {
 }
 
 /// What serves the requests.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Sources {
 	/// The Gateway's own addresses, in order of preference (the Service's load balancer
 	/// addresses, else its ClusterIPs; the fleet's addresses). Empty: none yet.
 	pub default: Vec<StatusAddress>,
-	/// The static addresses (empty routability, with a value) are in place.
-	pub statics: bool,
+	/// The static addresses (empty routability, with a value) are in place (`Err`: why not).
+	pub statics: Result<(), String>,
 	/// The ClusterIP of each dedicated request's Service, by its place in `spec.addresses`
 	/// (`Err`: why there is none).
 	pub dedicated: BTreeMap<usize, Result<String, String>>,
-	/// Why dedicated requests cannot be served at all (the fleet).
+	/// Why dedicated requests cannot be served at all (the fleet; the sentinel, which carries no
+	/// guarantee, then takes a default address).
 	pub no_dedicated: Option<String>,
+}
+
+impl Default for Sources {
+	fn default() -> Sources {
+		Sources { default: vec![], statics: Err("waiting for the rproxy Service".into()), dedicated: BTreeMap::new(), no_dedicated: None }
+	}
 }
 
 /// `status.addresses` and the `AddressesAssigned` condition for `requests` (`spec.addresses`).
@@ -99,7 +109,21 @@ pub fn assign(requests: &[Request], src: &Sources) -> (Vec<StatusAddress>, Cond)
 	let mut missing: Vec<String> = vec![];
 	for (i, r) in requests.iter().enumerate() {
 		let taken = |out: &[StatusAddress], v: &str| out.iter().any(|a| a.value == v);
-		let got: Result<StatusAddress, String> = if r.dedicated() {
+		let any_default = |out: &[StatusAddress]| match src
+			.default
+			.iter()
+			.find(|a| !taken(out, &a.value) && !requests.iter().any(|q| q.value == a.value))
+		{
+			Some(a) => Ok(a.clone()),
+			None if src.default.is_empty() => Err("waiting for an address (the rproxy Service)".to_string()),
+			None => Err("no other address of the Gateway is left for it".to_string()),
+		};
+		let got: Result<StatusAddress, String> = if let Some(why) = &r.refused {
+			Err(why.clone())
+		} else if r.routability == SENTINEL && r.value.is_empty() && src.no_dedicated.is_some() {
+			// no guarantee: any address of the Gateway (the fleet's), reported as asked
+			any_default(&out).map(|a| StatusAddress { routability: SENTINEL.into(), ..a })
+		} else if r.dedicated() {
 			match (&src.no_dedicated, src.dedicated.get(&i)) {
 				(Some(why), _) => Err(why.clone()),
 				(None, Some(Ok(ip))) if !r.value.is_empty() && ip != &r.value => {
@@ -112,18 +136,10 @@ pub fn assign(requests: &[Request], src: &Sources) -> (Vec<StatusAddress>, Cond)
 		} else if !r.routability.is_empty() {
 			Err(format!("routability {} is not supported (empty, {CLUSTER} or {SENTINEL})", r.routability))
 		} else if !r.value.is_empty() {
-			if src.statics {
-				// an external IP: not in the ServiceCIDR
-				Ok(StatusAddress::new("IPAddress", &r.value, ""))
-			} else {
-				Err("waiting for the rproxy Service".into())
-			}
+			// an external IP: not in the ServiceCIDR
+			src.statics.clone().map(|_| StatusAddress::new("IPAddress", &r.value, ""))
 		} else {
-			match src.default.iter().find(|a| !taken(&out, &a.value) && !requests.iter().any(|q| q.value == a.value)) {
-				Some(a) => Ok(a.clone()),
-				None if src.default.is_empty() => Err("waiting for an address (the rproxy Service)".into()),
-				None => Err("no other address of the Gateway is left for it".into()),
-			}
+			any_default(&out)
 		};
 		match got {
 			Ok(a) if taken(&out, &a.value) => missing.push(format!("{}: {} is another entry's", r.describe(i), a.value)),
@@ -146,11 +162,11 @@ mod tests {
 	use super::*;
 
 	fn req(value: &str, routability: &str) -> Request {
-		Request { value: value.into(), routability: routability.into() }
+		Request { value: value.into(), routability: routability.into(), refused: None }
 	}
 
 	fn lb_and_cluster() -> Sources {
-		Sources { default: vec![StatusAddress::new("IPAddress", "203.0.113.5", "")], statics: true, ..Default::default() }
+		Sources { default: vec![StatusAddress::new("IPAddress", "203.0.113.5", "")], statics: Ok(()), ..Default::default() }
 	}
 
 	#[test]
@@ -217,7 +233,7 @@ mod tests {
 	fn statics_and_the_fleet() {
 		let src = Sources {
 			default: vec![StatusAddress::new("IPAddress", "198.51.100.1", "")],
-			statics: true,
+			statics: Ok(()),
 			no_dedicated: Some("the rproxy fleet has no ClusterIP of a Gateway's own".into()),
 			..Default::default()
 		};
@@ -229,9 +245,37 @@ mod tests {
 		assert_eq!(a.len(), 1);
 		assert_eq!(c.reason, "PartiallyAssigned");
 		// a static value is not handed to an empty request as well
-		let src = Sources { default: vec![StatusAddress::new("IPAddress", "192.0.2.10", "")], statics: true, ..Default::default() };
+		let src = Sources { default: vec![StatusAddress::new("IPAddress", "192.0.2.10", "")], statics: Ok(()), ..Default::default() };
 		let (a, c) = assign(&[req("", ""), req("192.0.2.10", "")], &src);
 		assert_eq!(a, vec![StatusAddress::new("IPAddress", "192.0.2.10", "")]);
+		assert_eq!(c.reason, "PartiallyAssigned");
+	}
+
+	/// The fleet: the sentinel takes a default address, reported as the sentinel; a refused value is not assigned.
+	#[test]
+	fn fleet_sentinel_and_refused() {
+		let src = Sources {
+			default: vec![StatusAddress::new("IPAddress", "198.51.100.1", "")],
+			statics: Ok(()),
+			no_dedicated: Some("the rproxy fleet has no ClusterIP of a Gateway's own".into()),
+			..Default::default()
+		};
+		let (a, c) = assign(&[req("", SENTINEL)], &src);
+		assert_eq!(a, vec![StatusAddress::new("IPAddress", "198.51.100.1", SENTINEL)]);
+		assert!(c.status);
+		let refused = Request { refused: Some("policy.clusterIPs".into()), ..req("10.96.0.200", CLUSTER) };
+		assert!(!refused.dedicated());
+		let (a, c) = assign(&[refused, req("", "")], &src);
+		assert_eq!(a.len(), 1);
+		assert!(c.message.contains("policy.clusterIPs"), "{}", c.message);
+		// an unusable static address: the others are still assigned
+		let src = Sources {
+			statics: Err("0.0.0.0 cannot be used".into()),
+			dedicated: [(1, Ok("10.96.3.3".to_string()))].into(),
+			..Default::default()
+		};
+		let (a, c) = assign(&[req("0.0.0.0", ""), req("", CLUSTER)], &src);
+		assert_eq!(a, vec![StatusAddress::new("IPAddress", "10.96.3.3", CLUSTER)]);
 		assert_eq!(c.reason, "PartiallyAssigned");
 	}
 
@@ -239,7 +283,7 @@ mod tests {
 	fn service_names() {
 		assert_eq!(req("", CLUSTER).service_suffix(3), "n3");
 		let a = req("10.96.7.7", CLUSTER).service_suffix(0);
-		assert!(a.starts_with('a') && a.len() == 5);
+		assert!(a.len() == 8 && a.chars().all(|c| c.is_ascii_hexdigit()), "{a}");
 		assert_eq!(a, req("10.96.7.7", SENTINEL).service_suffix(5), "by the value, not the place");
 	}
 }

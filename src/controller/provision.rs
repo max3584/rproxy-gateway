@@ -310,8 +310,14 @@ impl<'a> Target<'a> {
 		self.params.replicas.unwrap_or(m.replicas)
 	}
 
-	/// The Service's type: the parameters', else `--service-type`.
+	/// The Service's type: the parameters', else `--service-type`; `ClusterIP` when `spec.addresses` asks
+	/// for no address of the default routability (only `Cluster` ones: not exposed outside the cluster,
+	/// GEP-5093).
 	pub fn service_type(&self, m: &Managed) -> String {
+		let reqs = &self.plan.address_requests;
+		if !reqs.is_empty() && reqs.iter().all(|r| !r.routability.is_empty()) {
+			return "ClusterIP".into();
+		}
 		self.params.service.as_ref().and_then(|s| s.type_).map_or_else(|| m.service_type.clone(), |t| t.as_str().to_string())
 	}
 
@@ -2115,14 +2121,18 @@ mod tests {
 			listener_ports: [(crate::rproxy::model::Protocol::Tcp, 80)].into(),
 			..Default::default()
 		};
-		let req = |v: &str, r: &str| crate::render::routability::Request { value: v.into(), routability: r.into() };
+		let req = |v: &str, r: &str| crate::render::routability::Request { value: v.into(), routability: r.into(), refused: None };
 		plan.address_requests = vec![req("", ""), req("10.96.7.7", "Cluster"), req("", "Cluster"), req("", "example.com/x")];
 		let t = Target::new(&plan);
 		let names: Vec<(usize, String, Option<String>)> = t.dedicated.clone();
 		let base = object_name(&t.id);
 		assert_eq!(names.len(), 2);
 		assert_eq!((names[0].0, names[0].2.as_deref()), (1, Some("10.96.7.7")));
-		assert!(names[0].1.starts_with(&format!("{base}-a")) && names[0].1.len() <= 63, "{}", names[0].1);
+		assert!(names[0].1.starts_with(&format!("{base}-")) && names[0].1.len() == base.len() + 9, "{}", names[0].1);
+		// the longest Gateway id still makes a Service name (63 characters at most)
+		let long_plan = crate::render::GatewayPlan { namespace: "n".repeat(63), name: "g".repeat(253), ..plan.clone() };
+		let long = Target::new(&long_plan);
+		assert!(long.dedicated.iter().all(|(_, n, _)| n.len() <= 63), "{:?}", long.dedicated);
 		assert_eq!(names[1], (2, format!("{base}-n2"), None));
 		let s = address_service(&t, &names[0].1, names[0].2.as_deref());
 		let spec = s.spec.unwrap();
@@ -2132,6 +2142,12 @@ mod tests {
 		assert_eq!(spec.ports.unwrap()[0].port, 80);
 		let l = s.metadata.labels.unwrap();
 		assert_eq!(l.get(LABEL_ADDRESS).map(String::as_str), Some("true"));
+		// with an entry of the default routability the Service keeps its type; with Cluster ones only, ClusterIP
+		let m = Managed { service_type: "LoadBalancer".into(), ..Default::default() };
+		assert_eq!(t.service_type(&m), "LoadBalancer");
+		let mut only = plan.clone();
+		only.address_requests = vec![req("", "Cluster")];
+		assert_eq!(Target::new(&only).service_type(&m), "ClusterIP");
 		assert_eq!(l.get(LABEL_GATEWAY), Some(&t.id), "collect_garbage finds it with the Gateway's objects");
 	}
 }
