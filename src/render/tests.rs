@@ -703,13 +703,17 @@ fn listener_filters_become_pre_routing() {
 	// whether they run listener filters
 	assert!(old.accepted(), "{:?}", old.conds);
 	assert!(old.ports().contains(&(rp::Protocol::Tcp, 8080)));
-	// known to lack it (a pod answered without it, the bundled rproxy v0.4.21): refused as before, nothing placed
+	// known to lack it: refused ("lacks it"); placed still when a pod answered so (else no pod would
+	// be left, and it would be placed again), not when the pods roll to the bundled rproxy v0.4.21
 	let w = world(&yaml);
-	let lacking = render_gateway(&w, &w.gateways[0], &Options { pre_routing: PreRouting::Lacking, ..Default::default() });
-	let c = cond(&lacking.listeners[0].conds, "Accepted");
-	assert!(!c.status && c.message.contains("the Gateway's rproxy lacks it"), "{}", c.message);
-	assert!(!lacking.accepted(), "{:?}", lacking.conds);
-	assert!(lacking.ports().is_empty());
+	for (place, placed) in [(true, true), (false, false)] {
+		let lacking = render_gateway(&w, &w.gateways[0], &Options { pre_routing: PreRouting::Lacking { place }, ..Default::default() });
+		let c = cond(&lacking.listeners[0].conds, "Accepted");
+		assert!(!c.status && c.message.contains("the Gateway's rproxy lacks it"), "{}", c.message);
+		assert!(lacking.rules_json().is_empty());
+		assert_eq!(lacking.accepted(), placed, "{:?}", lacking.conds);
+		assert_eq!(lacking.ports().contains(&(rp::Protocol::Tcp, 8080)), placed);
+	}
 }
 
 /// A filter rproxy cannot run before routing, one that changes Host, one naming a service, a filter

@@ -90,19 +90,19 @@ spec:
       backendRefs: [{name: echo, port: 8080}]
 YAML
 kubectl -n $ns rollout status deploy/echo --timeout=180s > /dev/null
-# the Gateway's rproxy pods: the listener is accepted once every one of them reports http_options pre_routing
-retry 180 sh -c "kubectl -n $ns get deploy -l gateway.networking.k8s.io/gateway-name=lf -o name | grep -q ."
-kubectl -n $ns rollout status deploy -l gateway.networking.k8s.io/gateway-name=lf --timeout=180s > /dev/null
+# the listener's Accepted first: accepted once every rproxy pod of the Gateway reports http_options
+# pre_routing; "lacks it" once one answered without it, or with the bundled rproxy before v0.4.22 (then
+# nothing may be placed, and there is no Deployment to wait for); "not known (yet)" until then
 cond() { kubectl -n $ns get gateway lf -o jsonpath="{.status.listeners[0].conditions[?(@.type==\"Accepted\")].$1}"; }
-accepted() { test "$(cond status)" = True; }
-if ! retry 60 accepted; then
-  message=$(cond message)
-  echo "listener Accepted: $(cond status) $(cond reason): $message"
-  if grep -q "http_options pre_routing" <<< "$message"; then
-    echo "listener filters: skipped (this rproxy has no http.pre_routing, rproxy v0.4.22)"
-    exit 0
-  fi
+settled() { [ "$(cond status)" = True ] || grep -q "lacks it" <<< "$(cond message)"; }
+if ! retry 300 settled; then
+  echo "listener Accepted: $(cond status) $(cond reason): $(cond message)"
   exit 1
+fi
+if [ "$(cond status)" != True ]; then
+  echo "listener Accepted: $(cond status) $(cond reason): $(cond message)"
+  echo "listener filters: skipped (this rproxy lacks http.pre_routing, rproxy v0.4.22)"
+  exit 0
 fi
 kubectl -n $ns wait --for=condition=Programmed gateway/lf --timeout=120s > /dev/null
 addr=$(kubectl -n $ns get gateway lf -o jsonpath='{.status.addresses[0].value}')

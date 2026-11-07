@@ -1033,9 +1033,12 @@ async fn listener_filters_are_kept_while_a_new_pod_is_not_known() {
 	// a pod that answered without pre_routing: refused at once (lacking)
 	let b = ep("k-b", image, without_port);
 	let with_b = [pod(&a), pod(&b), pod(&new)];
-	assert_eq!(pre_routing_state(&rp, &[a.clone(), b.clone()], &with_b, Some(image), set, &mut caps).await, PreRouting::Lacking);
-	// the bundled image without it (rproxy v0.4.21): lacking, also with no pod yet
-	assert_eq!(pre_routing_state(&rp, &[], &[], Some(provision::RPROXY_IMAGE), set, &mut caps).await, PreRouting::Lacking);
+	assert_eq!(
+		pre_routing_state(&rp, &[a.clone(), b.clone()], &with_b, Some(image), set, &mut caps).await,
+		PreRouting::Lacking { place: true }
+	);
+	// the bundled image without it (rproxy v0.4.21): lacking and not placed, also with no pod yet
+	assert_eq!(pre_routing_state(&rp, &[], &[], Some(provision::RPROXY_IMAGE), set, &mut caps).await, PreRouting::Lacking { place: false });
 	// another image with no pod yet: not known
 	assert_eq!(pre_routing_state(&rp, &[], &[], Some("example/rproxy:unknown"), set, &mut caps).await, PreRouting::Unknown);
 	// nothing in force (no pre_routing in the set, or no set): not started on a pod not known
@@ -1045,4 +1048,62 @@ async fn listener_filters_are_kept_while_a_new_pod_is_not_known() {
 	assert_eq!(pre_routing_state(&rp, std::slice::from_ref(&a), &pods, Some(image), set, &mut caps).await, PreRouting::Unknown);
 	// no pod answered at all: not kept
 	assert_eq!(pre_routing_state(&rp, &[], &[pod(&new)], Some(image), set, &mut caps).await, PreRouting::Unknown);
+}
+
+/// A managed Gateway whose listeners all have filters, on an image of another name that lacks
+/// `pre_routing` (an older custom build, the bundled image mirrored elsewhere): unknown, so placed; its
+/// pod answers without it, lacking, and the Gateway stays placed (no loop of removing and placing it
+/// again, its load balancer with it).
+#[tokio::test]
+async fn a_gateway_on_an_image_lacking_listener_filters_stays_placed() {
+	use crate::render::PreRouting;
+	let old = Arc::new(Mutex::new(Fake::default()));
+	let port = start(old.clone()).await;
+	let rp = Client::new(None, "secret").unwrap();
+	let image = "registry.example.com/mirror/rproxy:0.4.21";
+	let yaml = r#"
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyMiddleware
+metadata: {name: tag, namespace: default}
+spec: {headers: {request: {set: {x-tag: one}}}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {name: gw, namespace: default}
+spec:
+  gatewayClassName: rproxy
+  listeners:
+    - name: f
+      port: 8080
+      protocol: HTTP
+      filters: {requests: [{type: ExtensionRef, extensionRef: {group: rproxy.max3584.net, kind: RproxyMiddleware, name: tag}}]}
+"#;
+	let mut world = crate::render::world::World::default();
+	world.read_manifests(yaml).unwrap();
+	let render = |pre_routing: PreRouting| {
+		crate::render::render_gateway(&world, &world.gateways[0], &render::Options { pre_routing, ..Default::default() })
+	};
+	let set = "k8s/default/gw";
+	let mut caps = HashMap::new();
+	// no pod yet: unknown, placed (accepted, the port on the Service: the Deployment and Service are kept)
+	let none = pre_routing_state(&rp, &[], &[], Some(image), set, &mut caps).await;
+	assert_eq!(none, PreRouting::Unknown);
+	let plan = render(none);
+	assert!(plan.accepted() && !plan.ports().is_empty(), "{:?}", plan.conds);
+	// its pod answers without pre_routing: lacking, refused with that message, and still placed
+	let ep = Endpoint {
+		pod: "rproxy-a".into(),
+		uid: "u-a".into(),
+		ip: "127.0.0.1".into(),
+		api_port: port,
+		rproxy_image: Some(image.into()),
+		..Default::default()
+	};
+	let lacking =
+		pre_routing_state(&rp, std::slice::from_ref(&ep), &[(ep.caps_key(), Some(image.into()))], Some(image), set, &mut caps).await;
+	assert_eq!(lacking, PreRouting::Lacking { place: true });
+	let plan = render(lacking);
+	let l = plan.listeners[0].conds.iter().find(|c| c.kind == "Accepted").unwrap();
+	assert!(!l.status && l.message.contains("lacks it"), "{l:?}");
+	assert!(plan.accepted() && !plan.ports().is_empty() && plan.rules.is_empty(), "{:?}", plan.conds);
 }

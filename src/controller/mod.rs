@@ -1532,7 +1532,7 @@ static FEATURE_IMAGES: std::sync::Mutex<BTreeSet<(String, String)>> = std::sync:
 
 /// Features of the image this controller ships (`--rproxy-image`'s default, rproxy v0.4.21).
 /// When the bundled rproxy goes to v0.4.22, add `http_options.pre_routing` (`render::listener_filters::FEATURE`):
-/// until then the bundled image is known to lack listener filters (`render::PreRouting::Lacking`).
+/// until then the bundled image is known to lack listener filters (`render::PreRouting::Lacking`, not placed).
 const SHIPPED_FEATURES: &[&str] = &["graceful_shutdown", "tokens_reload", "control_limits", "http_stream_limits"];
 
 /// Whether `image` has `feature` (rproxy's `features`): the image this controller ships, or one a pod
@@ -1662,10 +1662,14 @@ async fn pre_routing_state(
 	if let Some(kinds) = pre_routing_kinds(rp, eps, &keys, target, caps).await {
 		return render::PreRouting::Known { kinds, ports: None };
 	}
-	let lacking = keys.iter().any(|k| caps.get(k).is_some_and(|c| !c.has(feature)))
-		|| target.is_some_and(|t| t == provision::RPROXY_IMAGE && !SHIPPED_FEATURES.contains(&feature));
-	if lacking {
-		return render::PreRouting::Lacking;
+	// the bundled image without it: nothing placed for the listener
+	if target.is_some_and(|t| t == provision::RPROXY_IMAGE && !SHIPPED_FEATURES.contains(&feature)) {
+		return render::PreRouting::Lacking { place: false };
+	}
+	// a pod that answered without it (an image of another name): refused, but the Gateway stays placed
+	// (removing it would leave no pod to answer, and it would be placed again: a loop)
+	if keys.iter().any(|k| caps.get(k).is_some_and(|c| !c.has(feature))) {
+		return render::PreRouting::Lacking { place: true };
 	}
 	match kept_pre_routing(rp, eps, pods, target, set, caps).await {
 		Some((kinds, ports)) => render::PreRouting::Known { kinds, ports: Some(ports) },

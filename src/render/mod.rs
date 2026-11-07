@@ -74,9 +74,12 @@ pub enum PreRouting {
 	/// that its pods start and answer (`awaits_rproxy`).
 	#[default]
 	Unknown,
-	/// Known not to: a pod answered without it, or the pods roll to an image that lacks it (the bundled
-	/// rproxy before v0.4.22). The listener is refused and places nothing.
-	Lacking,
+	/// Known not to: the listener is refused ("lacks it"). `place`: a pod answered without it (an image
+	/// of another name: an older custom build, the bundled image mirrored elsewhere): the Gateway stays
+	/// placed as while unknown (`awaits_rproxy`), else it would be removed and placed again in a loop
+	/// (no pod, unknown, placed, a pod answers, lacking, removed). Not placed (`false`) only when the pods
+	/// roll to the bundled image and it is known to lack it (`SHIPPED_FEATURES`: rproxy v0.4.21).
+	Lacking { place: bool },
 	/// The kinds rproxy runs there (`features.pre_routing_kinds`). `ports`: `None` when every pod and the
 	/// image they roll to are known to run it; `Some` while it is only kept (`controller::kept_pre_routing`:
 	/// a pod not known yet), and then only the listeners on these ports (where the filters are already in
@@ -1021,7 +1024,7 @@ fn validate_listener<'a>(
 		let http = matches!(family, Family::Http | Family::Https);
 		let why = if !http {
 			Some("listener filters apply to HTTP and HTTPS listeners only")
-		} else if opts.pre_routing == PreRouting::Lacking {
+		} else if matches!(opts.pre_routing, PreRouting::Lacking { .. }) {
 			Some(
 				"listener filters need rproxy to run middlewares before route matching (GET /capabilities: http_options pre_routing, rproxy v0.4.22); the Gateway's rproxy lacks it",
 			)
@@ -1034,7 +1037,7 @@ fn validate_listener<'a>(
 		};
 		if let Some(why) = why {
 			st.accepted = false;
-			st.awaits_rproxy = http && opts.pre_routing != PreRouting::Lacking;
+			st.awaits_rproxy = http && opts.pre_routing != PreRouting::Lacking { place: false };
 			st.conds.push(Cond::new("Accepted", false, "UnsupportedValue", format!("{}: {why}", named.join(", "))));
 		}
 	}

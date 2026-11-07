@@ -1374,7 +1374,7 @@ spec:
 	let pre_routing = if caps.has(render::listener_filters::FEATURE) {
 		render::PreRouting::Known { kinds, ports: None }
 	} else {
-		render::PreRouting::Lacking
+		render::PreRouting::Lacking { place: true }
 	};
 	let opts = render::Options {
 		listen_addrs: vec!["127.0.0.1".into()],
@@ -1384,9 +1384,9 @@ spec:
 	};
 	let plan = render::render_gateway(&world, &world.gateways[0], &opts);
 	let accepted = plan.listeners[0].conds.iter().any(|c| c.kind == "Accepted" && c.status);
-	if pre_routing == render::PreRouting::Lacking {
-		// never served without its filters, and nothing placed
-		assert!(!accepted && plan.rules.is_empty() && !plan.accepted(), "{:?}", plan.listeners[0].conds);
+	if pre_routing != (render::PreRouting::Known { kinds: caps.names("pre_routing_kinds"), ports: None }) {
+		// never served without its filters (the Gateway stays placed: its pod answered)
+		assert!(!accepted && plan.rules.is_empty() && plan.accepted(), "{:?}", plan.listeners[0].conds);
 		eprintln!("rproxy {} has no http_options pre_routing (v0.4.22); skipped", caps.version);
 		drop(rp);
 		let _ = std::fs::remove_dir_all(&dir);
