@@ -76,8 +76,8 @@ pub const OLD_STOP_GRACE: i64 = 15;
 /// The preStop of an rproxy without a graceful shutdown when `--pre-stop-secs` is unset.
 pub const PRE_STOP_SECS: u32 = 15;
 /// The rproxy image this controller deploys by default (`--rproxy-image`): it has a graceful shutdown
-/// and reads a changed token file again (rproxy v0.4.2 and later; ships v0.4.21).
-pub const RPROXY_IMAGE: &str = "ghcr.io/max3584/rproxy-gateway/rproxy:0.4.21";
+/// and reads a changed token file again (rproxy v0.4.2 and later; ships v0.4.22).
+pub const RPROXY_IMAGE: &str = "ghcr.io/max3584/rproxy-gateway/rproxy:0.4.22";
 const API_DIR: &str = "/etc/rproxy-gateway/api";
 
 /// How rproxy is deployed.

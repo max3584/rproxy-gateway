@@ -78,7 +78,7 @@ pub enum PreRouting {
 	/// of another name: an older custom build, the bundled image mirrored elsewhere): the Gateway stays
 	/// placed as while unknown (`awaits_rproxy`), else it would be removed and placed again in a loop
 	/// (no pod, unknown, placed, a pod answers, lacking, removed). Not placed (`false`) only when the pods
-	/// roll to the bundled image and it is known to lack it (`SHIPPED_FEATURES`: rproxy v0.4.21).
+	/// roll to the bundled image and it is known to lack it (`SHIPPED_FEATURES`; the bundled rproxy v0.4.22 has it).
 	Lacking { place: bool },
 	/// The kinds rproxy runs there (`features.pre_routing_kinds`). `ports`: `None` when every pod and the
 	/// image they roll to are known to run it; `Some` while it is only kept (`controller::kept_pre_routing`:

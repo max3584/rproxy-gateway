@@ -1530,10 +1530,11 @@ pub async fn sync_pod(
 /// pods all restart at once keeps its shape).
 static FEATURE_IMAGES: std::sync::Mutex<BTreeSet<(String, String)>> = std::sync::Mutex::new(BTreeSet::new());
 
-/// Features of the image this controller ships (`--rproxy-image`'s default, rproxy v0.4.21).
-/// When the bundled rproxy goes to v0.4.22, add `http_options.pre_routing` (`render::listener_filters::FEATURE`):
-/// until then the bundled image is known to lack listener filters (`render::PreRouting::Lacking`, not placed).
-const SHIPPED_FEATURES: &[&str] = &["graceful_shutdown", "tokens_reload", "control_limits", "http_stream_limits"];
+/// Features of the image this controller ships (`--rproxy-image`'s default, rproxy v0.4.22): listener
+/// filters (`http_options.pre_routing`, `render::listener_filters::FEATURE`) since v0.4.22, so a new
+/// Gateway of the bundled image translates them before its pods answer (`render::listener_filters::DOCUMENTED_KINDS`).
+const SHIPPED_FEATURES: &[&str] =
+	&["graceful_shutdown", "tokens_reload", "control_limits", "http_stream_limits", render::listener_filters::FEATURE];
 
 /// Whether `image` has `feature` (rproxy's `features`): the image this controller ships, or one a pod
 /// running it said so of. Unknown (another image before its pods answer): no; the pods roll again

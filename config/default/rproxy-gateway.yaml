@@ -177,7 +177,7 @@ spec:
         app.kubernetes.io/name: rproxy-gateway
       annotations:
         # a changed configuration rolls the controller
-        rproxy.max3584.net/config: b1aa2628e7989c47
+        rproxy.max3584.net/config: 57ba84cfa7f6503c
     spec:
       serviceAccountName: rproxy-gateway
       securityContext:
@@ -187,7 +187,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: controller
-          image: ghcr.io/max3584/rproxy-gateway:0.4.21
+          image: ghcr.io/max3584/rproxy-gateway:0.4.22
           imagePullPolicy: IfNotPresent
           # the settings are in the ConfigMap rproxy-gateway-config (RPROXY_GATEWAY_* environment
           # variables, so Kustomize can change them); extraArgs win over them (arguments beat the environment)
