@@ -65,6 +65,14 @@ pub fn to_rproxy(pattern: &str) -> String {
 	}
 }
 
+/// The route's own host name that an effective host name `name` comes from (the most specific
+/// of the route's names covering it; `None`: the route names no host). Gateway API v1.7
+/// (`GatewayRouteHostnameIntersectionPrecedence`): routes whose host names meet a listener's in
+/// the same name are ordered by these, not by the name they share.
+pub fn original<'a>(name: &str, route: &'a [String]) -> Option<&'a str> {
+	route.iter().filter(|r| covers(r, name)).max_by_key(|r| specificity(Some(r.as_str()))).map(|r| r.as_str())
+}
+
 /// How specific a host name is, for ordering routes (more specific first):
 /// exact names before wildcards, longer before shorter; `None` (any host) last.
 pub fn specificity(name: Option<&str>) -> (u8, usize) {
@@ -102,6 +110,15 @@ mod tests {
 			Ok(Some(vec!["a.example.com".into(), "*.example.com".into()]))
 		);
 		assert_eq!(effective(Some("a.example.com"), &["b.example.com".into()]), Err(NoMatch));
+	}
+
+	#[test]
+	fn originals() {
+		let route = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+		assert_eq!(original("abc.example.com", &route(&["*.com", "*.example.com"])), Some("*.example.com"));
+		assert_eq!(original("abc.example.com", &route(&["abc.example.com", "*.example.com"])), Some("abc.example.com"));
+		assert_eq!(original("*.example.com", &route(&["*.com"])), Some("*.com"));
+		assert_eq!(original("abc.example.com", &[]), None);
 	}
 
 	#[test]
