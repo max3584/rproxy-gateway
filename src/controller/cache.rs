@@ -255,7 +255,18 @@ fn spawn_dyn_watch(client: &kube::Client, ar: &ApiResource, scope: &Scope, chang
 	(Multi(stores), errors, tasks)
 }
 
-/// A dynamic kind's watches: the stores, the consecutive errors, the tasks.
+/// The HTTP status of a watch error from the API server (`None`: no answer, a connection error).
+fn watch_status(e: &watcher::Error) -> Option<u16> {
+	match e {
+		watcher::Error::InitialListFailed(kube::Error::Api(r))
+		| watcher::Error::WatchStartFailed(kube::Error::Api(r))
+		| watcher::Error::WatchFailed(kube::Error::Api(r)) => Some(r.code),
+		watcher::Error::WatchError(r) => Some(r.code),
+		_ => None,
+	}
+}
+
+/// A dynamic kind's watches: the stores, the consecutive 403 / 404 errors, the tasks.
 type DynParts = (Multi<DynamicObject>, Arc<AtomicU32>, Vec<tokio::task::AbortHandle>);
 
 fn spawn_dyn_watch_one(
@@ -277,7 +288,11 @@ fn spawn_dyn_watch_one(
 					changed.notify_one();
 				}
 				Err(e) => {
-					errors.fetch_add(1, Ordering::Relaxed);
+					// only "gone" (404) and "forbidden" (403) count towards dropping the kind: an API server
+					// restart or a broken connection does not stop using what was read
+					if matches!(watch_status(&e), Some(403 | 404)) {
+						errors.fetch_add(1, Ordering::Relaxed);
+					}
 					warn!(kind, error = %e, "watch error");
 				}
 			}
@@ -449,8 +464,14 @@ impl Cache {
 			w.namespaces.insert(n.metadata.name.clone().unwrap_or_default(), n.metadata.labels.clone().unwrap_or_default());
 		}
 		for (d, ar) in self.dynamic.read().unwrap().iter() {
-			if OPTIONAL_KINDS.contains(&d.kind) && (!d.listed() || d.errors.load(Ordering::Relaxed) >= DROP_AFTER) {
-				// not listed yet, or failing: none of its objects is used (no stale trust anchors)
+			if OPTIONAL_KINDS.contains(&d.kind) && d.errors.load(Ordering::Relaxed) >= DROP_AFTER {
+				// gone or no longer readable: none of its objects is used (no stale trust anchors)
+				continue;
+			}
+			if d.kind == "ClusterTrustBundle" && !d.listed() {
+				// served, not listed yet: references wait (Pending), the feature stays claimed
+				w.cluster_trust_bundles.get_or_insert_with(Default::default);
+				w.cluster_trust_bundles_pending = true;
 				continue;
 			}
 			if d.kind == "ClusterTrustBundle" {
@@ -524,6 +545,16 @@ mod tests {
 	/// Secrets and ConfigMaps are listed and watched as metadata only (#92): kube sends the
 	/// metadata-only Accept header for an `Api` of `PartialObjectMeta`. A kube upgrade that changes
 	/// this would hold every Secret's and ConfigMap's body again.
+	/// Only 403 and 404 count towards dropping an optional kind; a connection error does not.
+	#[test]
+	fn watch_status_of_errors() {
+		use kube::runtime::watcher;
+		let api = |code: u16| kube::core::Status::failure("x", "x").with_code(code).boxed();
+		assert_eq!(super::watch_status(&watcher::Error::WatchError(api(404))), Some(404));
+		assert_eq!(super::watch_status(&watcher::Error::InitialListFailed(kube::Error::Api(api(403)))), Some(403));
+		assert_eq!(super::watch_status(&watcher::Error::NoResourceVersion), None);
+	}
+
 	#[test]
 	fn secrets_and_config_maps_are_watched_as_metadata() {
 		assert!(PartialObjectMeta::<Secret>::metadata_api());

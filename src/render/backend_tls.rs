@@ -167,13 +167,7 @@ fn settings(
 					bundle.push(b'\n');
 					None
 				}
-				Err(None) => Some(Cond::new(
-					"ResolvedRefs",
-					false,
-					"InvalidKind",
-					format!("caCertificateRef ClusterTrustBundle {}: the API server does not serve ClusterTrustBundles", r.name),
-				)),
-				Err(Some(e)) => Some(Cond::new("ResolvedRefs", false, "InvalidCACertificateRef", e)),
+				Err(e) => Some(e.cond(&r.name, "InvalidKind")),
 			}
 		} else if !r.group.is_empty() || r.kind != "ConfigMap" {
 			Some(Cond::new(

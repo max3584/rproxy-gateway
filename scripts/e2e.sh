@@ -156,7 +156,12 @@ frontend=$(kubectl get crd gateways.gateway.networking.k8s.io -o json \
   | jq '[.spec.versions[] | select(.name == "v1") | .schema.openAPIV3Schema.properties.spec.properties.tls.properties.frontend.properties.default.properties.validation // empty] | length')
 # the feature is claimed exactly when the API server serves ClusterTrustBundles (GEP-5075)
 claims_ctb() { kubectl get gatewayclass rproxy -o json | jq -e '[.status.supportedFeatures[]?.name] | index("ClusterTrustBundle") != null' > /dev/null; }
-if [ -n "$ctb_v" ]; then
+# Gateway API v1.0 / v1.1 CRDs: supportedFeatures is a list of strings (no name), and the controller writes none
+named_features=$(kubectl get crd gatewayclasses.gateway.networking.k8s.io -o json \
+  | jq '[.spec.versions[] | select(.name == "v1") | .schema.openAPIV3Schema.properties.status.properties.supportedFeatures.items.properties.name // empty] | length')
+if [ "$named_features" -eq 0 ]; then
+  echo "== ClusterTrustBundle: this GatewayClass CRD has no supportedFeatures[].name, the claim is not checked"
+elif [ -n "$ctb_v" ]; then
   echo "== ClusterTrustBundle ($ctb_v): claimed"
   retry 60 claims_ctb
 else

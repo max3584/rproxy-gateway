@@ -1936,6 +1936,16 @@ spec: {{trustBundle: ""}}
 	let l = |n: &str| p.listeners.iter().find(|x| x.name == n).unwrap().clone();
 	assert_eq!(cond(&l("a").conds, "ResolvedRefs").reason, "InvalidCACertificateKind");
 	assert!(cond(&l("http").conds, "Accepted").status, "the rest is served");
+
+	// served but not listed yet: Pending, not an unknown kind
+	let mut w = world(&base);
+	w.cluster_trust_bundles = Some(Default::default());
+	w.cluster_trust_bundles_pending = true;
+	let p = render_gateway(&w, &w.gateways[0], &Options::default());
+	let st = |n: &str| p.backend_tls.iter().find(|s| s.name == n).cloned().unwrap();
+	assert_eq!(cond(&st("ctb").conds, "ResolvedRefs").reason, "Pending");
+	let l = |n: &str| p.listeners.iter().find(|x| x.name == n).unwrap().clone();
+	assert_eq!(cond(&l("a").conds, "ResolvedRefs").reason, "Pending");
 }
 
 /// A route naming another namespace's Service without a ReferenceGrant does not get that Service's

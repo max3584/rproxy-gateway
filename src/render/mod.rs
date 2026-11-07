@@ -1044,11 +1044,7 @@ fn client_ca(
 						bundle.push(b'\n');
 						None
 					}
-					Err(None) => Some(bad(
-						"InvalidCACertificateKind",
-						format!("caCertificateRef ClusterTrustBundle {}: the API server does not serve ClusterTrustBundles", r.name),
-					)),
-					Err(Some(e)) => Some(bad("InvalidCACertificateRef", e)),
+					Err(e) => Some(e.cond(&r.name, "InvalidCACertificateKind")),
 				}
 			}
 		} else if !group.is_empty() || kind != "ConfigMap" {
@@ -1081,15 +1077,46 @@ fn client_ca(
 	(Some(ca_file(&bundle, files, opts)), problem)
 }
 
-/// The PEM of the ClusterTrustBundle `name` (`spec.trustBundle`). `Err(None)`: the API server does
-/// not serve ClusterTrustBundles (an unknown kind); `Err(Some(_))`: missing, empty or not PEM.
-pub fn cluster_trust_bundle(world: &World, name: &str) -> Result<String, Option<String>> {
-	let bundles = world.cluster_trust_bundles.as_ref().ok_or(None)?;
-	let pem = bundles.get(name).ok_or_else(|| Some(format!("ClusterTrustBundle {name} not found")))?;
-	if pem.trim().is_empty() {
-		return Err(Some(format!("ClusterTrustBundle {name}: trustBundle is empty")));
+/// Why a ClusterTrustBundle reference cannot be used.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CtbError {
+	/// The API server does not serve ClusterTrustBundles (or they cannot be read): an unknown kind.
+	Unserved,
+	/// Served, but not listed yet (`ResolvedRefs: False`, `Pending`).
+	Pending,
+	/// Missing, empty or not PEM (`InvalidCACertificateRef`).
+	Invalid(String),
+}
+
+impl CtbError {
+	/// `ResolvedRefs: False` for it; `unknown`: the reason for an unknown kind where it is referred to.
+	pub fn cond(&self, name: &str, unknown: &str) -> Cond {
+		match self {
+			CtbError::Unserved => Cond::new(
+				"ResolvedRefs",
+				false,
+				unknown,
+				format!("caCertificateRef ClusterTrustBundle {name}: the API server does not serve ClusterTrustBundles"),
+			),
+			CtbError::Pending => {
+				Cond::new("ResolvedRefs", false, "Pending", format!("caCertificateRef ClusterTrustBundle {name}: not read yet"))
+			}
+			CtbError::Invalid(e) => Cond::new("ResolvedRefs", false, "InvalidCACertificateRef", e.clone()),
+		}
 	}
-	crate::pem::check_certs(pem.as_bytes()).map_err(|e| Some(format!("ClusterTrustBundle {name} trustBundle: {e}")))?;
+}
+
+/// The PEM of the ClusterTrustBundle `name` (`spec.trustBundle`).
+pub fn cluster_trust_bundle(world: &World, name: &str) -> Result<String, CtbError> {
+	if world.cluster_trust_bundles_pending {
+		return Err(CtbError::Pending);
+	}
+	let bundles = world.cluster_trust_bundles.as_ref().ok_or(CtbError::Unserved)?;
+	let pem = bundles.get(name).ok_or_else(|| CtbError::Invalid(format!("ClusterTrustBundle {name} not found")))?;
+	if pem.trim().is_empty() {
+		return Err(CtbError::Invalid(format!("ClusterTrustBundle {name}: trustBundle is empty")));
+	}
+	crate::pem::check_certs(pem.as_bytes()).map_err(|e| CtbError::Invalid(format!("ClusterTrustBundle {name} trustBundle: {e}")))?;
 	Ok(pem.clone())
 }
 
