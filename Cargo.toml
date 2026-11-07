@@ -41,3 +41,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[dev-dependencies]
+# tests/rproxy.rs: an HTTP/2 (h2c) backend, as a GRPCRoute's
+hyper = { version = "1", features = ["http2", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }

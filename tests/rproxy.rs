@@ -1199,3 +1199,96 @@ fn spec_with(yaml: &str, from: &str, to: &str) -> rproxy_gateway::k8s::params::R
 	world.read_manifests(&if from.is_empty() { yaml.to_string() } else { yaml.replace(from, to) }).unwrap();
 	render::params::gateway_parameters(&world, &world.gateways[0], &render::params::ParamsOptions::default()).unwrap().unwrap()
 }
+
+/// An h2c backend (a GRPCRoute's backends speak HTTP/2 without TLS) answering with the request
+/// headers `x-a`, `x-b`, `x-c`: `<x-a>|<x-b>|<x-c>`.
+async fn h2c_backend() -> u16 {
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let port = listener.local_addr().unwrap().port();
+	tokio::spawn(async move {
+		loop {
+			let Ok((tcp, _)) = listener.accept().await else { continue };
+			tokio::spawn(async move {
+				let svc = hyper::service::service_fn(|req: hyper::Request<hyper::body::Incoming>| async move {
+					let h = |n: &str| req.headers().get_all(n).iter().filter_map(|v| v.to_str().ok()).collect::<Vec<_>>().join(",");
+					let body = format!("{}|{}|{}", h("x-a"), h("x-b"), h("x-c"));
+					Ok::<_, std::convert::Infallible>(hyper::Response::new(http_body_util::Full::new(hyper::body::Bytes::from(body))))
+				});
+				let _ = hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+					.serve_connection(hyper_util::rt::TokioIo::new(tcp), svc)
+					.await;
+			});
+		}
+	});
+	port
+}
+
+/// GRPCRouteRequestHeaderModifier (Gateway API v1.7): a GRPCRoute's RequestHeaderModifier (set, add,
+/// remove) reaches the h2c backend through a real rproxy.
+#[tokio::test]
+async fn grpc_route_request_header_modifier_on_a_real_rproxy() {
+	let Some(bin) = rproxy_bin() else { return };
+	let _ = rustls::crypto::ring::default_provider().install_default();
+	let dir = std::env::temp_dir().join(format!("rproxy-gateway-grpc-headers-{}", std::process::id()));
+	let _ = std::fs::remove_dir_all(&dir);
+	std::fs::create_dir_all(&dir).unwrap();
+	let backend = h2c_backend().await;
+	let [port, api] = free_ports();
+	let rp = Rproxy::start(&bin, &dir, api);
+	rp.wait().await;
+	let client = Client::new(None, TOKEN).unwrap();
+	let caps = client.capabilities(SocketAddr::from(([127, 0, 0, 1], api))).await.unwrap();
+	let yaml = format!(
+		r#"
+apiVersion: v1
+kind: Service
+metadata: {{name: grpc, namespace: default}}
+spec: {{ports: [{{name: grpc, port: 80}}]}}
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata: {{name: grpc-1, namespace: default, labels: {{kubernetes.io/service-name: grpc}}}}
+addressType: IPv4
+ports: [{{name: grpc, port: {backend}}}]
+endpoints: [{{addresses: [127.0.0.1]}}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {{name: gw, namespace: default, generation: 1}}
+spec:
+  gatewayClassName: rproxy
+  listeners: [{{name: http, port: {port}, protocol: HTTP}}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata: {{name: grpc, namespace: default}}
+spec:
+  parentRefs: [{{name: gw}}]
+  hostnames: [grpc.example.com]
+  rules:
+    - matches: [{{method: {{service: echo.Echo, method: Hello}}}}]
+      filters:
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            set: [{{name: X-A, value: set}}]
+            add: [{{name: X-B, value: added}}]
+            remove: [X-C]
+      backendRefs: [{{name: grpc, port: 80}}]
+"#
+	);
+	let mut world = World::default();
+	world.read_manifests(&yaml).unwrap();
+	let opts = render::Options { listen_addrs: vec!["127.0.0.1".into()], features: render::Features::of(&caps), ..Default::default() };
+	let plan = render::render_gateway(&world, &world.gateways[0], &opts);
+	let ep = Endpoint { pod: "rproxy".into(), uid: "1".into(), ip: "127.0.0.1".into(), api_port: api, ..Default::default() };
+	let mut applied = Applied::new();
+	let mut caps_cache = HashMap::new();
+	let (r, _) = sync_pod(&client, &ep, &plan, &mut applied, &mut caps_cache).await;
+	let PodSync::Synced(views, _) = &r else { panic!("{r:?}") };
+	assert!(views.iter().all(|v| v.state == "running"), "{views:?}");
+	let (status, body) = get_with(port, "grpc.example.com", "/echo.Echo/Hello", "X-A: original\r\nX-B: original\r\nX-C: removed\r\n").await;
+	assert_eq!(status, 200, "{body}");
+	assert!(body.ends_with("set|original,added|"), "set, add (appended), remove: {body}");
+	drop(rp);
+	let _ = std::fs::remove_dir_all(&dir);
+}

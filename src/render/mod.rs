@@ -1394,7 +1394,11 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 		// client certificates: the port's CA (validation is per port)
 		let client_auth = members.iter().find_map(|i| listeners[*i].client_auth.clone());
 		// TLS routes by server name (passthrough, or terminated on a TLS listener)
-		let mut tls_routes: Vec<rp::TlsRoute> = vec![];
+		// (how specific the listener's name is, narrowed by the listener, how specific the route's own name is,
+		// (created, namespace, name)), the route
+		type Spec = std::cmp::Reverse<(u8, usize)>;
+		type TlsOrder = (Spec, bool, Spec, (Option<String>, Option<String>, Option<String>));
+		let mut tls_routes: Vec<(TlsOrder, rp::TlsRoute)> = vec![];
 		for a in attachments.iter().filter(|a| a.kind == RouteKind::Tls && mine(a)) {
 			let route = l4_route(world, RouteKind::Tls, a.route);
 			// every pod of every backend (weights spread over them) where rproxy takes several
@@ -1410,13 +1414,13 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 			if entry.0.is_none() {
 				entry.0 = resolved;
 			}
-			let names: Vec<String> = a.hosts.clone().unwrap_or_default().iter().map(|h| hostname::to_rproxy(h)).collect();
-			if names.is_empty() {
+			let hosts = a.hosts.clone().unwrap_or_default();
+			if hosts.is_empty() {
 				continue;
 			}
 			let passthrough =
 				listeners[a.listener].family == Some(Family::TlsPassthrough) && (has(Family::Https) || has(Family::TlsTerminate));
-			let mut tr = rp::TlsRoute { server_names: names, passthrough, ..Default::default() };
+			let mut tr = rp::TlsRoute { passthrough, ..Default::default() };
 			// a TLSRoute rproxy terminates: TLS again to a backend with a BackendTLSPolicy
 			let mut refused = false;
 			if listeners[a.listener].family == Some(Family::TlsTerminate) && !passthrough {
@@ -1445,9 +1449,30 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 				}
 				_ => tr.targets = targets,
 			}
-			tls_routes.push(tr);
+			// rproxy takes the most specific matching name, and of the same name the route written first
+			// (docs/API.md `tls.routes`): a route on a more specific listener first (the listener the name
+			// goes to), then the names the route names itself (or a route naming none: the listener's)
+			// before a name only the listener narrows it to, which goes by how specific the route's own
+			// name is (GatewayRouteHostnameIntersectionPrecedence), then the oldest route
+			let listener_spec = std::cmp::Reverse(hostname::specificity(listeners[a.listener].l.hostname.as_deref()));
+			let meta = &route.metadata;
+			let age = (meta.creation_timestamp.as_ref().map(|t| t.0.to_string()), meta.namespace.clone(), meta.name.clone());
+			let (own, narrowed): (Vec<&String>, Vec<&String>) =
+				hosts.iter().partition(|h| hostname::original(h, &route.spec.hostnames).is_some_and(|o| o.eq_ignore_ascii_case(h)));
+			if !own.is_empty() {
+				let server_names = own.iter().map(|h| hostname::to_rproxy(h)).collect();
+				tls_routes
+					.push(((listener_spec, false, std::cmp::Reverse((0, 0)), age.clone()), rp::TlsRoute { server_names, ..tr.clone() }));
+			}
+			for h in narrowed {
+				let spec = hostname::specificity(hostname::original(h, &route.spec.hostnames));
+				let server_names = vec![hostname::to_rproxy(h)];
+				tls_routes.push(((listener_spec, true, std::cmp::Reverse(spec), age.clone()), rp::TlsRoute { server_names, ..tr.clone() }));
+			}
 			carried.push((RouteKind::Tls, a.route, a.listener));
 		}
+		tls_routes.sort_by(|a, b| a.0.cmp(&b.0));
+		let tls_routes: Vec<rp::TlsRoute> = tls_routes.into_iter().map(|(_, r)| r).collect();
 		if has(Family::Http) || has(Family::Https) {
 			let https = has(Family::Https);
 			let mut entries = vec![];
