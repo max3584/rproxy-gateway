@@ -528,8 +528,47 @@ fn listener_filters_not_accepted() {
 	let l = |n: &str| p.listeners.iter().find(|x| x.name == n).unwrap();
 	let c = cond(&l("auth").conds, "Accepted");
 	assert_eq!((c.status, c.reason.as_str()), (false, "UnsupportedValue"));
+	assert!(c.message.contains("filters.requests[0] (ExternalAuth)"), "{}", c.message);
 	assert!(cond(&l("plain").conds, "Accepted").status);
 	assert!(cond(&l("empty").conds, "Accepted").status);
+}
+
+/// A listener not accepted for its filters keeps its host name out of a wildcard listener on the same
+/// port: its requests get no route (404), not the wildcard's routes without the ExternalAuth.
+#[test]
+fn listener_filters_do_not_fall_through_to_a_wildcard() {
+	let yaml = format!(
+		"{BASE}{}{}",
+		gw(r#"  - {name: wild, port: 8080, protocol: HTTP, hostname: "*.example.com"}
+  - name: secure
+    port: 8080
+    protocol: HTTP
+    hostname: secure.example.com
+    filters:
+      requests:
+        - type: ExternalAuth
+          externalAuth: {protocol: HTTP, backendRef: {name: api, namespace: other, port: 8000}, http: {}}"#),
+		r#"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: r, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  rules: [{backendRefs: [{name: web, port: 80}]}]
+"#
+	);
+	let p = plan(&yaml);
+	let l = |n: &str| p.listeners.iter().find(|x| x.name == n).unwrap();
+	assert!(!cond(&l("secure").conds, "Accepted").status);
+	assert!(cond(&l("wild").conds, "Accepted").status);
+	let http = &p.rules_json()[0]["http"];
+	let routes = http["routes"].as_array().unwrap();
+	assert!(!routes.is_empty());
+	for r in routes {
+		let m = r["match"].as_str().unwrap();
+		assert!(m.contains("!Host(`secure.example.com`)"), "{m}");
+	}
 }
 
 #[test]

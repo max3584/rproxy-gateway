@@ -730,6 +730,10 @@ struct ListenerState<'a> {
 	/// rproxy's `tls.client_auth` for the listener's port (frontend validation).
 	client_auth: Option<Value>,
 	accepted: bool,
+	/// Not accepted only for its pre-routing filters (GEP-5224, not supported): its host name still
+	/// stays out of the port's other listeners (`exclusions`), so its traffic is not served by a
+	/// wildcard sibling without the filters (an ExternalAuth skipped).
+	filtered: bool,
 	/// Accepted but with nothing to serve with (no usable certificate): routes
 	/// attach, but no rule is made.
 	unservable: bool,
@@ -896,6 +900,7 @@ fn validate_listener<'a>(
 		certs: vec![],
 		client_auth: None,
 		accepted: true,
+		filtered: false,
 		unservable: false,
 		attached: 0,
 	};
@@ -942,9 +947,21 @@ fn validate_listener<'a>(
 	}
 	// listener filters run before route matching (GEP-5224); served without them, an ExternalAuth
 	// would be skipped: not accepted until rproxy can run them (max3584/rproxy-api#386)
-	if l.filters.as_ref().and_then(|f| f.get("requests")).and_then(Value::as_array).is_some_and(|r| !r.is_empty()) {
+	if let Some(reqs) = l.filters.as_ref().and_then(|f| f.get("requests")).and_then(Value::as_array).filter(|r| !r.is_empty()) {
+		// GEP-5224: the message names the filters not supported
+		let named: Vec<String> = reqs
+			.iter()
+			.enumerate()
+			.map(|(i, f)| format!("filters.requests[{i}] ({})", f.get("type").and_then(Value::as_str).unwrap_or("?")))
+			.collect();
 		st.accepted = false;
-		st.conds.push(Cond::new("Accepted", false, "UnsupportedValue", "listener filters (filters.requests) are not supported"));
+		st.filtered = true;
+		st.conds.push(Cond::new(
+			"Accepted",
+			false,
+			"UnsupportedValue",
+			format!("{}: listener filters are not supported (rproxy runs no filter before route matching)", named.join(", ")),
+		));
 	}
 	if family == Family::Https && tls_mode != "Terminate" {
 		st.accepted = false;
@@ -1129,7 +1146,9 @@ fn exclusions(listeners: &[ListenerState], i: usize) -> Vec<String> {
 	listeners
 		.iter()
 		.enumerate()
-		.filter(|(j, o)| *j != i && o.accepted && !o.unservable && o.port == listeners[i].port && o.family == listeners[i].family)
+		.filter(|(j, o)| {
+			*j != i && (o.accepted || o.filtered) && !o.unservable && o.port == listeners[i].port && o.family == listeners[i].family
+		})
 		.filter_map(|(_, o)| o.l.hostname.clone())
 		.filter(|h| match me {
 			None => true,
