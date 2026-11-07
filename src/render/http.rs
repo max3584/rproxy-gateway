@@ -1,7 +1,8 @@
 //! HTTPRoute → rproxy `http` routes, services and middlewares.
 //!
 //! One rproxy route per (route rule, match, host name). Gateway API's
-//! precedence (most specific host name, then exact path, longest prefix,
+//! precedence (most specific host name, then the most specific of the route's own
+//! host names (Gateway API v1.7, `GatewayRouteHostnameIntersectionPrecedence`), exact path, longest prefix,
 //! method, most header matches, most query matches, oldest route, namespace and
 //! name, rule order) is turned into explicit `priority` values once all routes
 //! on a port are known (`assign_priorities`).
@@ -54,6 +55,10 @@ pub struct Entry {
 pub struct SortKey {
 	/// Reversed: larger is more specific.
 	pub host: std::cmp::Reverse<(u8, usize)>,
+	/// The route's own host name the entry's host name comes from (`hostname::original`): of two
+	/// routes meeting a listener in the same name, the one naming it more specifically wins, before
+	/// paths and age; a route naming no host as naming the name itself. Reversed as `host`.
+	pub route_host: std::cmp::Reverse<(u8, usize)>,
 	pub path_kind: std::cmp::Reverse<u8>,
 	pub path_len: std::cmp::Reverse<usize>,
 	pub method: std::cmp::Reverse<bool>,
@@ -228,6 +233,7 @@ fn sort_key(route: &HttpRoute, m: &HttpRouteMatch, host: Option<&str>, rule: usi
 	};
 	SortKey {
 		host: Reverse(hostname::specificity(host)),
+		route_host: Reverse(hostname::specificity(host.and_then(|h| hostname::original(h, &route.spec.hostnames)))),
 		path_kind: Reverse(path_kind),
 		path_len: Reverse(path_len),
 		method: Reverse(m.method.is_some()),
