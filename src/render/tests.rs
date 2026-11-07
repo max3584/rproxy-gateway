@@ -1621,7 +1621,7 @@ spec:
   hostnames: [grpc.example.com]
   rules:
     - matches: [{method: {service: echo.Echo, method: Hello}}]
-      filters: [{type: RequestHeaderModifier, requestHeaderModifier: {set: [{name: X-A, value: a}]}}]
+      filters: [{type: RequestHeaderModifier, requestHeaderModifier: {set: [{name: X-A, value: a}], add: [{name: X-B, value: b}], remove: [X-C]}}]
       backendRefs: [{name: web, port: 80}]
     - matches: [{method: {service: echo.Echo}}, {method: {method: Bye}}, {method: {type: RegularExpression, service: "echo\\..*"}, headers: [{name: v, value: "2"}]}]
       backendRefs: [{name: web, port: 80}]
@@ -1654,7 +1654,11 @@ spec:
 	assert_eq!(http["services"]["grpc:default/grpc/r0"]["protocol"], "h2c");
 	assert!(http["services"]["default/grpc/r0"].get("protocol").is_none());
 	let r0 = routes.iter().find(|r| r["name"] == "grpc:default/grpc/r0/m0/h0").unwrap();
-	assert!(http["middlewares"][r0["middlewares"][0].as_str().unwrap()]["headers"].is_object());
+	// GRPCRouteRequestHeaderModifier (Gateway API v1.7): set, add and remove, as for an HTTPRoute
+	assert_eq!(
+		http["middlewares"][r0["middlewares"][0].as_str().unwrap()]["headers"]["request"],
+		json!({"set": {"X-A": "a"}, "add": {"X-B": "b"}, "remove": ["X-C"]})
+	);
 }
 
 #[test]
@@ -3118,4 +3122,211 @@ spec:
 	let text = serde_json::to_string(&p.rules_json()).unwrap();
 	assert!(!text.contains("rate_limit") && !text.contains("limited.example.com"), "{text}");
 	assert!(text.contains("plain.example.com"), "{text}");
+}
+
+/// Gateway API v1.7 `GatewayRouteHostnameIntersectionPrecedence`: routes meeting a listener in the
+/// same host name are ordered by the route's own host name (exact before wildcard, the longer
+/// wildcard first) before paths and age.
+#[test]
+fn route_hostname_precedence_over_the_intersection() {
+	// host "": the route names no host
+	let route = |name: &str, created: &str, host: &str, path: &str| {
+		let hostnames = if host.is_empty() { "[]".to_string() } else { format!("[\"{host}\"]") };
+		format!(
+			r#"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {{name: {name}, namespace: default, creationTimestamp: "{created}"}}
+spec:
+  parentRefs: [{{name: gw}}]
+  hostnames: {hostnames}
+  rules: [{{matches: [{{path: {{type: PathPrefix, value: {path}}}}}], backendRefs: [{{name: web, port: 80}}]}}]
+"#
+		)
+	};
+	// listener "": the listener names no host
+	let order = |listener: &str, routes: &str| -> Vec<String> {
+		let hostname = if listener.is_empty() { String::new() } else { format!(", hostname: \"{listener}\"") };
+		let yaml = format!("{BASE}{}{routes}", gw(&format!("  - {{name: http, port: 80, protocol: HTTP{hostname}}}")));
+		let p = plan(&yaml);
+		let rules = p.rules_json();
+		let mut routes: Vec<(i64, String)> = rules[0]["http"]["routes"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.map(|r| (r["priority"].as_i64().unwrap(), r["name"].as_str().unwrap().split('/').nth(1).unwrap().to_string()))
+			.collect();
+		routes.sort_by_key(|a| std::cmp::Reverse(a.0));
+		routes.into_iter().map(|(_, n)| n).collect()
+	};
+	// the exact route wins over the older wildcard route, despite the wildcard's longer prefix
+	let exact = format!(
+		"{}{}",
+		route("wc-older", "2026-01-01T00:00:00Z", "*.example.com", "/path/prefix"),
+		route("exact-newer", "2026-01-02T00:00:00Z", "abc.example.com", "/path")
+	);
+	assert_eq!(order("abc.example.com", &exact), ["exact-newer", "wc-older"]);
+	// the longer wildcard wins over the shorter one
+	let wildcards = format!(
+		"{}{}",
+		route("short-older", "2026-01-01T00:00:00Z", "*.com", "/path/prefix"),
+		route("long-newer", "2026-01-02T00:00:00Z", "*.example.com", "/path")
+	);
+	assert_eq!(order("*.example.com", &wildcards), ["long-newer", "short-older"]);
+	// different names after the intersection: the more specific name first, as before
+	assert_eq!(order("*.example.com", &exact), ["exact-newer", "wc-older"]);
+	let wc_listener = format!(
+		"{}{}",
+		route("exact-older", "2026-01-01T00:00:00Z", "abc.example.com", "/"),
+		route("wc-newer", "2026-01-02T00:00:00Z", "*.example.com", "/path/prefix")
+	);
+	assert_eq!(order("*.example.com", &wc_listener), ["exact-older", "wc-newer"]);
+	// a route naming no host counts as naming the listener's name: against a route naming that name,
+	// paths and age decide as before (not always last)
+	let none = |path_none: &str, path_exact: &str| {
+		format!(
+			"{}{}",
+			route("none-older", "2026-01-01T00:00:00Z", "", path_none),
+			route("exact-newer", "2026-01-02T00:00:00Z", "abc.example.com", path_exact)
+		)
+	};
+	assert_eq!(order("abc.example.com", &none("/path/prefix", "/path")), ["none-older", "exact-newer"], "the longer prefix");
+	assert_eq!(order("abc.example.com", &none("/path", "/path/prefix")), ["exact-newer", "none-older"], "the longer prefix");
+	assert_eq!(order("abc.example.com", &none("/path", "/path")), ["none-older", "exact-newer"], "the older route");
+	// and before a wildcard the listener narrows
+	let none_wc = format!(
+		"{}{}",
+		route("wc-older", "2026-01-01T00:00:00Z", "*.example.com", "/path/prefix"),
+		route("none-newer", "2026-01-02T00:00:00Z", "", "/path")
+	);
+	assert_eq!(order("abc.example.com", &none_wc), ["none-newer", "wc-older"]);
+	// a listener naming no host: nothing is narrowed, the order is as before (host name, then path, then age)
+	let same = format!(
+		"{}{}",
+		route("wc-a-older", "2026-01-01T00:00:00Z", "*.example.com", "/path/prefix"),
+		route("wc-b-newer", "2026-01-02T00:00:00Z", "*.example.com", "/path")
+	);
+	assert_eq!(order("", &same), ["wc-a-older", "wc-b-newer"]);
+	assert_eq!(order("", &none("/path/prefix", "/path")), ["exact-newer", "none-older"], "a host name before any host");
+	assert_eq!(order("", &exact), ["exact-newer", "wc-older"]);
+}
+
+/// The same for TLSRoutes: rproxy takes the route written first of the same name, so the route
+/// naming the listener's name itself goes first, then the longer wildcard, then the oldest.
+#[test]
+fn tls_route_hostname_precedence_over_the_intersection() {
+	let route = |name: &str, created: &str, hosts: &str, backend: &str| {
+		format!(
+			r#"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TLSRoute
+metadata: {{name: {name}, namespace: default, creationTimestamp: "{created}"}}
+spec:
+  parentRefs: [{{name: gw}}]
+  hostnames: {hosts}
+  rules: [{{backendRefs: [{{name: {backend}, port: 443}}]}}]
+"#
+		)
+	};
+	let services = r#"
+---
+apiVersion: v1
+kind: Service
+metadata: {name: one, namespace: default}
+spec: {clusterIP: 10.96.0.1, ports: [{port: 443}]}
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata: {name: one-1, namespace: default, labels: {kubernetes.io/service-name: one}}
+addressType: IPv4
+ports: [{port: 8443}]
+endpoints: [{addresses: [10.0.4.1]}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: two, namespace: default}
+spec: {clusterIP: 10.96.0.2, ports: [{port: 443}]}
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata: {name: two-1, namespace: default, labels: {kubernetes.io/service-name: two}}
+addressType: IPv4
+ports: [{port: 8443}]
+endpoints: [{addresses: [10.0.4.2]}]
+"#;
+	let routes = |listener: &str, routes: &str| -> serde_json::Value {
+		let yaml = format!(
+			"{BASE}{services}{}{routes}",
+			gw(&format!("  - {{name: tls, port: 443, protocol: TLS, hostname: \"{listener}\", tls: {{mode: Passthrough}}}}"))
+		);
+		let w = world(&yaml);
+		let opts = Options { features: Features { tls_route_targets: false, ..Default::default() }, ..Default::default() };
+		let p = render_gateway(&w, &w.gateways[0], &opts);
+		let rules = p.rules_json();
+		json!(
+			rules[0]["tls"]["routes"].as_array().unwrap().iter().map(|r| json!([r["server_names"], r["remote_addr"]])).collect::<Vec<_>>()
+		)
+	};
+	// an older wildcard route and a newer exact one (names before: the older first)
+	let exact = format!(
+		"{}{}",
+		route("a-wc-older", "2026-01-01T00:00:00Z", r#"["*.example.com"]"#, "one"),
+		route("b-exact-newer", "2026-01-02T00:00:00Z", r#"["abc.example.com"]"#, "two")
+	);
+	assert_eq!(routes("abc.example.com", &exact), json!([[["abc.example.com"], "10.96.0.2"], [["abc.example.com"], "10.96.0.1"]]));
+	let wildcards = format!(
+		"{}{}",
+		route("a-short-older", "2026-01-01T00:00:00Z", r#"["*.com"]"#, "one"),
+		route("b-long-newer", "2026-01-02T00:00:00Z", r#"["*.example.com"]"#, "two")
+	);
+	assert_eq!(routes("*.example.com", &wildcards), json!([[["**.example.com"], "10.96.0.2"], [["**.example.com"], "10.96.0.1"]]));
+	// a route's own names stay together; only the name the listener narrows it to goes apart
+	let mixed = format!(
+		"{}{}",
+		route("a-mixed", "2026-01-01T00:00:00Z", r#"["a.example.com", "x.example.com", "*.com"]"#, "one"),
+		route("b-own", "2026-01-02T00:00:00Z", r#"["*.example.com"]"#, "two")
+	);
+	assert_eq!(
+		routes("*.example.com", &mixed),
+		json!([[["a.example.com", "x.example.com"], "10.96.0.1"], [["**.example.com"], "10.96.0.2"], [["**.example.com"], "10.96.0.1"]])
+	);
+	// a route naming no host counts as naming the listener's name: the older route of the two
+	let none = format!(
+		"{}{}",
+		route("b-none-older", "2026-01-01T00:00:00Z", "[]", "one"),
+		route("a-exact-newer", "2026-01-02T00:00:00Z", r#"["abc.example.com"]"#, "two")
+	);
+	assert_eq!(routes("abc.example.com", &none), json!([[["abc.example.com"], "10.96.0.1"], [["abc.example.com"], "10.96.0.2"]]));
+	// two listeners on one port: a name the more specific listener narrows a route to goes before the
+	// same name another route names itself on the wildcard listener (the name goes to the specific listener)
+	let yaml = format!(
+		r#"{BASE}{services}{}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TLSRoute
+metadata: {{name: a-on-wc-older, namespace: default, creationTimestamp: "2026-01-01T00:00:00Z"}}
+spec:
+  parentRefs: [{{name: gw, sectionName: wc}}]
+  hostnames: [abc.example.com]
+  rules: [{{backendRefs: [{{name: one, port: 443}}]}}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: TLSRoute
+metadata: {{name: b-on-exact-newer, namespace: default, creationTimestamp: "2026-01-02T00:00:00Z"}}
+spec:
+  parentRefs: [{{name: gw, sectionName: exact}}]
+  hostnames: ["*.example.com"]
+  rules: [{{backendRefs: [{{name: two, port: 443}}]}}]
+"#,
+		gw(r#"  - {name: wc, port: 443, protocol: TLS, hostname: "*.example.com", tls: {mode: Passthrough}}
+  - {name: exact, port: 443, protocol: TLS, hostname: abc.example.com, tls: {mode: Passthrough}}"#)
+	);
+	let w = world(&yaml);
+	let opts = Options { features: Features { tls_route_targets: false, ..Default::default() }, ..Default::default() };
+	let p = render_gateway(&w, &w.gateways[0], &opts);
+	let rules = p.rules_json();
+	let got: Vec<_> = rules[0]["tls"]["routes"].as_array().unwrap().iter().map(|r| json!([r["server_names"], r["remote_addr"]])).collect();
+	assert_eq!(json!(got), json!([[["abc.example.com"], "10.96.0.2"], [["abc.example.com"], "10.96.0.1"]]));
 }
