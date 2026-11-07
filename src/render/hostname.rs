@@ -66,10 +66,15 @@ pub fn to_rproxy(pattern: &str) -> String {
 }
 
 /// The route's own host name that an effective host name `name` comes from (the most specific
-/// of the route's names covering it; `None`: the route names no host). Gateway API v1.7
-/// (`GatewayRouteHostnameIntersectionPrecedence`): routes whose host names meet a listener's in
-/// the same name are ordered by these, not by the name they share.
-pub fn original<'a>(name: &str, route: &'a [String]) -> Option<&'a str> {
+/// of the route's names covering it). Gateway API v1.7 (`GatewayRouteHostnameIntersectionPrecedence`):
+/// routes whose host names meet a listener's in the same name are ordered by these, not by the name
+/// they share. A route naming no host counts as naming the name itself (the listener's), so it is
+/// not put after every route that names one, and keeps its place among routes naming the listener's
+/// name by path and age (the specification leaves it open; the smaller change).
+pub fn original<'a>(name: &'a str, route: &'a [String]) -> Option<&'a str> {
+	if route.is_empty() {
+		return Some(name);
+	}
 	route.iter().filter(|r| covers(r, name)).max_by_key(|r| specificity(Some(r.as_str()))).map(|r| r.as_str())
 }
 
@@ -118,7 +123,7 @@ mod tests {
 		assert_eq!(original("abc.example.com", &route(&["*.com", "*.example.com"])), Some("*.example.com"));
 		assert_eq!(original("abc.example.com", &route(&["abc.example.com", "*.example.com"])), Some("abc.example.com"));
 		assert_eq!(original("*.example.com", &route(&["*.com"])), Some("*.com"));
-		assert_eq!(original("abc.example.com", &[]), None);
+		assert_eq!(original("abc.example.com", &[]), Some("abc.example.com"), "no host names: the name itself");
 	}
 
 	#[test]

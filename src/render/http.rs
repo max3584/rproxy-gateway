@@ -57,7 +57,7 @@ pub struct SortKey {
 	pub host: std::cmp::Reverse<(u8, usize)>,
 	/// The route's own host name the entry's host name comes from (`hostname::original`): of two
 	/// routes meeting a listener in the same name, the one naming it more specifically wins, before
-	/// paths and age. Reversed as `host`.
+	/// paths and age; a route naming no host as naming the name itself. Reversed as `host`.
 	pub route_host: std::cmp::Reverse<(u8, usize)>,
 	pub path_kind: std::cmp::Reverse<u8>,
 	pub path_len: std::cmp::Reverse<usize>,

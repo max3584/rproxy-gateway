@@ -1394,8 +1394,10 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 		// client certificates: the port's CA (validation is per port)
 		let client_auth = members.iter().find_map(|i| listeners[*i].client_auth.clone());
 		// TLS routes by server name (passthrough, or terminated on a TLS listener)
-		// (narrowed by the listener, how specific the route's own name is, (created, namespace, name)), the route
-		type TlsOrder = (bool, std::cmp::Reverse<(u8, usize)>, (Option<String>, Option<String>, Option<String>));
+		// (how specific the listener's name is, narrowed by the listener, how specific the route's own name is,
+		// (created, namespace, name)), the route
+		type Spec = std::cmp::Reverse<(u8, usize)>;
+		type TlsOrder = (Spec, bool, Spec, (Option<String>, Option<String>, Option<String>));
 		let mut tls_routes: Vec<(TlsOrder, rp::TlsRoute)> = vec![];
 		for a in attachments.iter().filter(|a| a.kind == RouteKind::Tls && mine(a)) {
 			let route = l4_route(world, RouteKind::Tls, a.route);
@@ -1448,21 +1450,24 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 				_ => tr.targets = targets,
 			}
 			// rproxy takes the most specific matching name, and of the same name the route written first
-			// (docs/API.md `tls.routes`): the names the route names itself go before a name only the
-			// listener narrows it to, which goes by how specific the route's own name is
-			// (GatewayRouteHostnameIntersectionPrecedence), then the oldest route
+			// (docs/API.md `tls.routes`): a route on a more specific listener first (the listener the name
+			// goes to), then the names the route names itself (or a route naming none: the listener's)
+			// before a name only the listener narrows it to, which goes by how specific the route's own
+			// name is (GatewayRouteHostnameIntersectionPrecedence), then the oldest route
+			let listener_spec = std::cmp::Reverse(hostname::specificity(listeners[a.listener].l.hostname.as_deref()));
 			let meta = &route.metadata;
 			let age = (meta.creation_timestamp.as_ref().map(|t| t.0.to_string()), meta.namespace.clone(), meta.name.clone());
 			let (own, narrowed): (Vec<&String>, Vec<&String>) =
 				hosts.iter().partition(|h| hostname::original(h, &route.spec.hostnames).is_some_and(|o| o.eq_ignore_ascii_case(h)));
 			if !own.is_empty() {
 				let server_names = own.iter().map(|h| hostname::to_rproxy(h)).collect();
-				tls_routes.push(((false, std::cmp::Reverse((0, 0)), age.clone()), rp::TlsRoute { server_names, ..tr.clone() }));
+				tls_routes
+					.push(((listener_spec, false, std::cmp::Reverse((0, 0)), age.clone()), rp::TlsRoute { server_names, ..tr.clone() }));
 			}
 			for h in narrowed {
 				let spec = hostname::specificity(hostname::original(h, &route.spec.hostnames));
 				let server_names = vec![hostname::to_rproxy(h)];
-				tls_routes.push(((true, std::cmp::Reverse(spec), age.clone()), rp::TlsRoute { server_names, ..tr.clone() }));
+				tls_routes.push(((listener_spec, true, std::cmp::Reverse(spec), age.clone()), rp::TlsRoute { server_names, ..tr.clone() }));
 			}
 			carried.push((RouteKind::Tls, a.route, a.listener));
 		}
