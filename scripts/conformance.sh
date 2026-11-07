@@ -12,7 +12,7 @@ REPORT=${REPORT:-$PWD/conformance-report.yaml}
 PROFILES=${PROFILES:-GATEWAY-HTTP,GATEWAY-GRPC,GATEWAY-TLS,GATEWAY-TCP,GATEWAY-UDP}
 # the extended features rproxy-gateway claims (src/controller/mod.rs SUPPORTED_FEATURES)
 # GatewayStaticAddresses: a usable address becomes the Service's externalIPs; 0.0.0.0 is refused
-FEATURES=${FEATURES:-Gateway,GatewayPort8080,GatewayHTTPListenerIsolation,GatewayRouteHostnameIntersectionPrecedence,HTTPRoute,ReferenceGrant,HTTPRouteMethodMatching,HTTPRouteQueryParamMatching,HTTPRouteResponseHeaderModification,HTTPRoutePortRedirect,HTTPRouteSchemeRedirect,HTTPRoutePathRedirect,HTTPRoutePathRewrite,TLSRoute,TLSRouteModeTerminate,TLSRouteModeMixed,TCPRoute,UDPRoute,HTTPRouteParentRefPort,HTTPRouteDestinationPortMatching,HTTPRouteNamedRouteRule,HTTPRouteBackendProtocolWebSocket,HTTPRouteBackendTimeout,GatewayStaticAddresses,GatewayAddressEmpty,GatewayInfrastructure,HTTPRoute303RedirectStatusCode,HTTPRoute307RedirectStatusCode,HTTPRoute308RedirectStatusCode,HTTPRouteRequestTimeout,HTTPRouteHostRewrite,HTTPRouteBackendRequestHeaderModification,HTTPRouteBackendURLRewrite,HTTPRouteCORS,HTTPRouteRetry,HTTPRouteRetryCodes,HTTPRouteRetryBackendTimeout,HTTPRouteRetryConnectionError,HTTPRouteRequestMirror,HTTPRouteRequestMultipleMirrors,HTTPRouteRequestPercentageMirror,HTTPRouteBackendProtocolH2C,GatewayFrontendClientCertificateValidation,GatewayFrontendClientCertificateValidationInsecureFallback,ListenerSet,GRPCRoute,GRPCRouteNamedRouteRule,GRPCRouteRequestHeaderModifier,BackendTLSPolicy,BackendTLSPolicySANValidation,GatewayBackendClientCertificate,GatewayHTTPSListenerDetectMisdirectedRequests,HTTPRouteExternalAuth,HTTPRouteExternalAuthHTTP,HTTPRouteExternalAuthGRPC,HTTPRouteExternalAuthForwardBody,GatewayAddressRoutability,GatewayAddressRoutabilityCluster,ClusterTrustBundle}
+FEATURES=${FEATURES:-Gateway,GatewayListenerFilters,GatewayPort8080,GatewayHTTPListenerIsolation,GatewayRouteHostnameIntersectionPrecedence,HTTPRoute,ReferenceGrant,HTTPRouteMethodMatching,HTTPRouteQueryParamMatching,HTTPRouteResponseHeaderModification,HTTPRoutePortRedirect,HTTPRouteSchemeRedirect,HTTPRoutePathRedirect,HTTPRoutePathRewrite,TLSRoute,TLSRouteModeTerminate,TLSRouteModeMixed,TCPRoute,UDPRoute,HTTPRouteParentRefPort,HTTPRouteDestinationPortMatching,HTTPRouteNamedRouteRule,HTTPRouteBackendProtocolWebSocket,HTTPRouteBackendTimeout,GatewayStaticAddresses,GatewayAddressEmpty,GatewayInfrastructure,HTTPRoute303RedirectStatusCode,HTTPRoute307RedirectStatusCode,HTTPRoute308RedirectStatusCode,HTTPRouteRequestTimeout,HTTPRouteHostRewrite,HTTPRouteBackendRequestHeaderModification,HTTPRouteBackendURLRewrite,HTTPRouteCORS,HTTPRouteRetry,HTTPRouteRetryCodes,HTTPRouteRetryBackendTimeout,HTTPRouteRetryConnectionError,HTTPRouteRequestMirror,HTTPRouteRequestMultipleMirrors,HTTPRouteRequestPercentageMirror,HTTPRouteBackendProtocolH2C,GatewayFrontendClientCertificateValidation,GatewayFrontendClientCertificateValidationInsecureFallback,ListenerSet,GRPCRoute,GRPCRouteNamedRouteRule,GRPCRouteRequestHeaderModifier,BackendTLSPolicy,BackendTLSPolicySANValidation,GatewayBackendClientCertificate,GatewayHTTPSListenerDetectMisdirectedRequests,HTTPRouteExternalAuth,HTTPRouteExternalAuthHTTP,HTTPRouteExternalAuthGRPC,HTTPRouteExternalAuthForwardBody,GatewayAddressRoutability,GatewayAddressRoutabilityCluster,ClusterTrustBundle}
 work=${RUNNER_TEMP:-/tmp}/rproxy-gateway-conformance
 mkdir -p "$work"
 
@@ -72,6 +72,16 @@ else
   echo "no report" > "$work/core-failures"
 fi
 
+# listener filters (GEP-5224): no conformance test for GatewayListenerFilters in the suite yet (v1.7.0);
+# checked here on the same cluster (skipped without listeners[].filters or rproxy's http.pre_routing)
+if scripts/listener-filters.sh > "$work/listener-filters.log" 2>&1; then
+  lf=$(tail -1 "$work/listener-filters.log")
+else
+  lf="listener filters: FAILED (scripts/listener-filters.sh, $work/listener-filters.log)"
+  echo "GATEWAY-HTTP: $lf" >> "$work/core-failures"
+fi
+cat "$work/listener-filters.log"
+
 # a short summary: top-level and sub-test results
 passed=$(grep -cE '^\s*--- PASS' "$work/conformance.log" || true)
 failed=$(grep -cE '^\s*--- FAIL' "$work/conformance.log" || true)
@@ -80,6 +90,8 @@ skipped=$(grep -cE '^\s*--- SKIP' "$work/conformance.log" || true)
   echo "## Gateway API conformance ($GATEWAY_API_VERSION)"
   echo
   echo "Profiles: \`$PROFILES\`. Tests (including sub-tests): $passed passed, $failed failed, $skipped skipped."
+  echo
+  echo "$lf"
   echo
   if [ "$failed" -gt 0 ]; then
     echo "### Failed"

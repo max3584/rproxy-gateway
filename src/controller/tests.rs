@@ -935,7 +935,7 @@ fn supported_features_match_the_conformance_script() {
 	let mut script_features: Vec<&str> = list.split(',').collect();
 	// the conformance job runs the managed mode, on a cluster that serves ClusterTrustBundles (Kubernetes 1.37: v1)
 	let served = crate::render::world::World { cluster_trust_bundles: Some(Default::default()), ..Default::default() };
-	let mut ours: Vec<&str> = super::supported_features(&super::Mode::Managed(Default::default()), &served);
+	let mut ours: Vec<&str> = super::supported_features(&super::Mode::Managed(Default::default()), &served, true);
 	script_features.sort();
 	ours.sort();
 	assert_eq!(script_features, ours, "SUPPORTED_FEATURES and scripts/conformance.sh FEATURES differ");
@@ -946,20 +946,31 @@ fn supported_features_match_the_conformance_script() {
 fn cluster_trust_bundle_claimed_only_when_served() {
 	let managed = super::Mode::Managed(Default::default());
 	let mut w = crate::render::world::World::default();
-	assert!(!super::supported_features(&managed, &w).contains(&"ClusterTrustBundle"));
+	assert!(!super::supported_features(&managed, &w, false).contains(&"ClusterTrustBundle"));
 	w.cluster_trust_bundles = Some(Default::default());
-	assert!(super::supported_features(&managed, &w).contains(&"ClusterTrustBundle"));
+	assert!(super::supported_features(&managed, &w, false).contains(&"ClusterTrustBundle"));
 }
 
 /// `GatewayAddressRoutabilityCluster` only in managed mode; `GatewayAddressRoutability` in both (GEP-5093).
 #[test]
 fn cluster_routability_claimed_only_when_managed() {
 	let w = crate::render::world::World::default();
-	let managed = super::supported_features(&super::Mode::Managed(Default::default()), &w);
+	let managed = super::supported_features(&super::Mode::Managed(Default::default()), &w, false);
 	assert!(managed.contains(&"GatewayAddressRoutabilityCluster") && managed.contains(&"GatewayAddressRoutability"));
 	let fleet = super::supported_features(
 		&super::Mode::Fleet(crate::controller::provision::Fleet { selector: String::new(), addresses: vec![], listen_on_addresses: false }),
 		&w,
+		false,
 	);
 	assert!(!fleet.contains(&"GatewayAddressRoutabilityCluster") && fleet.contains(&"GatewayAddressRoutability"));
+}
+
+/// `GatewayListenerFilters` only when the rproxy runs listener filters (rproxy v0.4.22, `http.pre_routing`).
+#[test]
+fn listener_filters_claimed_only_when_rproxy_runs_them() {
+	let w = crate::render::world::World::default();
+	let managed = super::Mode::Managed(Default::default());
+	assert!(!super::supported_features(&managed, &w, false).contains(&"GatewayListenerFilters"));
+	assert!(super::supported_features(&managed, &w, true).contains(&"GatewayListenerFilters"));
+	assert!(!super::SUPPORTED_FEATURES.contains(&"GatewayListenerFilters"));
 }

@@ -390,7 +390,7 @@ enum Filtered {
 
 /// rproxy's `forward_auth` for an ExternalAuth filter (Envoy's ext_authz), asking a service of
 /// the backend's pods (`{base}/extauth`). `Ok(None)`: the backend cannot be used (`out.resolved`).
-fn external_auth(
+pub(crate) fn external_auth(
 	ctx: &Ctx,
 	ns: &str,
 	ea: &crate::k8s::gateway::ExternalAuth,

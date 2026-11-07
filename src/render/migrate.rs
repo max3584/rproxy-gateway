@@ -824,6 +824,11 @@ pub fn apply_port(
 					notes.push(format!("{where_}: TLS differs between the Gateway's listener and the migrated routes; left out"));
 					return (None, notes);
 				}
+				if !http.pre_routing.is_empty() {
+					notes.push(format!(
+						"{where_}: the Gateway listener's filters.requests run before the migrated routes too (one rule per port)"
+					));
+				}
 				http.routes.extend(routes);
 				http.services.extend(add.services);
 				http.middlewares.extend(add.middlewares);
@@ -842,7 +847,13 @@ pub fn apply_port(
 			}
 			None => {
 				let mut rule = base;
-				rule.http = Some(rp::Http { routes, default: add.default, services: add.services, middlewares: add.middlewares });
+				rule.http = Some(rp::Http {
+					routes,
+					default: add.default,
+					services: add.services,
+					middlewares: add.middlewares,
+					..Default::default()
+				});
 				if https {
 					if add.certificates.is_empty() {
 						notes.push(format!("{where_}: TLS routers without a certificate (secretName or certResolver); left out"));

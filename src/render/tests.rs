@@ -629,6 +629,179 @@ spec:
 	}
 }
 
+/// Listener filters with rproxy's `http.pre_routing` (`Options::pre_routing`).
+fn plan_pre_routing(yaml: &str) -> GatewayPlan {
+	let w = world(yaml);
+	let kinds = listener_filters::DOCUMENTED_KINDS.iter().map(|k| k.to_string()).collect();
+	render_gateway(&w, &w.gateways[0], &Options { pre_routing: Some(kinds), ..Default::default() })
+}
+
+const FILTER_MIDDLEWARES: &str = r#"
+---
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyMiddleware
+metadata: {name: tag, namespace: default}
+spec: {headers: {request: {set: {x-tag: one}}}}
+---
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyMiddleware
+metadata: {name: again, namespace: default}
+spec: {retry: {attempts: 2}}
+---
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyMiddleware
+metadata: {name: host, namespace: default}
+spec: {headers: {request: {set: {Host: elsewhere.example.com}}}}
+---
+apiVersion: rproxy.max3584.net/v1beta1
+kind: RproxyMiddleware
+metadata: {name: pages, namespace: default}
+spec: {errors: {status: ["500"], service: r0, path: /e}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: r, namespace: default}
+spec:
+  parentRefs: [{name: gw}]
+  rules: [{matches: [{headers: [{name: x-tag, value: one}]}], backendRefs: [{name: web, port: 80}]}]
+"#;
+
+/// GEP-5224 with rproxy's `pre_routing`: ExternalAuth and an RproxyMiddleware in the listener's order,
+/// before every route of the port.
+#[test]
+fn listener_filters_become_pre_routing() {
+	let yaml = format!(
+		"{BASE}{}{FILTER_MIDDLEWARES}",
+		gw(r#"  - name: auth
+    port: 8080
+    protocol: HTTP
+    filters:
+      requests:
+        - type: ExternalAuth
+          externalAuth: {protocol: HTTP, backendRef: {name: web, port: 80}, http: {path: /check}}
+        - type: ExtensionRef
+          extensionRef: {group: rproxy.max3584.net, kind: RproxyMiddleware, name: tag}"#),
+	);
+	let p = plan_pre_routing(&yaml);
+	let l = &p.listeners[0];
+	assert!(cond(&l.conds, "Accepted").status, "{:?}", l.conds);
+	assert!(cond(&l.conds, "ResolvedRefs").status, "{:?}", l.conds);
+	let rules = p.rules_json();
+	let http = &rules[0]["http"];
+	assert_eq!(http["pre_routing"], json!(["listener:f0", "listener:f1"]));
+	assert_eq!(http["middlewares"]["listener:f0"]["forward_auth"]["service"], "listener:f0/extauth");
+	assert_eq!(http["middlewares"]["listener:f0"]["forward_auth"]["path"], "/check");
+	assert_eq!(http["middlewares"]["listener:f1"], json!({"headers": {"request": {"set": {"x-tag": "one"}}}}));
+	assert!(http["services"]["listener:f0/extauth"]["servers"].as_array().is_some_and(|s| !s.is_empty()));
+	// the route matches what the filters left (rproxy matches after them)
+	assert!(http["routes"].as_array().unwrap().iter().any(|r| r["match"].as_str().unwrap().contains("Header(`x-tag`, `one`)")));
+	// without pre_routing on every pod: not accepted, as before
+	let old = plan(&yaml);
+	assert!(!cond(&old.listeners[0].conds, "Accepted").status);
+	assert!(old.rules_json().iter().all(|r| r["http"].get("pre_routing").is_none()));
+}
+
+/// A filter rproxy cannot run before routing, one that changes Host, one naming a service, a filter
+/// of another kind than RproxyMiddleware: the listener is not accepted, the message names the filter.
+#[test]
+fn listener_filters_rproxy_cannot_run() {
+	for (name, want) in [
+		("again", "the middleware kind retry cannot run before route matching"),
+		("host", "cannot change Host"),
+		("pages", "errors.service names a service"),
+	] {
+		let yaml = format!(
+			"{BASE}{}{FILTER_MIDDLEWARES}",
+			gw(&format!(
+				r#"  - name: f
+    port: 8080
+    protocol: HTTP
+    filters:
+      requests:
+        - type: ExtensionRef
+          extensionRef: {{group: rproxy.max3584.net, kind: RproxyMiddleware, name: tag}}
+        - type: ExtensionRef
+          extensionRef: {{group: rproxy.max3584.net, kind: RproxyMiddleware, name: {name}}}"#
+			)),
+		);
+		let p = plan_pre_routing(&yaml);
+		let c = cond(&p.listeners[0].conds, "Accepted");
+		assert_eq!((c.status, c.reason.as_str()), (false, "UnsupportedValue"), "{name}");
+		assert!(c.message.starts_with("filters.requests[1] (ExtensionRef): ") && c.message.contains(want), "{name}: {}", c.message);
+		assert!(p.rules_json().is_empty(), "{name}: nothing served without the filters");
+	}
+	let yaml = format!(
+		"{BASE}{}",
+		gw(r#"  - name: f
+    port: 8080
+    protocol: HTTP
+    filters: {requests: [{type: ExtensionRef, extensionRef: {group: example.com, kind: Thing, name: x}}]}"#),
+	);
+	let c = cond(&plan_pre_routing(&yaml).listeners[0].conds, "Accepted").clone();
+	assert!(!c.status && c.message.contains("RproxyMiddleware only"), "{}", c.message);
+}
+
+/// A reference that does not resolve: `ResolvedRefs: False` (InvalidListenerFilterRef, RefNotPermitted
+/// across namespaces without a ReferenceGrant), and the filter answers 500 in its place.
+#[test]
+fn listener_filter_refs_that_do_not_resolve() {
+	for (filter, reason) in [
+		(
+			"{type: ExtensionRef, extensionRef: {group: rproxy.max3584.net, kind: RproxyMiddleware, name: missing}}",
+			"InvalidListenerFilterRef",
+		),
+		("{type: ExternalAuth, externalAuth: {protocol: HTTP, backendRef: {name: nope, port: 80}, http: {}}}", "InvalidListenerFilterRef"),
+		(
+			"{type: ExternalAuth, externalAuth: {protocol: HTTP, backendRef: {name: api, namespace: other, port: 8000}, http: {}}}",
+			"RefNotPermitted",
+		),
+	] {
+		let yaml = format!(
+			"{BASE}{}{FILTER_MIDDLEWARES}",
+			gw(&format!("  - {{name: f, port: 8080, protocol: HTTP, filters: {{requests: [{filter}]}}}}")),
+		);
+		let p = plan_pre_routing(&yaml);
+		let l = &p.listeners[0];
+		assert!(cond(&l.conds, "Accepted").status, "{filter}: {:?}", l.conds);
+		let r = cond(&l.conds, "ResolvedRefs");
+		assert_eq!((r.status, r.reason.as_str()), (false, reason), "{filter}");
+		assert!(r.message.starts_with("filters.requests[0] ("), "{}", r.message);
+		let http = &p.rules_json()[0]["http"];
+		assert_eq!(http["pre_routing"], json!(["listener:f0"]));
+		assert_eq!(http["middlewares"]["listener:f0"]["respond"]["status"], 500, "{filter}");
+	}
+}
+
+/// One rule per port: listeners of a port with different filters cannot be told apart by rproxy's
+/// `pre_routing`, so the ones with filters are refused (their names stay out of the others); with
+/// the same filters, all are served.
+#[test]
+fn listener_filters_per_port() {
+	let f = "filters: {requests: [{type: ExtensionRef, extensionRef: {group: rproxy.max3584.net, kind: RproxyMiddleware, name: tag}}]}";
+	let yaml = format!(
+		"{BASE}{}{FILTER_MIDDLEWARES}",
+		gw(&format!(
+			r#"  - {{name: wild, port: 8080, protocol: HTTP, hostname: "*.example.com"}}
+  - {{name: secure, port: 8080, protocol: HTTP, hostname: secure.example.com, {f}}}
+  - {{name: a, port: 8081, protocol: HTTP, hostname: a.example.com, {f}}}
+  - {{name: b, port: 8081, protocol: HTTP, hostname: b.example.com, {f}}}"#
+		)),
+	);
+	let p = plan_pre_routing(&yaml);
+	let l = |n: &str| p.listeners.iter().find(|x| x.name == n).unwrap();
+	let c = cond(&l("secure").conds, "Accepted");
+	assert!(!c.status && c.message.contains("do not all have the same filters.requests"), "{}", c.message);
+	assert!(cond(&l("wild").conds, "Accepted").status);
+	assert!(cond(&l("a").conds, "Accepted").status && cond(&l("b").conds, "Accepted").status);
+	let rules = p.rules_json();
+	let on = |port: u16| rules.iter().find(|r| r["listen_port"] == port).unwrap();
+	assert!(on(8080)["http"].get("pre_routing").is_none());
+	for r in on(8080)["http"]["routes"].as_array().unwrap() {
+		assert!(r["match"].as_str().unwrap().contains("!Host(`secure.example.com`)"), "{r}");
+	}
+	assert_eq!(on(8081)["http"]["pre_routing"], json!(["listener:f0"]));
+}
+
 #[test]
 fn external_auth() {
 	let yaml = format!(

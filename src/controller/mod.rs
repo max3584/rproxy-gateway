@@ -102,15 +102,24 @@ pub const CLUSTER_FEATURES: &[&str] = &["ClusterTrustBundle"];
 /// which the fleet does not have (GEP-5093).
 pub const MANAGED_FEATURES: &[&str] = &["GatewayAddressRoutabilityCluster"];
 
+/// Features claimed only when the rproxy runs it: `GatewayListenerFilters` (GEP-5224) needs
+/// `http.pre_routing` (rproxy v0.4.22, `features.http_options` `pre_routing`).
+pub const RPROXY_FEATURES: &[&str] = &["GatewayListenerFilters"];
+
 /// The features the GatewayClasses of this controller claim (`supportedFeatures`): `SUPPORTED_FEATURES`,
-/// the `MANAGED_FEATURES` in managed mode and the `CLUSTER_FEATURES` this cluster allows.
-pub fn supported_features(mode: &Mode, world: &render::world::World) -> Vec<&'static str> {
+/// the `MANAGED_FEATURES` in managed mode, the `CLUSTER_FEATURES` this cluster allows and
+/// `GatewayListenerFilters` when `listener_filters` (`listener_filters_claimed`: the managed image
+/// known to run listener filters, or every fleet pod answered so).
+pub fn supported_features(mode: &Mode, world: &render::world::World, listener_filters: bool) -> Vec<&'static str> {
 	let mut out = SUPPORTED_FEATURES.to_vec();
 	if matches!(mode, Mode::Managed(_)) {
 		out.extend(MANAGED_FEATURES);
 	}
 	if world.cluster_trust_bundles.is_some() {
 		out.push("ClusterTrustBundle");
+	}
+	if listener_filters {
+		out.push("GatewayListenerFilters");
 	}
 	out
 }
@@ -450,12 +459,14 @@ async fn reconcile_all(
 		cross_namespace_secrets: cfg.cross_namespace_secrets,
 		params: params_opts.clone(),
 		backends: cfg.backends.clone(),
+		pre_routing: None,
 	};
 	let world = snapshot(client, cache, cfg, &opts).await;
 	let now = render::status::now();
 	let mut soon = false;
 
 	// GatewayClasses
+	let listener_filters = listener_filters_claimed(rp, &cfg.mode, &cfg.namespace, &cache.pods.state(), &mut state.caps).await;
 	let classes: BTreeSet<String> =
 		world.classes.iter().filter(|c| c.spec.controller_name == cfg.controller_name).filter_map(|c| c.metadata.name.clone()).collect();
 	if let Some(api) = dyn_api(client, cache, "GatewayClass", None) {
@@ -465,7 +476,7 @@ async fn reconcile_all(
 			let invalid = render::params::class_parameters(&world, c, &params_opts).err();
 			let st = status::class_status(
 				c.metadata.generation.unwrap_or(0),
-				&supported_features(&cfg.mode, &world),
+				&supported_features(&cfg.mode, &world, listener_filters),
 				invalid.as_deref(),
 				previous.as_ref(),
 				&now,
@@ -510,15 +521,30 @@ async fn reconcile_all(
 	for gw in world.gateways.iter().filter(|g| classes.contains(&g.spec.gateway_class_name)) {
 		// what the Gateway's rproxy pods take (all of rproxy v0.4.0 before they are asked)
 		let (ns, name) = (gw.metadata.namespace.clone().unwrap_or_default(), gw.metadata.name.clone().unwrap_or_default());
-		let eps = match &cfg.mode {
+		let (pods_ns, selector) = match &cfg.mode {
 			Mode::Managed(_) => {
 				let id = provision::gateway_id(&ns, &name, gw.metadata.uid.as_deref().unwrap_or_default());
-				provision::pods(&pods_now, &ns, &[(provision::LABEL_GATEWAY.to_string(), id)].into())
+				(ns.clone(), [(provision::LABEL_GATEWAY.to_string(), id)].into())
 			}
-			Mode::Fleet(f) => provision::pods(&pods_now, &cfg.namespace, &provision::parse_selector(&f.selector)),
+			Mode::Fleet(f) => (cfg.namespace.clone(), provision::parse_selector(&f.selector)),
 		};
+		let eps = provision::pods(&pods_now, &pods_ns, &selector);
 		let features = pod_features(rp, &eps, &mut state.caps).await;
-		let mut opts = render::Options { features, ..opts.clone() };
+		// listener filters (GEP-5224): every pod there is, and the image they roll to, runs `http.pre_routing`
+		// (the Gateway's parameters name the image; parameters that cannot be used keep the pods as they
+		// were, whose image is not known here: not taken)
+		let target = match &cfg.mode {
+			Mode::Managed(m) => render::params::gateway_parameters(&world, gw, &params_opts)
+				.ok()
+				.map(|p| Some(p.and_then(|p| p.rproxy.and_then(|r| r.image)).unwrap_or_else(|| m.rproxy_image.clone()))),
+			Mode::Fleet(_) => Some(None),
+		};
+		let keys = provision::pod_keys(&pods_now, &pods_ns, &selector);
+		let pre_routing = match target {
+			Some(target) => pre_routing_kinds(rp, &eps, &keys, target.as_deref(), &mut state.caps).await,
+			None => None,
+		};
+		let mut opts = render::Options { features, pre_routing, ..opts.clone() };
 		// fleet listening on Gateways' addresses: a Gateway with spec.addresses (allowed by --address-cidr)
 		// listens on them (rproxy with listen_freebind: whether a node has them yet or not)
 		if let Mode::Fleet(f) = &cfg.mode {
@@ -1517,7 +1543,7 @@ async fn image_feature(rp: &Client, image: &str, feature: &str, eps: &[Endpoint]
 	}
 	let mine: Vec<Endpoint> = eps.iter().filter(|ep| ep.rproxy_image.as_deref() == Some(image)).cloned().collect();
 	pod_features(rp, &mine, caps).await;
-	let known = mine.iter().any(|ep| caps.get(&ep.caps_key()).is_some_and(|c| c.feature(feature)));
+	let known = mine.iter().any(|ep| caps.get(&ep.caps_key()).is_some_and(|c| c.has(feature)));
 	if known {
 		info!(image, feature, "rproxy has the feature");
 		FEATURE_IMAGES.lock().unwrap().insert(key);
@@ -1555,7 +1581,7 @@ async fn every_pod_has(
 	caps: &mut HashMap<String, Capabilities>,
 ) -> bool {
 	pod_features(rp, eps, caps).await;
-	let answered = |key: &str| caps.get(key).is_some_and(|c| c.feature(feature));
+	let answered = |key: &str| caps.get(key).is_some_and(|c| c.has(feature));
 	if !keys.iter().all(|k| answered(k)) {
 		return false;
 	}
@@ -1580,6 +1606,62 @@ enum SettingsKnown {
 	/// An older rproxy (v0.4.17 to v0.4.19 refuse settings they do not know and would not start), or
 	/// not known for a form that has no file yet.
 	No,
+}
+
+/// The middleware kinds rproxy runs before route matching (`render::Options::pre_routing`): `Some` when
+/// every pod there is (`keys`) and the image they roll to (`target`; `None`: the fleet) run
+/// `http.pre_routing` (`every_pod_has`, as for `allow_freebind`), with the kinds every pod lists
+/// (`features.pre_routing_kinds`). The image is then remembered for the GatewayClass's
+/// `GatewayListenerFilters` (`listener_filters_claimed`).
+async fn pre_routing_kinds(
+	rp: &Client,
+	eps: &[Endpoint],
+	keys: &[String],
+	target: Option<&str>,
+	caps: &mut HashMap<String, Capabilities>,
+) -> Option<Vec<String>> {
+	let feature = render::listener_filters::FEATURE;
+	if !every_pod_has(rp, eps, keys, target, feature, caps).await {
+		return None;
+	}
+	if let Some(image) = target {
+		FEATURE_IMAGES.lock().unwrap().insert((feature.to_string(), image.to_string()));
+	}
+	let mut kinds: Option<Vec<String>> = None;
+	for k in keys {
+		let names = caps.get(k).map(|c| c.names("pre_routing_kinds")).unwrap_or_default();
+		kinds = Some(match kinds {
+			None => names,
+			Some(v) => v.into_iter().filter(|n| names.contains(n)).collect(),
+		});
+	}
+	// no pod yet, the image this controller ships: the kinds rproxy-api documents
+	Some(kinds.unwrap_or_else(|| render::listener_filters::DOCUMENTED_KINDS.iter().map(|k| k.to_string()).collect()))
+}
+
+/// Whether the GatewayClasses claim `GatewayListenerFilters`: managed, the image the controller deploys
+/// is known to run listener filters (the one it ships, if that has them, or one whose Gateway's pods all
+/// answered so: `pre_routing_kinds`); fleet, every fleet pod answered so (`every_pod_has`).
+async fn listener_filters_claimed(
+	rp: &Client,
+	mode: &Mode,
+	namespace: &str,
+	pods: &[std::sync::Arc<k8s_openapi::api::core::v1::Pod>],
+	caps: &mut HashMap<String, Capabilities>,
+) -> bool {
+	let feature = render::listener_filters::FEATURE;
+	match mode {
+		Mode::Managed(m) => {
+			(m.rproxy_image == provision::RPROXY_IMAGE && SHIPPED_FEATURES.contains(&feature))
+				|| FEATURE_IMAGES.lock().unwrap().contains(&(feature.to_string(), m.rproxy_image.clone()))
+		}
+		Mode::Fleet(f) => {
+			let selector = provision::parse_selector(&f.selector);
+			let eps = provision::pods(pods, namespace, &selector);
+			let keys = provision::pod_keys(pods, namespace, &selector);
+			every_pod_has(rp, &eps, &keys, None, feature, caps).await
+		}
+	}
 }
 
 /// Whether the settings file may be written (#109), decided as for `allow_freebind` (`freebind_known`):

@@ -13,6 +13,7 @@ pub mod backends;
 pub mod hostname;
 pub mod http;
 pub mod l4;
+pub mod listener_filters;
 pub mod migrate;
 pub mod params;
 pub mod policy;
@@ -60,6 +61,11 @@ pub struct Options {
 	pub params: params::ParamsOptions,
 	/// What every backend gets unless an RproxyPolicy sets it (passive health checks, connect timeouts).
 	pub backends: BackendDefaults,
+	/// The middleware kinds rproxy runs before route matching (`http.pre_routing`, rproxy v0.4.22:
+	/// `features.pre_routing_kinds`), when every rproxy pod of the Gateway (and the image they roll
+	/// to) answered `http_options` `pre_routing`. `None`: not known, and a listener with
+	/// `filters.requests` is not accepted (never served without its filters).
+	pub pre_routing: Option<Vec<String>>,
 }
 
 /// What the controller gives every backend it renders unless an RproxyPolicy sets it (v0.4.5,
@@ -198,6 +204,7 @@ impl Default for Options {
 			cross_namespace_secrets: true,
 			params: params::ParamsOptions::default(),
 			backends: BackendDefaults::default(),
+			pre_routing: None,
 		}
 	}
 }
@@ -753,11 +760,14 @@ struct ListenerState<'a> {
 	/// rproxy's `tls.client_auth` for the listener's port (frontend validation).
 	client_auth: Option<Value>,
 	accepted: bool,
-	/// Not accepted only for its pre-routing filters (GEP-5224, not supported): its host name still
-	/// stays out of the port's other listeners (`exclusions`), so its traffic is not served by a
-	/// wildcard sibling without the filters (an ExternalAuth skipped), even when it has no usable
-	/// certificate either (`unservable`).
+	/// It has pre-routing filters (GEP-5224): its host name always stays out of the port's other
+	/// listeners (`exclusions`), accepted or not, so its traffic is never served by a wildcard
+	/// sibling without the filters (an ExternalAuth skipped), even when it is not accepted (filters
+	/// rproxy cannot run, another listener of the port with other filters) or has no usable
+	/// certificate (`unservable`).
 	filtered: bool,
+	/// `Gateway` or `ListenerSet` (ReferenceGrants of an ExternalAuth filter are from it).
+	from_kind: &'static str,
 	/// Accepted but with nothing to serve with (no usable certificate): routes
 	/// attach, but no rule is made.
 	unservable: bool,
@@ -925,6 +935,7 @@ fn validate_listener<'a>(
 		client_auth: None,
 		accepted: true,
 		filtered: false,
+		from_kind: origin.kind,
 		unservable: false,
 		attached: 0,
 	};
@@ -969,23 +980,26 @@ fn validate_listener<'a>(
 		resolved =
 			Cond::new("ResolvedRefs", false, "InvalidRouteKinds", format!("route kinds not supported: {}", invalid_kinds.join(", ")));
 	}
-	// listener filters run before route matching (GEP-5224); served without them, an ExternalAuth
-	// would be skipped: not accepted until rproxy can run them (max3584/rproxy-api#386)
-	if let Some(reqs) = l.filters.as_ref().and_then(|f| f.get("requests")).and_then(Value::as_array).filter(|r| !r.is_empty()) {
-		// GEP-5224: the message names the filters not supported
-		let named: Vec<String> = reqs
-			.iter()
-			.enumerate()
-			.map(|(i, f)| format!("filters.requests[{i}] ({})", f.get("type").and_then(Value::as_str).unwrap_or("?")))
-			.collect();
-		st.accepted = false;
+	// listener filters run before route matching (GEP-5224): rproxy's `http.pre_routing` when every pod
+	// runs it (`opts.pre_routing`, translated once all listeners are known: `listener_filters`); served
+	// without them, an ExternalAuth would be skipped, so otherwise the listener is not accepted
+	if let Some(reqs) = listener_filters::requests(l) {
 		st.filtered = true;
-		st.conds.push(Cond::new(
-			"Accepted",
-			false,
-			"UnsupportedValue",
-			format!("{}: listener filters are not supported (rproxy runs no filter before route matching)", named.join(", ")),
-		));
+		// GEP-5224: the message names the filters
+		let named: Vec<String> = reqs.iter().enumerate().map(|(i, f)| listener_filters::label(i, f)).collect();
+		let why = if !matches!(family, Family::Http | Family::Https) {
+			Some("listener filters apply to HTTP and HTTPS listeners only")
+		} else if opts.pre_routing.is_none() {
+			Some(
+				"listener filters need every rproxy pod of the Gateway, and the image they roll to, to run middlewares before route matching (GET /capabilities: http_options pre_routing, rproxy v0.4.22); not known (yet)",
+			)
+		} else {
+			None
+		};
+		if let Some(why) = why {
+			st.accepted = false;
+			st.conds.push(Cond::new("Accepted", false, "UnsupportedValue", format!("{}: {why}", named.join(", "))));
+		}
 	}
 	if family == Family::Https && tls_mode != "Terminate" {
 		st.accepted = false;
@@ -1053,6 +1067,87 @@ fn validate_listener<'a>(
 	}
 	st.conds.push(resolved);
 	st
+}
+
+/// The listeners' filters (GEP-5224) as rproxy middlewares, by listener index, for the accepted
+/// listeners that have them (`opts.pre_routing` known). A filter that cannot be used refuses its
+/// listener (`Accepted: False`, `UnsupportedValue`). rproxy runs `pre_routing` for every request of a
+/// rule, and the listeners of one port share one rule: where the served listeners of a port do not all
+/// have the same filters (same namespace, same list), the ones with filters are refused (their host
+/// names stay out of the others: `exclusions`), so no request goes without its listener's filters or
+/// through another listener's.
+fn listener_chains(
+	world: &World,
+	listeners: &mut [ListenerState],
+	opts: &Options,
+	tls: &backend_tls::Index,
+	files: &BTreeSet<String>,
+	middleware_policy: Option<&crate::k8s::params::MiddlewarePolicy>,
+) -> BTreeMap<usize, listener_filters::Chain> {
+	let mut chains = BTreeMap::new();
+	let Some(kinds) = &opts.pre_routing else { return chains };
+	for (i, st) in listeners.iter_mut().enumerate() {
+		let Some(reqs) = listener_filters::requests(st.l).filter(|_| st.accepted) else { continue };
+		let ctx = http::Ctx {
+			world,
+			scheme: if st.family == Some(Family::Https) { "https" } else { "http" },
+			port: st.port,
+			features: &opts.features,
+			kind: st.from_kind,
+			grpc: false,
+			backend_tls: Some(tls),
+			files: Some((&opts.cert_dir, files)),
+			middleware_policy,
+		};
+		match listener_filters::build(&ctx, &st.ns, reqs, kinds) {
+			Ok(built) => {
+				if let Some(c) = built.resolved {
+					if status::get(&st.conds, "ResolvedRefs").is_none_or(|r| r.status) {
+						status::set(&mut st.conds, c);
+					}
+				}
+				chains.insert(i, built.chain);
+			}
+			Err(e) => {
+				st.accepted = false;
+				status::set(&mut st.conds, Cond::new("Accepted", false, "UnsupportedValue", e));
+			}
+		}
+	}
+	// one rule per port: the served listeners there must agree
+	let mut ports: BTreeMap<(rp::Protocol, u16), Vec<usize>> = BTreeMap::new();
+	for (i, st) in listeners.iter().enumerate() {
+		if let (true, false, Some(f @ (Family::Http | Family::Https))) = (st.accepted, st.unservable, st.family) {
+			ports.entry((f.protocol(), st.port)).or_default().push(i);
+		}
+	}
+	for ((_, port), members) in ports {
+		let keys: Vec<Option<(String, Vec<Value>)>> =
+			members.iter().map(|i| listener_filters::requests(listeners[*i].l).map(|r| (listeners[*i].ns.clone(), r.clone()))).collect();
+		if keys.iter().all(|k| *k == keys[0]) {
+			continue;
+		}
+		for (i, k) in members.into_iter().zip(keys) {
+			if k.is_none() {
+				continue;
+			}
+			chains.remove(&i);
+			let st = &mut listeners[i];
+			st.accepted = false;
+			status::set(
+				&mut st.conds,
+				Cond::new(
+					"Accepted",
+					false,
+					"UnsupportedValue",
+					format!(
+						"the listeners on port {port} do not all have the same filters.requests: rproxy runs listener filters for every request of a port (one rule per port); give every listener on the port the same filters, or this one a port of its own"
+					),
+				),
+			);
+		}
+	}
+	chains
 }
 
 /// The frontend validation of a port: `spec.tls.frontend.perPort`, else its `default`.
@@ -1442,6 +1537,13 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 	}
 	conflicts(&mut listeners);
 
+	// the files the Gateway's tenant-written settings may name (its own certificates)
+	let own_files: BTreeSet<String> = files.keys().cloned().collect();
+	let middleware_policy = params::class_middleware_policy(world, gw, &opts.params);
+	// listener filters (GEP-5224) → `http.pre_routing`, before routes attach (a listener refused here
+	// takes no route)
+	let chains = listener_chains(world, &mut listeners, opts, &tls_index, &own_files, middleware_policy.as_ref());
+
 	// attach routes
 	let mut attachments: Vec<Attachment> = vec![];
 	// the owner each entry of plan.parents names
@@ -1469,9 +1571,6 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 		st.attached = attachments.iter().filter(|a| a.listener == i).map(|a| (a.kind, a.route)).collect::<BTreeSet<_>>().len() as i32;
 	}
 
-	// the files the Gateway's tenant-written settings may name (its own certificates)
-	let own_files: BTreeSet<String> = files.keys().cloned().collect();
-	let middleware_policy = params::class_middleware_policy(world, gw, &opts.params);
 	let inputs = HttpInputs { tls: &tls_index, files: &own_files, middleware_policy: middleware_policy.as_ref() };
 	// one rule per (protocol, port)
 	let mut groups: BTreeMap<(rp::Protocol, u16), Vec<usize>> = BTreeMap::new();
@@ -1584,6 +1683,9 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 		let tls_routes: Vec<rp::TlsRoute> = tls_routes.into_iter().map(|(_, r)| r).collect();
 		if has(Family::Http) || has(Family::Https) {
 			let https = has(Family::Https);
+			// the listeners' filters: the same on every listener of the port (`listener_chains`)
+			let chain = members.iter().find_map(|i| chains.get(i));
+			let authenticates = chain.is_some_and(listener_filters::Chain::authenticates);
 			let mut entries = vec![];
 			let mut services = BTreeMap::new();
 			let mut middlewares = BTreeMap::new();
@@ -1601,6 +1703,12 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 					for e in &mut out.entries {
 						e.route.name = on_listener(&e.route.name, &listeners[a.listener].label);
 					}
+				}
+				// rproxy refuses a `cache` without `share_after_auth` behind an authenticating listener filter
+				if authenticates && out.unsupported.is_none() && out.middlewares.values().any(listener_filters::unshared_cache) {
+					out.unsupported = Some(format!(
+						"a cache needs share_after_auth: true on port {port}: a listener filter decides who the user is before routing"
+					));
 				}
 				let entry = results.entry((a.kind, a.route)).or_insert((None, None));
 				if entry.0.is_none() {
@@ -1622,7 +1730,14 @@ pub fn render_gateway(world: &World, gw: &Gateway, opts: &Options) -> GatewayPla
 				carried.push((a.kind, a.route, a.listener));
 			}
 			let routes = http::assign_priorities(&mut entries);
-			rule.http = Some(rp::Http { routes, default: None, services, middlewares });
+			let mut h = rp::Http { routes, default: None, services, middlewares, ..Default::default() };
+			if let Some(c) = chain {
+				h.pre_routing = c.names.clone();
+				h.middlewares.extend(c.middlewares.clone());
+				h.services.extend(c.services.clone());
+				tls_used.extend(c.tls_policies.iter().cloned());
+			}
+			rule.http = Some(h);
 			if https {
 				let passthrough: Vec<rp::TlsRoute> = tls_routes.into_iter().filter(|r| r.passthrough).collect();
 				let misdirected = if opts.features.misdirected { misdirected_groups(&listeners, members) } else { None };
