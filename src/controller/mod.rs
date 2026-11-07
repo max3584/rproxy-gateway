@@ -67,6 +67,7 @@ pub const SUPPORTED_FEATURES: &[&str] = &[
 	"HTTPRouteRequestTimeout",
 	"HTTPRouteHostRewrite",
 	"HTTPRouteBackendRequestHeaderModification",
+	"HTTPRouteBackendURLRewrite",
 	"HTTPRouteCORS",
 	"HTTPRouteRetry",
 	"HTTPRouteRetryCodes",
