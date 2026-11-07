@@ -42,6 +42,7 @@ use crate::controller::bootstrap;
 use crate::k8s::params::RproxyGatewayParametersSpec as Params;
 use crate::render::GatewayPlan;
 use crate::render::params::{object, objects};
+use crate::render::routability::StatusAddress;
 use crate::rproxy::client::server_name_for;
 
 pub const MANAGER: &str = "rproxy-gateway";
@@ -50,6 +51,8 @@ pub const LABEL_CERTS_FOR: &str = "rproxy.max3584.net/certs-for";
 /// Gateway API's label for objects made for a Gateway (`GatewayNameLabelKey`).
 pub const LABEL_GATEWAY_NAME: &str = "gateway.networking.k8s.io/gateway-name";
 pub const ANNOTATION_GATEWAY: &str = "rproxy.max3584.net/gateway";
+/// On a Gateway's ClusterIP Service of one `spec.addresses` entry (`Cluster`, GEP-5093): `true`.
+pub const LABEL_ADDRESS: &str = "rproxy.max3584.net/address";
 /// On rproxy pods: the hash of the certificate Secret's content they should have mounted.
 pub const ANNOTATION_CERTS: &str = "rproxy.max3584.net/certs";
 /// On a control API Secret: the name its certificate was issued for.
@@ -247,6 +250,9 @@ pub struct Target<'a> {
 	pub annotations: BTreeMap<String, String>,
 	/// `spec.addresses` (IP addresses) the Service takes (`externalIPs`).
 	pub addresses: Vec<String>,
+	/// The `spec.addresses` entries served by a ClusterIP Service of their own (routability `Cluster`):
+	/// (place in `spec.addresses`, the Service's name, the ClusterIP asked for).
+	pub dedicated: Vec<(usize, String, Option<String>)>,
 	/// Annotation prefixes let onto the Service though they steer addresses (`--service-annotation-prefix`).
 	pub service_annotations: Vec<String>,
 	/// The GatewayClass's and the Gateway's RproxyGatewayParameters, merged (checked by `render::params`).
@@ -283,6 +289,7 @@ impl<'a> Target<'a> {
 			labels: BTreeMap::new(),
 			annotations: BTreeMap::new(),
 			addresses: vec![],
+			dedicated: dedicated_services(plan),
 			service_annotations: vec![],
 			params: Params::default(),
 			graceful: false,
@@ -735,9 +742,9 @@ fn external_traffic_policy(t: &Target, m: &Managed) -> Option<String> {
 	}
 }
 
-pub fn service(t: &Target, m: &Managed) -> Service {
-	let ports = t
-		.plan
+/// The ports of a Gateway's Services: every port rproxy listens on.
+fn service_ports(t: &Target) -> Vec<ServicePort> {
+	t.plan
 		.ports()
 		.into_iter()
 		.map(|(proto, port)| ServicePort {
@@ -747,7 +754,11 @@ pub fn service(t: &Target, m: &Managed) -> Service {
 			protocol: Some(proto.k8s().into()),
 			..Default::default()
 		})
-		.collect();
+		.collect()
+}
+
+pub fn service(t: &Target, m: &Managed) -> Service {
+	let ports = service_ports(t);
 	let sp = t.params.service.clone().unwrap_or_default();
 	let service_type = t.service_type(m);
 	Service {
@@ -771,6 +782,39 @@ pub fn service(t: &Target, m: &Managed) -> Service {
 			load_balancer_source_ranges: sp.load_balancer_source_ranges.clone(),
 			ip_family_policy: sp.ip_family_policy.map(|p| p.as_str().to_string()),
 			type_: Some(service_type),
+			..Default::default()
+		}),
+		..Default::default()
+	}
+}
+
+/// The `spec.addresses` entries of `plan` served by a ClusterIP Service of their own (`Target::dedicated`).
+pub fn dedicated_services(plan: &GatewayPlan) -> Vec<(usize, String, Option<String>)> {
+	let id = gateway_id(&plan.namespace, &plan.name, &plan.uid);
+	plan.address_requests
+		.iter()
+		.enumerate()
+		.filter(|(_, r)| r.dedicated())
+		.map(|(i, r)| (i, format!("{}-{}", object_name(&id), r.service_suffix(i)), (!r.value.is_empty()).then(|| r.value.clone())))
+		.collect()
+}
+
+/// The ClusterIP Service of one `spec.addresses` entry (routability `Cluster`): the Gateway's ports,
+/// its rproxy pods, the ClusterIP asked for (else the API server's).
+pub fn address_service(t: &Target, name: &str, ip: Option<&str>) -> Service {
+	let mut l = labels(&t.id);
+	l.insert(LABEL_ADDRESS.into(), "true".into());
+	let mut meta = t.meta(name, l);
+	if let Some(a) = meta.annotations.as_mut() {
+		a.retain(|k, _| k == ANNOTATION_GATEWAY);
+	}
+	Service {
+		metadata: meta,
+		spec: Some(ServiceSpec {
+			selector: Some(labels(&t.id)),
+			ports: Some(service_ports(t)),
+			cluster_ip: ip.map(Into::into),
+			type_: Some("ClusterIP".into()),
 			..Default::default()
 		}),
 		..Default::default()
@@ -948,6 +992,8 @@ pub struct Applied {
 	pub pdb: bool,
 	/// The hash of the control API Secret's content (the pod template's `ANNOTATION_API`).
 	pub api: String,
+	/// The ClusterIP of each dedicated `spec.addresses` entry's Service, by its place (`Err`: why none).
+	pub dedicated: BTreeMap<usize, Result<String, String>>,
 }
 
 /// Writes a Gateway's certificate and control API Secrets; returns the hashes of their content.
@@ -1023,10 +1069,49 @@ pub async fn apply_managed(
 	if t.plan.ports().is_empty() {
 		// a Service needs a port; none until a listener is valid
 		let _ = svc_api.delete(&name, &DeleteParams::default()).await;
-		return Ok(Applied { service: None, certs, pdb: pdb.is_some(), api: api_hash });
+		apply_address_services(client, t, false).await;
+		return Ok(Applied { service: None, certs, pdb: pdb.is_some(), api: api_hash, dedicated: BTreeMap::new() });
 	}
 	let service = svc_api.patch(&name, &pp(), &Patch::Apply(&service(t, m))).await?;
-	Ok(Applied { service: Some(service), certs, pdb: pdb.is_some(), api: api_hash })
+	let dedicated = apply_address_services(client, t, true).await;
+	Ok(Applied { service: Some(service), certs, pdb: pdb.is_some(), api: api_hash, dedicated })
+}
+
+/// Writes the ClusterIP Services of the dedicated `spec.addresses` entries (`want`: else none) and
+/// deletes the Gateway's others first (a ClusterIP asked for again is free by then). A Service the
+/// API server refuses (a ClusterIP outside the ServiceCIDR or taken) leaves its entry unassigned.
+async fn apply_address_services(client: &kube::Client, t: &Target<'_>, want: bool) -> BTreeMap<usize, Result<String, String>> {
+	let api = Api::<Service>::namespaced(client.clone(), t.ns());
+	let wanted: Vec<&String> = if want { t.dedicated.iter().map(|(_, n, _)| n).collect() } else { vec![] };
+	let lp = ListParams::default().labels(&format!("{LABEL_GATEWAY}={},{LABEL_ADDRESS}=true", t.id));
+	match api.list(&lp).await {
+		Ok(list) => {
+			for svc in list.items {
+				let n = svc.metadata.name.unwrap_or_default();
+				if !wanted.contains(&&n) {
+					if let Err(e) = api.delete(&n, &DeleteParams::default()).await {
+						tracing::warn!(gateway = %t.plan.ruleset, service = n, error = %e, "cannot delete an address Service");
+					}
+				}
+			}
+		}
+		Err(e) => tracing::warn!(gateway = %t.plan.ruleset, error = %e, "cannot list the address Services"),
+	}
+	let mut out = BTreeMap::new();
+	if !want {
+		return out;
+	}
+	for (i, name, ip) in &t.dedicated {
+		let got = match api.patch(name, &pp(), &Patch::Apply(&address_service(t, name, ip.as_deref()))).await {
+			Ok(s) => {
+				s.spec.and_then(|s| s.cluster_ip).filter(|ip| ip != "None").ok_or_else(|| "its Service has no ClusterIP yet".to_string())
+			}
+			Err(kube::Error::Api(e)) => Err(format!("the API server refused its Service: {}", e.message)),
+			Err(e) => Err(format!("cannot write its Service: {e}")),
+		};
+		out.insert(*i, got);
+	}
+	out
 }
 
 /// Whether a Gateway's rproxy Deployment exists (a Gateway kept in its last good shape when its
@@ -1115,21 +1200,22 @@ where
 	Ok(out)
 }
 
-/// Gateway status addresses from the Service: load balancer addresses, else the ClusterIP.
-pub fn service_addresses(svc: &Service) -> Vec<(String, String)> {
-	let mut out = vec![];
+/// Gateway status addresses from the Service: load balancer addresses (no routability guarantee),
+/// else the ClusterIP (`Cluster`, GEP-5093).
+pub fn service_addresses(svc: &Service) -> Vec<StatusAddress> {
+	let mut out: Vec<StatusAddress> = vec![];
 	for i in svc.status.as_ref().and_then(|s| s.load_balancer.as_ref()).and_then(|l| l.ingress.as_ref()).into_iter().flatten() {
 		if let Some(ip) = &i.ip {
-			out.push(("IPAddress".to_string(), ip.clone()));
+			out.push(StatusAddress::new("IPAddress", ip, ""));
 		} else if let Some(h) = &i.hostname {
-			out.push(("Hostname".to_string(), h.clone()));
+			out.push(StatusAddress::new("Hostname", h, ""));
 		}
 	}
 	let spec = svc.spec.clone().unwrap_or_default();
 	if out.is_empty() && spec.type_.as_deref() != Some("LoadBalancer") {
 		for ip in spec.cluster_ips.unwrap_or_default().into_iter().chain(spec.cluster_ip) {
-			if ip != "None" && !out.iter().any(|(_, v)| v == &ip) {
-				out.push(("IPAddress".to_string(), ip));
+			if ip != "None" && !out.iter().any(|a| a.value == ip) {
+				out.push(StatusAddress::new("IPAddress", &ip, crate::render::routability::CLUSTER));
 			}
 		}
 	}
@@ -2016,5 +2102,36 @@ mod tests {
 			assert!(!caps_keys(&[other]).contains(&ep.caps_key()), "{why}");
 		}
 		assert_eq!(caps_key("u", None), "u", "before the kubelet says: the uid");
+	}
+
+	/// A `Cluster` entry of `spec.addresses` (GEP-5093): a ClusterIP Service of its own, the Gateway's ports
+	/// and pods, the value as its clusterIP; named by the value (a ClusterIP cannot change), else by the place.
+	#[test]
+	fn address_services() {
+		let mut plan = crate::render::GatewayPlan {
+			namespace: "ns".into(),
+			name: "gw".into(),
+			uid: "u".into(),
+			listener_ports: [(crate::rproxy::model::Protocol::Tcp, 80)].into(),
+			..Default::default()
+		};
+		let req = |v: &str, r: &str| crate::render::routability::Request { value: v.into(), routability: r.into() };
+		plan.address_requests = vec![req("", ""), req("10.96.7.7", "Cluster"), req("", "Cluster"), req("", "example.com/x")];
+		let t = Target::new(&plan);
+		let names: Vec<(usize, String, Option<String>)> = t.dedicated.clone();
+		let base = object_name(&t.id);
+		assert_eq!(names.len(), 2);
+		assert_eq!((names[0].0, names[0].2.as_deref()), (1, Some("10.96.7.7")));
+		assert!(names[0].1.starts_with(&format!("{base}-a")) && names[0].1.len() <= 63, "{}", names[0].1);
+		assert_eq!(names[1], (2, format!("{base}-n2"), None));
+		let s = address_service(&t, &names[0].1, names[0].2.as_deref());
+		let spec = s.spec.unwrap();
+		assert_eq!(spec.type_.as_deref(), Some("ClusterIP"));
+		assert_eq!(spec.cluster_ip.as_deref(), Some("10.96.7.7"));
+		assert_eq!(spec.selector, Some(labels(&t.id)));
+		assert_eq!(spec.ports.unwrap()[0].port, 80);
+		let l = s.metadata.labels.unwrap();
+		assert_eq!(l.get(LABEL_ADDRESS).map(String::as_str), Some("true"));
+		assert_eq!(l.get(LABEL_GATEWAY), Some(&t.id), "collect_garbage finds it with the Gateway's objects");
 	}
 }

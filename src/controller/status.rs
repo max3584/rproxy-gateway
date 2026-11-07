@@ -4,6 +4,7 @@
 
 use serde_json::{Value, json};
 
+use crate::render::routability::StatusAddress;
 use crate::render::status::{self, Cond, to_k8s};
 use crate::render::{GatewayPlan, ListenerPlan, ListenerSetPlan, ParentStatus};
 use crate::rproxy::model::RuleView;
@@ -108,7 +109,15 @@ pub fn listener_conds(l: &ListenerPlan, pods: &[PodSync]) -> Vec<Cond> {
 }
 
 /// Gateway `status`.
-pub fn gateway_status(plan: &GatewayPlan, addresses: &[(String, String)], pods: &[PodSync], previous: Option<&Value>, now: &str) -> Value {
+/// `assigned`: the `AddressesAssigned` condition (GEP-5093; `None`: addresses not reconciled, left out).
+pub fn gateway_status(
+	plan: &GatewayPlan,
+	addresses: &[StatusAddress],
+	assigned: Option<Cond>,
+	pods: &[PodSync],
+	previous: Option<&Value>,
+	now: &str,
+) -> Value {
 	let generation = plan.generation;
 	let prev = |path: &str| previous.and_then(|p| p.pointer(path));
 	let mut conds = plan.conds.clone();
@@ -129,8 +138,10 @@ pub fn gateway_status(plan: &GatewayPlan, addresses: &[(String, String)], pods: 
 		Cond::ok("Programmed", "Programmed")
 	};
 	status::set(&mut conds, programmed);
+	conds.extend(assigned);
 	let mut out = json!({
-		"addresses": addresses.iter().map(|(t, v)| json!({"type": t, "value": v})).collect::<Vec<_>>(),
+		// routability on every address, empty for the default (GEP-5093)
+		"addresses": addresses.iter().map(|a| json!({"type": a.kind, "value": a.value, "routability": a.routability})).collect::<Vec<_>>(),
 		"conditions": to_k8s(&conds, generation, prev("/conditions"), now),
 		"listeners": listeners_status(&plan.listeners, pods, generation, previous, now),
 	});
@@ -317,6 +328,18 @@ pub fn class_status(generation: i64, features: &[&str], invalid: Option<&str>, p
 	})
 }
 
+/// A Gateway's `status` without the addresses' `routability`: as the API server keeps it with CRDs
+/// that do not have the field (before Gateway API v1.7, the standard channel).
+pub fn without_routability(status: &Value) -> Value {
+	let mut st = status.clone();
+	for a in st.get_mut("addresses").and_then(Value::as_array_mut).into_iter().flatten() {
+		if let Some(o) = a.as_object_mut() {
+			o.remove("routability");
+		}
+	}
+	st
+}
+
 /// `status` without `supportedFeatures`, for the CRDs of Gateway API v1.0 and v1.1: there the field is a list of
 /// strings from a fixed set (objects with `name` since v1.2), and the API server refuses the whole status. The
 /// conformance suites of that time take the features from their flags instead.
@@ -397,17 +420,28 @@ mod tests {
 	#[test]
 	fn gateway_status_from_rproxy() {
 		let p = plan();
-		let addrs = vec![("IPAddress".to_string(), "10.96.0.10".to_string())];
-		let s = gateway_status(&p, &addrs, &[PodSync::Synced(vec![view(80, "True")], vec![])], None, "T");
-		assert_eq!(s["addresses"][0]["value"], "10.96.0.10");
+		let addrs = vec![StatusAddress::new("IPAddress", "10.96.0.10", "Cluster")];
+		let s = gateway_status(&p, &addrs, None, &[PodSync::Synced(vec![view(80, "True")], vec![])], None, "T");
+		assert_eq!(s["addresses"][0], json!({"type": "IPAddress", "value": "10.96.0.10", "routability": "Cluster"}));
+		// CRDs without the field drop it; written as read back, nothing is written again
+		assert!(without_routability(&s)["addresses"][0].get("routability").is_none());
+		let s2 = gateway_status(
+			&p,
+			&addrs,
+			Some(Cond::ok("AddressesAssigned", "AddressesAssigned")),
+			&[PodSync::Synced(vec![view(80, "True")], vec![])],
+			None,
+			"T",
+		);
+		assert_eq!(s2["conditions"][2]["type"], "AddressesAssigned");
 		assert_eq!(s["conditions"][1]["type"], "Programmed");
 		assert_eq!(s["conditions"][1]["status"], "True");
 		assert_eq!(s["listeners"][0]["conditions"][2]["status"], "True");
 		assert_eq!(s["listeners"][0]["attachedRoutes"], 1);
-		let s = gateway_status(&p, &addrs, &[PodSync::Synced(vec![view(80, "False")], vec![])], None, "T");
+		let s = gateway_status(&p, &addrs, None, &[PodSync::Synced(vec![view(80, "False")], vec![])], None, "T");
 		let c = &s["listeners"][0]["conditions"][2];
 		assert_eq!((c["status"].as_str(), c["reason"].as_str()), (Some("False"), Some("Invalid")));
-		let s = gateway_status(&p, &[], &[PodSync::NotReady("starting".into())], None, "T");
+		let s = gateway_status(&p, &[], None, &[PodSync::NotReady("starting".into())], None, "T");
 		assert_eq!(s["conditions"][1]["reason"], "AddressNotAssigned");
 		assert_eq!(s["listeners"][0]["conditions"][2]["reason"], "Pending");
 	}
@@ -416,12 +450,12 @@ mod tests {
 	fn invalid_parameters_keep_the_last_good_rproxy() {
 		let mut p = plan();
 		p.conds = vec![Cond::new("Accepted", false, "InvalidParameters", "spec.pod.tolerations: not allowed")];
-		let addrs = vec![("IPAddress".to_string(), "10.96.0.10".to_string())];
+		let addrs = vec![StatusAddress::new("IPAddress", "10.96.0.10", "Cluster")];
 		let synced = [PodSync::Synced(vec![view(80, "True")], vec![])];
-		let s = gateway_status(&p, &addrs, &synced, None, "T");
+		let s = gateway_status(&p, &addrs, None, &synced, None, "T");
 		assert_eq!(s["conditions"][1]["status"], "False", "a new Gateway with invalid parameters is not deployed");
 		p.kept = Some("spec.pod.tolerations: not allowed".into());
-		let s = gateway_status(&p, &addrs, &synced, None, "T");
+		let s = gateway_status(&p, &addrs, None, &synced, None, "T");
 		assert_eq!(
 			(s["conditions"][0]["status"].as_str(), s["conditions"][0]["reason"].as_str()),
 			(Some("False"), Some("InvalidParameters"))

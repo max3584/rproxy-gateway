@@ -282,7 +282,8 @@ async fn waits_for_certificate_files_and_reports_failures() {
 			}],
 			..p.clone()
 		},
-		&[("IPAddress".into(), "10.0.0.9".into())],
+		&[crate::render::routability::StatusAddress::new("IPAddress", "10.0.0.9", "")],
+		None,
 		&[r],
 		None,
 		"T",
