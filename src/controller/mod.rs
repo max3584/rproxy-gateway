@@ -94,15 +94,23 @@ pub const SUPPORTED_FEATURES: &[&str] = &[
 	"HTTPRouteExternalAuthForwardBody",
 ];
 
+/// Features claimed only when the cluster serves what they need (GatewayClass `supportedFeatures`):
+/// `ClusterTrustBundle` (GEP-5075) only when the API server serves ClusterTrustBundles.
+pub const CLUSTER_FEATURES: &[&str] = &["ClusterTrustBundle"];
+
 /// Features claimed only in managed mode: a `Cluster` address is a Gateway's own ClusterIP Service,
 /// which the fleet does not have (GEP-5093).
 pub const MANAGED_FEATURES: &[&str] = &["GatewayAddressRoutabilityCluster"];
 
-/// The features the GatewayClasses of this controller claim (`supportedFeatures`).
-pub fn supported_features(mode: &Mode) -> Vec<&'static str> {
+/// The features the GatewayClasses of this controller claim (`supportedFeatures`): `SUPPORTED_FEATURES`,
+/// the `MANAGED_FEATURES` in managed mode and the `CLUSTER_FEATURES` this cluster allows.
+pub fn supported_features(mode: &Mode, world: &render::world::World) -> Vec<&'static str> {
 	let mut out = SUPPORTED_FEATURES.to_vec();
 	if matches!(mode, Mode::Managed(_)) {
 		out.extend(MANAGED_FEATURES);
+	}
+	if world.cluster_trust_bundles.is_some() {
+		out.push("ClusterTrustBundle");
 	}
 	out
 }
@@ -457,7 +465,7 @@ async fn reconcile_all(
 			let invalid = render::params::class_parameters(&world, c, &params_opts).err();
 			let st = status::class_status(
 				c.metadata.generation.unwrap_or(0),
-				&supported_features(&cfg.mode),
+				&supported_features(&cfg.mode, &world),
 				invalid.as_deref(),
 				previous.as_ref(),
 				&now,

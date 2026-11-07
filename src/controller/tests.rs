@@ -933,22 +933,33 @@ fn supported_features_match_the_conformance_script() {
 	let line = script.lines().find(|l| l.starts_with("FEATURES=${FEATURES:-")).expect("FEATURES in scripts/conformance.sh");
 	let list = line.trim_start_matches("FEATURES=${FEATURES:-").trim_end_matches('}');
 	let mut script_features: Vec<&str> = list.split(',').collect();
-	// the conformance job runs the managed mode
-	let mut ours: Vec<&str> = super::supported_features(&super::Mode::Managed(Default::default()));
+	// the conformance job runs the managed mode, on a cluster that serves ClusterTrustBundles (Kubernetes 1.37: v1)
+	let served = crate::render::world::World { cluster_trust_bundles: Some(Default::default()), ..Default::default() };
+	let mut ours: Vec<&str> = super::supported_features(&super::Mode::Managed(Default::default()), &served);
 	script_features.sort();
 	ours.sort();
 	assert_eq!(script_features, ours, "SUPPORTED_FEATURES and scripts/conformance.sh FEATURES differ");
 }
 
+/// `ClusterTrustBundle` is claimed only when the API server serves ClusterTrustBundles (GEP-5075).
+#[test]
+fn cluster_trust_bundle_claimed_only_when_served() {
+	let managed = super::Mode::Managed(Default::default());
+	let mut w = crate::render::world::World::default();
+	assert!(!super::supported_features(&managed, &w).contains(&"ClusterTrustBundle"));
+	w.cluster_trust_bundles = Some(Default::default());
+	assert!(super::supported_features(&managed, &w).contains(&"ClusterTrustBundle"));
+}
+
 /// `GatewayAddressRoutabilityCluster` only in managed mode; `GatewayAddressRoutability` in both (GEP-5093).
 #[test]
 fn cluster_routability_claimed_only_when_managed() {
-	let managed = super::supported_features(&super::Mode::Managed(Default::default()));
+	let w = crate::render::world::World::default();
+	let managed = super::supported_features(&super::Mode::Managed(Default::default()), &w);
 	assert!(managed.contains(&"GatewayAddressRoutabilityCluster") && managed.contains(&"GatewayAddressRoutability"));
-	let fleet = super::supported_features(&super::Mode::Fleet(crate::controller::provision::Fleet {
-		selector: String::new(),
-		addresses: vec![],
-		listen_on_addresses: false,
-	}));
+	let fleet = super::supported_features(
+		&super::Mode::Fleet(crate::controller::provision::Fleet { selector: String::new(), addresses: vec![], listen_on_addresses: false }),
+		&w,
+	);
 	assert!(!fleet.contains(&"GatewayAddressRoutabilityCluster") && fleet.contains(&"GatewayAddressRoutability"));
 }

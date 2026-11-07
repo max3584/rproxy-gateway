@@ -151,6 +151,78 @@ test "$(kubectl -n e2e get httproute echo -o jsonpath='{.status.parents[0].condi
 test "$(kubectl -n e2e get httproute echo -o jsonpath='{.status.parents[0].conditions[?(@.type=="ResolvedRefs")].status}')" = True
 test "$(kubectl -n e2e get gateway e2e -o jsonpath='{.status.listeners[?(@.name=="https")].conditions[?(@.type=="Programmed")].status}')" = True
 
+ctb_v=$(kubectl api-resources --api-group=certificates.k8s.io --no-headers 2>/dev/null | awk '$1 == "clustertrustbundles" {print $(NF-2)}')
+frontend=$(kubectl get crd gateways.gateway.networking.k8s.io -o json \
+  | jq '[.spec.versions[] | select(.name == "v1") | .schema.openAPIV3Schema.properties.spec.properties.tls.properties.frontend.properties.default.properties.validation // empty] | length')
+# the feature is claimed exactly when the API server serves ClusterTrustBundles (GEP-5075)
+claims_ctb() { kubectl get gatewayclass rproxy -o json | jq -e '[.status.supportedFeatures[]?.name] | index("ClusterTrustBundle") != null' > /dev/null; }
+# Gateway API v1.0 / v1.1 CRDs: supportedFeatures is a list of strings (no name), and the controller writes none
+named_features=$(kubectl get crd gatewayclasses.gateway.networking.k8s.io -o json \
+  | jq '[.spec.versions[] | select(.name == "v1") | .schema.openAPIV3Schema.properties.status.properties.supportedFeatures.items.properties.name // empty] | length')
+if [ "$named_features" -eq 0 ]; then
+  echo "== ClusterTrustBundle: this GatewayClass CRD has no supportedFeatures[].name, the claim is not checked"
+elif [ -n "$ctb_v" ]; then
+  echo "== ClusterTrustBundle ($ctb_v): claimed"
+  retry 60 claims_ctb
+else
+  echo "== ClusterTrustBundle: not served here, not claimed"
+  if claims_ctb; then echo "ClusterTrustBundle claimed without the API"; exit 1; fi
+fi
+if [ -n "$ctb_v" ] && [ "$frontend" -gt 0 ]; then
+  echo "== ClusterTrustBundle ($ctb_v, GEP-5075): client certificates checked against a cluster-wide CA"
+  openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=e2e-client-ca -keyout "$work/client-ca.key" -out "$work/client-ca.crt" 2> /dev/null
+  openssl req -newkey rsa:2048 -nodes -subj /CN=e2e-client -keyout "$work/client.key" -out "$work/client.csr" 2> /dev/null
+  openssl x509 -req -in "$work/client.csr" -CA "$work/client-ca.crt" -CAkey "$work/client-ca.key" -CAcreateserial -days 2 \
+    -extfile <(printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=clientAuth\n') -out "$work/client.crt" 2> /dev/null
+  cat <<YAML | kubectl apply -f - > /dev/null
+apiVersion: $ctb_v
+kind: ClusterTrustBundle
+metadata: {name: e2e-client-ca}
+spec:
+  trustBundle: |
+$(sed 's/^/    /' "$work/client-ca.crt")
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {name: mtls, namespace: e2e}
+spec:
+  gatewayClassName: rproxy
+  tls:
+    frontend:
+      default:
+        validation:
+          caCertificateRefs: [{group: certificates.k8s.io, kind: ClusterTrustBundle, name: e2e-client-ca}]
+  listeners:
+    - {name: https, port: 443, protocol: HTTPS, hostname: secure.example.com, tls: {certificateRefs: [{name: secure-cert}]}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: mtls, namespace: e2e}
+spec:
+  parentRefs: [{name: mtls}]
+  rules: [{backendRefs: [{name: echo, port: 8080}]}]
+YAML
+  kubectl -n e2e wait --for=condition=Programmed gateway/mtls --timeout=240s > /dev/null
+  mtls_addr=$(kubectl -n e2e get gateway mtls -o jsonpath='{.status.addresses[0].value}')
+  mtls="--cacert $work/tls2.crt --resolve secure.example.com:443:$mtls_addr --max-time 5"
+  # shellcheck disable=SC2086
+  retry 90 sh -c "curl -sf $mtls --cert $work/client.crt --key $work/client.key https://secure.example.com/mtls > $work/mtls.json"
+  jq -e '.path == "/mtls"' "$work/mtls.json" > /dev/null
+  test "$(kubectl -n e2e get gateway mtls -o jsonpath='{.status.listeners[0].conditions[?(@.type=="ResolvedRefs")].status}')" = True
+  # no client certificate: refused in the handshake
+  # shellcheck disable=SC2086
+  test "$(curl -s -o /dev/null -w '%{http_code}' $mtls https://secure.example.com/none || true)" = 000
+  # the bundle deleted: the reference is invalid, nothing is served with the old CA
+  kubectl delete clustertrustbundle e2e-client-ca > /dev/null
+  retry 60 sh -c "test \"\$(kubectl -n e2e get gateway mtls -o jsonpath='{.status.listeners[0].conditions[?(@.type==\"ResolvedRefs\")].reason}')\" = InvalidCACertificateRef"
+  # shellcheck disable=SC2086
+  retry 60 sh -c "! curl -sf $mtls --cert $work/client.crt --key $work/client.key https://secure.example.com/gone > /dev/null"
+  kubectl -n e2e delete gateway mtls > /dev/null
+  kubectl -n e2e delete httproute mtls > /dev/null
+elif [ -n "$ctb_v" ]; then
+  echo "== ClusterTrustBundle: this Gateway API has no frontend client certificate validation, mTLS skipped"
+fi
+
 echo "== east-west (docs/PLATFORM.md): clients in the cluster call the original Service name, rproxy in between"
 # the real backend renamed (api-backend); the original name (api) selects the Gateway's rproxy pods by the
 # labels the controller puts on them; api-ext is the same as an ExternalName to the Gateway's Service

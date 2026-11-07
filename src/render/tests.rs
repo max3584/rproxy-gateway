@@ -1992,6 +1992,164 @@ spec:
 	assert_eq!(rpc["servers"][0]["url"], "https://10.0.5.1:8443");
 }
 
+/// ClusterTrustBundles in `caCertificateRefs` (GEP-5075): by name, no ReferenceGrant, for
+/// BackendTLSPolicy and the Gateway's client certificate validation; missing or not PEM:
+/// `InvalidCACertificateRef`; the API not served: an unknown kind.
+#[test]
+fn cluster_trust_bundles() {
+	let (crt, key) = crate::pem::tests::pair("example.com");
+	let (ca, _) = crate::pem::tests::pair("corp-ca");
+	let base = format!(
+		r#"{BASE}
+---
+apiVersion: v1
+kind: Secret
+metadata: {{name: cert, namespace: default}}
+stringData:
+  tls.crt: |
+{}
+  tls.key: |
+{}
+---
+apiVersion: v1
+kind: Service
+metadata: {{name: secure, namespace: default}}
+spec: {{ports: [{{name: https, port: 443}}]}}
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata: {{name: secure-1, namespace: default, labels: {{kubernetes.io/service-name: secure}}}}
+addressType: IPv4
+ports: [{{name: https, port: 8443}}]
+endpoints: [{{addresses: [10.0.5.1]}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {{name: broken, namespace: default}}
+spec: {{ports: [{{name: https, port: 443}}]}}
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata: {{name: broken-1, namespace: default, labels: {{kubernetes.io/service-name: broken}}}}
+addressType: IPv4
+ports: [{{name: https, port: 8443}}]
+endpoints: [{{addresses: [10.0.6.1]}}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: {{name: ctb, namespace: default}}
+spec:
+  targetRefs: [{{group: "", kind: Service, name: secure}}]
+  validation:
+    caCertificateRefs: [{{group: certificates.k8s.io, kind: ClusterTrustBundle, name: corp}}]
+    hostname: abc.example.com
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata: {{name: missing, namespace: default}}
+spec:
+  targetRefs: [{{group: "", kind: Service, name: broken}}]
+  validation:
+    caCertificateRefs: [{{group: certificates.k8s.io, kind: ClusterTrustBundle, name: nothing}}]
+    hostname: abc.example.com
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {{name: gw, namespace: default}}
+spec:
+  gatewayClassName: rproxy
+  tls:
+    frontend:
+      default:
+        validation: {{caCertificateRefs: [{{group: certificates.k8s.io, kind: ClusterTrustBundle, name: corp}}]}}
+      perPort:
+        - {{port: 8443, tls: {{validation: {{caCertificateRefs: [{{group: certificates.k8s.io, kind: ClusterTrustBundle, name: empty}}]}}}}}}
+        - {{port: 9443, tls: {{validation: {{caCertificateRefs: [{{group: certificates.k8s.io, kind: ClusterTrustBundle, name: corp, namespace: default}}]}}}}}}
+  listeners:
+    - {{name: a, port: 443, protocol: HTTPS, tls: {{certificateRefs: [{{name: cert}}]}}}}
+    - {{name: b, port: 8443, protocol: HTTPS, tls: {{certificateRefs: [{{name: cert}}]}}}}
+    - {{name: c, port: 9443, protocol: HTTPS, tls: {{certificateRefs: [{{name: cert}}]}}}}
+    - {{name: http, port: 80, protocol: HTTP}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {{name: tls, namespace: default}}
+spec:
+  parentRefs: [{{name: gw, sectionName: http}}]
+  rules:
+    - matches: [{{path: {{value: /secure}}}}]
+      backendRefs: [{{name: secure, port: 443}}]
+    - matches: [{{path: {{value: /broken}}}}]
+      backendRefs: [{{name: broken, port: 443}}]
+"#,
+		indent(&crt),
+		indent(&key),
+	);
+	let bundles = format!(
+		r#"
+---
+apiVersion: certificates.k8s.io/v1
+kind: ClusterTrustBundle
+metadata: {{name: corp}}
+spec:
+  trustBundle: |
+{}
+---
+apiVersion: certificates.k8s.io/v1
+kind: ClusterTrustBundle
+metadata: {{name: empty}}
+spec: {{trustBundle: ""}}
+"#,
+		indent(&ca)
+	);
+	let p = plan(&format!("{base}{bundles}"));
+	// BackendTLSPolicy: the bundle is the CA file
+	let http = &p.rules_json().iter().find(|r| r["listen_port"] == 80).unwrap()["http"].clone();
+	let svc = &http["services"]["default/tls/r0"];
+	let ca_name = svc["tls"]["ca_file"].as_str().unwrap().rsplit('/').next().unwrap();
+	assert_eq!(String::from_utf8_lossy(&p.files[ca_name]).trim(), ca.trim());
+	let st = |n: &str| p.backend_tls.iter().find(|s| s.name == n).cloned().unwrap();
+	assert!(cond(&st("ctb").conds, "Accepted").status);
+	assert!(cond(&st("ctb").conds, "ResolvedRefs").status);
+	assert_eq!(cond(&st("missing").conds, "ResolvedRefs").reason, "InvalidCACertificateRef");
+	assert_eq!(cond(&st("missing").conds, "Accepted").reason, "NoValidCACertificate");
+	let broken = http["routes"].as_array().unwrap().iter().find(|r| r["name"] == "default/tls/r1/m0/h0").unwrap();
+	assert_eq!(broken["middlewares"], json!([http::RESPOND_500]));
+	// frontend validation
+	let rules = p.rules_json();
+	let rule = |port: u16| rules.iter().find(|r| r["listen_port"] == port);
+	let auth = &rule(443).unwrap()["tls"]["client_auth"];
+	assert_eq!(auth["mode"], "required");
+	let file = auth["ca_file"].as_str().unwrap().rsplit('/').next().unwrap();
+	assert_eq!(String::from_utf8_lossy(&p.files[file]).trim(), ca.trim());
+	let l = |n: &str| p.listeners.iter().find(|x| x.name == n).unwrap().clone();
+	assert!(cond(&l("a").conds, "ResolvedRefs").status);
+	for n in ["b", "c"] {
+		assert_eq!(cond(&l(n).conds, "ResolvedRefs").reason, "InvalidCACertificateRef", "{n}");
+		assert_eq!(cond(&l(n).conds, "Accepted").reason, "NoValidCACertificate", "{n}");
+	}
+	assert!(rule(8443).is_none() && rule(9443).is_none());
+
+	// the API server does not serve ClusterTrustBundles: an unknown kind
+	let p = plan(&base);
+	let st = |n: &str| p.backend_tls.iter().find(|s| s.name == n).cloned().unwrap();
+	assert_eq!(cond(&st("ctb").conds, "ResolvedRefs").reason, "InvalidKind");
+	assert_eq!(cond(&st("ctb").conds, "Accepted").reason, "NoValidCACertificate");
+	let l = |n: &str| p.listeners.iter().find(|x| x.name == n).unwrap().clone();
+	assert_eq!(cond(&l("a").conds, "ResolvedRefs").reason, "InvalidCACertificateKind");
+	assert!(cond(&l("http").conds, "Accepted").status, "the rest is served");
+
+	// served but not listed yet: Pending, not an unknown kind
+	let mut w = world(&base);
+	w.cluster_trust_bundles = Some(Default::default());
+	w.cluster_trust_bundles_pending = true;
+	let p = render_gateway(&w, &w.gateways[0], &Options::default());
+	let st = |n: &str| p.backend_tls.iter().find(|s| s.name == n).cloned().unwrap();
+	assert_eq!(cond(&st("ctb").conds, "ResolvedRefs").reason, "Pending");
+	let l = |n: &str| p.listeners.iter().find(|x| x.name == n).unwrap().clone();
+	assert_eq!(cond(&l("a").conds, "ResolvedRefs").reason, "Pending");
+}
+
 /// A route naming another namespace's Service without a ReferenceGrant does not get that Service's
 /// BackendTLSPolicy status written for the Gateway (#101); with a grant it does.
 #[test]
