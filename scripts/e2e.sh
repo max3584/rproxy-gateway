@@ -51,7 +51,15 @@ for i in 1 2 3 4 5; do
   [ "$i" = 5 ] && { echo "cannot download the Gateway API CRDs"; exit 1; }
   sleep $((i * 5))
 done
-kubectl apply --server-side -f "$crds" > /dev/null
+# a newer API server can refuse a Gateway API release's CRDs (CEL rules over its cost budget, #125): say so
+# and stop here, before rproxy-gateway is installed (nothing of ours has run). The marker tells the compat
+# job (e2e.yml) this failure from the others
+rm -f "$work/crds-refused"
+if ! kubectl apply --server-side -f "$crds" > /dev/null; then
+  echo "::error::the API server (${KIND_NODE_IMAGE:-the default kind node image}) refused the Gateway API $GATEWAY_API_VERSION CRDs ($GATEWAY_API_CHANNEL): these two versions do not go together; rproxy-gateway was not installed"
+  echo "$GATEWAY_API_VERSION $GATEWAY_API_CHANNEL" > "$work/crds-refused"
+  exit 1
+fi
 # the runner reaches ClusterIPs (Gateway addresses) through the kind node (kube-proxy there)
 node_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CLUSTER-control-plane")
 svc_cidr=$(kubectl get svc kubernetes -o jsonpath='{.spec.clusterIP}' | awk -F. '{print $1"."$2".0.0/16"}')

@@ -10,6 +10,10 @@ newest Kubernetes and Gateway API are always in it without editing the workflow:
 - Kubernetes below the chart's range, each with the Gateway API of its time (FLOOR; recorded, the
   chart's kubeVersion is relaxed for these runs only).
 
+A pair in KNOWN_UPSTREAM (a Kubernetes pre-release whose API server refuses a Gateway API release's
+CRDs, an upstream problem) gets "known": <issue>: the job passes when the CRDs are refused, and the
+summary shows the failure with the issue. Any other failure of that pair still fails the run.
+
 strict: the latest two Gateway API minors (the conformance badge counts them) on a Kubernetes the
 chart allows must pass conformance core; everything else is recorded. A Kubernetes release with
 no kindest/node image yet (the newest patch often comes out before kind publishes it, and the next
@@ -36,6 +40,12 @@ CRD_NEEDS_DEFAULT = 32
 FLOOR = [(22, (1, 0)), (23, (1, 0)), (24, (1, 0)), (25, (1, 2)), (25, (1, 4))]
 # the oldest minors of the chart's range also get the oldest Gateway API they run with (besides the newest)
 ALSO = [(26, (1, 2)), (27, (1, 2)), (28, (1, 2))]
+# pairs whose CRD install fails upstream: (Kubernetes minor, Gateway API release) -> the issue. Only for a
+# Kubernetes pre-release (beta / rc): a release of that minor, or another Gateway API release, fails as usual
+KNOWN_UPSTREAM = {
+    # 1.38.0-beta.0 refuses v1.7.0's Gateway CRD: the CEL rule of addresses[].routability exceeds the cost budget
+    (38, "v1.7.0"): 125,
+}
 NODE_REPO = "ghcr.io/max3584/rproxy-gateway/kind-node"
 SEMVER = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(?:-(alpha|beta|rc)\.(\d+))?$")
 
@@ -122,6 +132,14 @@ def needs(gw_minor):
     return CRD_NEEDS.get(gw_minor, CRD_NEEDS_DEFAULT)
 
 
+def known_upstream(k8s, gwapi):
+    """The issue of a known upstream failure of this pair, or None (Kubernetes pre-releases only)."""
+    p = parse(k8s)
+    if not p or p[1] is None:
+        return None
+    return KNOWN_UPSTREAM.get((p[0][1], gwapi))
+
+
 def main():
     token = os.environ.get("GITHUB_TOKEN")
     floor = chart_floor()
@@ -143,6 +161,9 @@ def main():
             entry["strict"] = True
         if kind == "floor":
             entry["floor"] = True
+        issue = known_upstream(k, g)
+        if issue:
+            entry["known"] = issue
         include.append(entry)
 
     # every Gateway API minor (and the next rc) on the newest Kubernetes

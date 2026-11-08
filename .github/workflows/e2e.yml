@@ -20,7 +20,9 @@ name: e2e
 #   e2e must pass on every pair the chart allows (rproxy-gateway works there); conformance core must pass
 #   on the latest two Gateway API minors, the others are recorded (the artifact compat-<k8s>-<gateway api>
 #   has result.json and the report; "compat summary" puts them in one table). A weekly run that fails
-#   opens an issue (or comments on the open one).
+#   opens an issue (or comments on the open one). A pair in KNOWN_UPSTREAM (compat-matrix.py; a Kubernetes
+#   pre-release that refuses a Gateway API release's CRDs) passes when the CRDs are refused and is shown
+#   in the summary as a known upstream failure with its issue; any other failure of it still fails.
 # - by hand with stress: only "stress", random HTTP / TCP / UDP requests (stress_total, default 120000)
 #   through a Gateway with every byte checked (scripts/stress.sh, test/stress), e.g.
 #     gh workflow run e2e.yml -f stress=true
@@ -255,7 +257,7 @@ jobs:
             echo
             echo "| Kubernetes | Gateway API | kind | node image |"
             echo "|---|---|---|---|"
-            jq -r '.include[] | "| \(.k8s) | \(.gwapi) | \(if .strict then "strict" elif .floor then "floor (recorded)" else "recorded" end) | \(.image) |"' <<< "$m"
+            jq -r '.include[] | "| \(.k8s) | \(.gwapi) | \(if .strict then "strict" elif .floor then "floor (recorded)" else "recorded" end)\(if .known then ", known upstream #\(.known)" else "" end) | \(.image) |"' <<< "$m"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # node images kind has not published (the newest patch, the next minor's beta / rc): built once from
@@ -333,13 +335,29 @@ jobs:
         run: |
           sed -i 's/^kubeVersion:.*/kubeVersion: ">=1.18.0-0"/' charts/rproxy-gateway/Chart.yaml
       # rproxy-gateway works here: the same e2e as on every PR, against this Kubernetes and these CRDs
+      # a known upstream pair (matrix.known) goes on to the next step, which lets only the CRD refusal through
       - name: scripts/e2e.sh
         id: e2e
-        continue-on-error: ${{ matrix.floor == true }}
+        continue-on-error: ${{ matrix.floor == true || matrix.known != null }}
         env:
           MIGRATE: e2e/e2e
           GATEWAY_API_CHANNEL: experimental
         run: scripts/e2e.sh
+      - name: known upstream issue (#${{ matrix.known }})
+        id: known
+        if: ${{ matrix.known != null && steps.e2e.outcome != 'skipped' }}
+        env:
+          ISSUE_URL: ${{ github.server_url }}/${{ github.repository }}/issues/${{ matrix.known }}
+        run: |
+          if [ "${{ steps.e2e.outcome }}" = success ]; then
+            echo "::warning::k8s ${{ matrix.k8s }} took the Gateway API ${{ matrix.gwapi }} CRDs and the e2e passed: the known upstream issue #${{ matrix.known }} no longer happens here, take the pair out of KNOWN_UPSTREAM (scripts/compat-matrix.py) ($ISSUE_URL)"
+          elif [ -f "$RUNNER_TEMP/rproxy-gateway-e2e/crds-refused" ]; then
+            echo "refused=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::known upstream issue #${{ matrix.known }}: k8s ${{ matrix.k8s }} refuses the Gateway API ${{ matrix.gwapi }} CRDs; rproxy-gateway is not tested on this pair ($ISSUE_URL)"
+          else
+            echo "::error::the e2e failed on k8s ${{ matrix.k8s }}, Gateway API ${{ matrix.gwapi }} after the CRDs installed: not the known upstream issue #${{ matrix.known }}"
+            exit 1
+          fi
       - name: controller log
         if: always()
         run: kubectl -n rproxy-gateway-system logs deploy/rproxy-gateway --tail=200 || true
@@ -351,8 +369,10 @@ jobs:
           go-version: stable
           cache: false
       # strict pairs must pass core; the others are recorded (an older suite does not know the newer features)
+      # the same CRDs would be refused again
       - name: scripts/conformance.sh
         id: conformance
+        if: ${{ steps.known.outputs.refused != 'true' }}
         continue-on-error: ${{ !matrix.strict }}
         run: scripts/conformance.sh
       - name: core (strict pairs)
@@ -375,6 +395,7 @@ jobs:
             --arg e2e "${{ steps.e2e.outcome }}" --arg conformance "${{ steps.conformance.outcome }}" \
             --argjson passed "${passed:-0}" --argjson failed "${failed:-0}" --arg failures "$failures" \
             --arg core "$(cat "$w/core-failures" 2>/dev/null || true)" \
+            --arg known "${{ matrix.known }}" --arg crds_refused "${{ steps.known.outputs.refused }}" \
             '$ARGS.named' | tee result.json
       - uses: actions/upload-artifact@v4
         if: always()
@@ -409,7 +430,8 @@ jobs:
             echo "|---|---|---|---|---|---|---|"
             find compat -name result.json -print0 | xargs -0 cat | jq -s -r 'sort_by(.k8s, .gwapi) | reverse | .[]
               | (.failures | split(";") | map(select(. != "TestConformance" and (ltrimstr("TestConformance/") | contains("/") | not))) | map(ltrimstr("TestConformance/")) | join(", ")) as $f
-              | "| \(.k8s) | \(.gwapi) | \(.kind) | \(.e2e) | \(.passed) | \($f) | \(.core | gsub("\n"; "; ")) |"'
+              | (if (.known // "") == "" then "" elif .crds_refused == "true" then " (known upstream [#\(.known)](${{ github.server_url }}/${{ github.repository }}/issues/\(.known)): CRDs refused)" elif .e2e == "success" then " (known upstream #\(.known) no longer happens)" else " (not the known upstream #\(.known))" end) as $k
+              | "| \(.k8s) | \(.gwapi) | \(.kind) | \(.e2e)\($k) | \(.passed) | \($f) | \(.core | gsub("\n"; "; ")) |"'
           } | tee table.md >> "$GITHUB_STEP_SUMMARY"
       - name: issue (weekly run failed)
         if: ${{ github.event_name == 'schedule' && needs.compat.result == 'failure' }}
