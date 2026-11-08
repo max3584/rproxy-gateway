@@ -94,6 +94,8 @@ Kubernetes 1.26 以上（chart の `kubeVersion`。確かめているのは 1.26
 
 chart の範囲より古い Kubernetes も、試験のときだけ `kubeVersion` を外して確かめています（記録だけ）：1.23〜1.25 は PodDisruptionBudget の `unhealthyPodEvictionPolicy`（1.26 から）を断られ、replicas が 2 以上の Gateway に PodDisruptionBudget ができません（e2e はそこで止まり、その後は確かめていません。conformance は通ります）。1.22 は Gateway API の CRD が入りません。
 
+次のマイナーの Kubernetes 1.38.0-beta.0 の API サーバは、Gateway API v1.7.0 の Gateway の CRD を断ります（`addresses[].routability` の CEL の規則が見積もりのコストの上限を超える。上流の問題で、rproxy-gateway を入れる前に止まる。[#125](https://github.com/max3584/rproxy-gateway/issues/125)）。互換性テストではこの組み合わせを既知の上流の問題として記録しています。
+
 古い CRD では、TCPRoute・UDPRoute（v1.6 より前は `v1alpha2`）、TLSRoute（v1.4 は `v1alpha3`）、ReferenceGrant（v1.4 は `v1beta1`）を、API サーバが出している版で読み書きします。CRD は `experimental-install.yaml` を勧めます（TCPRoute・UDPRoute と HTTPRoute の retry のため）。
 
 ### Helm を使わずに入れる（kubectl・Kustomize）

@@ -94,6 +94,8 @@ Kubernetes 1.26 or later (the chart's `kubeVersion`; 1.26 to 1.37.x are checked,
 
 Kubernetes older than the chart allows is checked too, with `kubeVersion` relaxed for those runs only (recorded): 1.23 to 1.25 refuse the PodDisruptionBudget's `unhealthyPodEvictionPolicy` (from 1.26), so Gateways with 2 or more replicas get no PodDisruptionBudget (the e2e stops there and the rest is not checked; conformance passes). On 1.22 the Gateway API CRDs do not install.
 
+The API server of the next minor, Kubernetes 1.38.0-beta.0, refuses Gateway API v1.7.0's Gateway CRD (the CEL rule of `addresses[].routability` exceeds the estimated cost budget; an upstream problem that stops before rproxy-gateway is installed, [#125](https://github.com/max3584/rproxy-gateway/issues/125)). The compatibility run records this pair as a known upstream failure.
+
 With older CRDs, TCPRoute and UDPRoute (`v1alpha2` before v1.6), TLSRoute (`v1alpha3` in v1.4) and ReferenceGrant (`v1beta1` in v1.4) are read and written at the version the API server serves. `experimental-install.yaml` is recommended (TCPRoute, UDPRoute and HTTPRoute retries).
 
 ### Installing without Helm (kubectl, Kustomize)
