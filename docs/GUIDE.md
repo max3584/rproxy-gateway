@@ -1434,7 +1434,7 @@ kubectl get gateway -A        # ADDRESS が変わったことを確かめる
 | `RproxyGatewayParameters`（replicas 以外の Pod の形）・`spec.infrastructure` のラベル・注釈 | Pod の rolling update（下の 9.3）。replicas は Pod を足す・減らすだけ |
 | `rproxy.http` の値 | Pod は入れ替わらない（rproxy が設定ファイルを読み直す。kubelet の更新まで 1 分ほど）。初めて付けた・全部外したときは rolling update |
 | `service.type` の変更 | Service が変わり、LB のアドレスが変わる |
-| コントローラの更新（rproxy のイメージが変わる） | managed のすべての Gateway で rolling update |
+| コントローラの更新（rproxy・certsync のイメージが変わる） | managed のすべての Gateway で rolling update |
 
 ### 9.2 誤りは状態に出る
 
@@ -1570,7 +1570,7 @@ kubectl -n rproxy-gateway-system rollout status deploy/rproxy-gateway
 kubectl get gateway -A
 ```
 
-- chart の版ごとに同梱の rproxy の版が決まっている（chart の `rproxy.image.tag`。chart 0.4.22 は rproxy 0.4.22）。コントローラを上げると rproxy のイメージも変わり、managed のすべての Gateway の Pod が rolling update で入れ替わる（9.3。replicas が 2 以上なら途切れはふつう 1 秒ほどまで。[README](../README.md) の「可用性」）。fleet では DaemonSet が入れ替わる。
+- chart の版ごとに同梱の rproxy の版が決まっている（chart の `rproxy.image.tag`。chart 0.4.22 は rproxy 0.4.22）。rproxy のイメージ（とコントローラのイメージの certsync）が変わると、managed のすべての Gateway の Pod が rolling update で入れ替わる（9.3。replicas が 2 以上なら途切れはふつう 1 秒ほどまで。[README](../README.md) の「可用性」）。fleet では DaemonSet が入れ替わる。
 - 版ごとの変更はリリースノート（GitHub の Releases）で確かめる。v0.4.x の間は、今の値・Gateway を壊さない（[DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) の 1.）。
 - Kustomize・`install.yaml` で入れたなら、新しい版の `install.yaml` を `kubectl apply --server-side` する（CRD も含む）。
 - Gateway API の CRD を上げるときは、新しい版の `standard-install.yaml`（か experimental）を `kubectl apply --server-side` する。コントローラは新しい種類を 30 秒ごとに探すので、再起動は要らない。Kubernetes の版との組み合わせは [README](../README.md) の「対応する版」。

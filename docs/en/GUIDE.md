@@ -1434,7 +1434,7 @@ On every change the controller renders a Gateway's whole rule set again and send
 | `RproxyGatewayParameters` (pod shape other than replicas), `spec.infrastructure` labels/annotations | a pod rolling update (9.3 below). Replicas only adds or removes pods |
 | `rproxy.http` values | no pod replacement (rproxy reads its settings file again; about a minute until the kubelet updates it). Setting it the first time or removing all of it rolls the pods |
 | `service.type` | the Service changes and so does its load balancer address |
-| Controller upgrade (a new rproxy image) | a rolling update of every managed Gateway |
+| Controller upgrade (a new rproxy or certsync image) | a rolling update of every managed Gateway |
 
 ### 9.2 Errors show in status
 
@@ -1570,7 +1570,7 @@ kubectl -n rproxy-gateway-system rollout status deploy/rproxy-gateway
 kubectl get gateway -A
 ```
 
-- Each chart version comes with an rproxy version (the chart's `rproxy.image.tag`; chart 0.4.22 has rproxy 0.4.22). Upgrading the controller changes the rproxy image too, and every managed Gateway's pods are replaced by a rolling update (9.3; with 2 or more replicas the gap is normally up to about a second, "Availability" in the [README](../../README.en.md)). In fleet mode the DaemonSet rolls.
+- Each chart version comes with an rproxy version (the chart's `rproxy.image.tag`; chart 0.4.22 has rproxy 0.4.22). When the rproxy image (or the controller image, which runs certsync) changes, every managed Gateway's pods are replaced by a rolling update (9.3; with 2 or more replicas the gap is normally up to about a second, "Availability" in the [README](../../README.en.md)). In fleet mode the DaemonSet rolls.
 - Read each version's changes in the release notes (GitHub Releases). Within v0.4.x, current values and Gateways keep working (1. of [DESIGN-v0.4.x.md](DESIGN-v0.4.x.md)).
 - Installed with Kustomize or `install.yaml`: `kubectl apply --server-side` the new version's `install.yaml` (CRDs included).
 - To upgrade Gateway API's CRDs, `kubectl apply --server-side` the new `standard-install.yaml` (or experimental). The controller looks for new kinds every 30 s; no restart needed. Which Kubernetes versions go with it: "Supported versions" in the [README](../../README.en.md).
