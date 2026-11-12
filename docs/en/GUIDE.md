@@ -388,6 +388,8 @@ kubectl -n default get certificate app-tls     # READY True
 kubectl -n default get secret app-tls
 ```
 
+**rproxy's ACME is not used**: rproxy has ACME (getting certificates from Let's Encrypt by itself), but Gateway API does not use it. Certificates come from the Secrets in `certificateRefs`. rproxy's ACME would order a certificate from every pod, so with several pods an HTTP-01 challenge can reach another pod and fail. Get certificates with cert-manager. The only exception is migrating Traefik's `certResolver` ("Mapping" in [MIGRATION.md](MIGRATION.md)). DNS providers cert-manager does not build in (OCI and others) can often be covered by cert-manager DNS-01 webhooks (a separate webhook per provider; this project has not tested them).
+
 ### 3.3 Redirect HTTP to HTTPS
 
 Attach a redirect-only route to the HTTP listener.
@@ -1019,7 +1021,7 @@ spec:
 
 - The RproxyMiddleware is in the route's namespace. If it is missing the rule answers 500 and the route is `ResolvedRefs: False`.
 - A shape or value rproxy does not take makes the route `Accepted: False` (`UnsupportedValue`, the reason in the message); the other routes of the port keep working.
-- `rate_limit` and `in_flight` counts start over when the port's rproxy rule changes (any route on that port changes).
+- `rate_limit`, `in_flight` and `circuit_breaker` counts start over whenever the `http` of the port's rproxy rule changes. Backend pod IPs are inside the rule's `http` too (the `servers` of `services`), so this happens not only when any route on the port changes but also whenever backend pods come, go or are replaced (scaling, rollouts).
 - backendRef `filters` cannot have `ExtensionRef` (`UnsupportedValue`).
 - Fields naming files (`basic_auth`'s `users_file` and others) can name only the Gateway's certificate files ([SECURITY.md](SECURITY.md)). A user list file cannot be given, so authenticate with `forward_auth` or Gateway API's `ExternalAuth`.
 
@@ -1207,7 +1209,7 @@ kubectl -n default get deploy -l gateway.networking.k8s.io/gateway-name=web
 - A field not allowed or a wrong value: the Gateway is `Accepted: False` (`InvalidParameters`), the message names the field (e.g. "spec.service.type: not allowed by the GatewayClass (policy.gatewayOverrides)").
 - **A Gateway already running does not stop**: a Gateway with an rproxy Deployment keeps running in its last correct shape (`Programmed: True`). Fix it and the next pass applies the new shape.
 - `rproxy.http` shows in the condition `rproxy.max3584.net/HTTPSettings` (`Applied`, `Kept`, `UnsupportedRproxy`).
-- In fleet mode a Gateway's reference cannot be used (`InvalidParameters`).
+- In fleet mode a Gateway's reference cannot be used. A Gateway with `parametersRef` is `Accepted: False` (`InvalidParameters`, "not used in fleet mode"), and the rules of a Gateway that is not accepted are not sent to the fleet's pods. Keeping the last shape running is for managed mode only, so in fleet mode its traffic stops (no changes arrive, and restarted pods or pods on new nodes get nothing). Remove `parametersRef` in fleet mode.
 
 ### 7.5 Listener filters
 
@@ -1377,7 +1379,7 @@ spec:
 | Address | the Service's load balancer address (MetalLB, cloud...) | node IPs or `fleet.addresses` (the platform provides VIPs) |
 | Keys and tokens | per Gateway | shared by every Gateway |
 | Separates tenants | yes | no (for one admin) |
-| `RproxyGatewayParameters` | usable | a Gateway's reference is not (the DaemonSet takes the chart's `fleet.*`) |
+| `RproxyGatewayParameters` | usable | a Gateway's reference is not: the Gateway becomes `InvalidParameters`, its rules are not sent and its traffic stops (the DaemonSet takes the chart's `fleet.*`) |
 | RproxyRule | usable | not read by default (`fleet.rproxyRules`) |
 | One port for two Gateways | works (separate Services) | the older Gateway holds it; the later listener is `Accepted: False` (`PortUnavailable`). With `fleet.listen: addresses`, different addresses can share it |
 | NetworkPolicy | one per Gateway | does not work (protect with a firewall) |
@@ -1399,7 +1401,7 @@ Point the health check of the load balancer or VIP in front to `https://<node IP
 
 **Switching** (change `fleet.enabled` with `helm upgrade`):
 
-- managed → fleet: the controller deletes the managed Deployments and Services and sends the rules to the fleet's pods. Gateway addresses change (load balancer addresses → node IPs or `fleet.addresses`). Gateways' `parametersRef` becomes `InvalidParameters`. RproxyRules are not used unless `fleet.rproxyRules: true`.
+- managed → fleet: the controller deletes the managed Deployments and Services and sends the rules to the fleet's pods. Gateway addresses change (load balancer addresses → node IPs or `fleet.addresses`). A Gateway with `parametersRef` becomes `InvalidParameters`, its rules are not sent and its traffic stops (unlike managed mode, the last shape is not kept running). **Before switching, remove `spec.infrastructure.parametersRef` from every Gateway** (the pods' shape comes from the chart's `fleet.*`). RproxyRules are not used unless `fleet.rproxyRules: true`.
 - fleet → managed: helm deletes the DaemonSet and the controller creates a Deployment and Service per Gateway. Addresses become new load balancer addresses.
 - Both interrupt traffic and change addresses. Do it in a maintenance window, together with DNS and firewalls.
 
@@ -1422,8 +1424,8 @@ On every change the controller renders a Gateway's whole rule set again and send
 
 | Change | What happens |
 |---|---|
-| Add, change, delete routes (paths, headers, weights, filters) | `in_place`; connections kept (`rate_limit`/`in_flight` counts start over) |
-| Backend pods come and go (scaling, rollouts) | `in_place`; stopping pods get no new requests |
+| Add, change, delete routes (paths, headers, weights, filters) | `in_place`; connections kept (the port's `rate_limit`/`in_flight`/`circuit_breaker` counts start over) |
+| Backend pods come and go (scaling, rollouts) | `in_place`; stopping pods get no new requests. On HTTP ports pod IPs are inside the rule's `http`, so the port's `rate_limit`/`in_flight`/`circuit_breaker` counts start over |
 | Certificate Secret renewed (cert-manager) | `in_place`; file names are content hashes, so new connections get the new certificate |
 | RproxyPolicy (`allowFrom`, `limits`, timeouts...) | `in_place`; from the next connection |
 | Add or remove a listener (hostname) on a port in use | `in_place` on that port's rule (other hostnames' connections kept) |
@@ -1481,7 +1483,7 @@ Nobody instructs rproxy directly: changing Kubernetes objects is the instruction
 
 - Gateway API: GatewayClass, Gateway, HTTPRoute, GRPCRoute, TLSRoute, TCPRoute, UDPRoute, ReferenceGrant, ListenerSet, BackendTLSPolicy
 - rproxy's CRDs: RproxyMiddleware, RproxyPolicy, RproxyRule, RproxyGatewayParameters
-- Kubernetes: Service, EndpointSlice, Secret, ConfigMap (contents read only for the ones referred to), Namespace (`allowedRoutes` selectors), ClusterTrustBundle; for migration, Ingress and Traefik's CRDs
+- Kubernetes: Pod (rproxy pods' status, the readiness gate), Service, EndpointSlice, Secret, ConfigMap (contents read only for the ones referred to), Namespace (`allowedRoutes` selectors), ClusterTrustBundle; for migration, Ingress and Traefik's CRDs
 
 | Trigger | What changes |
 |---|---|
@@ -1512,7 +1514,7 @@ spec:
 
 - Gateways (ports, certificates, addresses): only infrastructure admins (for example in an `infra` namespace).
 - Routes: each team in its own namespace. Which namespaces' routes a Gateway takes is the admin's `allowedRoutes` ([6.1](#61-allowedroutes-which-namespaces-routes-a-gateway-takes)).
-- Only the controller holds rproxy's control API tokens. Users, CI and GitOps tools never call rproxy's API; they only write Kubernetes objects.
+- Only the controller holds a token that can write to rproxy's control API (with the chart's `ui.namespace` set, the management UI holds a read-only one). Users, CI and GitOps tools never call rproxy's API; they only write Kubernetes objects.
 
 ## 10. How it talks to rproxy
 
@@ -1549,8 +1551,8 @@ The Gateway `web` and HTTPRoute `app` of 2.2 become this rule set (`rproxy-gatew
         "services": {
           "default/app/r0": {
             "servers": [
-              {"url": "http://10.244.1.10:8080"},
-              {"url": "http://10.244.2.11:8080"}
+              {"url": "http://10.244.1.10:3000"},
+              {"url": "http://10.244.2.11:3000"}
             ]
           }
         }
@@ -1565,7 +1567,7 @@ The Gateway `web` and HTTPRoute `app` of 2.2 become this rule set (`rproxy-gatew
 }
 ```
 
-- `servers` are the pod IPs of the Service's EndpointSlices.
+- `servers` are the pod IPs of the Service's EndpointSlices with the pod port (the Service's `targetPort`: `:3000` for the 8080 → 3000 Service of 2.1).
 - The running controller adds the chart's `backends` defaults (the service's `outlier_detection`, `timeouts.connect: 1s`, `timeouts.response: 30s`) before sending.
 
 **What does not go through the control API** (keys never travel over the API; rproxy's pods do not use the Kubernetes API):
@@ -1587,7 +1589,7 @@ Details in [SECURITY.md](SECURITY.md).
 - **rproxy's pods do not use the Kubernetes API**: no ServiceAccount token mounted, no RBAC.
 - **No Service for the control API**: each Gateway's Service carries only the listener ports (and the listen ports of RproxyRules); no Service is made for the control API (9443) or certsync (9444). The controller PUTs to each pod's `https://<pod IP>:9443` directly. Every pod holds its own rule set, so going through a Service would be wrong: it would reach only one pod. Users do not need to create a Service or NetworkPolicy for 9443 and 9444.
 - **NetworkPolicy (managed)**: created automatically per Gateway. The control API (9443) and certsync (9444) only from the controller's pods (with the chart's `ui.namespace` set, also 9443 of the Gateways shown from the UI's pods), listener ports from anyone. It works only with a CNI that handles NetworkPolicies.
-- **Fleet and hostNetwork**: NetworkPolicies do not apply. The control API (9443) and certsync (9444) listen on node IPs, so firewall the nodes' 9443 and 9444 from outside (only the load balancer doing health checks). Fleet is for one trust domain and does not separate tenants.
+- **Fleet and hostNetwork**: NetworkPolicies do not apply. The control API (9443) and certsync (9444) listen on node IPs, so restrict the nodes' 9443 and 9444 with the node firewall. Not only outside hosts but also pods in the cluster reach hostNetwork 9443 and 9444, and NetworkPolicies cannot stop them. Let 9443 through only from the controller and the load balancer's `/readyz` health check, and 9444 (certsync, listening on `0.0.0.0`) only from the controller. The controller usually comes from its pod IP (the source of pod-to-node traffic depends on the CNI), so allow the controller pods' range (or the controller's nodes) and refuse the rest. Fleet is for one trust domain and does not separate tenants.
 - **Off by default**: `spec.addresses` (`managed.addressCIDRs`), ExternalName Services, middlewares calling outside URLs (`policy.middlewares.outboundHosts`), load balancer annotations deciding addresses (`serviceAnnotationPrefixes`). Open them only on classes for trusted tenants.
 - **Private keys of other namespaces**: used through a ReferenceGrant, the key is copied into the Gateway's namespace in managed mode. If that is a problem, `controller.crossNamespaceSecrets: false`.
 - **Narrow the controller's permissions**: `controller.watchNamespaces` and `rbac.admissionPolicy.enabled: true` (Kubernetes 1.30 or later).
@@ -1686,7 +1688,7 @@ Restore after installing Gateway API's CRDs and the chart. With Velero or other 
 
 ### 12.5 Log levels
 
-- Controller: the chart's `controller.logFormat` (default `json`). The level is the environment variable `RPROXY_GATEWAY_LOG` (default `info`; `debug` and so on). To raise it for a while: `kubectl -n rproxy-gateway-system set env deploy/rproxy-gateway RPROXY_GATEWAY_LOG=debug` (the next `helm upgrade` puts it back).
+- Controller: the chart's `controller.logFormat` (default `json`). The level is the environment variable `RPROXY_GATEWAY_LOG` (default `info`; `debug` and so on). To raise it for a while: `kubectl -n rproxy-gateway-system set env deploy/rproxy-gateway RPROXY_GATEWAY_LOG=debug`. `RPROXY_GATEWAY_LOG` is not a chart value, so `helm upgrade` does not remove it (Helm only changes the fields it wrote). Remove it with `kubectl -n rproxy-gateway-system set env deploy/rproxy-gateway RPROXY_GATEWAY_LOG-`.
 - rproxy: `RproxyGatewayParameters` `rproxy.logLevel` (`error` to `trace`).
 
 ## 13. Recipes
@@ -1844,7 +1846,7 @@ spec:
 
 - The backend Service `dns` lists port 53 for both TCP and UDP.
 - The load balancer implementation must support TCP and UDP mixed in one Service.
-- To show client addresses to the backend, `externalTrafficPolicy: Local` (the `LoadBalancer` default).
+- With `externalTrafficPolicy: Local` (the `LoadBalancer` default) the client address reaches rproxy only; rproxy uses it for `allowFrom`, `geoip` and logs. The TCP and UDP rules rendered from Gateway routes pass no source to the backend (no `source_ip`), so the backend sees the rproxy pod's IP. To pass the client address on, write the rproxy rule itself in an RproxyRule with `source_ip: proxy_v2` (UDP too) or `proxy_v1` (TCP only); the backend must read PROXY protocol ("ルール" in rproxy-api docs/API.md). RproxyPolicy has no field for passing the source.
 
 ### 13.4 SNI passthrough on 443
 

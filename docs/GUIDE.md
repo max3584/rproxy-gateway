@@ -388,6 +388,8 @@ kubectl -n default get certificate app-tls     # READY が True
 kubectl -n default get secret app-tls
 ```
 
+**rproxy の ACME は使わない**：rproxy には ACME（Let's Encrypt から自分で証明書を取る機能）があるが、Gateway API からは使わない。証明書は `certificateRefs` の Secret から渡る。rproxy の ACME は Pod ごとに証明書を取りに行くので、Pod が複数あると HTTP-01 のチャレンジがほかの Pod に届いて失敗しうる。証明書は cert-manager で取る。例外は Traefik の `certResolver` を移行するときだけ（[MIGRATION.md](MIGRATION.md) の「変換」）。DNS-01 で使う DNS の事業者が cert-manager に組み込まれていなくても（OCI など）、cert-manager の DNS-01 の webhook で対応できることが多い（webhook は事業者ごとに別のもので、このプロジェクトでは試していない）。
+
 ### 3.3 HTTP から HTTPS へリダイレクト
 
 HTTP のリスナーには、リダイレクトだけのルートをつなぐ。
@@ -1019,7 +1021,7 @@ spec:
 
 - RproxyMiddleware はルートと同じ namespace のもの。見つからなければそのルールは 500 を返し、ルートは `ResolvedRefs: False`。
 - 形や値が rproxy の決まりに合わないと、ルートは `Accepted: False`（`UnsupportedValue`、message に理由）になり、同じポートのほかのルートはそのまま動く。
-- `rate_limit`・`in_flight` の数は、そのポートの rproxy のルールが変わる（同じポートのどれかのルートを変える）と最初からになる。
+- `rate_limit`・`in_flight`・`circuit_breaker` の数は、そのポートの rproxy のルールの `http` が変わると最初からになる。転送先の Pod の IP もルールの `http` の中（`services` の `servers`）にあるので、同じポートのどれかのルートを変えたときだけでなく、転送先の Pod が増える・減る・入れ替わる（スケール・rollout）たびにも最初からになる。
 - backendRef の `filters` には `ExtensionRef` を書けない（`UnsupportedValue`）。
 - 名前でファイルを指す項目（`basic_auth` の `users_file` など）は、その Gateway の証明書のファイルしか指せない（[SECURITY.md](SECURITY.md)）。利用者の一覧のファイルは渡せないので、認証は `forward_auth` か Gateway API の `ExternalAuth` を使う。
 
@@ -1207,7 +1209,7 @@ kubectl -n default get deploy -l gateway.networking.k8s.io/gateway-name=web
 - 許されていない項目・誤った値：Gateway が `Accepted: False`（`InvalidParameters`）。message に項目の名前（例「spec.service.type: not allowed by the GatewayClass (policy.gatewayOverrides)」）。
 - **もう動いている Gateway は止めない**：rproxy の Deployment がある Gateway は、前の正しい形のまま動き続ける（`Programmed: True`）。直せば次の反映で新しい形になる。
 - `rproxy.http` は条件 `rproxy.max3584.net/HTTPSettings`（`Applied`・`Kept`・`UnsupportedRproxy`）で分かる。
-- fleet では Gateway の参照は使えない（`InvalidParameters`）。
+- fleet では Gateway の参照は使えない。`parametersRef` を書いた Gateway は `Accepted: False`（`InvalidParameters`、「not used in fleet mode」）で、受け付けられない Gateway のルールは fleet の Pod に送らない。「前の形のまま動かす」のは managed だけなので、fleet では通信が止まる（変更も届かず、再起動した Pod・新しいノードの Pod には何も載らない）。fleet では `parametersRef` を外す。
 
 ### 7.5 リスナーのフィルタ
 
@@ -1377,7 +1379,7 @@ spec:
 | アドレス | Service の LB のアドレス（MetalLB・クラウドなど） | ノードの IP か `fleet.addresses`（VIP はプラットフォームが用意する） |
 | 鍵・トークン | Gateway ごと | すべての Gateway で共有 |
 | テナントを分けるか | 分ける | 分けない（1 人の管理者のため） |
-| `RproxyGatewayParameters` | 使える | Gateway の参照は使えない（DaemonSet は chart の `fleet.*` で） |
+| `RproxyGatewayParameters` | 使える | Gateway の参照は使えない。書くと Gateway が `InvalidParameters` で、ルールが送られず通信が止まる（DaemonSet は chart の `fleet.*` で） |
 | RproxyRule | 使える | 既定で読まない（`fleet.rproxyRules`） |
 | 同じポートを 2 つの Gateway で | 使える（Service が別） | 古い Gateway が持つ。後のリスナーは `Accepted: False`（`PortUnavailable`）。`fleet.listen: addresses` ならアドレスが違えば使える |
 | NetworkPolicy | Gateway ごとに作る | 効かない（ファイアウォールで守る） |
@@ -1399,7 +1401,7 @@ fleet:
 
 **切り替え**（`helm upgrade` で `fleet.enabled` を変える）：
 
-- managed → fleet：コントローラは managed の Deployment・Service を消し、fleet の Pod にルールを送る。Gateway のアドレスが変わる（LB のアドレス → ノードの IP・`fleet.addresses`）。Gateway の `parametersRef` は `InvalidParameters` になる。RproxyRule は `fleet.rproxyRules: true` でないと使われない。
+- managed → fleet：コントローラは managed の Deployment・Service を消し、fleet の Pod にルールを送る。Gateway のアドレスが変わる（LB のアドレス → ノードの IP・`fleet.addresses`）。`parametersRef` を書いた Gateway は `InvalidParameters` になり、ルールが送られず通信が止まる（managed のように前の形のまま動かすことはしない）。**切り替える前に、すべての Gateway の `spec.infrastructure.parametersRef` を外す**（Pod の形は chart の `fleet.*` で決める）。RproxyRule は `fleet.rproxyRules: true` でないと使われない。
 - fleet → managed：helm が DaemonSet を消し、コントローラが Gateway ごとの Deployment・Service を作る。アドレスは新しい LB のアドレスになる。
 - どちらも通信が途切れ、アドレスが変わる。メンテナンスの時間に、DNS とファイアウォールを合わせて行う。
 
@@ -1422,8 +1424,8 @@ kubectl get gateway -A        # ADDRESS が変わったことを確かめる
 
 | 変更 | どうなるか |
 |---|---|
-| ルートを足す・変える・消す（パス・ヘッダ・重み・フィルタ） | `in_place`。接続は切れない（`rate_limit`・`in_flight` の数は最初から） |
-| 転送先の Pod が増える・減る（スケール・rollout） | `in_place`。終わる Pod には新しいリクエストを送らない |
+| ルートを足す・変える・消す（パス・ヘッダ・重み・フィルタ） | `in_place`。接続は切れない（そのポートの `rate_limit`・`in_flight`・`circuit_breaker` の数は最初から） |
+| 転送先の Pod が増える・減る（スケール・rollout） | `in_place`。終わる Pod には新しいリクエストを送らない。HTTP のポートでは Pod の IP がルールの `http` の中にあるので、そのポートの `rate_limit`・`in_flight`・`circuit_breaker` の数は最初から |
 | 証明書の Secret の更新（cert-manager の更新） | `in_place`。ファイルの名前が中身のハッシュなので、新しい接続から新しい証明書 |
 | RproxyPolicy（`allowFrom`・`limits`・時間など） | `in_place`。次の接続から |
 | 同じポートにリスナー（ホスト名）を足す・消す | そのポートのルールの `in_place`（ほかのホスト名の接続は切れない） |
@@ -1481,7 +1483,7 @@ rproxy に直接指示する人はいない。Kubernetes のオブジェクト�
 
 - Gateway API：GatewayClass・Gateway・HTTPRoute・GRPCRoute・TLSRoute・TCPRoute・UDPRoute・ReferenceGrant・ListenerSet・BackendTLSPolicy
 - rproxy の CRD：RproxyMiddleware・RproxyPolicy・RproxyRule・RproxyGatewayParameters
-- Kubernetes：Service・EndpointSlice・Secret・ConfigMap（中身は参照されたものだけを読む）・Namespace（`allowedRoutes` の selector）・ClusterTrustBundle、移行のときは Ingress と Traefik の CRD
+- Kubernetes：Pod（rproxy の Pod の状態・readiness gate）・Service・EndpointSlice・Secret・ConfigMap（中身は参照されたものだけを読む）・Namespace（`allowedRoutes` の selector）・ClusterTrustBundle、移行のときは Ingress と Traefik の CRD
 
 | きっかけ | 何が変わるか |
 |---|---|
@@ -1512,7 +1514,7 @@ spec:
 
 - Gateway（ポート・証明書・アドレス）：インフラの管理者だけに書かせる（たとえば `infra` の namespace に置く）。
 - ルート：チームごとの namespace で、そのチームに書かせる。どの namespace のルートを受けるかは Gateway の `allowedRoutes`（[6.1](#61-allowedroutesgateway-がどの-namespace-のルートを受けるか)）で管理者が決める。
-- rproxy の制御 API のトークンを持つのはコントローラだけ。利用者・CI・GitOps の道具は rproxy の API を叩かず、Kubernetes のオブジェクトだけを書く。
+- rproxy の制御 API に書き込めるトークンを持つのはコントローラだけ（chart の `ui.namespace` を決めたときは、管理 UI が読むだけのトークンを持つ）。利用者・CI・GitOps の道具は rproxy の API を叩かず、Kubernetes のオブジェクトだけを書く。
 
 ## 10. rproxy との話し方
 
@@ -1549,8 +1551,8 @@ If-Match: <今の etag>
         "services": {
           "default/app/r0": {
             "servers": [
-              {"url": "http://10.244.1.10:8080"},
-              {"url": "http://10.244.2.11:8080"}
+              {"url": "http://10.244.1.10:3000"},
+              {"url": "http://10.244.2.11:3000"}
             ]
           }
         }
@@ -1565,7 +1567,7 @@ If-Match: <今の etag>
 }
 ```
 
-- `servers` は Service の EndpointSlice の Pod の IP。
+- `servers` は Service の EndpointSlice の Pod の IP と、Pod のポート（Service の `targetPort`。2.1 の Service は 8080 → 3000 なので `:3000`）。
 - 本物のコントローラは、これに chart の `backends` の既定（サービスの `outlier_detection`、`timeouts.connect: 1s`、`timeouts.response: 30s`）を足して送る。
 
 **制御 API を通らないもの**（鍵を API に流さない。rproxy の Pod は Kubernetes の API を使わない）：
@@ -1587,7 +1589,7 @@ fleet では、証明書は `rproxy-fleet-certs`、トークンファイルは `
 - **rproxy の Pod は Kubernetes の API を使わない**：ServiceAccount のトークンをつながず、RBAC もない。
 - **制御 API の Service はない**：Gateway ごとの Service が持つのはリスナーのポート（と RproxyRule の待ち受けのポート）だけで、制御 API（9443）と certsync（9444）の Service は作らない。コントローラは Pod ごとに `https://<Pod の IP>:9443` へ直接 PUT する。Pod ごとに自分のルールセットを持つので、Service を通すと 1 つの Pod にしか届かず、正しくない。利用者が 9443・9444 のための Service や NetworkPolicy を作る必要はない。
 - **NetworkPolicy（managed）**：Gateway ごとに自動で作る。制御 API（9443）と certsync（9444）はコントローラの Pod からだけ（chart の `ui.namespace` を決めたときは、見せる Gateway の 9443 に UI の Pod からも）、リスナーのポートは誰からでも。CNI が NetworkPolicy を扱わないと効かない。
-- **fleet と hostNetwork**：NetworkPolicy は効かない。制御 API（9443）と certsync（9444）はノードの IP で待ち受けるので、外からのノードの 9443・9444 への通信をファイアウォールで絞る（ヘルスチェックをするロードバランサだけ）。fleet は 1 つの信頼の範囲のためのもので、テナントを分けない。
+- **fleet と hostNetwork**：NetworkPolicy は効かない。制御 API（9443）と certsync（9444）はノードの IP で待ち受けるので、ノードの 9443・9444 への通信をノードのファイアウォールで絞る。外からだけでなく、クラスタの中の Pod からも hostNetwork の 9443・9444 に届き、NetworkPolicy では止められない。9443 はコントローラと、`/readyz` を見るロードバランサのヘルスチェックだけ、9444（certsync、`0.0.0.0` で待ち受ける）はコントローラだけを通す。コントローラは Pod の IP から来ることが多い（Pod からノードへの通信の送信元は CNI による）ので、コントローラの Pod の範囲（かコントローラのノード）を許し、ほかを断る。fleet は 1 つの信頼の範囲のためのもので、テナントを分けない。
 - **既定で閉じているもの**：`spec.addresses`（`managed.addressCIDRs`）、ExternalName の Service、外への URL のミドルウェア（`policy.middlewares.outboundHosts`）、アドレスを決める LB の注釈（`serviceAnnotationPrefixes`）。開けるときは信頼するテナントのクラスだけ。
 - **ほかの namespace の秘密鍵**：ReferenceGrant で使うと、managed ではその鍵が Gateway の namespace に写る。困るなら `controller.crossNamespaceSecrets: false`。
 - **コントローラの権限を絞る**：`controller.watchNamespaces` と `rbac.admissionPolicy.enabled: true`（Kubernetes 1.30 以上）。
@@ -1686,7 +1688,7 @@ kubectl get rproxypolicies,rproxymiddlewares,rproxyrules,rproxygatewayparameters
 
 ### 12.5 ログの段階
 
-- コントローラ：chart の `controller.logFormat`（既定 `json`）。段階は環境変数 `RPROXY_GATEWAY_LOG`（既定 `info`、`debug` など）。試しに上げるなら `kubectl -n rproxy-gateway-system set env deploy/rproxy-gateway RPROXY_GATEWAY_LOG=debug`（次の `helm upgrade` で戻る）。
+- コントローラ：chart の `controller.logFormat`（既定 `json`）。段階は環境変数 `RPROXY_GATEWAY_LOG`（既定 `info`、`debug` など）。試しに上げるなら `kubectl -n rproxy-gateway-system set env deploy/rproxy-gateway RPROXY_GATEWAY_LOG=debug`。`RPROXY_GATEWAY_LOG` は chart にない値なので、`helm upgrade` では消えない（Helm は自分が書いた項目しか直さない）。戻すときは `kubectl -n rproxy-gateway-system set env deploy/rproxy-gateway RPROXY_GATEWAY_LOG-` で消す。
 - rproxy：`RproxyGatewayParameters` の `rproxy.logLevel`（`error`〜`trace`）。
 
 ## 13. レシピ
@@ -1844,7 +1846,7 @@ spec:
 
 - 転送先の Service `dns` には TCP と UDP の 53 の両方のポートを書く。
 - LB の実装が、1 つの Service の TCP と UDP の混在に対応していること。
-- クライアントのアドレスを転送先に見せたいなら `externalTrafficPolicy: Local`（`LoadBalancer` の既定）。
+- `externalTrafficPolicy: Local`（`LoadBalancer` の既定）でクライアントのアドレスが届くのは rproxy まで。rproxy はそれを `allowFrom`・`geoip`・ログに使う。Gateway のルートから描く TCP・UDP のルールは転送先へ送信元を渡さない（`source_ip` を付けない）ので、転送先に見えるのは rproxy の Pod の IP。転送先にクライアントのアドレスを渡すには、RproxyRule で rproxy のルールそのものを書き、`source_ip: proxy_v2`（UDP でも使える）か `proxy_v1`（TCP だけ）を付ける（転送先が PROXY protocol を読めること。rproxy-api の docs/API.md の「ルール」）。RproxyPolicy には送信元を渡す項目はない。
 
 ### 13.4 443 で SNI の passthrough
 
