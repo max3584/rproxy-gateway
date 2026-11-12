@@ -1475,6 +1475,45 @@ kubectl -n default get pod -l gateway.networking.k8s.io/gateway-name=web -o wide
 
 While the controller is down, changes do not reach rproxy (it keeps running as it is).
 
+### 9.5 Who changes things, and how
+
+Nobody instructs rproxy directly: changing Kubernetes objects is the instruction. The controller watches these kinds (`src/controller/cache.rs`) and, whenever one changes, renders the Gateway's rule set again and sends it.
+
+- Gateway API: GatewayClass, Gateway, HTTPRoute, GRPCRoute, TLSRoute, TCPRoute, UDPRoute, ReferenceGrant, ListenerSet, BackendTLSPolicy
+- rproxy's CRDs: RproxyMiddleware, RproxyPolicy, RproxyRule, RproxyGatewayParameters
+- Kubernetes: Service, EndpointSlice, Secret, ConfigMap (contents read only for the ones referred to), Namespace (`allowedRoutes` selectors), ClusterTrustBundle; for migration, Ingress and Traefik's CRDs
+
+| Trigger | What changes |
+|---|---|
+| A person runs `kubectl apply` | Gateways, routes, rproxy's CRDs |
+| GitOps (Argo CD, Flux) applies what is in Git | the same (no different from `kubectl apply`) |
+| Pods scale, fail or roll | EndpointSlice → rproxy's `servers` (automatic; nobody does anything) |
+| cert-manager renews a certificate | Secret → certificate files (automatic) |
+| Progressive delivery tools (Argo Rollouts, Flagger) change weights | the HTTPRoute's `backendRefs[].weight` |
+
+Progressive delivery tools only edit HTTPRoutes (through their Gateway API plugins), so they should work in principle. This project has not tested them.
+
+A 90 / 10 weight example (what such tools do too):
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: app, namespace: default}
+spec:
+  parentRefs: [{name: web}]
+  hostnames: [app.example.com]
+  rules:
+    - backendRefs:
+        - {name: app, port: 8080, weight: 90}      # the current version
+        - {name: app-v2, port: 8080, weight: 10}   # the new version
+```
+
+**Who may change what** is Kubernetes RBAC:
+
+- Gateways (ports, certificates, addresses): only infrastructure admins (for example in an `infra` namespace).
+- Routes: each team in its own namespace. Which namespaces' routes a Gateway takes is the admin's `allowedRoutes` ([6.1](#61-allowedroutes-which-namespaces-routes-a-gateway-takes)).
+- Only the controller holds rproxy's control API tokens. Users, CI and GitOps tools never call rproxy's API; they only write Kubernetes objects.
+
 ## 10. How it talks to rproxy
 
 The controller turns each Gateway into one rproxy rule set and sends it through rproxy-api's control API: the same API you use with `curl` on an rproxy VM, with the same rule JSON.

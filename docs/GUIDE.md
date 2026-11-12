@@ -1475,6 +1475,45 @@ kubectl -n default get pod -l gateway.networking.k8s.io/gateway-name=web -o wide
 
 コントローラが止まっている間は、変更が rproxy に届かない（今の形のまま動く）。
 
+### 9.5 誰が・どうやって切り替えるか
+
+rproxy に直接指示する人はいない。Kubernetes のオブジェクトを変えることが指示になる。コントローラが次の種類を watch し（`src/controller/cache.rs`）、変わればそのつど Gateway のルールセットを描き直して送る。
+
+- Gateway API：GatewayClass・Gateway・HTTPRoute・GRPCRoute・TLSRoute・TCPRoute・UDPRoute・ReferenceGrant・ListenerSet・BackendTLSPolicy
+- rproxy の CRD：RproxyMiddleware・RproxyPolicy・RproxyRule・RproxyGatewayParameters
+- Kubernetes：Service・EndpointSlice・Secret・ConfigMap（中身は参照されたものだけを読む）・Namespace（`allowedRoutes` の selector）・ClusterTrustBundle、移行のときは Ingress と Traefik の CRD
+
+| きっかけ | 何が変わるか |
+|---|---|
+| 人が `kubectl apply` する | Gateway・ルート・rproxy の CRD |
+| GitOps（Argo CD・Flux）が Git の中身を当てる | 同じ（`kubectl apply` と区別しない） |
+| Pod が増える・減る・落ちる・入れ替わる | EndpointSlice → rproxy の `servers`（自動。人は何もしない） |
+| cert-manager が証明書を更新する | Secret → 証明書のファイル（自動） |
+| 段階的なリリースの道具（Argo Rollouts・Flagger）が重みを変える | HTTPRoute の `backendRefs[].weight` |
+
+段階的なリリースの道具は HTTPRoute（Gateway API のプラグイン）を書き換えるだけなので、しくみの上では動くはず。ただしこのプロジェクトでは試していない。
+
+重みを 90 / 10 にする例（道具がしていることも同じ）：
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: app, namespace: default}
+spec:
+  parentRefs: [{name: web}]
+  hostnames: [app.example.com]
+  rules:
+    - backendRefs:
+        - {name: app, port: 8080, weight: 90}      # 今の版
+        - {name: app-v2, port: 8080, weight: 10}   # 新しい版
+```
+
+**誰が何を変えられるか**は Kubernetes の RBAC で決める。
+
+- Gateway（ポート・証明書・アドレス）：インフラの管理者だけに書かせる（たとえば `infra` の namespace に置く）。
+- ルート：チームごとの namespace で、そのチームに書かせる。どの namespace のルートを受けるかは Gateway の `allowedRoutes`（[6.1](#61-allowedroutesgateway-がどの-namespace-のルートを受けるか)）で管理者が決める。
+- rproxy の制御 API のトークンを持つのはコントローラだけ。利用者・CI・GitOps の道具は rproxy の API を叩かず、Kubernetes のオブジェクトだけを書く。
+
 ## 10. rproxy との話し方
 
 コントローラは Gateway 1 つを rproxy のルールセット 1 つにし、rproxy-api の制御 API で送る。rproxy の VM で `curl` で使う API と同じもので、ルールの JSON も同じ形。
