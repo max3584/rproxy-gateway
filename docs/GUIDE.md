@@ -59,7 +59,7 @@ v0.4.22 までの版のこの説明書から章の番号が変わりました。
 
 - **印なし**：標準の Gateway API（standard channel の機能）です。同じ YAML がほかの実装でも同じ意味になります。ただし、どの機能に対応しているかは実装ごとに違うので、移る先の実装の対応表（conformance の結果）は確かめてください。
 - **Gateway API experimental**：標準の Gateway API の一部ですが、まだ experimental channel にある（GA になっていない）機能です。experimental の CRD が要り、これからの版で形が変わることがあります。
-- **rproxy 固有**：rproxy-gateway の拡張や、rproxy ならではの動きです。ほかの実装には持っていけません。rproxy の CRD、chart の値、managed と fleet、rproxy の変更の当て方（`in_place`・`recreate`）、readiness gate、Gateway ごとの NetworkPolicy などがこれにあたります。
+- **rproxy 固有**：rproxy-gateway の拡張や、rproxy ならではの動きです。ほかの実装には持っていけません。rproxy の CRD、chart の値、managed と fleet、rproxy の変更の当て方（`in_place`・`recreate`）、readiness gate、Gateway ごとの NetworkPolicy などがこれにあたります。Gateway API が「実装ごと（Implementation-specific）」としている書き方のうち rproxy が受け付けるもの（ClusterTrustBundle を CA に指すなど）は、「**rproxy 固有（実装ごと）**」と書きます。
 
 **標準の Gateway API でできること（ほかの実装と同じ）**
 
@@ -71,7 +71,7 @@ v0.4.22 までの版のこの説明書から章の番号が変わりました。
 | gRPC の振り分け | [4.6](#46-grpcroute) |
 | TCP・UDP・TLS のまま転送する | [5.](#5-l4-の転送) |
 | namespace をまたいで使う（allowedRoutes・ReferenceGrant・ListenerSet） | [6.](#6-ほかの-namespace) |
-| 転送先への TLS、クライアント証明書の確かめ | [7.1](#71-backendtlspolicy)・[7.2](#72-clustertrustbundle-とクライアント証明書の確かめ) |
+| 転送先への TLS、クライアント証明書の確かめ（CA を ClusterTrustBundle で指すのは **rproxy 固有（実装ごと）**。Core は ConfigMap だけ） | [7.1](#71-backendtlspolicy)・[7.2](#72-clustertrustbundle-とクライアント証明書の確かめ) |
 | HTTPRoute の `retry`・`ExternalAuth`、リスナーのフィルタ、アドレスの到達範囲（**Gateway API experimental**） | [4.5](#45-retry-とタイムアウト)・[7.3](#73-リスナーのフィルタ)・[7.4](#74-アドレスの到達範囲) |
 
 **rproxy だけの設定（この実装の拡張）**
@@ -206,7 +206,7 @@ Helm を使わずに入れたいとき（`install.yaml` や Kustomize）は、[R
 | `controller.crossNamespaceSecrets` | `true` | ほかの namespace の証明書の Secret を使えるか |
 
 - `controller.replicas`：コントローラは何個動かしても、Lease（Kubernetes のロックのしくみ）で選ばれた 1 つ（リーダー）だけが rproxy に変更を送ります。ほかは控えとして待ち、リーダーが止まると引き継ぎます。2 つあれば、コントローラの Pod が入れ替わるときも、控えがすぐに引き継げます。ふつうは既定のままにします（[13.3](#133-冗長化とスケール)）。
-- `controller.watchNamespaces`：空のときは、すべての namespace の Gateway やルートを見ます。namespace を並べると、その namespace（とリリースの namespace）だけを見て、コントローラの権限もクラスタ全体の ClusterRole ではなく、その namespace の Role に絞られます。rproxy-gateway を使う namespace が決まっていて、コントローラの権限を小さくしたいときに使います（[12.](#12-セキュリティの基本)）。
+- `controller.watchNamespaces`：空のときは、すべての namespace の Gateway やルートを見ます。namespace を並べると、その namespace（とリリースの namespace）だけを見て、namespace に属するオブジェクト（Service・Secret・ルートなど）への権限も、クラスタ全体の ClusterRole ではなく、その namespace の Role に絞られます。namespace に属さないオブジェクト（GatewayClass など）のための ClusterRole は残ります。rproxy-gateway を使う namespace が決まっていて、コントローラの権限を小さくしたいときに使います（[12.](#12-セキュリティの基本)）。
 - `controller.crossNamespaceSecrets`：`true` のとき、Gateway の `certificateRefs` から、ReferenceGrant（[6.2](#62-referencegrantほかの-namespace-の-servicesecret-を使う)）で許されたほかの namespace の Secret を使えます。managed では、その秘密鍵が Gateway の namespace の Secret に写されます。秘密鍵がほかの namespace に写るのを避けたいときは `false` にします（[SECURITY.md](SECURITY.md)）。
 
 **Gateway ごとの rproxy（managed）**
@@ -266,7 +266,7 @@ Helm を使わずに入れたいとき（`install.yaml` や Kustomize）は、[R
 | `ui.namespace` | `""`（使わない） | 管理 UI に Gateway の rproxy を見せるか |
 | `migration.migrateTo` | `""`（使わない） | Ingress・Traefik の設定を取り込む先の Gateway |
 
-- `ui.namespace`：管理 UI（別の chart で入れます）の namespace を書くと、コントローラがその namespace に、UI が Gateway の rproxy を見つけるための Secret（`rproxy-ui-discovery`）と、読むだけのトークンを書きます。Gateway の NetworkPolicy も、UI の Pod から制御 API へ届くように開けます。UI を使わないなら空のままにします。
+- `ui.namespace`：管理 UI（別の chart で入れます）の namespace を書くと、コントローラがその namespace に、UI が Gateway の rproxy を見つけるための Secret（`rproxy-ui-discovery`）と、読むだけのトークンを書きます。UI に見せる Gateway（RproxyGatewayParameters の `ui.visible` が `false` でないもの）の NetworkPolicy も、UI の Pod から制御 API へ届くように開けます。UI を使わないなら空のままにします。
 - `migration.migrateTo`：Ingress や Traefik の設定を rproxy に取り込むときに、取り込み先の Gateway を `namespace/名前` で書きます。手順は [MIGRATION.md](MIGRATION.md) にあります。
 
 **例**：rproxy を Gateway ごとに 2 つずつ置き、MetalLB でアドレスを配るクラスタに入れる `values.yaml` です。
@@ -1159,7 +1159,9 @@ spec:
 
 この節では、CA の証明書をクラスタ全体で共有する ClusterTrustBundle の使い方と、クライアントに証明書を求める（mTLS）設定を説明します。
 
-ClusterTrustBundle は、クラスタ全体で使う CA の証明書の束を置く Kubernetes のリソースです（Kubernetes 1.37 の `certificates.k8s.io/v1`。それより前はベータの API を有効にしたときに使えます）。`caCertificateRefs` から名前で指せ、namespace に属さないので ReferenceGrant は要りません。社内の CA を一か所に置いて、多くの Gateway や BackendTLSPolicy から使いたいときに便利です。
+ClusterTrustBundle は、クラスタ全体で使う CA の証明書の束を置く Kubernetes のリソースです（Kubernetes 1.37 の `certificates.k8s.io/v1`。それより前はベータの API を有効にしたときに使えます）。`caCertificateRefs` から名前で指せ、namespace に属さないので ReferenceGrant は要りません。
+
+> **rproxy 固有（実装ごと）**：Gateway API で `caCertificateRefs` が必ず指せる（Core）のは ConfigMap だけで、ClusterTrustBundle を指せるかは実装ごとに違います（Implementation-specific）。ほかの実装に持っていくなら、CA は ConfigMap に置いてください。`frontend.validation` と BackendTLSPolicy そのものは標準です。社内の CA を一か所に置いて、多くの Gateway や BackendTLSPolicy から使いたいときに便利です。
 
 次の例では、社内の CA を ClusterTrustBundle にし、それを転送先の証明書の確かめ（BackendTLSPolicy）と、クライアント証明書の確かめ（Gateway）の両方に使います。
 
@@ -1395,16 +1397,17 @@ spec:
   responseTimeout: 2m
   outlierDetection:
     consecutive_gateway_failures: 5
+    consecutive_5xx: 0
     ejection_time: 30s
 ```
 
-`outlierDetection` は、ゲートウェイの失敗（502・503・504・接続できないなど）が 5 回続いた Pod を、まず 30 秒外す、という設定です（既定は 3 回・10 秒）。
+`outlierDetection` は、ゲートウェイの失敗（502・503・504・接続できないなど）が 5 回続いた Pod を、まず 30 秒外す、という設定です（chart の既定は 3 回・10 秒）。`consecutive_5xx: 0` で、アプリ自身が返した 5xx は数えないようにしています（chart の既定と同じ）。これを書かないと、rproxy の既定の `consecutive_5xx: 5` が効き、アプリの 5xx が 5 回続いただけで Pod が外れます。
 
 効き方の決まりは次のとおりです。
 
 - Service を指すと、その Service へ送る L4 のルールに効きます。`outlierDetection`・`connectTimeout`・`responseTimeout` は、その Service を転送先にする HTTP のサービスにも効きます。
 - 同じ項目を 2 つのポリシーが決めていたら、古いポリシーが勝ちます。
-- `outlierDetection` を書くと、chart の `backends.outlierDetection`（[1.3](#13-主な-chart-の値)）の既定は付かなくなります。外すしくみ自体を止めたいときは `outlierDetection: {max_ejected_percent: 0}` と書きます。
+- `outlierDetection` を書くと、chart の `backends.outlierDetection`（[1.3](#13-主な-chart-の値)）の既定は丸ごと使われなくなります。書かなかった項目は、chart の既定ではなく rproxy 自身の既定になります（HTTP では `consecutive_5xx: 5`（アプリの 5xx も数えます）、`ejection_time: 30s`、`max_ejection_time: 5m` など。rproxy-api の docs/API.md の「受け身のヘルスチェック」）。chart の既定と同じ動きにしたい項目は、自分で書いてください。外すしくみ自体を止めたいときは `outlierDetection: {max_ejected_percent: 0}` と書きます。
 - `idleTimeout`・`halfCloseTimeout` は、HTTP・HTTPS のルールと UDP には付きません。HTTP の接続の時間は [8.4](#84-rproxygatewayparameters) の `rproxy.http` で決めます。
 - HTTPRoute に `timeouts` を書いたルールには、`responseTimeout` は付きません（ルートに書いたほうが勝ちます）。
 
@@ -1708,7 +1711,7 @@ managed:
 
 - `extraEnv` で rproxy のルールの数の上限（`RPROXY_MAX_RULES`）を上げています。値は文字列なので引用符で囲みます。
 - `policy.maxReplicas: 5` で、テナントが `replicas` に書ける上限を 5 にしています。
-- `policy.gatewayOverrides` を書くと、書いた項目だけをテナントが書けるようになります（既定の「書ける」のリストと丸ごと置き換わります）。この例では `pod.tolerations` を開け、その代わりに `pod.topologySpreadConstraints`・`service.*`・`rproxy.shutdown`・`rproxy.http` を閉じています。そのため、このクラスでは、上の Gateway `web` の参照は `InvalidParameters` になります。
+- `policy.gatewayOverrides` を書くと、書いた項目だけをテナントが書けるようになります（既定の「書ける」のリストと丸ごと置き換わります）。この例では `pod.tolerations` を開け、リストにない既定の項目は閉じています。閉じた項目のうち、上の Gateway `web` の参照が使っているのは `pod.topologySpreadConstraints`・`service.*`・`rproxy.shutdown`・`rproxy.http` です。そのため、このクラスでは、上の Gateway `web` の参照は `InvalidParameters` になります。
 
 値の合わせ方の決まりは次のとおりです。
 
@@ -2009,7 +2012,7 @@ fleet では、証明書は Secret `rproxy-fleet-certs`、トークンファイ�
   - 外の URL に問い合わせるミドルウェア（`policy.middlewares.outboundHosts`）
   - アドレスを決めるロードバランサの注釈（`serviceAnnotationPrefixes`）
 - **ほかの namespace の秘密鍵**：ReferenceGrant でほかの namespace の証明書を使うと、managed ではその秘密鍵が Gateway の namespace に写されます。困るなら chart の `controller.crossNamespaceSecrets: false` にしてください。
-- **コントローラの権限を絞る**：chart の `controller.watchNamespaces` で見る namespace を限ると、権限もその namespace の Role に絞られます。さらに `rbac.admissionPolicy.enabled: true`（Kubernetes 1.30 以上）にすると、ValidatingAdmissionPolicy で、コントローラが書き換えられるものを自分の作ったオブジェクトに限れます。
+- **コントローラの権限を絞る**：chart の `controller.watchNamespaces` で見る namespace を限ると、namespace に属するオブジェクトへの権限が、その namespace の Role に絞られます（GatewayClass など namespace に属さないもののための ClusterRole は残ります）。さらに `rbac.admissionPolicy.enabled: true`（Kubernetes 1.30 以上）にすると、ValidatingAdmissionPolicy で、コントローラが書き換えられるものを自分の作ったオブジェクトに限れます。
 
 ## 第 4 部 運用と困ったとき
 

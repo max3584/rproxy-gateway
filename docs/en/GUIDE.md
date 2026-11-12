@@ -59,7 +59,7 @@ The text marks them like this:
 
 - **No mark**: standard Gateway API (standard-channel features). The same YAML means the same on other implementations. Which features an implementation supports still differs, so check the support table (conformance results) of the implementation you move to.
 - **Gateway API experimental**: part of standard Gateway API, but still in the experimental channel (not GA). It needs the experimental CRDs, and its shape may change in later versions.
-- **rproxy-specific**: rproxy-gateway's extensions and behaviour particular to rproxy. These do not carry over to other implementations. rproxy's CRDs, chart values, managed and fleet, how rproxy applies changes (`in_place`, `recreate`), the readiness gate and the per-Gateway NetworkPolicy all belong here.
+- **rproxy-specific**: rproxy-gateway's extensions and behaviour particular to rproxy. These do not carry over to other implementations. rproxy's CRDs, chart values, managed and fleet, how rproxy applies changes (`in_place`, `recreate`), the readiness gate and the per-Gateway NetworkPolicy all belong here. Forms that Gateway API leaves to implementations (Implementation-specific) and rproxy accepts, such as naming a ClusterTrustBundle as a CA, are marked **rproxy-specific (implementation-specific)**.
 
 **What standard Gateway API does (the same on other implementations)**
 
@@ -71,7 +71,7 @@ The text marks them like this:
 | gRPC routing | [4.6](#46-grpcroute) |
 | Forwarding TCP, UDP and TLS as they are | [5.](#5-l4-forwarding) |
 | Using a Gateway across namespaces (allowedRoutes, ReferenceGrant, ListenerSet) | [6.](#6-other-namespaces) |
-| TLS to backends, client certificate validation | [7.1](#71-backendtlspolicy), [7.2](#72-clustertrustbundle-and-client-certificate-validation) |
+| TLS to backends, client certificate validation (naming the CA with a ClusterTrustBundle is **rproxy-specific (implementation-specific)**; Core is ConfigMap only) | [7.1](#71-backendtlspolicy), [7.2](#72-clustertrustbundle-and-client-certificate-validation) |
 | HTTPRoute `retry` and `ExternalAuth`, listener filters, address routability (**Gateway API experimental**) | [4.5](#45-retries-and-timeouts), [7.3](#73-listener-filters), [7.4](#74-address-routability) |
 
 **rproxy-only settings (this implementation's extensions)**
@@ -206,7 +206,7 @@ Two terms first:
 | `controller.crossNamespaceSecrets` | `true` | Whether certificate Secrets from other namespaces may be used |
 
 - `controller.replicas`: however many controllers run, only one of them, the leader chosen through a Lease (a Kubernetes locking mechanism), sends changes to rproxy. The others wait as standbys and take over if the leader stops. With two, a standby can take over right away while a controller pod is being replaced. The default is normally fine ([13.3](#133-scaling-and-ha)).
-- `controller.watchNamespaces`: when empty, the controller watches Gateways and routes in every namespace. When you list namespaces, it watches only those (plus the release namespace), and its permissions shrink from a cluster-wide ClusterRole to Roles in those namespaces. Use it when you know which namespaces will use rproxy-gateway and want the controller to hold fewer permissions ([12.](#12-security-basics)).
+- `controller.watchNamespaces`: when empty, the controller watches Gateways and routes in every namespace. When you list namespaces, it watches only those (plus the release namespace), and its permissions on namespaced objects (Services, Secrets, routes and so on) shrink from a cluster-wide ClusterRole to Roles in those namespaces. The ClusterRole for cluster-scoped objects (such as GatewayClasses) stays. Use it when you know which namespaces will use rproxy-gateway and want the controller to hold fewer permissions ([12.](#12-security-basics)).
 - `controller.crossNamespaceSecrets`: when `true`, a Gateway's `certificateRefs` may name a Secret in another namespace that a ReferenceGrant ([6.2](#62-referencegrant-using-another-namespaces-services-and-secrets)) allows. In managed mode, that private key is copied into a Secret in the Gateway's namespace. Set it to `false` if you do not want private keys copied across namespaces ([SECURITY.md](SECURITY.md)).
 
 **Per-Gateway rproxy (managed)**
@@ -266,7 +266,7 @@ These three are the defaults for how rproxy connects to and watches the pods beh
 | `ui.namespace` | `""` (off) | Whether the management UI can see Gateways' rproxies |
 | `migration.migrateTo` | `""` (off) | Which Gateway takes in Ingress and Traefik configuration |
 
-- `ui.namespace`: when you give the namespace of the management UI (installed with its own chart), the controller writes there a Secret (`rproxy-ui-discovery`) the UI uses to find Gateways' rproxies, along with read-only tokens. It also opens the Gateways' NetworkPolicy so the UI's pods can reach the control API. Leave it empty if you do not use the UI.
+- `ui.namespace`: when you give the namespace of the management UI (installed with its own chart), the controller writes there a Secret (`rproxy-ui-discovery`) the UI uses to find Gateways' rproxies, along with read-only tokens. It also opens the NetworkPolicy of the Gateways shown to the UI (those whose RproxyGatewayParameters `ui.visible` is not `false`) so the UI's pods can reach the control API. Leave it empty if you do not use the UI.
 - `migration.migrateTo`: when bringing Ingress or Traefik configuration into rproxy, the `namespace/name` of the Gateway that receives it. The steps are in [MIGRATION.md](MIGRATION.md).
 
 **Example**: a `values.yaml` for a cluster where every Gateway gets two rproxy pods and MetalLB hands out addresses:
@@ -1159,7 +1159,9 @@ Check it in `Status.Ancestors` (status per Gateway) of `kubectl -n default descr
 
 This section covers ClusterTrustBundle, which shares CA certificates across the cluster, and asking clients for certificates (mTLS).
 
-A ClusterTrustBundle is a Kubernetes resource that holds a bundle of CA certificates for the whole cluster (`certificates.k8s.io/v1` in Kubernetes 1.37; before that, when the beta API is turned on). `caCertificateRefs` can name it, and since it belongs to no namespace, no ReferenceGrant is needed. It is handy when you keep your internal CA in one place and use it from many Gateways and BackendTLSPolicies.
+A ClusterTrustBundle is a Kubernetes resource that holds a bundle of CA certificates for the whole cluster (`certificates.k8s.io/v1` in Kubernetes 1.37; before that, when the beta API is turned on). `caCertificateRefs` can name it, and since it belongs to no namespace, no ReferenceGrant is needed.
+
+> **rproxy-specific (implementation-specific)**: in Gateway API, the only kind `caCertificateRefs` must support (Core) is ConfigMap; whether it can name a ClusterTrustBundle differs per implementation (Implementation-specific). To carry the setup over to another implementation, keep the CA in a ConfigMap. `frontend.validation` and BackendTLSPolicy themselves are standard. It is handy when you keep your internal CA in one place and use it from many Gateways and BackendTLSPolicies.
 
 In the example, the internal CA becomes a ClusterTrustBundle, used both to check backend certificates (BackendTLSPolicy) and to check client certificates (Gateway):
 
@@ -1395,16 +1397,17 @@ spec:
   responseTimeout: 2m
   outlierDetection:
     consecutive_gateway_failures: 5
+    consecutive_5xx: 0
     ejection_time: 30s
 ```
 
-The `outlierDetection` here leaves out a pod for 30 seconds at first after 5 gateway failures in a row (502, 503, 504, no connection and so on); the default is 3 failures and 10 seconds.
+The `outlierDetection` here leaves out a pod for 30 seconds at first after 5 gateway failures in a row (502, 503, 504, no connection and so on); the chart's default is 3 failures and 10 seconds. `consecutive_5xx: 0` keeps 5xx answers from the app itself from being counted (as in the chart's default). Without it, rproxy's default `consecutive_5xx: 5` applies, and a pod is left out after the app returns 5xx five times in a row.
 
 How it applies:
 
 - Naming a Service applies the policy to the L4 rules that send to that Service. `outlierDetection`, `connectTimeout` and `responseTimeout` also apply to HTTP services whose backend is that Service.
 - If two policies set the same field, the older policy wins.
-- Writing `outlierDetection` drops the chart's `backends.outlierDetection` default ([1.3](#13-main-chart-values)). To turn leaving pods out off entirely, write `outlierDetection: {max_ejected_percent: 0}`.
+- Writing `outlierDetection` drops the chart's `backends.outlierDetection` default ([1.3](#13-main-chart-values)) as a whole. Fields you leave out take rproxy's own defaults, not the chart's (for HTTP: `consecutive_5xx: 5`, which also counts the app's 5xx, `ejection_time: 30s`, `max_ejection_time: 5m` and so on; "受け身のヘルスチェック" in rproxy-api docs/API.md). Write out any field you want to behave as in the chart's default. To turn leaving pods out off entirely, write `outlierDetection: {max_ejected_percent: 0}`.
 - `idleTimeout` and `halfCloseTimeout` do not apply to HTTP and HTTPS rules or to UDP. HTTP connection timing is set with `rproxy.http` in [8.4](#84-rproxygatewayparameters).
 - Rules of an HTTPRoute with `timeouts` do not get `responseTimeout` (what the route says wins).
 
@@ -1708,7 +1711,7 @@ managed:
 
 - `extraEnv` raises rproxy's limit on the number of rules (`RPROXY_MAX_RULES`). The value is a string, so it is quoted.
 - `policy.maxReplicas: 5` caps the `replicas` tenants may write at 5.
-- With `policy.gatewayOverrides`, tenants may set only the fields listed (it replaces the default "may" list as a whole). This example opens `pod.tolerations` and in exchange closes `pod.topologySpreadConstraints`, `service.*`, `rproxy.shutdown` and `rproxy.http`. So with this class, the Gateway `web`'s reference above becomes `InvalidParameters`.
+- With `policy.gatewayOverrides`, tenants may set only the fields listed (it replaces the default "may" list as a whole). This example opens `pod.tolerations` and closes the default fields it does not list. Of the closed fields, the Gateway `web`'s reference above uses `pod.topologySpreadConstraints`, `service.*`, `rproxy.shutdown` and `rproxy.http`, so with this class that reference becomes `InvalidParameters`.
 
 How values are combined:
 
@@ -2009,7 +2012,7 @@ This chapter briefly sums up how rproxy-gateway keeps Gateways and tenants apart
   - Middlewares that call outside URLs (`policy.middlewares.outboundHosts`)
   - Load balancer annotations that pick addresses (`serviceAnnotationPrefixes`)
 - **Private keys from other namespaces**: when you use another namespace's certificate through a ReferenceGrant, managed mode copies its private key into the Gateway's namespace. If that is a problem, set the chart's `controller.crossNamespaceSecrets: false`.
-- **Narrowing the controller's permissions**: limiting the watched namespaces with the chart's `controller.watchNamespaces` also narrows its permissions to Roles in those namespaces. In addition, `rbac.admissionPolicy.enabled: true` (Kubernetes 1.30 or later) uses a ValidatingAdmissionPolicy to limit what the controller may change to the objects it made itself.
+- **Narrowing the controller's permissions**: limiting the watched namespaces with the chart's `controller.watchNamespaces` narrows its permissions on namespaced objects to Roles in those namespaces (the ClusterRole for cluster-scoped objects such as GatewayClasses stays). In addition, `rbac.admissionPolicy.enabled: true` (Kubernetes 1.30 or later) uses a ValidatingAdmissionPolicy to limit what the controller may change to the objects it made itself.
 
 ## Part 4: Operations and troubleshooting
 
