@@ -8,6 +8,8 @@
 
 日本語: [README.md](README.md)
 
+New to it? Start with [docs/en/GUIDE.md](docs/en/GUIDE.md) (configuration guide: installing, writing Gateways and routes, HTTPS, L4, rproxy's CRDs, operations, troubleshooting).
+
 A Kubernetes controller for [rproxy](https://github.com/max3584/rproxy-api). It turns Gateway API resources (v1.6, standard channel) into rproxy rules and applies them through rproxy's control API (rule sets, `PUT /rulesets/{name}`) (max3584/rproxy-api#28; the design is docs/en/DESIGN-v0.4.md 3. in rproxy-api).
 
 - rproxy knows nothing of the Kubernetes API. This controller and rproxy meet only at the control API (`docs/openapi.json` in rproxy-api). It needs rproxy v0.4.0 or later (`features.rulesets`).

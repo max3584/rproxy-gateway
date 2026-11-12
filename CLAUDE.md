@@ -24,6 +24,7 @@ scripts/acceptance.sh         # 受け入れテスト（同上。手動の accep
 - `src/controller/`：watch（`cache.rs`）、反映のループと `sync_pod`（`mod.rs`）、状態（`status.rs`）、rproxy の配置（`provision.rs`）、CA・トークンの Secret（`bootstrap.rs`）、UI に見せる発見の Secret と UI 用のトークン（`ui.rs`。`--ui-namespace`）。`tests.rs` は制御 API の文書どおりの偽の rproxy
 - `src/rproxy/`：制御 API のクライアントと形。`src/certsync.rs`：rproxy の Pod の中で証明書をファイルにする
 - `charts/rproxy-gateway/`：Helm chart（`crds/` は `rproxy-gateway crds` の出力。コントローラの設定は ConfigMap `rproxy-gateway-config` の `RPROXY_GATEWAY_*`）。`config/`：chart から描いた Kustomize の base（`default`・`fleet`・`crd`）と `samples/`（手で書く overlay の例）。`Dockerfile`（コントローラ）、`Dockerfile.rproxy`（rproxy）は Alpine で、Alpine のジョブが作った musl のバイナリを入れる
+- 利用者向けの設定説明書（やりたいことごとの手順と YAML、運用、困ったとき）は docs/GUIDE.md。設定・挙動を変えたらここも直す
 - 決めごとは docs/DESIGN.md、移行は docs/MIGRATION.md、conformance の結果は docs/CONFORMANCE.md、プラットフォームでのアドレスの用意（MetalLB・kube-vip・Cilium・クラウド・NodePort + L4・fleet の keepalived など）は docs/PLATFORM.md（どれも日本語・英語）
 
 ## 約束
