@@ -8,6 +8,8 @@
 
 English: [README.en.md](README.en.md)
 
+はじめての方は [docs/GUIDE.md](docs/GUIDE.md)（設定説明書：入れ方、Gateway とルートの書き方、HTTPS、L4、rproxy の CRD、運用、困ったとき）。
+
 [rproxy](https://github.com/max3584/rproxy-api) の Kubernetes コントローラ。Gateway API（v1.6、standard channel）のリソースを rproxy のルールにして、rproxy の制御 API（ルールセット、`PUT /rulesets/{name}`）で反映する（max3584/rproxy-api#28、設計は rproxy-api の docs/DESIGN-v0.4.md 3.）。
 
 - rproxy は Kubernetes の API を知らない。このコントローラと rproxy は制御 API（rproxy-api の `docs/openapi.json`）だけでつながる。rproxy v0.4.0 以降（`features.rulesets`）が要る。
