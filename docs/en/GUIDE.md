@@ -15,7 +15,7 @@ Related documents:
 
 The names in the examples (`app.example.com`, the `default` namespace, the Service `app`) and the addresses (`192.0.2.0/24`, `203.0.113.0/24`) are reserved for documentation. Replace them with your own.
 
-The examples were checked with this version (v0.4.22, with the bundled rproxy v0.4.22). Every YAML was checked against the CRD schemas, and its conversion into rproxy rules was checked with `rproxy-gateway render` ([15.3](#153-checking-without-a-cluster)).
+The examples were checked with this version (v0.4.23, with the bundled rproxy v0.4.23). Every YAML was checked against the CRD schemas, and its conversion into rproxy rules was checked with `rproxy-gateway render` ([15.3](#153-checking-without-a-cluster)).
 
 ## Contents
 
@@ -1264,7 +1264,7 @@ What rproxy supports, and its rules (**rproxy-specific**):
 - These RproxyMiddleware settings cannot be used: `retry`, `mirror` and `replace_host`, which rproxy's `pre_routing` does not accept; settings that name a service (such as `forward_auth`'s `service`), because only a route's rules can be named and a listener has none (for authentication use `ExternalAuth` or `forward_auth`'s `address`); and `headers` that change Host, refused because the listener is not chosen again after such a change.
 - In rproxy, the listeners on one port form a single rule, so give every listener on a port the same filters. If they differ, the listeners with filters become `Accepted: False` (reason `UnsupportedValue`).
 - If a reference does not resolve (the Service or RproxyMiddleware is missing), the listener becomes `ResolvedRefs: False` (reason `InvalidListenerFilterRef`) and answers 500 at that filter. It never skips authentication and lets the request through.
-- Until all of the Gateway's rproxy pods report that they support `pre_routing`, the listener is `Accepted: False` (reason `UnsupportedValue`, message "not known (yet)"). The bundled rproxy v0.4.22 supports it, so normally the listener is accepted once the pods start.
+- Until all of the Gateway's rproxy pods report that they support `pre_routing`, the listener is `Accepted: False` (reason `UnsupportedValue`, message "not known (yet)"). The bundled rproxy v0.4.23 supports it, so normally the listener is accepted once the pods start.
 - Details: 17. of [DESIGN-v0.4.x.md](DESIGN-v0.4.x.md).
 
 ### 7.4 Address routability
@@ -2028,9 +2028,9 @@ How to move rproxy-gateway to a new version. Helm does not update CRDs when it u
 
 ```bash
 # 1. apply rproxy's CRDs first (helm upgrade does not update CRDs)
-kubectl apply --server-side -f https://github.com/max3584/rproxy-gateway/releases/download/v0.4.22/rproxy.max3584.net.yaml
+kubectl apply --server-side -f https://github.com/max3584/rproxy-gateway/releases/download/v0.4.23/rproxy.max3584.net.yaml
 # 2. upgrade the chart
-helm upgrade rproxy-gateway oci://ghcr.io/max3584/charts/rproxy-gateway --version 0.4.22 \
+helm upgrade rproxy-gateway oci://ghcr.io/max3584/charts/rproxy-gateway --version 0.4.23 \
   -n rproxy-gateway-system -f values.yaml
 # 3. check
 kubectl -n rproxy-gateway-system rollout status deploy/rproxy-gateway
@@ -2039,7 +2039,7 @@ kubectl get gateway -A
 
 What an upgrade does, and what to keep in mind:
 
-- Each chart version comes with a fixed rproxy version (the chart's `rproxy.image.tag`; chart 0.4.22 has rproxy 0.4.22). When the rproxy image (or certsync, which is in the controller's image) changes, the pods of every managed Gateway are replaced by a rolling update (10.3). With 2 or more replicas, the gap is normally about a second at most ("Availability" in the [README](../../README.en.md)). In fleet mode the DaemonSet is replaced.
+- Each chart version comes with a fixed rproxy version (the chart's `rproxy.image.tag`; chart 0.4.23 has rproxy 0.4.23). When the rproxy image (or certsync, which is in the controller's image) changes, the pods of every managed Gateway are replaced by a rolling update (10.3). With 2 or more replicas, the gap is normally about a second at most ("Availability" in the [README](../../README.en.md)). In fleet mode the DaemonSet is replaced.
 - Check each version's changes in the release notes (GitHub Releases). Within v0.4.x, changes do not break your current values or Gateways ([DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) 1.).
 - If you installed with Kustomize or `install.yaml`, `kubectl apply --server-side` the new version's `install.yaml` (it includes the CRDs).
 - To upgrade Gateway API's CRDs, `kubectl apply --server-side` the new version's `standard-install.yaml` (or experimental). The controller looks for new kinds every 30 seconds, so it does not need a restart. Check which Kubernetes versions go with it in "Supported versions" in the [README](../../README.en.md).
@@ -2501,7 +2501,7 @@ For more detail, set `RPROXY_GATEWAY_LOG=debug` as in 13.5. rproxy's own logs ar
 `rproxy-gateway render` draws rproxy's rule sets and the status from a file of manifests. It needs neither a cluster nor rproxy, so use it to check YAML before applying it, or to see what the conversion produces. Put the GatewayClass, Services and EndpointSlices in the same file.
 
 ```bash
-docker run --rm -v $PWD:/w ghcr.io/max3584/rproxy-gateway:0.4.22 render -f /w/manifests.yaml
+docker run --rm -v $PWD:/w ghcr.io/max3584/rproxy-gateway:0.4.23 render -f /w/manifests.yaml
 ```
 
 The `conditions` of `listeners` and `routes` in the output show the same reasons as in a cluster. Items decided by asking rproxy's pods (listener filters, for example) show as "not known (yet)".

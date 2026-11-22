@@ -1530,7 +1530,7 @@ pub async fn sync_pod(
 /// pods all restart at once keeps its shape).
 static FEATURE_IMAGES: std::sync::Mutex<BTreeSet<(String, String)>> = std::sync::Mutex::new(BTreeSet::new());
 
-/// Features of the image this controller ships (`--rproxy-image`'s default, rproxy v0.4.22): listener
+/// Features of the image this controller ships (`--rproxy-image`'s default, rproxy v0.4.23): listener
 /// filters (`http_options.pre_routing`, `render::listener_filters::FEATURE`) since v0.4.22, so a new
 /// Gateway of the bundled image translates them before its pods answer (`render::listener_filters::DOCUMENTED_KINDS`).
 const SHIPPED_FEATURES: &[&str] =

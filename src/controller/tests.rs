@@ -362,11 +362,11 @@ async fn tokens_reload_is_known_from_the_image_or_the_pods() {
 		..Default::default()
 	};
 	let mut caps = HashMap::new();
-	assert!(image_feature(&rp, provision::RPROXY_IMAGE, "tokens_reload", &[], &mut caps).await, "the shipped image (v0.4.22)");
-	assert!(image_feature(&rp, provision::RPROXY_IMAGE, "control_limits", &[], &mut caps).await, "the shipped image (v0.4.22)");
+	assert!(image_feature(&rp, provision::RPROXY_IMAGE, "tokens_reload", &[], &mut caps).await, "the shipped image (v0.4.23)");
+	assert!(image_feature(&rp, provision::RPROXY_IMAGE, "control_limits", &[], &mut caps).await, "the shipped image (v0.4.23)");
 	assert!(
 		image_feature(&rp, provision::RPROXY_IMAGE, crate::render::listener_filters::FEATURE, &[], &mut caps).await,
-		"the shipped image (v0.4.22)"
+		"the shipped image (v0.4.23)"
 	);
 	assert!(!image_feature(&rp, provision::RPROXY_IMAGE, "another", &[], &mut caps).await);
 	assert!(!image_feature(&rp, "example/rproxy:reload", "tokens_reload", &[ep("r1")], &mut caps).await, "rproxy before v0.4.2");
@@ -452,7 +452,7 @@ async fn the_settings_file_needs_every_pod_or_keeps_the_current_form() {
 	};
 	let custom = "example/rproxy:settings";
 	let mut caps = HashMap::new();
-	// a new Gateway of the shipped image (v0.4.22): written
+	// a new Gateway of the shipped image (v0.4.23): written
 	assert_eq!(settings_known(&rp, &[], &[], provision::RPROXY_IMAGE, false, &mut caps).await, SettingsKnown::Yes);
 	// another image without pods: not by its name
 	assert_eq!(settings_known(&rp, &[], &[], custom, false, &mut caps).await, SettingsKnown::No);
@@ -985,7 +985,7 @@ fn listener_filters_claimed_only_when_rproxy_runs_them() {
 
 /// Listener filters while not every pod has answered (a scale-up, a restart, a rollout to another image):
 /// kept where they are already in force; refused (`Lacking`) once a pod answers without `pre_routing`;
-/// known with no pod yet for the bundled image (rproxy v0.4.22 has it); else waiting (`Unknown`).
+/// known with no pod yet for the bundled image (rproxy v0.4.22 and later have it); else waiting (`Unknown`).
 #[tokio::test]
 async fn listener_filters_are_kept_while_a_new_pod_is_not_known() {
 	use crate::render::PreRouting;
@@ -1041,7 +1041,7 @@ async fn listener_filters_are_kept_while_a_new_pod_is_not_known() {
 		pre_routing_state(&rp, &[a.clone(), b.clone()], &with_b, Some(image), set, &mut caps).await,
 		PreRouting::Lacking { place: true }
 	);
-	// the bundled image (rproxy v0.4.22) has it: known with no pod yet, with the kinds rproxy-api documents
+	// the bundled image (rproxy v0.4.23) has it: known with no pod yet, with the kinds rproxy-api documents
 	let documented: Vec<String> = crate::render::listener_filters::DOCUMENTED_KINDS.iter().map(|k| k.to_string()).collect();
 	assert_eq!(
 		pre_routing_state(&rp, &[], &[], Some(provision::RPROXY_IMAGE), set, &mut caps).await,
