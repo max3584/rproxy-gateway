@@ -15,7 +15,7 @@ English: [en/GUIDE.md](en/GUIDE.md)
 
 例の中の名前（`app.example.com`、namespace `default`、Service `app`）とアドレス（`192.0.2.0/24`・`203.0.113.0/24`）は、文書のために予約された値です。実際に使うときは自分の環境のものに置き換えてください。
 
-例はこの版（v0.4.22、同梱の rproxy も v0.4.22）で確かめています。YAML はすべて CRD のスキーマに照らして確かめ、`rproxy-gateway render`（[15.3](#153-クラスタなしで確かめる)）で rproxy のルールに変換できることも確かめています。
+例はこの版（v0.4.23、同梱の rproxy も v0.4.23）で確かめています。YAML はすべて CRD のスキーマに照らして確かめ、`rproxy-gateway render`（[15.3](#153-クラスタなしで確かめる)）で rproxy のルールに変換できることも確かめています。
 
 ## 目次
 
@@ -1264,7 +1264,7 @@ rproxy で使えるものと決まりは次のとおりです（**rproxy 固有*
 - RproxyMiddleware のうち、次のものは使えません。`retry`・`mirror`・`replace_host` は、rproxy の `pre_routing` が受け付けません。サービスを名指す設定（`forward_auth` の `service` など）は、名指せる先がルートのルールだけで、リスナーにはありません（認証は `ExternalAuth` か `forward_auth` の `address` を使います）。Host を変える `headers` は、変えた後でリスナーを選び直すことはしないので断ります。
 - rproxy では同じポートのリスナーが 1 つのルールになるので、フィルタはそのポートのすべてのリスナーで同じにしてください。そろっていないと、フィルタを持つリスナーが `Accepted: False`（reason `UnsupportedValue`）になります。
 - 参照が解決しない（Service や RproxyMiddleware がない）ときは、リスナーが `ResolvedRefs: False`（reason `InvalidListenerFilterRef`）になり、そのフィルタのところで 500 を返します。認証を飛ばして通すことはしません。
-- Gateway の rproxy の Pod がすべて `pre_routing` に対応していると答えるまで、リスナーは `Accepted: False`（reason `UnsupportedValue`、message「not known (yet)」）です。同梱の rproxy v0.4.22 は対応しているので、ふつうは Pod が起動すれば受け付けられます。
+- Gateway の rproxy の Pod がすべて `pre_routing` に対応していると答えるまで、リスナーは `Accepted: False`（reason `UnsupportedValue`、message「not known (yet)」）です。同梱の rproxy v0.4.23 は対応しているので、ふつうは Pod が起動すれば受け付けられます。
 - 詳しくは [DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) の 17. にあります。
 
 ### 7.4 アドレスの到達範囲
@@ -2028,9 +2028,9 @@ rproxy-gateway を新しい版に上げる手順です。Helm は chart を上�
 
 ```bash
 # 1. rproxy の CRD を先に当てる（helm upgrade は CRD を更新しない）
-kubectl apply --server-side -f https://github.com/max3584/rproxy-gateway/releases/download/v0.4.22/rproxy.max3584.net.yaml
+kubectl apply --server-side -f https://github.com/max3584/rproxy-gateway/releases/download/v0.4.23/rproxy.max3584.net.yaml
 # 2. chart を上げる
-helm upgrade rproxy-gateway oci://ghcr.io/max3584/charts/rproxy-gateway --version 0.4.22 \
+helm upgrade rproxy-gateway oci://ghcr.io/max3584/charts/rproxy-gateway --version 0.4.23 \
   -n rproxy-gateway-system -f values.yaml
 # 3. 確かめる
 kubectl -n rproxy-gateway-system rollout status deploy/rproxy-gateway
@@ -2039,7 +2039,7 @@ kubectl get gateway -A
 
 更新で起きることと、気をつけることは次のとおりです。
 
-- chart の版ごとに、同梱の rproxy の版が決まっています（chart の `rproxy.image.tag`。chart 0.4.22 なら rproxy 0.4.22）。rproxy のイメージ（とコントローラのイメージに入っている certsync）が変わると、managed のすべての Gateway の Pod が rolling update で入れ替わります（10.3）。replicas が 2 以上なら、途切れはふつう 1 秒ほどまでです（[README](../README.md) の「可用性」）。fleet では DaemonSet が入れ替わります。
+- chart の版ごとに、同梱の rproxy の版が決まっています（chart の `rproxy.image.tag`。chart 0.4.23 なら rproxy 0.4.23）。rproxy のイメージ（とコントローラのイメージに入っている certsync）が変わると、managed のすべての Gateway の Pod が rolling update で入れ替わります（10.3）。replicas が 2 以上なら、途切れはふつう 1 秒ほどまでです（[README](../README.md) の「可用性」）。fleet では DaemonSet が入れ替わります。
 - 版ごとの変更は、GitHub の Releases のリリースノートで確かめてください。v0.4.x の間は、今の値や Gateway を壊す変更はしません（[DESIGN-v0.4.x.md](DESIGN-v0.4.x.md) の 1.）。
 - Kustomize や `install.yaml` で入れたときは、新しい版の `install.yaml` を `kubectl apply --server-side` します（CRD も含まれています）。
 - Gateway API の CRD を上げるときは、新しい版の `standard-install.yaml`（か experimental）を `kubectl apply --server-side` します。コントローラは新しい種類を 30 秒ごとに探すので、コントローラの再起動は要りません。Kubernetes の版との組み合わせは [README](../README.md) の「対応する版」で確かめてください。
@@ -2501,7 +2501,7 @@ kubectl -n rproxy-gateway-system logs $LEADER --since=1h \
 `rproxy-gateway render` を使うと、マニフェストのファイルから、rproxy のルールセットと状態を描けます。クラスタも rproxy も要らないので、当てる前に YAML を確かめたいときや、変換の結果を見たいときに使います。GatewayClass・Service・EndpointSlice も同じファイルに入れてください。
 
 ```bash
-docker run --rm -v $PWD:/w ghcr.io/max3584/rproxy-gateway:0.4.22 render -f /w/manifests.yaml
+docker run --rm -v $PWD:/w ghcr.io/max3584/rproxy-gateway:0.4.23 render -f /w/manifests.yaml
 ```
 
 出力の `listeners`・`routes` の `conditions` には、クラスタで出るのと同じ reason が出ます。ただし、rproxy の Pod に聞いて決める項目（たとえばリスナーのフィルタ）は、「not known (yet)」になります。
